@@ -1,8 +1,12 @@
 use {
     crate::{
         accounts::{
-            address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, writer_epoch, writer_lease::WriterLease, AccountsDB,
+            address_index_repair::repair_address_signatures,
+            postgres::{ensure_address_signatures_signature_index, PostgresAccountsDB},
+            redis::RedisAccountsDB,
+            writer_epoch,
+            writer_lease::WriterLease,
+            AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -418,6 +422,8 @@ async fn start_services(
         };
         let writer_epoch = writer_epoch::bump(postgres_db).await?;
         info!("Claimed writer epoch {writer_epoch}");
+        // Before any address_signatures writer starts, so a first build blocks nothing live.
+        ensure_address_signatures_signature_index(&postgres_db.pool).await?;
         repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
         let (initial_live_blockhashes, initial_dedup_cache) =
             load_dedup_state(&db, config.max_blockhashes).await?;

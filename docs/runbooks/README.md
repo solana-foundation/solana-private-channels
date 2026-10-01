@@ -146,7 +146,7 @@ The runbooks call this out at every relevant site.
   paged; the resync fails closed before deleting anything, so the database is
   intact.
 - [`resync_consumed_mint_mismatch.md`](resync_consumed_mint_mismatch.md) - a
-  resync aborting because an authority-signed channel mint names a source event
+  resync aborting because a channel mint names a source event
   but does not pay it, or one event was minted twice. Log-discovered, not paged;
   fails closed before deleting anything, but keep the operators stopped until
   the affected rows are quarantined.

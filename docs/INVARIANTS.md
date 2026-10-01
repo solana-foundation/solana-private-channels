@@ -24,6 +24,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
 | C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
 | C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
+| C17 | A transaction that lists the spl-token native mint MUST be rejected at ingress, and the admin VM MUST NOT create it, so fabricated lamports never become wSOL. Revisit if a second ingress path or a lamport-valued exit is added | MUST | Done | - |
 
 ## On-chain Programs
 
@@ -32,6 +33,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | P1 | Escrow program MUST require SPL transfers on escrow | MUST | Done | #18 |
 | P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
 | P3 | Escrow program MUST require an authorized operator to release funds AND that the withdrawal's nonce is unconsumed in the current bitmap generation | MUST | Done | #9, #10, #29 |
+| P4 | Escrow program MUST NOT allow the spl-token native mint | MUST | Done | - |
 
 ## Indexer
 

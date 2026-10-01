@@ -58,6 +58,11 @@ first and note the newest signature whose memo still fails to parse:
 solana transaction-history <CHANNEL_AUTHORITY> --url <CHANNEL_RPC> --show-transactions
 ```
 
+After a channel admin rotation, a legacy memo can also come from an old key, and
+resync reads each receipt mint's history too. So also list each receipt mint's
+history the same way (`solana transaction-history <RECEIPT_MINT> ...`), not only
+the current authority's.
+
 Everything at or older than that point predates the cutover.
 
 ### 2. Drain the operator

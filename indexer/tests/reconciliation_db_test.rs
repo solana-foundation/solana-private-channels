@@ -60,8 +60,8 @@ async fn insert_mint(
     token_program: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, created_at)
-         VALUES ($1, $2, $3, NOW())",
+        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot, created_at)
+         VALUES ($1, $2, $3, 0, NOW())",
     )
     .bind(mint_address)
     .bind(decimals)

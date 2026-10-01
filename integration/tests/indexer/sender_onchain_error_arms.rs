@@ -263,11 +263,11 @@ async fn retry_under_idempotent_policy_recursively_resends_and_completes() {
 // variants and asserts the resulting `TransactionStatusUpdate` shape.
 // ============================================================================
 
-/// Build a `SenderState` with optional pre-seeded mint cache + builder for
+/// Build a `SenderState` with an optional seeded mint row + builder for
 /// the JIT-driven caller-arm tests. The default `build_default_sender_state`
 /// fixture doesn't seed anything; these tests need both knobs.
 async fn build_state_for_jit_caller_arm(
-    populate_mint_cache: bool,
+    seed_mint_row: bool,
 ) -> (
     private_channel_indexer::operator::sender::types::SenderState,
     tokio::sync::mpsc::Receiver<TransactionStatusUpdate>,
@@ -279,10 +279,10 @@ async fn build_state_for_jit_caller_arm(
     let mock = MockRpcServer::start().await;
     let mock_storage = MockStorage::new();
     let mint = Pubkey::new_unique();
-    if populate_mint_cache {
+    if seed_mint_row {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(mint.to_string(), 6, spl_token::id().to_string(), 0),
         );
     }
     let storage = Arc::new(Storage::Mock(mock_storage));
@@ -513,12 +513,12 @@ async fn mint_not_initialized_jit_manual_review_corrupt_state() {
 /// private channel mint until someone edited the database by hand.
 #[tokio::test]
 async fn mint_not_initialized_jit_transient_requeues_deposit() {
-    // Mint cache empty, so the JIT body returns Transient("mint not in mint cache").
+    // No mint row, so the JIT body returns Transient("mint decimals unavailable").
     let (mut state, mut storage_rx, storage_tx, mock, mint) =
         build_state_for_jit_caller_arm(false).await;
 
     // Pre-check sees uninit (would normally fall through to init) but
-    // get_mint_metadata fails because the cache is empty.
+    // get_mint_decimals fails because there is no mint row.
     mock.enqueue(
         "getAccountInfo",
         account_info_reply_bytes(&[0u8; Mint::LEN]),

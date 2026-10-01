@@ -2671,16 +2671,7 @@ mod tests {
         let payer = Keypair::new();
         let wallet = Pubkey::new_unique();
         let ata = spl_associated_token_account::get_associated_token_address(&wallet, &mint);
-        let ix = spl_associated_token_account::instruction::create_associated_token_account(
-            &payer.pubkey(),
-            &wallet,
-            &mint,
-            &spl_token::id(),
-        );
-        let msg = Message::new(&[ix], Some(&payer.pubkey()));
-        let raw = Transaction::new(&[&payer], msg, Hash::default());
-        let ata_tx = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
-            .expect("failed to build ATA-create tx");
+        let ata_tx = ata_create_tx(&payer, &wallet, &mint);
 
         let result = run_batch(&mut deps, &metrics, vec![admin_tx, ata_tx]).await;
 
@@ -2698,6 +2689,67 @@ mod tests {
             bob_balance(&deps.bob, &payer.pubkey()).is_none_or(|l| l == 0),
             "the fabricated payer must not persist"
         );
+    }
+
+    /// Gasless ATA-create tx for `wallet` and `mint`, paid by `payer`.
+    fn ata_create_tx(payer: &Keypair, wallet: &Pubkey, mint: &Pubkey) -> SanitizedTransaction {
+        let ix = spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(),
+            wallet,
+            mint,
+            &spl_token::id(),
+        );
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let raw = Transaction::new(&[payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build ATA-create tx")
+    }
+
+    /// The native mint cannot be created, so a gasless native ATA cannot be
+    /// born holding its fabricated lamport as wSOL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_ata_cannot_be_minted_from_fabricated_lamports() {
+        use solana_sdk::instruction::InstructionError;
+        use solana_transaction_error::TransactionError;
+
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let native = spl_token::native_mint::id();
+        let (admin_tx, _) = create_admin_initialize_mint_tx_for(native);
+        let wallet = Pubkey::new_unique();
+        let ata = spl_associated_token_account::get_associated_token_address(&wallet, &native);
+        let ata_tx = ata_create_tx(&Keypair::new(), &wallet, &native);
+
+        let result = run_batch(&mut deps, &metrics, vec![admin_tx, ata_tx]).await;
+
+        let admin = result
+            .admin_results
+            .as_ref()
+            .expect("admin results present");
+        let Ok(ProcessedTransaction::Executed(admin_exec)) = &admin.processing_results[0] else {
+            panic!("expected an executed admin result");
+        };
+        assert_eq!(
+            admin_exec.execution_details.status,
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidArgument
+            )),
+            "the native mint must be refused"
+        );
+        // ATA's mint check fails: the native address holds no token-owned mint.
+        assert_eq!(
+            regular_status(&result, 0),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::IncorrectProgramId
+            ))
+        );
+        assert!(deps.bob.get_account_shared_data(&native).is_none());
+        assert!(deps.bob.get_account_shared_data(&ata).is_none());
     }
 
     /// A transaction may list accounts no instruction touches. The unrelated
@@ -2927,10 +2979,14 @@ mod tests {
     /// Build a well-formed admin InitializeMint tx (single SPL Token ix,
     /// type=0), returning it alongside the mint address it initializes.
     fn create_admin_initialize_mint_tx() -> (SanitizedTransaction, Pubkey) {
+        create_admin_initialize_mint_tx_for(Pubkey::new_unique())
+    }
+
+    /// Same as `create_admin_initialize_mint_tx`, targeting `mint`.
+    fn create_admin_initialize_mint_tx_for(mint: Pubkey) -> (SanitizedTransaction, Pubkey) {
         use solana_sdk::instruction::{AccountMeta, Instruction};
 
         let payer = Keypair::new();
-        let mint = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
         let mut data = vec![0u8; 35];
         data[1] = 6; // decimals

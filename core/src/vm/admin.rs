@@ -342,6 +342,17 @@ impl AdminVm {
             return Err(InstructionError::NotEnoughAccountKeys);
         };
 
+        // Ingress already refuses the native mint; this keeps the admin path from
+        // creating it too. Checked before the account read so no target state can
+        // bypass it. InvalidArgument is an error the operator gives no special meaning.
+        if mint_pubkey == spl_token::native_mint::id() {
+            debug!(
+                "[admin-vm] InitializeMint: native mint {} refused",
+                mint_pubkey
+            );
+            return Err(InstructionError::InvalidArgument);
+        }
+
         // The slot beside the account is not tracked here.
         let existing = callbacks
             .get_account_shared_data(&mint_pubkey)
@@ -599,6 +610,19 @@ mod tests {
         Pubkey,
         Pubkey,
     ) {
+        make_two_instruction_spl_tx_with(ix1_data, ix2_data, Pubkey::new_unique())
+    }
+
+    /// Same as `make_two_instruction_spl_tx`, with the second mint chosen by the caller.
+    fn make_two_instruction_spl_tx_with(
+        ix1_data: Vec<u8>,
+        ix2_data: Vec<u8>,
+        mint_b: Pubkey,
+    ) -> (
+        solana_sdk::transaction::SanitizedTransaction,
+        Pubkey,
+        Pubkey,
+    ) {
         use solana_sdk::{
             instruction::{AccountMeta, Instruction},
             message::Message,
@@ -609,7 +633,6 @@ mod tests {
 
         let payer = Keypair::new();
         let mint_a = Pubkey::new_unique();
-        let mint_b = Pubkey::new_unique();
         let ix1 = Instruction {
             program_id: spl_token::id(),
             accounts: vec![
@@ -946,18 +969,12 @@ mod tests {
         let admin = Keypair::new();
         let mint = Pubkey::new_unique();
         let decimals = 6;
-        let ix = spl_token::instruction::initialize_mint(
-            &spl_token::id(),
+        let sanitized = operator_init_mint_tx(
+            &admin,
             &mint,
-            &admin.pubkey(),
-            Some(&admin.pubkey()),
             decimals,
-        )
-        .unwrap();
-        let msg = Message::new(&[ix], Some(&admin.pubkey()));
-        let tx = Transaction::new(&[&admin], msg, solana_sdk::hash::Hash::default());
-        let sanitized =
-            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+            spl_token::instruction::initialize_mint,
+        );
 
         let executed =
             assert_executed_with_status(run_admin_vm(std::slice::from_ref(&sanitized)), Ok(()));
@@ -973,6 +990,119 @@ mod tests {
         let mint_state = Mint::unpack(account.data()).unwrap();
         assert_eq!(mint_state.decimals, decimals);
         assert_eq!(mint_state.mint_authority, COption::Some(admin.pubkey()));
+    }
+
+    /// Signature shared by spl-token's `initialize_mint` and `initialize_mint2`.
+    type InitMintIx =
+        fn(
+            &Pubkey,
+            &Pubkey,
+            &Pubkey,
+            Option<&Pubkey>,
+            u8,
+        ) -> Result<Instruction, spl_token::solana_program::program_error::ProgramError>;
+
+    /// Admin-signed InitializeMint tx built with spl-token's own instruction
+    /// builder, as the operator does. `init` picks the variant.
+    fn operator_init_mint_tx(
+        admin: &Keypair,
+        mint: &Pubkey,
+        decimals: u8,
+        init: InitMintIx,
+    ) -> SanitizedTransaction {
+        let ix = init(
+            &spl_token::id(),
+            mint,
+            &admin.pubkey(),
+            Some(&admin.pubkey()),
+            decimals,
+        )
+        .unwrap();
+        let msg = Message::new(&[ix], Some(&admin.pubkey()));
+        let tx = Transaction::new(&[admin], msg, solana_sdk::hash::Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap()
+    }
+
+    /// The native mint is refused for both variants whatever the callback
+    /// holds at its address, and nothing persists.
+    #[test]
+    fn native_mint_initialize_is_rejected() {
+        let native = spl_token::native_mint::id();
+        let variants: [(&str, InitMintIx); 2] = [
+            ("initialize_mint", spl_token::instruction::initialize_mint),
+            ("initialize_mint2", spl_token::instruction::initialize_mint2),
+        ];
+        let states: [(&str, Option<AccountSharedData>); 4] = [
+            ("absent", None),
+            ("allocated", Some(mint_allocation())),
+            (
+                "live mint",
+                Some(AdminVm::create_mint_account(
+                    9,
+                    &Pubkey::new_unique().to_bytes(),
+                    None,
+                )),
+            ),
+            (
+                "system-owned lamports",
+                Some(AccountSharedData::new(
+                    1,
+                    0,
+                    &solana_sdk_ids::system_program::id(),
+                )),
+            ),
+        ];
+
+        for (variant, init) in variants {
+            for (state, account) in &states {
+                let tx = operator_init_mint_tx(&Keypair::new(), &native, 9, init);
+                let output = match account {
+                    None => run_admin_vm(std::slice::from_ref(&tx)),
+                    Some(account) => run_admin_vm_with_cb(
+                        std::slice::from_ref(&tx),
+                        &StubCbForPubkey {
+                            key: native,
+                            account: account.clone(),
+                        },
+                    ),
+                };
+                let result = output.processing_results.into_iter().next().unwrap();
+                let Ok(ProcessedTransaction::Executed(executed)) = result else {
+                    panic!("{variant}/{state}: expected Executed");
+                };
+                assert_eq!(
+                    executed.execution_details.status,
+                    Err(TransactionError::InstructionError(
+                        0,
+                        InstructionError::InvalidArgument
+                    )),
+                    "{variant}/{state}"
+                );
+                assert!(
+                    executed.loaded_transaction.accounts.is_empty(),
+                    "{variant}/{state}: nothing may persist"
+                );
+            }
+        }
+    }
+
+    /// A valid mint followed by the native mint fails the whole tx at the
+    /// second instruction, so the valid mint does not persist either.
+    #[test]
+    fn valid_mint_then_native_fails_whole_tx() {
+        let valid = valid_init_mint_data(6, Pubkey::new_unique());
+        let native = valid_init_mint_data(9, Pubkey::new_unique());
+
+        let (tx, _mint_a, _native) =
+            make_two_instruction_spl_tx_with(valid, native, spl_token::native_mint::id());
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                1,
+                InstructionError::InvalidArgument,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
     }
 
     // ─── Failure paths ──────────────────────────────────────────────────────

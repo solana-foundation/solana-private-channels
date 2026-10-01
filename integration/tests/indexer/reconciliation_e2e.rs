@@ -8,8 +8,11 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
+#[path = "setup.rs"]
+#[allow(dead_code)]
+mod setup;
+
 use helpers::{generate_mint, mint_to_owner, setup_wallets};
-use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::IndexerError,
@@ -17,12 +20,10 @@ use private_channel_indexer::{
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
+use setup::{allow_mint_for_program, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-};
+use solana_sdk::signature::Keypair;
 use sqlx::PgPool;
 use std::sync::Arc;
 use test_utils::validator_helper::start_test_validator;
@@ -31,22 +32,14 @@ use testcontainers_modules::postgres::Postgres;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn instance_pda(seed: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"instance", seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-    )
-    .0
-}
-
 async fn seed_mint_and_deposit(
     pool: &PgPool,
     mint_address: &str,
     amount: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, created_at)
-         VALUES ($1, 6, $2, NOW())",
+        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot, created_at)
+         VALUES ($1, 6, $2, 0, NOW())",
     )
     .bind(mint_address)
     .bind(spl_token::id().to_string())
@@ -126,9 +119,10 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
     let mint_keypair = Keypair::new();
     let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
-    // Derive escrow instance PDA
-    let seed_keypair = Keypair::new();
-    let pda = instance_pda(&seed_keypair.pubkey());
+    // A real instance with the mint allowed; startup ignores custody of unapproved mints.
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
 
     const AMOUNT: u64 = 500_000;
 

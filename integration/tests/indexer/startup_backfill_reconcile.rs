@@ -276,27 +276,37 @@ async fn wait_for_block_servable(rpc_url: &str, slot: u64) {
     }
 }
 
-/// Mock the escrow sweep. `holdings` is the per-mint custody the instance is reported to
-/// hold; an empty slice means the escrow holds nothing.
+/// Mock the escrow sweep. `holdings` is the per-mint custody `instance`'s ATAs are reported
+/// to hold; an empty slice means the escrow holds nothing.
 ///
 /// Answers every attempt's two token programs, so it is left uncounted rather than pinned
-/// to an exact hit count.
-async fn mock_escrow_custody(rpc: &mut MockitoServer, holdings: &[(String, i64)]) -> mockito::Mock {
-    mock_escrow_custody_at(rpc, holdings, MOCK_TIP).await
+/// to an exact hit count. Every held mint is reported as allowed.
+async fn mock_escrow_custody(
+    rpc: &mut MockitoServer,
+    instance: Pubkey,
+    holdings: &[(String, i64)],
+) -> Vec<mockito::Mock> {
+    mock_escrow_custody_at(rpc, instance, holdings, MOCK_TIP).await
 }
 
 /// Same, with the slot the reading is reported as valid at. Startup fills up to that slot
 /// and no further, so a value below the tip is what leaves a band for the live source.
 async fn mock_escrow_custody_at(
     rpc: &mut MockitoServer,
+    instance: Pubkey,
     holdings: &[(String, i64)],
     context_slot: u64,
-) -> mockito::Mock {
+) -> Vec<mockito::Mock> {
     let accounts: Vec<serde_json::Value> = holdings
         .iter()
         .map(|(mint, amount)| {
+            let ata = get_associated_token_address_with_program_id(
+                &instance,
+                &mint.parse::<Pubkey>().unwrap(),
+                &TOKEN_PROGRAM_ID,
+            );
             json!({
-                "pubkey": Pubkey::new_unique().to_string(),
+                "pubkey": ata.to_string(),
                 "account": {
                     "lamports": 2_039_280,
                     "owner": TOKEN_PROGRAM_ID.to_string(),
@@ -319,7 +329,8 @@ async fn mock_escrow_custody_at(
         })
         .collect();
 
-    rpc.mock("POST", "/")
+    let sweep = rpc
+        .mock("POST", "/")
         .match_body(Matcher::PartialJson(
             json!({"method": "getTokenAccountsByOwner"}),
         ))
@@ -334,7 +345,42 @@ async fn mock_escrow_custody_at(
         )
         .expect_at_least(1)
         .create_async()
-        .await
+        .await;
+
+    // The sweep keeps a mint only if its AllowedMint PDA is owned by the escrow program, so
+    // answer every PDA with such an account, at the slot asked for.
+    let allowed_mints = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getMultipleAccounts"}),
+        ))
+        .with_status(200)
+        .with_body_from_request(|req| {
+            let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let key_count = body["params"][0].as_array().unwrap().len();
+            let allowed_mint = json!({
+                "lamports": 1_000_000,
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": 0,
+                "data": ["", "base64"]
+            });
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": body["params"][1]["minContextSlot"]},
+                    "value": vec![allowed_mint; key_count]
+                }
+            })
+            .to_string()
+            .into_bytes()
+        })
+        .create_async()
+        .await;
+
+    vec![sweep, allowed_mints]
 }
 
 /// A block whose one transaction is a top-level escrow Deposit, shaped the way the fill's
@@ -481,8 +527,8 @@ async fn slot_of(client: &RpcClient, signature: &Signature) -> u64 {
 /// Register a mint, as an AllowMint indexed before the outage would have.
 async fn seed_allowed_mint(pool: &PgPool, mint_address: &str) {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, created_at)
-         VALUES ($1, 6, $2, NOW())
+        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot, created_at)
+         VALUES ($1, 6, $2, 0, NOW())
          ON CONFLICT (mint_address) DO NOTHING",
     )
     .bind(mint_address)
@@ -703,20 +749,15 @@ async fn unexplainable_mismatch_still_halts_startup() {
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
     // Escrow custody holds nothing, so nothing backs the phantom row.
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     // Only the supply invariant reads this, and it errors on every method, so each mint
     // is skipped with a warning and the custody comparison is what fails the boot.
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let handle = spawn_indexer(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        MOCK_START_SLOT,
-    );
+    let handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -773,8 +814,12 @@ async fn the_fill_imports_the_deposit_that_explains_custody() {
     .await;
     // Custody holds exactly the deposit the block carries, so the two agree only once
     // that block has been imported.
-    let _custody =
-        mock_escrow_custody(&mut rpc, &[(mint.to_string(), DEPOSIT_AMOUNT as i64)]).await;
+    let _custody = mock_escrow_custody(
+        &mut rpc,
+        instance,
+        &[(mint.to_string(), DEPOSIT_AMOUNT as i64)],
+    )
+    .await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
@@ -847,17 +892,12 @@ async fn custody_read_from_behind_the_ledger_stops_startup() {
 
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
-    let _custody = mock_escrow_custody_at(&mut rpc, &[], 890).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody_at(&mut rpc, instance, &[], 890).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
-    let handle = spawn_indexer(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        MOCK_START_SLOT,
-    );
+    let handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -941,7 +981,7 @@ async fn the_live_source_resumes_where_the_fill_stopped() {
     .await;
     // Empty at the measured slot: the deposit has not happened yet as of then, so startup
     // reconciles clean and the deposit is purely the live source's to find.
-    let _custody = mock_escrow_custody_at(&mut rpc, &[], custody_slot).await;
+    let _custody = mock_escrow_custody_at(&mut rpc, instance, &[], custody_slot).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
@@ -1010,17 +1050,12 @@ async fn matching_ledger_reconciles_after_the_fill_and_startup_continues() {
 
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
-    let _custody = mock_escrow_custody(&mut rpc, &[(mint.clone(), PHANTOM_AMOUNT)]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[(mint.clone(), PHANTOM_AMOUNT)]).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
-    let mut handle = spawn_indexer(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        MOCK_START_SLOT,
-    );
+    let mut handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     // The fill has to commit through its target before reconciliation is even attempted.
     let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
@@ -1069,7 +1104,8 @@ async fn start_slot_ahead_of_checkpoint_refuses_startup() {
 
     let mut rpc = MockitoServer::new_async().await;
     // Custody is captured before the floor is resolved, so that read still has to succeed.
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
     // The fill never starts, so no slot is ever enumerated.
     let no_enumeration = rpc
         .mock("POST", "/")
@@ -1081,13 +1117,7 @@ async fn start_slot_ahead_of_checkpoint_refuses_startup() {
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let handle = spawn_indexer(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        MOCK_START_SLOT,
-    );
+    let handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     let err = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -1120,7 +1150,8 @@ async fn rpc_polling_start_slot_ahead_of_checkpoint_refuses_startup() {
     seed_checkpoint(&pool, "escrow", stale_checkpoint).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
@@ -1129,7 +1160,7 @@ async fn rpc_polling_start_slot_ahead_of_checkpoint_refuses_startup() {
         postgres,
         rpc.url(),
         chain.url(),
-        Pubkey::new_unique(),
+        instance,
         None,
         Some(MOCK_START_SLOT),
     );
@@ -1204,19 +1235,13 @@ async fn backfill_disabled_counts_completed_withdrawals_when_the_checkpoint_is_b
     seed_completed_withdrawal(&pool, &mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let mut handle = spawn_indexer_with(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        None,
-        None,
-    );
+    let mut handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
 
     // Reconciliation runs before the live source on this path, so a few seconds is well
     // past the point where an abort would have ended the task.
@@ -1243,19 +1268,13 @@ async fn backfill_disabled_still_aborts_on_a_shortfall_no_completion_explains() 
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let handle = spawn_indexer_with(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        None,
-        None,
-    );
+    let handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
 
     let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -1289,19 +1308,13 @@ async fn backfill_disabled_compares_when_the_checkpoint_reaches_the_snapshot() {
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let handle = spawn_indexer_with(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        None,
-        None,
-    );
+    let handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
 
     let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -1335,20 +1348,14 @@ async fn backfill_disabled_with_a_lagging_checkpoint_still_enforces_the_supply_i
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     // Custody holds nothing, so any supply at all is supply the escrow cannot honour.
     let chain = MockRpcServer::start().await;
     mock_channel_supply(&chain, PHANTOM_AMOUNT as u64);
 
-    let handle = spawn_indexer_with(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        None,
-        None,
-    );
+    let handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
 
     let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
         .await
@@ -1375,7 +1382,8 @@ async fn live_source_resumes_from_checkpoint_when_nothing_configures_a_start() {
     seed_checkpoint(&pool, "escrow", checkpoint).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    let instance = Pubkey::new_unique();
+    let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
     // Answering the tip proves the resume slot is not taken from it.
     let _slot = rpc
         .mock("POST", "/")
@@ -1400,14 +1408,7 @@ async fn live_source_resumes_from_checkpoint_when_nothing_configures_a_start() {
     let chain = MockRpcServer::start().await;
     mock_empty_channel_supply(&chain);
 
-    let handle = spawn_indexer_with(
-        postgres,
-        rpc.url(),
-        chain.url(),
-        Pubkey::new_unique(),
-        None,
-        None,
-    );
+    let handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
 
     // The enumeration is the assertion; give the poller a few intervals to issue it.
     tokio::time::sleep(Duration::from_secs(5)).await;

@@ -774,8 +774,8 @@ async fn upsert_mints_empty_ok() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string());
-    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string());
+    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string(), 0);
+    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string(), 0);
     storage.upsert_mints_batch(&[m1, m2]).await?;
 
     let got_a = storage.get_mint("mint_a").await?;
@@ -796,15 +796,55 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m = DbMint::new("mint_upd".to_string(), 6, "TokenkegQ".to_string());
+    let m = DbMint::new("mint_upd".to_string(), 6, "TokenkegQ".to_string(), 100);
     storage.upsert_mints_batch(&[m]).await?;
 
-    // Upsert with new decimals
-    let m2 = DbMint::new("mint_upd".to_string(), 9, "TokenkegQ".to_string());
+    // Upsert with new decimals from a newer slot
+    let m2 = DbMint::new("mint_upd".to_string(), 9, "TokenkegQ".to_string(), 106);
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
     assert_eq!(got.decimals, 9);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_ignores_older_profile_slot() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let live_slot = 106;
+
+    let live = DbMint::new(
+        "mint_live".to_string(),
+        9,
+        "TokenzQdB".to_string(),
+        live_slot,
+    );
+    storage.upsert_mints_batch(&[live]).await?;
+
+    // A gap repair delivering the older AllowMint after the live one.
+    let repaired = DbMint::new("mint_live".to_string(), 6, "TokenkegQ".to_string(), 103);
+    storage.upsert_mints_batch(&[repaired]).await?;
+
+    let got = storage.get_mint("mint_live").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
+    assert_eq!(got.profile_slot, live_slot);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_same_slot_later_profile_wins() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let slot = 106;
+
+    // A close and recreate between two AllowMints in one slot, in block order.
+    let first = DbMint::new("mint_same".to_string(), 6, "TokenkegQ".to_string(), slot);
+    let second = DbMint::new("mint_same".to_string(), 9, "TokenzQdB".to_string(), slot);
+    storage.upsert_mints_batch(&[first, second]).await?;
+
+    let got = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
     Ok(())
 }
 
@@ -814,7 +854,7 @@ async fn sync_mint_status_mirrors_history_against_postgres(
     let (_pool, storage, _pg) = start_postgres().await?;
 
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string(), 0)])
         .await?;
     assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
@@ -846,7 +886,7 @@ async fn sync_mint_status_mirrors_history_against_postgres(
         .await?;
     storage.sync_mint_status(&["sm".to_string()]).await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string(), 0)])
         .await?;
     assert_eq!(
         storage.get_mint("sm").await?.unwrap().status,
@@ -870,7 +910,7 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     let mint = "recon_mint";
     let tp = "TokenkegQ";
     storage
-        .upsert_mints_batch(&[DbMint::new(mint.to_string(), 6, tp.to_string())])
+        .upsert_mints_batch(&[DbMint::new(mint.to_string(), 6, tp.to_string(), 0)])
         .await?;
 
     // Pending deposit (ALL deposits count for reconciliation)
@@ -3523,7 +3563,12 @@ async fn seed_both_sides(
     .execute(pool)
     .await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("mint_addr".to_string(), 6, "token".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_addr".to_string(),
+            6,
+            "token".to_string(),
+            0,
+        )])
         .await?;
     storage
         .insert_mint_statuses_batch(&[mk_status("mint_addr", "allowed", 1, "allow-sig")])

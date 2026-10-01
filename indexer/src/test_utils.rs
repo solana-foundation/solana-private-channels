@@ -156,14 +156,14 @@ pub mod rpc_blocks {
     }
 }
 
-/// Byte-layout builders for escrow Deposit instructions and their DepositEvent
-/// self-CPI. Centralised here so the escrow parser tests and the decoder tests
-/// build the exact same bytes against one source of truth (the `pub(crate)`
-/// escrow constants), rather than each re-encoding the layout.
+/// Byte-layout builders for escrow Deposit and ReleaseFunds instructions and the
+/// DepositEvent self-CPI. Centralised here so the escrow parser tests and the
+/// decoder tests build the exact same bytes against one source of truth (the
+/// `pub(crate)` escrow constants), rather than each re-encoding the layout.
 #[cfg(any(test, feature = "test-mock-storage"))]
 pub mod escrow_fixtures {
     use crate::indexer::datasource::common::parser::escrow::{
-        DEPOSIT, DEPOSIT_EVENT_DISCRIMINATOR, EVENT_IX_TAG_LE,
+        DEPOSIT, DEPOSIT_EVENT_DISCRIMINATOR, EVENT_IX_TAG_LE, RELEASE_FUNDS,
     };
     use solana_sdk::pubkey::Pubkey;
 
@@ -185,6 +185,22 @@ pub mod escrow_fixtures {
     pub fn deposit_ix_bytes(amount: u64, recipient: Option<Pubkey>) -> Vec<u8> {
         let mut data = vec![DEPOSIT];
         data.extend(deposit_borsh(amount, recipient));
+        data
+    }
+
+    /// Borsh body of a ReleaseFunds instruction (after the discriminator):
+    /// amount (u64 LE) + user (32) + transaction_nonce (u64 LE).
+    pub fn release_funds_borsh(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
+        let mut data = amount.to_le_bytes().to_vec();
+        data.extend_from_slice(user.as_ref());
+        data.extend_from_slice(&nonce.to_le_bytes());
+        data
+    }
+
+    /// Full ReleaseFunds *instruction* bytes: discriminator + borsh body. Pre-base58.
+    pub fn release_funds_ix_bytes(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
+        let mut data = vec![RELEASE_FUNDS];
+        data.extend(release_funds_borsh(amount, user, nonce));
         data
     }
 

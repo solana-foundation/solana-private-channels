@@ -26,7 +26,6 @@ use spl_transfer_hook_interface::instruction::ExecuteInstruction;
 use spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute;
 use spl_type_length_value::state::TlvStateBorrowed;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 const DECIMALS_OFFSET: usize = 44;
@@ -71,28 +70,14 @@ async fn read_target_mint_account(
     }
 }
 
-/// In-memory cache for basic mint metadata (`token_program`, `decimals`).
-///
-/// A mint's extension set, freeze authority and hook presence are deliberately
-/// *not* cached here. They are read from the reviewed profile in the withdrawal's
-/// `AllowedMint` account, which the escrow program keeps honest by rejecting a
-/// deposit whose mint has drifted from it. Caching them in the process was a
-/// correctness bug: a Token-2022 mint carrying `MintCloseAuthority` can be closed
-/// at zero supply and recreated at the same address with a different profile, and
-/// nothing tells a running operator that happened.
+/// Mint reads and per-mint existence floors. Nothing a recreated mint can change
+/// is cached: decimals come from the DB, the rest from `AllowedMint`.
 pub struct MintCache {
     storage: Arc<Storage>,
     rpc_client: Option<Arc<RpcClientWithRetry>>,
-    cache: HashMap<String, MintMetadata>,
     /// Per-mint slot the mint provably existed at, recorded by the caller that
     /// proved it. Absent means unproven, which keeps a missing account retryable.
     existence_floor: HashMap<String, u64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MintMetadata {
-    pub token_program: Pubkey,
-    pub decimals: u8,
 }
 
 /// Outcome of resolving a mint's transfer-hook accounts.
@@ -113,7 +98,6 @@ impl MintCache {
         Self {
             storage,
             rpc_client: None,
-            cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
     }
@@ -122,7 +106,6 @@ impl MintCache {
         Self {
             storage,
             rpc_client: Some(rpc_client),
-            cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
     }
@@ -149,37 +132,18 @@ impl MintCache {
         self.existence_floor.get(&mint.to_string()).copied()
     }
 
-    /// Basic mint metadata (decimals + token program), served from cache, then DB,
-    /// then RPC only when no DB row exists.
-    pub async fn get_mint_metadata(
-        &mut self,
-        mint: &Pubkey,
-    ) -> Result<MintMetadata, OperatorError> {
+    /// Mint decimals from the DB, or from RPC when no DB row exists.
+    pub async fn get_mint_decimals(&self, mint: &Pubkey) -> Result<u8, OperatorError> {
         let mint_str = mint.to_string();
 
-        if let Some(metadata) = self.cache.get(&mint_str) {
-            return Ok(metadata.clone());
-        }
-
-        // Retry a transient DB blip before falling through to the RPC leg, so a
-        // brief outage does not surface as Transient and strand the withdrawal.
+        // Retry a transient DB blip before falling through to the RPC leg.
         // transaction_id=-1: no per-call txn context here; retries log by op name.
-        let db_mint = with_storage_backoff("mint metadata read", -1, || {
+        let db_mint = with_storage_backoff("mint decimals read", -1, || {
             self.storage.get_mint(&mint_str)
         })
         .await?;
         if let Some(m) = db_mint {
-            let token_program =
-                Pubkey::from_str(&m.token_program).map_err(|e| OperatorError::InvalidPubkey {
-                    pubkey: m.token_program.clone(),
-                    reason: e.to_string(),
-                })?;
-            let metadata = MintMetadata {
-                token_program,
-                decimals: m.decimals as u8,
-            };
-            self.cache.insert(mint_str, metadata.clone());
-            return Ok(metadata);
+            return Ok(m.decimals as u8);
         }
 
         let floor = self.existence_floor(mint);
@@ -189,9 +153,7 @@ impl MintCache {
             ))
         })?;
 
-        let metadata = self.fetch_mint_from_rpc(mint, rpc, floor).await?;
-        self.cache.insert(mint_str, metadata.clone());
-        Ok(metadata)
+        self.fetch_mint_from_rpc(mint, rpc, floor).await
     }
 
     /// Live check of the `PausableConfig.paused` flag. Intended for the
@@ -452,12 +414,10 @@ impl MintCache {
         mint: &Pubkey,
         rpc: &RpcClientWithRetry,
         existence_floor: Option<u64>,
-    ) -> Result<MintMetadata, OperatorError> {
+    ) -> Result<u8, OperatorError> {
         let account = read_target_mint_account(rpc, mint, existence_floor).await?;
 
-        let token_program = account.owner;
-
-        if ![TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].contains(&token_program) {
+        if ![TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].contains(&account.owner) {
             return Err(AccountError::InvalidMint {
                 pubkey: *mint,
                 reason: format!("Invalid mint owner: {}", account.owner),
@@ -475,24 +435,10 @@ impl MintCache {
             .into());
         }
 
-        let decimals = account.data[DECIMALS_OFFSET];
-
-        Ok(MintMetadata {
-            token_program,
-            decimals,
-        })
+        Ok(account.data[DECIMALS_OFFSET])
     }
 
-    /// Pre-populate cache with mint metadata
-    pub async fn prefetch_mints(&mut self, mints: &[Pubkey]) -> Result<(), OperatorError> {
-        for mint in mints {
-            self.get_mint_metadata(mint).await?;
-        }
-        Ok(())
-    }
-
-    // For now private_channel only supports SPL, when we want to make the move to token 2022, we
-    // can call get mint_metadata above instead of this function.
+    // The private channel only supports SPL for now.
     pub fn get_private_channel_token_program(&self) -> Pubkey {
         TOKEN_PROGRAM_ID
     }
@@ -543,16 +489,6 @@ mod tests {
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
     use std::time::Duration;
 
-    impl MintCache {
-        pub fn clear(&mut self) {
-            self.cache.clear();
-        }
-
-        pub fn cache_size(&self) -> usize {
-            self.cache.len()
-        }
-    }
-
     impl RpcClientWithRetry {
         pub fn new_mocked(mocks: solana_client::rpc_client::Mocks) -> Self {
             Self {
@@ -595,57 +531,8 @@ mod tests {
         })
     }
 
-    fn create_test_storage_with_mint(
-        mint: &Pubkey,
-        token_program: &Pubkey,
-        decimals: i16,
-    ) -> Arc<Storage> {
-        let mut mock = MockStorage::new();
-
-        mock.add_mint(DbMint {
-            withdrawals_blocked: false,
-            mint_address: mint.to_string(),
-            decimals,
-            token_program: token_program.to_string(),
-            created_at: chrono::Utc::now(),
-            status: "allowed".to_string(),
-        });
-        mock.mint_status_history.lock().unwrap().push(DbMintStatus {
-            withdrawals_blocked: false,
-            mint_address: mint.to_string(),
-            status: "allowed".to_string(),
-            effective_slot: 0,
-            signature: format!("test-seed-{mint}"),
-            created_at: chrono::Utc::now(),
-        });
-
-        Arc::new(Storage::Mock(mock))
-    }
-
     #[tokio::test]
-    async fn test_cache_miss_then_hit() {
-        let mint = create_test_mint();
-        let token_program = TOKEN_PROGRAM_ID;
-        let storage = create_test_storage_with_mint(&mint, &token_program, 6);
-
-        let mut cache = MintCache::new(storage);
-
-        assert_eq!(cache.cache_size(), 0);
-
-        // First call - cache miss, fetches from storage
-        let metadata1 = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata1.token_program, token_program);
-        assert_eq!(metadata1.decimals, 6);
-        assert_eq!(cache.cache_size(), 1);
-
-        // Second call - cache hit, no storage fetch
-        let metadata2 = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata2, metadata1);
-        assert_eq!(cache.cache_size(), 1);
-    }
-
-    #[tokio::test]
-    async fn get_mint_metadata_retries_transient_db_error() {
+    async fn get_mint_decimals_retries_transient_db_error() {
         let mint = create_test_mint();
         let mock = MockStorage::new();
         mock.mints.lock().unwrap().insert(
@@ -657,30 +544,16 @@ mod tests {
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         // Two transient blips then success: the read backoff must ride them out.
         mock.set_fail_times("get_mint", 2);
         let storage = Arc::new(Storage::Mock(mock.clone()));
-        let mut cache = MintCache::new(storage);
+        let cache = MintCache::new(storage);
 
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata.token_program, TOKEN_PROGRAM_ID);
-        assert_eq!(metadata.decimals, 6);
+        assert_eq!(cache.get_mint_decimals(&mint).await.unwrap(), 6);
         assert_eq!(mock.calls("get_mint"), 3, "two failures + one success");
-    }
-
-    #[tokio::test]
-    async fn test_token_2022_mint() {
-        let mint = create_test_mint();
-        let token_program = TOKEN_2022_PROGRAM_ID;
-        let storage = create_test_storage_with_mint(&mint, &token_program, 9);
-
-        let mut cache = MintCache::new(storage);
-
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata.token_program, TOKEN_2022_PROGRAM_ID);
-        assert_eq!(metadata.decimals, 9);
     }
 
     #[tokio::test]
@@ -688,79 +561,10 @@ mod tests {
         let mint = create_test_mint();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
 
-        let mut cache = MintCache::new(storage);
+        let cache = MintCache::new(storage);
 
-        let result = cache.get_mint_metadata(&mint).await;
+        let result = cache.get_mint_decimals(&mint).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_prefetch_mints() {
-        let mint1 = create_test_mint();
-        let mint2 = create_test_mint();
-        let mint3 = create_test_mint();
-
-        let mut mock = MockStorage::new();
-        for mint in [&mint1, &mint2, &mint3] {
-            mock.add_mint(DbMint {
-                withdrawals_blocked: false,
-                mint_address: mint.to_string(),
-                decimals: 6,
-                token_program: TOKEN_PROGRAM_ID.to_string(),
-                created_at: chrono::Utc::now(),
-                status: "allowed".to_string(),
-            });
-        }
-
-        let storage = Arc::new(Storage::Mock(mock));
-        let mut cache = MintCache::new(storage);
-
-        assert_eq!(cache.cache_size(), 0);
-
-        cache.prefetch_mints(&[mint1, mint2, mint3]).await.unwrap();
-        assert_eq!(cache.cache_size(), 3);
-
-        let _ = cache.get_mint_metadata(&mint1).await.unwrap();
-        let _ = cache.get_mint_metadata(&mint2).await.unwrap();
-        let _ = cache.get_mint_metadata(&mint3).await.unwrap();
-        assert_eq!(cache.cache_size(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_mints_different_programs() {
-        let spl_mint = create_test_mint();
-        let t22_mint = create_test_mint();
-
-        let mut mock = MockStorage::new();
-        mock.add_mint(DbMint {
-            withdrawals_blocked: false,
-            mint_address: spl_mint.to_string(),
-            decimals: 6,
-            token_program: TOKEN_PROGRAM_ID.to_string(),
-            created_at: chrono::Utc::now(),
-            status: "allowed".to_string(),
-        });
-        mock.add_mint(DbMint {
-            withdrawals_blocked: false,
-            mint_address: t22_mint.to_string(),
-            decimals: 9,
-            token_program: TOKEN_2022_PROGRAM_ID.to_string(),
-            created_at: chrono::Utc::now(),
-            status: "allowed".to_string(),
-        });
-
-        let storage = Arc::new(Storage::Mock(mock));
-        let mut cache = MintCache::new(storage);
-
-        let spl_metadata = cache.get_mint_metadata(&spl_mint).await.unwrap();
-        assert_eq!(spl_metadata.token_program, TOKEN_PROGRAM_ID);
-        assert_eq!(spl_metadata.decimals, 6);
-
-        let t22_metadata = cache.get_mint_metadata(&t22_mint).await.unwrap();
-        assert_eq!(t22_metadata.token_program, TOKEN_2022_PROGRAM_ID);
-        assert_eq!(t22_metadata.decimals, 9);
-
-        assert_eq!(cache.cache_size(), 2);
     }
 
     #[tokio::test]
@@ -774,13 +578,10 @@ mod tests {
         let rpc_client = RpcClientWithRetry::new_mocked(mocks);
 
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
 
         // Should fallback to RPC since mint not in storage
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata.token_program, TOKEN_PROGRAM_ID);
-        assert_eq!(metadata.decimals, 9);
-        assert_eq!(cache.cache_size(), 1);
+        assert_eq!(cache.get_mint_decimals(&mint).await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -794,42 +595,10 @@ mod tests {
         let rpc_client = RpcClientWithRetry::new_mocked(mocks);
 
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
 
-        // Should fallback to RPC and detect Token-2022
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata.token_program, TOKEN_2022_PROGRAM_ID);
-        assert_eq!(metadata.decimals, 6);
-    }
-
-    #[tokio::test]
-    async fn get_mint_metadata_does_not_require_rpc_when_db_flags_are_unresolved() {
-        let mint = create_test_mint();
-
-        // DB row has flags = None. Pre-fix, `get_mint_metadata` would force
-        // RPC resolution and fail here (breaking JIT-mint init on the
-        // deposit path, where the mint-cache RPC can't see the mint yet).
-        // Post-fix, `get_mint_metadata` is pure decimals + token_program —
-        // flags are resolved separately via `get_extension_flags`.
-        let mock_storage = MockStorage::new();
-        mock_storage.mints.lock().unwrap().insert(
-            mint.to_string(),
-            DbMint {
-                withdrawals_blocked: false,
-                mint_address: mint.to_string(),
-                decimals: 6,
-                token_program: TOKEN_PROGRAM_ID.to_string(),
-                created_at: chrono::Utc::now(),
-                status: "allowed".to_string(),
-            },
-        );
-
-        let storage = Arc::new(Storage::Mock(mock_storage));
-        let mut cache = MintCache::new(storage);
-
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert_eq!(metadata.token_program, TOKEN_PROGRAM_ID);
-        assert_eq!(metadata.decimals, 6);
+        // Should fallback to RPC and accept a Token-2022 owner
+        assert_eq!(cache.get_mint_decimals(&mint).await.unwrap(), 6);
     }
 
     fn create_mock_token_account_data(amount: u64, frozen: bool) -> Vec<u8> {
@@ -1467,10 +1236,10 @@ mod tests {
         let rpc_client = RpcClientWithRetry::new_mocked(mocks);
 
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
 
         // Should error on invalid owner
-        let result = cache.get_mint_metadata(&mint).await;
+        let result = cache.get_mint_decimals(&mint).await;
         assert!(result.is_err());
     }
     /// An RPC that answers successfully but reports the account as absent.
@@ -1503,12 +1272,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_metadata_rpc_fallback_absent_account_stays_transient() {
+    async fn mint_decimals_rpc_fallback_absent_account_stays_transient() {
         let mint = create_test_mint();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
 
-        let err = cache.get_mint_metadata(&mint).await.unwrap_err();
+        let err = cache.get_mint_decimals(&mint).await.unwrap_err();
 
         assert!(
             matches!(err, OperatorError::RpcError(_)),
@@ -1517,14 +1286,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_metadata_rpc_fallback_transport_error_is_rpc_error() {
+    async fn mint_decimals_rpc_fallback_transport_error_is_rpc_error() {
         let mut server = mockito::Server::new_async().await;
         let rpc = rpc_failing_transport(&mut server).await;
         let mint = create_test_mint();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc));
 
-        let err = cache.get_mint_metadata(&mint).await.unwrap_err();
+        let err = cache.get_mint_decimals(&mint).await.unwrap_err();
 
         assert!(
             matches!(err, OperatorError::RpcError(_)),
@@ -1603,7 +1372,7 @@ mod tests {
         cache.record_existence_floor(&mint, 42);
 
         cache
-            .get_mint_metadata(&mint)
+            .get_mint_decimals(&mint)
             .await
             .expect("the node answers when the floor is honoured");
 

@@ -366,6 +366,7 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
         mint_pubkey.to_string(),
         6,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        0,
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage

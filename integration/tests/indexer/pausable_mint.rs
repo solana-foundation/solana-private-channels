@@ -351,6 +351,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         mint_pubkey.to_string(),
         6,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        0,
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
