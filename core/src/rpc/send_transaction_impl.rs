@@ -4,8 +4,8 @@ use crate::rpc::{
     WriteDeps,
 };
 use crate::transactions::{
-    has_address_table_lookups, is_allowed_program_instruction, ADDRESS_LOOKUP_UNSUPPORTED,
-    NATIVE_MINT_UNSUPPORTED,
+    has_address_table_lookups, is_allowed_program_instruction, lists_native_mint,
+    ADDRESS_LOOKUP_UNSUPPORTED, NATIVE_MINT_UNSUPPORTED,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -64,15 +64,7 @@ pub async fn send_transaction_impl(
     SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
         .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 
-    // spl-token builds a native (wSOL) account without loading the mint, so this is
-    // the gate that keeps fabricated gasless lamports from becoming wSOL. A CPI can
-    // only reach listed keys, and lookup tables are refused above.
-    if sanitized_tx
-        .message()
-        .account_keys()
-        .iter()
-        .any(|key| *key == spl_token::native_mint::id())
-    {
+    if lists_native_mint(&sanitized_tx) {
         return Err(custom_error(INVALID_PARAMS_CODE, NATIVE_MINT_UNSUPPORTED));
     }
 
