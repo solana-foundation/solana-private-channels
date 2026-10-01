@@ -622,6 +622,24 @@ mod tests {
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
 
+    /// A stalled tip read times out and the retry on a fresh connection returns the tip.
+    #[tokio::test]
+    async fn latest_slot_with_retry_recovers_from_a_stalled_tip_read() {
+        use crate::indexer::datasource::rpc_polling::rpc::RPC_REQUEST_TIMEOUT;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let mut server = Server::new_async().await;
+        let _slot = mock_get_slot(&mut server, 105);
+        let (url, _) = stall_server(Stall::AfterHeaders, 1, Some(server.host_with_port())).await;
+        let poller = RpcPoller::new(url, UiTransactionEncoding::Json, CommitmentLevel::Finalized);
+
+        let tip = tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, latest_slot_with_retry(&poller))
+            .await
+            .expect("the stalled tip read never returned")
+            .unwrap();
+
+        assert_eq!(tip, 105);
+    }
+
     // ============================================================================
     // Startup anchor Tests
     // ============================================================================

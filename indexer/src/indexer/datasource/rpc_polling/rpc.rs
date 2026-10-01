@@ -5,6 +5,7 @@ use serde_json::json;
 use solana_commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// The widest run of slots an idle node can pass with no block. It heartbeats one
@@ -22,6 +23,14 @@ pub(crate) const MAX_LOOKAHEAD_SLOTS: u64 = MAX_IDLE_GAP_SLOTS * 10;
 /// instead of skipping it. https://solana.com/upgrades/larger-transaction-sizes
 const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
 
+/// Whole-request deadline, body included, so a stalled response becomes an error the caller retries.
+/// Sized from the measured worst case 100-block mainnet getBlock batch, about 30s, times 2.
+#[cfg(not(test))]
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tests stall a local socket, so the real deadline would cost a minute per case.
+#[cfg(test)]
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct RpcPoller {
     client: reqwest::Client,
     rpc_url: String,
@@ -35,7 +44,11 @@ impl RpcPoller {
         encoding: UiTransactionEncoding,
         commitment: CommitmentLevel,
     ) -> Self {
-        let client = reqwest::Client::new();
+        // Same as `Client::new()`, which also panics only if the TLS backend cannot start.
+        let client = reqwest::Client::builder()
+            .timeout(RPC_REQUEST_TIMEOUT)
+            .build()
+            .expect("reqwest client");
         Self {
             client,
             rpc_url,
@@ -578,6 +591,7 @@ fn fill_unproven(
 mod tests {
     use super::*;
     use crate::test_utils::rpc_mocks::*;
+    use crate::test_utils::stall_server::{stall_server, Stall};
     use mockito::Server;
 
     fn poller(server: &Server) -> RpcPoller {
@@ -1499,5 +1513,81 @@ mod tests {
         let (slots, chain_tip) = result.unwrap();
         assert!(slots.is_empty());
         assert_eq!(chain_tip, 100);
+    }
+
+    /// Fails unless `result` is the client deadline expiring.
+    fn assert_timed_out<T: std::fmt::Debug>(case: &str, result: Result<T, DataSourceRpcError>) {
+        match result {
+            Err(DataSourceRpcError::HttpRequest(e)) if e.is_timeout() => {}
+            other => panic!("{case}: expected a request timeout, got {other:?}"),
+        }
+    }
+
+    async fn call(poller: &RpcPoller, method: &str) -> Result<(), DataSourceRpcError> {
+        match method {
+            "getSlot" => poller.get_latest_slot().await.map(drop),
+            "getBlocks" => poller.get_blocks(100, 104).await.map(drop),
+            "getBlock" => poller.get_block_present(100).await.map(drop),
+            "getBlock signatures" => poller.confirm_empty_block(100, "hash").await.map(drop),
+            _ => unreachable!("unknown method {method}"),
+        }
+    }
+
+    /// Every request shape ends at the deadline, whether the node never answers or holds the body.
+    #[tokio::test]
+    async fn every_request_ends_at_the_deadline() {
+        let mut cases = vec![];
+        for stall in [Stall::BeforeHeaders, Stall::AfterHeaders] {
+            let (url, _) = stall_server(stall, usize::MAX, None).await;
+            let poller = std::sync::Arc::new(RpcPoller::new(
+                url,
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ));
+            for method in ["getSlot", "getBlocks", "getBlock", "getBlock signatures"] {
+                cases.push((stall, method, poller.clone()));
+            }
+        }
+
+        // All cases run at once, so the table costs one deadline.
+        let results = tokio::time::timeout(
+            3 * RPC_REQUEST_TIMEOUT,
+            join_all(cases.iter().map(|(stall, method, poller)| async move {
+                (format!("{method} {stall:?}"), call(poller, method).await)
+            })),
+        )
+        .await
+        .expect("a stalled request never returned");
+
+        for (case, result) in results {
+            assert_timed_out(&case, result);
+        }
+    }
+
+    /// After a stalled request times out, the next one opens a fresh connection and succeeds.
+    #[tokio::test]
+    async fn a_fresh_request_recovers_after_a_stalled_one() {
+        let mut server = Server::new_async().await;
+        let _slot = mock_get_slot(&mut server, 105);
+        let (url, accepted) =
+            stall_server(Stall::AfterHeaders, 1, Some(server.host_with_port())).await;
+        let poller = RpcPoller::new(url, UiTransactionEncoding::Json, CommitmentLevel::Finalized);
+
+        let (first, second) = tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, async {
+            (
+                poller.get_latest_slot().await,
+                poller.get_latest_slot().await,
+            )
+        })
+        .await
+        .expect("a stalled request never returned");
+
+        assert_timed_out("first getSlot", first);
+        assert_eq!(second.unwrap(), 105);
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the stalled connection must not be reused"
+        );
     }
 }

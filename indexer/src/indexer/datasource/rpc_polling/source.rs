@@ -1142,8 +1142,18 @@ mod tests {
         program_type: ProgramType,
         done: impl Fn(&[ProcessorMessage]) -> bool,
     ) -> Vec<ProcessorMessage> {
+        poll_slot_100_at(primary.url(), fallback, program_type, done).await
+    }
+
+    /// `poll_slot_100` against any primary URL, such as a stall server in front of mockito.
+    async fn poll_slot_100_at(
+        primary_url: String,
+        fallback: Option<&Server>,
+        program_type: ProgramType,
+        done: impl Fn(&[ProcessorMessage]) -> bool,
+    ) -> Vec<ProcessorMessage> {
         let mut source = RpcPollingSource::new(
-            primary.url(),
+            primary_url,
             Some(100),
             10,
             10,
@@ -1543,5 +1553,92 @@ mod tests {
                 "slot {slot} must be completed once the poller reaches past the window"
             );
         }
+    }
+
+    fn stall_test_source(url: String, from_slot: Option<u64>) -> RpcPollingSource {
+        RpcPollingSource::new(
+            url,
+            from_slot,
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            None,
+        )
+    }
+
+    /// A poll whose response stalls times out and the retry completes the same slot, without a restart.
+    #[tokio::test]
+    async fn a_stalled_poll_recovers_without_a_restart() {
+        use crate::test_utils::rpc_mocks::mock_get_block_at;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 105);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _b100 = mock_get_block_at(&mut primary, 100, 99);
+        // The first getSlot stalls; the retry opens a new connection that reaches mockito.
+        let (url, _) = stall_server(Stall::AfterHeaders, 1, Some(primary.host_with_port())).await;
+
+        // Longer than the helper's own 10s wait, which ends in an unbounded join.
+        let messages = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            poll_slot_100_at(url, None, ProgramType::Withdraw, |m| completed(m, 100)),
+        )
+        .await
+        .expect("the source stayed stuck on the stalled request");
+
+        assert!(
+            completed(&messages, 100),
+            "slot 100 must complete after the retry"
+        );
+    }
+
+    /// With no start slot, a stalled getSlot makes `start` fail instead of hanging.
+    #[tokio::test]
+    async fn start_fails_instead_of_hanging_when_get_slot_stalls() {
+        use crate::indexer::datasource::rpc_polling::rpc::RPC_REQUEST_TIMEOUT;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let (url, _) = stall_server(Stall::AfterHeaders, usize::MAX, None).await;
+        let mut source = stall_test_source(url, None);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            3 * RPC_REQUEST_TIMEOUT,
+            source.start(tx, CancellationToken::new()),
+        )
+        .await
+        .expect("start hung on the stalled getSlot");
+
+        match result {
+            Err(DataSourceError::Rpc(DataSourceRpcError::HttpRequest(e))) if e.is_timeout() => {}
+            other => panic!("expected a getSlot timeout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Cancelling while a request is stalled stops the source within about one deadline.
+    #[tokio::test]
+    async fn cancel_during_a_stalled_request_stops_the_source() {
+        use crate::indexer::datasource::rpc_polling::rpc::RPC_REQUEST_TIMEOUT;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        use std::sync::atomic::Ordering;
+        let (url, accepted) = stall_server(Stall::AfterHeaders, usize::MAX, None).await;
+        let mut source = stall_test_source(url, Some(100));
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        // Cancel only once a request is pending, or the test would pass without one.
+        while accepted.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+
+        tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, handle)
+            .await
+            .expect("the cancelled source stayed stuck on the stalled request")
+            .unwrap();
     }
 }
