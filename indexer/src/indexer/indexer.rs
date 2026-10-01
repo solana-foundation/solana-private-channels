@@ -89,6 +89,19 @@ async fn finish_checkpoint_writer(
     let _ = tokio::time::timeout(Duration::from_secs(5), checkpoint_handle).await;
 }
 
+/// Stop the writers without a flush if the lock is already gone; true when it did.
+async fn abandon_writers_on_lost_lock(
+    lock_lost: &CancellationToken,
+    writers: &[tokio::task::AbortHandle],
+) -> bool {
+    if !lock_lost.is_cancelled() {
+        return false;
+    }
+    error!("Live-state lock lost; stopping without draining");
+    crate::shutdown_utils::abort_and_await_writers(writers).await;
+    true
+}
+
 /// Race the processor against the shutdown signal and the startup fill, in that biased order.
 /// A processor error is the root cause, and a lost lock must never get a failed fill's drain.
 async fn supervise(
@@ -1095,6 +1108,20 @@ pub async fn run(
                 e
             );
 
+            // A lost lock gets no drain, since a resync may be rebuilding these tables.
+            cancellation_token.cancel();
+            if abandon_writers_on_lost_lock(
+                &processor_end_lock_lost,
+                &[
+                    processor_handle.abort_handle(),
+                    checkpoint_handle.abort_handle(),
+                ],
+            )
+            .await
+            {
+                return Err(e);
+            }
+
             // A graceful flush is safe here: the gate holds the checkpoint below the unfilled slot.
             if let Err(shutdown_err) = shutdown_indexer(
                 cancellation_token,
@@ -1483,6 +1510,41 @@ mod tests {
         assert!(
             !flushed.load(std::sync::atomic::Ordering::SeqCst),
             "a lost lock must abort the writer rather than cue its flush"
+        );
+    }
+
+    /// A failed backfill after the lock is lost must stop the writers, never cue a flush.
+    #[tokio::test]
+    async fn failed_backfill_does_not_flush_after_lock_loss() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+        let lost = CancellationToken::new();
+        lost.cancel();
+
+        let abandoned = abandon_writers_on_lost_lock(&lost, &[handle.abort_handle()]).await;
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(abandoned, "a lost lock must take the no-flush path");
+        assert!(
+            !flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a lost lock must abort the writer rather than let it flush"
+        );
+    }
+
+    /// Under a held lock the failed backfill keeps its graceful drain and flush.
+    #[tokio::test]
+    async fn failed_backfill_keeps_the_flush_while_the_lock_is_held() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+
+        let abandoned =
+            abandon_writers_on_lost_lock(&CancellationToken::new(), &[handle.abort_handle()]).await;
+        drop(tx);
+        let _ = handle.await;
+
+        assert!(!abandoned, "a held lock must leave the writers running");
+        assert!(
+            flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a held lock must still let the writer flush"
         );
     }
 
