@@ -44,6 +44,7 @@ have prefixes.
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
 | `refuses non-confidential credits` | A.non-halting | no | pre-flight |
@@ -243,6 +244,18 @@ would reopen the free retry loop it exists to close.
      exists. Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account invalid for mint` - the mint's
+     `ExtraAccountMetaList` does not parse or cannot resolve. The escrow still
+     holds the funds and the row is intact. Two causes:
+     - The list itself is broken (for example, a seed reading past the
+       instruction data). Every withdrawal of that mint parks here, and only the
+       hook program can rewrite it, so contact the mint issuer.
+     - An account the hook seeds from is absent or too short right now (for
+       example, the recipient's token account does not exist yet, or the node
+       is behind). Only this row is affected.
+
+     Re-arm the row once. If it parks here again, or other rows of the mint do
+     too, treat it as the first case. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook accounts exceed the per-transfer cap` - the mint's
      `ExtraAccountMetaList` resolves to more accounts than a release transaction
      can carry. The message gives the count and the cap. The escrow still holds

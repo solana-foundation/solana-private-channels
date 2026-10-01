@@ -7,7 +7,7 @@ use crate::operator::instruction_util::{
 };
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
-use crate::operator::utils::mint_util::MintCache;
+use crate::operator::utils::mint_util::{HookExtras, MintCache};
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
@@ -813,10 +813,11 @@ const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 15;
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
 ///
-/// Returns a bail when the mint's validation account is absent: no transfer of
-/// that mint can resolve, so the row parks rather than the task restarting on a
-/// transient forever. A failed read stays an error, since that is a node
-/// problem and not a row problem.
+/// Returns a bail when the mint's validation account is absent, unparseable or
+/// declares more accounts than a release can carry: no transfer of that mint can
+/// resolve, so the row parks rather than the task restarting on a transient
+/// forever. A failed read stays an error, since that is a node problem and not a
+/// row problem.
 async fn attach_hook_extras(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
@@ -858,7 +859,7 @@ async fn attach_hook_extras(
     let instance_ata =
         get_associated_token_address_with_program_id(&instance_pda, &mint, &token_program);
 
-    let Some(hook_extras) = processor_state
+    let hook_extras = match processor_state
         .mint_cache
         .resolve_hook_extras(
             &mint,
@@ -866,24 +867,32 @@ async fn attach_hook_extras(
             &recipient_ata,
             &instance_pda,
             transaction.amount.value(),
+            MAX_HOOK_EXTRAS_LEGACY_TX,
         )
         .await?
-    else {
-        return Ok(Some(BailReason::new(
-            metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
-            format!("transfer-hook validation account missing for mint: {mint}"),
-        )));
+    {
+        HookExtras::Resolved(hook_extras) => hook_extras,
+        HookExtras::ValidationMissing => {
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+                format!("transfer-hook validation account missing for mint: {mint}"),
+            )));
+        }
+        HookExtras::ValidationInvalid(reason) => {
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+                format!("transfer-hook validation account invalid for mint {mint}: {reason}"),
+            )));
+        }
+        HookExtras::OverCap { extras } => {
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+                format!(
+                    "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {extras} > {MAX_HOOK_EXTRAS_LEGACY_TX}"
+                ),
+            )));
+        }
     };
-
-    if hook_extras.len() > MAX_HOOK_EXTRAS_LEGACY_TX {
-        return Ok(Some(BailReason::new(
-            metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
-            format!(
-                "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {} > {MAX_HOOK_EXTRAS_LEGACY_TX}",
-                hook_extras.len()
-            ),
-        )));
-    }
 
     if !hook_extras.is_empty() {
         release.builder.add_remaining_accounts(&hook_extras);

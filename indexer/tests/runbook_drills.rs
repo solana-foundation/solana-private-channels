@@ -250,6 +250,18 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
+            "transfer-hook validation account missing for mint:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "transfer-hook validation account invalid for mint",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "transfer-hook accounts exceed the per-transfer cap",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
             "withdrawal pipeline halted after poison-pill",
             "indexer/src/operator/processor.rs",
         ),
