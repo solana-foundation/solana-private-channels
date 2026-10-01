@@ -435,8 +435,8 @@ impl Drop for IpConnGuard {
     }
 }
 
-/// Upstream response body that errors once the request deadline passes. An error, unlike
-/// a clean end, makes hyper drop the connection, so a cut-off page can't pass as complete.
+/// Upstream response body that errors once the request deadline passes, even mid-stream. An
+/// error, unlike a clean end, makes hyper drop the connection, so a cut-off page can't pass as complete.
 struct DeadlineBody {
     inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
     sleep: Pin<Box<tokio::time::Sleep>>,
@@ -463,13 +463,15 @@ impl Body for DeadlineBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
-        // Inner first, so data already on hand still goes out after the deadline.
-        if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
-            return Poll::Ready(frame);
-        }
-        // Polling the sleep also registers the wakeup for when the deadline passes.
-        if this.sleep.as_mut().poll(cx).is_pending() {
-            return Poll::Pending;
+        // Check the clock first, so an upstream with a frame always ready still stops at the deadline.
+        if tokio::time::Instant::now() < this.sleep.deadline() {
+            if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
+                return Poll::Ready(frame);
+            }
+            // Polling the sleep also registers the wakeup for when the deadline passes.
+            if this.sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
         }
         metrics::GATEWAY_ERRORS_TOTAL
             .with_label_values(&[UPSTREAM_TIMEOUT])
@@ -2953,15 +2955,40 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(150));
     }
 
-    #[tokio::test]
-    async fn deadline_body_prefers_ready_inner_after_deadline() {
-        // Data already on hand is delivered even past the deadline, so a finished page is never cut.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-        let mut body = DeadlineBody::new(full_body("abc"), deadline);
-        tokio::time::sleep_until(deadline + Duration::from_millis(50)).await;
+    /// Body with a frame ready on every poll, like an upstream that dribbles forever.
+    struct EndlessBody;
 
-        let frame = body.frame().await.unwrap().unwrap();
-        assert_eq!(&frame.into_data().unwrap()[..], b"abc");
-        assert!(body.frame().await.is_none());
+    impl Body for EndlessBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_body_errors_when_frames_keep_arriving() {
+        let start = Instant::now();
+        let mut body = DeadlineBody::new(
+            EndlessBody.boxed_unsync(),
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        );
+
+        // Frames never stop, so only the deadline can end this loop.
+        loop {
+            match body.frame().await {
+                Some(Ok(_)) => assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "frames kept flowing past the deadline"
+                ),
+                Some(Err(_)) => break,
+                None => panic!("an endless body must not end cleanly"),
+            }
+        }
+        assert!(start.elapsed() >= Duration::from_millis(150));
     }
 }
