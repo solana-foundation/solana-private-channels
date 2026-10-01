@@ -41,6 +41,9 @@ Recovers missed slots on indexer restart or network issues:
      cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
+   - If the fill fails (retries exhausted, or a slot it cannot fetch or decode), the indexer
+     stops the live source and exits non-zero, so the supervisor restarts it and the gap is
+     refilled from the durable checkpoint
 4. For the Yellowstone datasource, persist a startup anchor before the live stream runs, so a
    durable checkpoint always exists: every connection, the first one included, replays from it up
    to the slot the stream opened at, and withholds live slots rather than advancing the checkpoint
