@@ -22,8 +22,8 @@ use testcontainers_modules::postgres::Postgres;
 /// Insert a minimal mint row so the balance queries have something to aggregate.
 async fn insert_mint(pool: &PgPool, mint: &Pubkey) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot)
-         VALUES ($1, 6, $2, 0)",
+        "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee)
+         VALUES ($1, 6, $2, 1)",
     )
     .bind(mint.to_string())
     .bind(spl_token::id().to_string())

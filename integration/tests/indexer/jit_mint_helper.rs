@@ -25,7 +25,7 @@ use {
             SignerUtil,
         },
         storage::{
-            common::{models::DbMint, storage::mock::MockStorage},
+            common::{amount::TokenAmount, models::DbMint, storage::mock::MockStorage},
             Storage,
         },
     },
@@ -160,7 +160,12 @@ async fn build_fixture_inner(populate_builder: bool, seed_mint_row: bool) -> Fix
         // (account probe, blockhash, send, confirm, backoff).
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string(), 0),
+            DbMint::new(
+                mint.to_string(),
+                6,
+                spl_token::id().to_string(),
+                TokenAmount(1),
+            ),
         );
     }
 

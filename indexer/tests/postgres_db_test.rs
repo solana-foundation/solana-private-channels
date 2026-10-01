@@ -774,17 +774,19 @@ async fn upsert_mints_empty_ok() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string(), 0);
-    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string(), 0);
+    let fee_a = TokenAmount(1_000);
+    let fee_b = TokenAmount(2_500);
+    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string(), fee_a);
+    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string(), fee_b);
     storage.upsert_mints_batch(&[m1, m2]).await?;
 
-    let got_a = storage.get_mint("mint_a").await?;
-    assert!(got_a.is_some());
-    assert_eq!(got_a.unwrap().decimals, 6);
+    let got_a = storage.get_mint("mint_a").await?.unwrap();
+    assert_eq!(got_a.decimals, 6);
+    assert_eq!(got_a.withdraw_fee, fee_a);
 
-    let got_b = storage.get_mint("mint_b").await?;
-    assert!(got_b.is_some());
-    assert_eq!(got_b.unwrap().decimals, 9);
+    let got_b = storage.get_mint("mint_b").await?.unwrap();
+    assert_eq!(got_b.decimals, 9);
+    assert_eq!(got_b.withdraw_fee, fee_b);
 
     // Missing mint
     let got_c = storage.get_mint("mint_c").await?;
@@ -796,11 +798,27 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m = DbMint::new("mint_upd".to_string(), 6, "TokenkegQ".to_string(), 100);
+    let m = DbMint {
+        allow_mint_slot: 100,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m]).await?;
 
     // Upsert with new decimals from a newer slot
-    let m2 = DbMint::new("mint_upd".to_string(), 9, "TokenkegQ".to_string(), 106);
+    let m2 = DbMint {
+        allow_mint_slot: 106,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            9,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
@@ -808,27 +826,86 @@ async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// A backfill or resync can write an older AllowMint after a newer one. The fee
+/// and minimum follow the AllowMint's slot, not the order the rows were written in.
 #[tokio::test(flavor = "multi_thread")]
-async fn upsert_mint_ignores_older_profile_slot() -> Result<(), Box<dyn std::error::Error>> {
+async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let mint = "mint_allow_mint_slot";
+
+    let newer_fee = TokenAmount(10_000);
+    let newer_min_withdraw_amount = TokenAmount(50_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: newer_min_withdraw_amount,
+            allow_mint_slot: 100,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), newer_fee)
+        }])
+        .await?;
+
+    // The replayed older AllowMint leaves the newer values and their slot alone.
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: TokenAmount(1),
+            allow_mint_slot: 90,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), TokenAmount(1))
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, newer_fee);
+    assert_eq!(got.min_withdraw_amount, newer_min_withdraw_amount);
+    assert_eq!(got.allow_mint_slot, 100);
+
+    // A later AllowMint still reprices both.
+    let repriced_fee = TokenAmount(20_000);
+    let repriced_min_withdraw_amount = TokenAmount(70_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            min_withdraw_amount: repriced_min_withdraw_amount,
+            allow_mint_slot: 110,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), repriced_fee)
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, repriced_fee);
+    assert_eq!(got.min_withdraw_amount, repriced_min_withdraw_amount);
+    assert_eq!(got.allow_mint_slot, 110);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_profile_ignores_older_allow_mint() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
     let live_slot = 106;
 
-    let live = DbMint::new(
-        "mint_live".to_string(),
-        9,
-        "TokenzQdB".to_string(),
-        live_slot,
-    );
+    let live = DbMint {
+        allow_mint_slot: live_slot,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[live]).await?;
 
     // A gap repair delivering the older AllowMint after the live one.
-    let repaired = DbMint::new("mint_live".to_string(), 6, "TokenkegQ".to_string(), 103);
+    let repaired = DbMint {
+        allow_mint_slot: 103,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[repaired]).await?;
 
     let got = storage.get_mint("mint_live").await?.unwrap();
     assert_eq!(got.decimals, 9);
     assert_eq!(got.token_program, "TokenzQdB");
-    assert_eq!(got.profile_slot, live_slot);
+    assert_eq!(got.allow_mint_slot, live_slot);
     Ok(())
 }
 
@@ -838,8 +915,24 @@ async fn upsert_mint_same_slot_later_profile_wins() -> Result<(), Box<dyn std::e
     let slot = 106;
 
     // A close and recreate between two AllowMints in one slot, in block order.
-    let first = DbMint::new("mint_same".to_string(), 6, "TokenkegQ".to_string(), slot);
-    let second = DbMint::new("mint_same".to_string(), 9, "TokenzQdB".to_string(), slot);
+    let first = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
+    let second = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[first, second]).await?;
 
     let got = storage.get_mint("mint_same").await?.unwrap();
@@ -854,7 +947,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
     let (_pool, storage, _pg) = start_postgres().await?;
 
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string(), 0)])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
@@ -886,7 +984,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
         .await?;
     storage.sync_mint_status(&["sm".to_string()]).await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string(), 0)])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(
         storage.get_mint("sm").await?.unwrap().status,
@@ -910,7 +1013,12 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     let mint = "recon_mint";
     let tp = "TokenkegQ";
     storage
-        .upsert_mints_batch(&[DbMint::new(mint.to_string(), 6, tp.to_string(), 0)])
+        .upsert_mints_batch(&[DbMint::new(
+            mint.to_string(),
+            6,
+            tp.to_string(),
+            TokenAmount(1),
+        )])
         .await?;
 
     // Pending deposit (ALL deposits count for reconciliation)
@@ -3567,7 +3675,7 @@ async fn seed_both_sides(
             "mint_addr".to_string(),
             6,
             "token".to_string(),
-            0,
+            TokenAmount(1),
         )])
         .await?;
     storage

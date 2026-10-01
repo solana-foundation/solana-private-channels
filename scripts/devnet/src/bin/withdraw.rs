@@ -1,5 +1,7 @@
-use private_channel_withdraw_program_client::instructions::{
-    WithdrawFunds, WithdrawFundsInstructionArgs,
+use private_channel_withdraw_program_client::{
+    accounts::WithdrawConfig,
+    instructions::{WithdrawFunds, WithdrawFundsInstructionArgs},
+    PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, WITHDRAW_CONFIG_SEED,
 };
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -22,6 +24,7 @@ fn main() -> Result<()> {
         eprintln!("  - Local:  http://localhost:8899");
         eprintln!("  - Docker: gateway:8899");
         eprintln!("\nThis burns tokens on PrivateChannel. The operator will then release funds on Solana.");
+        eprintln!("The mint's withdraw fee is charged on top of <amount>, so the balance must cover both.");
         std::process::exit(1);
     }
 
@@ -54,8 +57,49 @@ fn main() -> Result<()> {
 
     let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
 
+    // The fee, where it goes and the minimum live in the mint's config on
+    // PrivateChannel. The operator writes it on the mint's deposits, so a mint
+    // nothing has been deposited into cannot be withdrawn yet.
+    let (withdraw_config_pda, _) = Pubkey::find_program_address(
+        &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
+        &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    );
+    let withdraw_config_data = client
+        .get_account_data(&withdraw_config_pda)
+        .map_err(|e| {
+            format!(
+                "No withdraw config for mint {} at {} ({}). Has a deposit of this mint been processed yet?",
+                mint, withdraw_config_pda, e
+            )
+        })?;
+    let withdraw_config = WithdrawConfig::from_bytes(&withdraw_config_data)
+        .map_err(|e| format!("Failed to decode withdraw config: {}", e))?;
+    // The treasury moves its collected fees out without a fee or a minimum.
+    let is_treasury = user_keypair.pubkey() == withdraw_config.treasury;
+    let (fee, min_withdraw_amount) = if is_treasury {
+        (0, 0)
+    } else {
+        (withdraw_config.fee, withdraw_config.min_withdraw_amount)
+    };
+
     println!("\n📍 Transaction details:");
     println!("User ATA (on PrivateChannel): {}", user_ata);
+    println!(
+        "Withdraw fee: {} (paid to {})",
+        fee, withdraw_config.treasury_token_account
+    );
+    println!("Minimum withdraw amount: {}", min_withdraw_amount);
+    if amount < min_withdraw_amount {
+        return Err(format!(
+            "amount {} is below the mint's minimum of {}",
+            amount, min_withdraw_amount
+        )
+        .into());
+    }
+    let total = amount
+        .checked_add(fee)
+        .ok_or("amount + fee exceeds u64::MAX, so no balance can cover this withdrawal")?;
+    println!("Total debited: {} (amount + fee)", total);
 
     let instruction = WithdrawFunds {
         user: user_keypair.pubkey(),
@@ -63,6 +107,8 @@ fn main() -> Result<()> {
         token_account: user_ata,
         token_program: spl_token::ID,
         associated_token_program: spl_associated_token_account::ID,
+        withdraw_config: withdraw_config_pda,
+        treasury_token_account: withdraw_config.treasury_token_account,
     }
     .instruction(WithdrawFundsInstructionArgs {
         amount,

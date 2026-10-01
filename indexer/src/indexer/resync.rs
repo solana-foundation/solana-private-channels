@@ -1035,7 +1035,7 @@ mod tests {
                 "mint".to_string(),
                 6,
                 "token".to_string(),
-                0,
+                crate::storage::common::amount::TokenAmount(1),
             ),
         );
         let storage = Arc::new(Storage::Mock(mock.clone()));

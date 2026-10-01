@@ -1,10 +1,21 @@
 use private_channel_indexer::{
     error::StorageError,
     storage::{
-        common::models::{DbMint, DbMintStatus},
+        common::{
+            amount::TokenAmount,
+            models::{DbMint, DbMintStatus},
+        },
         Storage,
     },
 };
+
+/// Withdraw fee the e2e harnesses allow mints with. The operator writes it to
+/// the channel on every deposit, so every withdrawal after one pays it.
+pub const TEST_WITHDRAW_FEE: u64 = 1_000;
+
+/// Minimum withdrawal the e2e harnesses allow mints with. Kept at 1 so every
+/// amount these suites withdraw stays valid.
+pub const TEST_MIN_WITHDRAW_AMOUNT: u64 = 1;
 
 /// Test helper: seed a mint AND a slot-0 `allowed` history entry so the
 /// operator gate (`assert_mint_allowed_at_slot`) and the reconciliation
@@ -17,12 +28,15 @@ pub async fn seed_allowed_mint(
     effective_slot: i64,
 ) -> Result<(), StorageError> {
     storage
-        .upsert_mints_batch(&[DbMint::new(
-            mint_address.to_string(),
-            decimals,
-            token_program.to_string(),
-            effective_slot,
-        )])
+        .upsert_mints_batch(&[DbMint {
+            allow_mint_slot: effective_slot,
+            ..DbMint::new(
+                mint_address.to_string(),
+                decimals,
+                token_program.to_string(),
+                TokenAmount(TEST_WITHDRAW_FEE),
+            )
+        }])
         .await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {

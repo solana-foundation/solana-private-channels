@@ -2576,7 +2576,7 @@ mod tests {
                     m.to_string(),
                     6,
                     spl_token::id().to_string(),
-                    0,
+                    TokenAmount(1),
                 )
             })
             .collect();

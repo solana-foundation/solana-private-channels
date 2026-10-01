@@ -314,6 +314,46 @@ groups:
                     params: [0.5]
               refId: C
 
+      # The floors above fire only once the wallet is nearly empty. This fires on
+      # the speed of the drop, so a zero-fee or underpriced mint looping failed
+      # releases or dust withdrawals pages while there is still SOL left. It
+      # measures the drop from the hour's highest balance, so a top-up never
+      # fires it. A release costs about 10,000 lamports, so 0.05 SOL an hour is
+      # roughly 5,000 releases; raise it above the deployment's normal volume.
+      - uid: feepayer-burn-rate
+        title: "Feepayer SOL dropped more than 0.05 in the last hour"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Feepayer {{ $labels.job }} ({{ $labels.program_type }}) spent {{ $values.A }} SOL in the last hour. Find the mint with the triage query in private-channel-deploy/README.md, then block its withdrawals or reprice it"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 3600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (max_over_time(private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"}[1h]) - private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"}) / 1e9
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.05]
+              refId: C
+
   - orgId: 1
     name: indexer-reconnect-alerts
     folder: Solana Private Channels Alerts
