@@ -494,7 +494,13 @@ async fn collect(
 ) -> Result<usize, String> {
     let address = scope.address();
     let signatures = rpc
-        .get_signatures_for_address_paginated(address, page_limit)
+        .get_signatures_for_address_paginated(address, page_limit, |status| {
+            status.err.is_none()
+                && status
+                    .memo
+                    .as_deref()
+                    .is_some_and(|m| !memo_markers(m).is_empty())
+        })
         .await
         .map_err(|e| {
             format!("consumed-set enumeration failed listing signatures for {address}: {e}")
@@ -502,28 +508,10 @@ async fn collect(
 
     // An accepted signature would yield the same entry again, so it is not fetched twice.
     let mut accepted: HashSet<Signature> = set.values().map(|mint| mint.signature).collect();
-    let (listed, mut fetched, mut added) = (signatures.len(), 0usize, 0usize);
+    let (candidates, mut fetched, mut added) = (signatures.len(), 0usize, 0usize);
     for status in signatures {
-        if status.err.is_some() {
-            continue;
-        }
-        let Some(memo) = status.memo.as_deref() else {
-            continue;
-        };
-
-        // A memo field can carry several "; "-joined entries, each possibly length-prefixed.
-        let mut markers = Vec::new();
-        for piece in memo.split("; ") {
-            let value = strip_memo_length_prefix(piece);
-            if let Some(rest) = value.strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX) {
-                markers.push((ConsumedMintKind::Deposit, rest));
-            } else if let Some(rest) = value.strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX) {
-                markers.push((ConsumedMintKind::Remint, rest));
-            }
-        }
-        if markers.is_empty() {
-            continue;
-        }
+        // The listing already dropped failed and marker-less entries.
+        let markers = memo_markers(status.memo.as_deref().unwrap_or_default());
 
         let signature = Signature::from_str(&status.signature)
             .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
@@ -631,12 +619,27 @@ async fn collect(
     }
     info!(
         %address,
-        listed,
+        candidates,
         fetched,
         added,
         "Scanned channel history for the consumed-set"
     );
     Ok(added)
+}
+
+/// Idempotency markers in a memo field, which can carry several "; "-joined entries, each
+/// possibly length-prefixed.
+fn memo_markers(memo: &str) -> Vec<(ConsumedMintKind, &str)> {
+    let mut markers = Vec::new();
+    for piece in memo.split("; ") {
+        let value = strip_memo_length_prefix(piece);
+        if let Some(rest) = value.strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX) {
+            markers.push((ConsumedMintKind::Deposit, rest));
+        } else if let Some(rest) = value.strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX) {
+            markers.push((ConsumedMintKind::Remint, rest));
+        }
+    }
+    markers
 }
 
 fn strip_memo_length_prefix(memo: &str) -> &str {

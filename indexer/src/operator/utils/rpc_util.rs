@@ -457,11 +457,14 @@ impl RpcClientWithRetry {
     /// the entire signature history for an address, oldest page last, so a consumed-set
     /// enumeration cannot miss a mint that sits beyond the first window. Any page error
     /// propagates as `Err` so the caller can fail closed rather than treat a partial
-    /// history as complete.
+    /// history as complete. Only entries `keep` accepts are retained, page by page.
     pub async fn get_signatures_for_address_paginated(
         &self,
         address: &Pubkey,
         page_limit: usize,
+        keep: impl Fn(
+            &solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
+        ) -> bool,
     ) -> Result<
         Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
         Box<client_error::Error>,
@@ -490,7 +493,8 @@ impl RpcClientWithRetry {
             let page_len = page.len();
             // Capture the oldest signature on this page; it becomes the next page's cursor.
             let last_signature = page.last().map(|s| s.signature.clone());
-            all.extend(page);
+            // Filter per page so a busy address's full history is never held in memory.
+            all.extend(page.into_iter().filter(|status| keep(status)));
 
             // A short page is the only legitimate end of history.
             if page_len < page_limit {
