@@ -9,7 +9,10 @@ use crate::{
     scheduler::{ConflictFreeBatch, TransactionWithIndex},
     stage_metrics::{NoopMetrics, SharedMetrics},
     stages::{execute_batch, get_execution_deps, sigverify_transaction, SigverifyResult},
-    transactions::{has_address_table_lookups, ADDRESS_LOOKUP_UNSUPPORTED},
+    transactions::{
+        has_address_table_lookups, lists_native_mint, ADDRESS_LOOKUP_UNSUPPORTED,
+        NATIVE_MINT_UNSUPPORTED,
+    },
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -157,6 +160,10 @@ pub async fn simulate_transaction(
     // Refuse here what sendTransaction refuses, so preflight cannot bless a tx that will never land.
     SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
         .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
+
+    if lists_native_mint(&sanitized_tx) {
+        return Err(custom_error(INVALID_PARAMS_CODE, NATIVE_MINT_UNSUPPORTED));
+    }
 
     // Checked here so a bad address list never pays for a simulation.
     if let Some(accounts_config) = config.accounts.as_ref() {
@@ -671,6 +678,20 @@ mod tests {
             1,
             "a failed call must release its permit"
         );
+    }
+
+    /// A tx listing the native mint is refused as sendTransaction refuses it,
+    /// before any permit or store read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_mint_reference_rejected() {
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        let encoded = encoded_transfer(&[spl_token::native_mint::id()]);
+
+        let err = simulate_transaction(&deps, encoded, None)
+            .await
+            .expect_err("a tx listing the native mint must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), NATIVE_MINT_UNSUPPORTED);
     }
 
     /// A simulation may fetch no more than one transaction's account data cap,

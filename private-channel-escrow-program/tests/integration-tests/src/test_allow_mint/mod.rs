@@ -5,8 +5,9 @@ use crate::{
     utils::{
         assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
         set_mint_2022_with_permanent_delegate, setup_hook_mint, TestContext,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        INVALID_ACCOUNT_DATA_ERROR, INVALID_ACCOUNT_OWNER_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_ALLOWED_MINT_ERROR, INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::AllowMintBuilder;
@@ -304,6 +305,63 @@ fn test_allow_mint_invalid_instance_account_owner() {
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
     assert_program_error(result, INVALID_ACCOUNT_DATA_ERROR);
+}
+
+/// The spl-token native mint is refused with InvalidMint whichever token program owns it,
+/// or with InvalidAccountOwner when the passed token program is not its owner.
+#[test]
+fn test_allow_mint_native_mint_rejected() {
+    let native_mint = spl_token::native_mint::ID;
+    type SetMint = fn(&mut TestContext, &Pubkey);
+    let cases: [(SetMint, Pubkey, u32); 3] = [
+        (set_mint, TOKEN_PROGRAM_ID, INVALID_MINT_ERROR),
+        (
+            set_mint_2022_basic,
+            TOKEN_2022_PROGRAM_ID,
+            INVALID_MINT_ERROR,
+        ),
+        (set_mint, TOKEN_2022_PROGRAM_ID, INVALID_ACCOUNT_OWNER_ERROR),
+    ];
+
+    for (set_native_mint, token_program, expected_error) in cases {
+        let mut context = TestContext::new();
+        let admin = Keypair::new();
+        let instance_seed = Keypair::new();
+
+        set_native_mint(&mut context, &native_mint);
+
+        let (instance_pda, _) =
+            assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+                .expect("CreateInstance should succeed");
+
+        let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &native_mint);
+        let (event_authority_pda, _) = find_event_authority_pda();
+        let instance_ata =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &instance_pda,
+                &native_mint,
+                &token_program,
+            );
+
+        let instruction = AllowMintBuilder::new()
+            .payer(context.payer.pubkey())
+            .admin(admin.pubkey())
+            .instance(instance_pda)
+            .mint(native_mint)
+            .allowed_mint(allowed_mint_pda)
+            .instance_ata(instance_ata)
+            .system_program(SYSTEM_PROGRAM_ID)
+            .token_program(token_program)
+            .associated_token_program(ATA_PROGRAM_ID)
+            .event_authority(event_authority_pda)
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .bump(bump)
+            .instruction();
+
+        let result = context.send_transaction_with_signers(instruction, &[&admin]);
+
+        assert_program_error(result, expected_error);
+    }
 }
 
 // ============================================================================

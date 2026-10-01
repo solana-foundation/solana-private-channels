@@ -1,5 +1,6 @@
 use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::transaction::SanitizedTransaction;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -53,6 +54,19 @@ pub fn is_allowed_program_instruction(program_id: &Pubkey, data: &[u8]) -> bool 
         || *program_id
             == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
         || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
+}
+
+/// Rejection reason for a transaction that lists the spl-token native mint.
+pub const NATIVE_MINT_UNSUPPORTED: &str = "The native mint (wSOL) is not supported on this channel";
+
+/// spl-token builds a native (wSOL) account without loading the mint, so refusing
+/// any tx that lists it keeps fabricated gasless lamports from becoming wSOL. A CPI
+/// can only reach listed keys, and lookup tables are refused before this runs.
+pub fn lists_native_mint(tx: &SanitizedTransaction) -> bool {
+    tx.message()
+        .account_keys()
+        .iter()
+        .any(|key| *key == spl_token::native_mint::id())
 }
 
 /// Rejection reason shared by every admission path, so clients see one wording.

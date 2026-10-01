@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use crate::{
-    constants::ALLOWED_MINT_SEED,
+    constants::{ALLOWED_MINT_SEED, SPL_NATIVE_MINT},
     error::PrivateChannelEscrowProgramError,
     events::AllowMintEvent,
     processor::{
@@ -66,6 +66,13 @@ pub fn process_allow_mint(
     validate_event_authority!(event_authority_info);
 
     verify_account_owner(mint_info, token_program_info.address())?;
+
+    // The channel cannot create the native mint, so deposits of it could never
+    // be minted there. Checked by address whichever token program owns it, before
+    // any side effect. Reuses InvalidMint to keep the error ABI unchanged.
+    if mint_info.address() == &SPL_NATIVE_MINT {
+        return Err(PrivateChannelEscrowProgramError::InvalidMint.into());
+    }
 
     // Also proves the account is a mint: the decimals below come from this
     // parse rather than an unchecked cast.

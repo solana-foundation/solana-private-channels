@@ -11,6 +11,11 @@ pub const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 // Instance
 pub const INSTANCE_VERSION: u8 = 1;
 
+// spl-token's native (wSOL) mint. Not `spl_token_2022::native_mint::ID`, which
+// is the Token-2022 native mint at a different address.
+pub const SPL_NATIVE_MINT: Address =
+    Address::from_str_const("So11111111111111111111111111111111111111112");
+
 #[cfg(not(feature = "test-tree"))]
 pub mod bitmap_constants {
     // Nonces covered by one bitmap generation, one bit each.

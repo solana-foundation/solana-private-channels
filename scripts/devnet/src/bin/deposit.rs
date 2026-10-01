@@ -33,7 +33,7 @@ fn main() -> Result<()> {
 
     if args.len() < 6 {
         eprintln!("Usage: {} <rpc-url> <user-keypair-path> <instance-id> <mint-address> <amount> [recipient]", args[0]);
-        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/user.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112 1000000", args[0]);
+        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/user.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU 1000000", args[0]);
         std::process::exit(1);
     }
 
