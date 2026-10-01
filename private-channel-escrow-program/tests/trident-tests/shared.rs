@@ -16,6 +16,13 @@ pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
     pubkey!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");
 pub const SPL_TOKEN_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
+/// Withdraw fee every harness AllowMint sets. The escrow records it but does not
+/// act on it.
+pub const FUZZ_WITHDRAW_FEE: u64 = 1_000;
+
+/// Minimum withdrawal every harness AllowMint sets. Recorded like the fee.
+pub const FUZZ_MIN_WITHDRAW_AMOUNT: u64 = 100;
+
 /// Clamp raw fuzz amounts to [1, 999_999].
 pub fn clamp_amount(raw: u64) -> u64 {
     (raw % 1_000_000).max(1)
@@ -166,6 +173,8 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
             .allowed_mint(allowed_mint_pda.client())
             .instance_ata(instance_ata.client())
             .bump(allowed_mint_bump)
+            .withdraw_fee(FUZZ_WITHDRAW_FEE)
+            .min_withdraw_amount(FUZZ_MIN_WITHDRAW_AMOUNT)
             .instruction()
             .to_trident()],
         Some("allow_mint"),

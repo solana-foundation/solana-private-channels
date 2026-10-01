@@ -2,6 +2,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateChannelWithdrawInstructionDiscriminators {
     WithdrawFunds = 0,
+    SetWithdrawConfig = 1,
 }
 
 impl TryFrom<u8> for PrivateChannelWithdrawInstructionDiscriminators {
@@ -10,6 +11,7 @@ impl TryFrom<u8> for PrivateChannelWithdrawInstructionDiscriminators {
     fn try_from(discriminator: u8) -> Result<Self, Self::Error> {
         match discriminator {
             0 => Ok(Self::WithdrawFunds),
+            1 => Ok(Self::SetWithdrawConfig),
             _ => Err(()),
         }
     }
@@ -32,7 +34,7 @@ mod tests {
 
     #[test]
     fn test_discriminator_invalid() {
-        let result = PrivateChannelWithdrawInstructionDiscriminators::try_from(1u8);
+        let result = PrivateChannelWithdrawInstructionDiscriminators::try_from(2u8);
 
         assert!(result.is_err());
     }

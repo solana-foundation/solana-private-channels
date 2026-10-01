@@ -46,6 +46,7 @@ have prefixes.
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
+| `refuses non-confidential credits` | A.non-halting | no | pre-flight |
 | `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
@@ -171,7 +172,9 @@ Note that parking is not a refund. `WithdrawFunds` burns the user's channel
 tokens before the row exists, and a row parked here never reaches the
 sender, so the compensating remint that normally restores those tokens
 after a permanent release failure never runs. Every disposition below has
-to say explicitly what the user is owed.
+to say explicitly what the user is owed. That is always the row's `amount`,
+never the withdraw fee: the fee was paid to the treasury, and refunding it
+would reopen the free retry loop it exists to close.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for this row. Expected: `NOT_LANDED` (pre-flight aborted before send).
@@ -214,6 +217,14 @@ to say explicitly what the user is owed.
      reminds their channel balance, so it lands in
      [withdrawal_failed_reminted.md](withdrawal_failed_reminted.md), not here.
      [Escalate](_escalation.md) (Tier 2).
+   - `refuses non-confidential credits` - the withdrawal's Solana destination is a
+     confidential-transfer account whose owner ran `DisableNonConfidentialCredits`, so
+     the release's transfer would fail on-chain after the operator paid for it. The
+     escrow still holds the funds. If the owner re-enables credits
+     (`EnableNonConfidentialCredits`), re-arm the row; the pre-flight reads the account
+     again. Otherwise refund the row's `amount` out-of-band. Several of these from the
+     same initiator is the retry loop the withdraw fee exists to price, so
+     [escalate](_escalation.md) (Tier 2) rather than refunding each one.
    - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
      `release_funds` rejects on-chain. The escrow still holds the funds and the row is
      intact, so nothing is lost. Re-open the gate (`BlockMint` with

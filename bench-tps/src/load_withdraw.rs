@@ -56,6 +56,8 @@ fn build_withdraw_tx(
         token_account,
         token_program: spl_token::id(),
         associated_token_program: spl_associated_token_account::id(),
+        withdraw_config: config.withdraw_config,
+        treasury_token_account: config.treasury_token_account,
     };
 
     let ix = accounts.instruction(WithdrawFundsInstructionArgs {

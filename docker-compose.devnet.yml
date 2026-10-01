@@ -463,9 +463,9 @@ services:
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack). The operator alias is deliberate: both roles are
-      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
-      # distinct key without also fixing feepayer_monitor.rs, which watches
-      # get_operator_pubkey() while the real fee payer is the admin key.
+      # the same hot service identity. Both operator services must share this key:
+      # it pays Solana releases, signs channel remints as mint authority, and
+      # deposits make it the withdraw fee treasury.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
@@ -521,9 +521,9 @@ services:
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack). The operator alias is deliberate: both roles are
-      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
-      # distinct key without also fixing feepayer_monitor.rs, which watches
-      # get_operator_pubkey() while the real fee payer is the admin key.
+      # the same hot service identity. Both operator services must share this key:
+      # it pays Solana releases, signs channel remints as mint authority, and
+      # deposits make it the withdraw fee treasury.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory

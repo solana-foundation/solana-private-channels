@@ -711,16 +711,22 @@ fn convert_to_db_models(
                     )
                 }
                 EscrowInstruction::AllowMint {
-                    accounts, event, ..
+                    accounts,
+                    data,
+                    event,
                 } => {
                     let mint_address = accounts.mint.to_string();
                     (
-                        Some(DbMint::new(
-                            mint_address.clone(),
-                            event.decimals as i16,
-                            accounts.token_program.to_string(),
-                            instruction_meta.slot as i64,
-                        )),
+                        Some(DbMint {
+                            min_withdraw_amount: TokenAmount(data.min_withdraw_amount),
+                            allow_mint_slot: instruction_meta.slot as i64,
+                            ..DbMint::new(
+                                mint_address.clone(),
+                                event.decimals as i16,
+                                accounts.token_program.to_string(),
+                                TokenAmount(data.withdraw_fee),
+                            )
+                        }),
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
@@ -882,6 +888,9 @@ mod tests {
         }
     }
 
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
+
     fn make_allow_mint_instruction(
         slot: u64,
         sig: Option<String>,
@@ -902,7 +911,11 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
                 event: AllowMintEvent { decimals },
             })),
             slot,
@@ -1096,6 +1109,15 @@ mod tests {
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
+        assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
+        assert_eq!(
+            mint.min_withdraw_amount,
+            TokenAmount(ALLOW_MINT_MIN_WITHDRAW_AMOUNT)
+        );
+        assert_eq!(
+            mint.allow_mint_slot, 200,
+            "the fee is stamped with its AllowMint's slot"
+        );
     }
 
     #[test]
@@ -1240,7 +1262,11 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
                 event: AllowMintEvent { decimals: 6 },
             })),
             slot: 200,
@@ -1407,7 +1433,7 @@ mod tests {
         let mints = mock.mints.lock().unwrap();
         let row = &mints[&make_pubkey(2).to_string()];
         assert_eq!(row.decimals, live_decimals as i16);
-        assert_eq!(row.profile_slot, live_slot as i64);
+        assert_eq!(row.allow_mint_slot, live_slot as i64);
     }
 
     #[tokio::test]
@@ -1448,7 +1474,7 @@ mod tests {
                 make_pubkey(2).to_string(),
                 6,
                 spl_token::id().to_string(),
-                0,
+                TokenAmount(ALLOW_MINT_WITHDRAW_FEE),
             ),
         );
         processor.buffer(make_block_mint_instruction(

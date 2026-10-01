@@ -53,8 +53,11 @@ cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
-  <MINT_ADDRESS>
+  <MINT_ADDRESS> \
+  <WITHDRAW_FEE> \
+  <MIN_WITHDRAW_AMOUNT>
 ```
+`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin; size it to cover one release's SOL cost. `<MIN_WITHDRAW_AMOUNT>` is the smallest amount one withdrawal may move, also in base units, which limits how many releases a balance can queue at once. `0` is allowed for either, but a fee of `0` leaves the operator paying every release, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with new values, to or from `0`, to reprice; they apply from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash
@@ -74,6 +77,7 @@ cargo run --bin withdraw -- \
   <MINT_ADDRESS> \
   <AMOUNT>
 ```
+Prints the mint's withdraw fee and minimum before sending, and stops if `<AMOUNT>` is below the minimum. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana. The operator admin withdraws without either.
 
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script

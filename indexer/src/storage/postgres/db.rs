@@ -806,7 +806,9 @@ impl PostgresDb {
                 mint_address TEXT PRIMARY KEY,
                 decimals SMALLINT NOT NULL,
                 token_program TEXT NOT NULL,
-                profile_slot BIGINT NOT NULL,
+                withdraw_fee NUMERIC(20,0) NOT NULL,
+                min_withdraw_amount NUMERIC(20,0) NOT NULL DEFAULT 0,
+                allow_mint_slot BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -3012,20 +3014,28 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program, status, profile_slot)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO mints
+                    (mint_address, decimals, token_program, status, withdraw_fee,
+                     min_withdraw_amount, allow_mint_slot)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program,
-                    profile_slot = EXCLUDED.profile_slot
-                WHERE mints.profile_slot <= EXCLUDED.profile_slot
+                    withdraw_fee = EXCLUDED.withdraw_fee,
+                    min_withdraw_amount = EXCLUDED.min_withdraw_amount,
+                    allow_mint_slot = EXCLUDED.allow_mint_slot
+                -- Slot-ordered like mint_status_history: a backfill or resync
+                -- replaying an older AllowMint cannot restore older values.
+                WHERE mints.allow_mint_slot <= EXCLUDED.allow_mint_slot
                 "#,
             )
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
             .bind(&mint.status)
-            .bind(mint.profile_slot)
+            .bind(mint.withdraw_fee)
+            .bind(mint.min_withdraw_amount)
+            .bind(mint.allow_mint_slot)
             .execute(&mut *tx)
             .await?;
         }

@@ -41,7 +41,7 @@ use {
             SignerUtil,
         },
         storage::{
-            common::{models::DbMint, storage::mock::MockStorage},
+            common::{amount::TokenAmount, models::DbMint, storage::mock::MockStorage},
             Storage, TransactionStatus,
         },
     },
@@ -282,7 +282,12 @@ async fn build_state_for_jit_caller_arm(
     if seed_mint_row {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string(), 0),
+            DbMint::new(
+                mint.to_string(),
+                6,
+                spl_token::id().to_string(),
+                TokenAmount(1),
+            ),
         );
     }
     let storage = Arc::new(Storage::Mock(mock_storage));

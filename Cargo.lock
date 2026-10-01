@@ -6470,6 +6470,7 @@ dependencies = [
  "pinocchio",
  "pinocchio-associated-token-account",
  "pinocchio-log",
+ "pinocchio-system",
  "pinocchio-token",
  "serde_json",
  "solana-address 2.6.1",

@@ -165,9 +165,10 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
-/// Reason labels for the withdrawal bails that park one row and leave the
-/// pipeline running. Kept here so the emitting code and the pre-registration
-/// below read one list and a label cannot exist in only one of them.
+/// Reason labels for the bails that park one row and leave the pipeline
+/// running, withdrawal-side except where noted. Kept here so the emitting code
+/// and the pre-registration below read one list and a label cannot exist in
+/// only one of them.
 pub const BAIL_REASON_UNSUPPORTED_MINT: &str = "unsupported_mint";
 pub const BAIL_REASON_WITHDRAWALS_BLOCKED: &str = "withdrawals_blocked";
 pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
@@ -176,8 +177,12 @@ pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
 pub const BAIL_REASON_ESCROW_FROZEN: &str = "escrow_frozen";
 pub const BAIL_REASON_HOOK_UNRESOLVABLE: &str = "hook_unresolvable";
 pub const BAIL_REASON_MINT_PROFILE_MISMATCH: &str = "mint_profile_mismatch";
+pub const BAIL_REASON_DESTINATION_REFUSES_CREDITS: &str = "destination_refuses_credits";
+/// Deposit-side: no `mints` row, so the fee and minimum the channel's withdraw
+/// config needs are unknown.
+pub const BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN: &str = "withdraw_config_unknown";
 
-pub const BAIL_REASONS: [&str; 8] = [
+pub const BAIL_REASONS: [&str; 10] = [
     BAIL_REASON_UNSUPPORTED_MINT,
     BAIL_REASON_WITHDRAWALS_BLOCKED,
     BAIL_REASON_TARGET_MINT_MISSING,
@@ -186,6 +191,8 @@ pub const BAIL_REASONS: [&str; 8] = [
     BAIL_REASON_ESCROW_FROZEN,
     BAIL_REASON_HOOK_UNRESOLVABLE,
     BAIL_REASON_MINT_PROFILE_MISMATCH,
+    BAIL_REASON_DESTINATION_REFUSES_CREDITS,
+    BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN,
 ];
 
 // Supervision: a critical task inside the operator exited.  The supervisor
