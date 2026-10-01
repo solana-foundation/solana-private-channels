@@ -67,7 +67,7 @@ Discriminator: `1`
 | `bump` | u8 | PDA bump seed for allowed mint account |
 | `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. `0` is allowed but leaves the operator paying every release; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The escrow records it in `AllowMintEvent`; the indexer reads it from the instruction data and the operator writes it to the channel's withdraw config on every deposit, so re-allowing with a new value (to or from `0`) reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
 | `min_withdraw_amount` | u64 | Smallest amount one channel withdrawal of this mint may move, `0` for none. Recorded, read and repriced the same way as `withdraw_fee` |
-| `min_deposit_amount` | u64 | Smallest amount one deposit of this mint must land in the escrow, net of any transfer fee, `0` for none. Unlike the two above it never reaches the channel: it is stored on `AllowedMint` and enforced by `Deposit`. Size it to cover the recipient ATA and channel mint the operator pays for. A re-allow reprices it |
+| `min_deposit_amount` | u64 | Smallest amount one deposit of this mint must land in the escrow, net of any transfer fee, `0` for none. Unlike the two above it never reaches the channel: it is stored on `AllowedMint` and enforced by `Deposit`. The depositor keeps the tokens, so it does not pay for the recipient ATA and channel mint the operator funds; it limits how much of that one balance triggers at once, and only the withdraw fee bounds the total. A re-allow reprices it |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |

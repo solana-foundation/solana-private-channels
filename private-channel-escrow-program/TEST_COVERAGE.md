@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**63 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **108 integration tests** (end-to-end behavior).
+**64 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **109 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -49,7 +49,7 @@
 - `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
 - `test_allow_mint_token_2022_transfer_hook_allowed` — hook mints are allowlistable, and the escrow ATA the CPI creates carries `TransferHookAccount`
 
-### BlockMint (11 integration tests)
+### BlockMint (12 integration tests)
 
 - `test_block_mint_success` — happy path; the PDA survives with both gates set
 - `test_block_mint_allowed_mint_not_found` — nonexistent mint fails
@@ -59,6 +59,7 @@
 - `test_block_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_block_mint_mismatched_mint` — PDA/mint mismatch rejected
 - `test_block_mint_prevents_deposit` — a deposit-blocked mint fails a subsequent deposit with DepositsBlockedForMint
+- `test_block_unblock_keeps_min_deposit_amount` — BlockMint rewrites the whole AllowedMint, so after block and unblock a deposit under the AllowMint minimum still fails with BelowMinimumDeposit
 - `test_allow_block_allow_cycle` — a mint can be re-allowed after being blocked; deposit succeeds once re-allowed
 - `test_block_mint_deposits_only_still_allows_release` — blocking deposits leaves already-escrowed funds withdrawable
 - `test_block_mint_withdrawals_prevents_release` — the withdrawal gate alone rejects a release with WithdrawalsBlockedForMint
@@ -168,7 +169,7 @@
 
 - `create_instance`: 4 tests (valid data, insufficient data, empty data, payload missing the bitmap bump)
 - `allow_mint`: 3 tests (valid bump, fee and both minimums, payload missing the deposit minimum, empty data)
-- `deposit`: 6 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
+- `deposit`: 7 tests (with/without recipient, insufficient length, empty accounts, zero amount rejected before the accounts are read and so before the CPI, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `rotate_bitmap`: 1 test (empty accounts)
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)

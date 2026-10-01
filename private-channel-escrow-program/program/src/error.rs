@@ -80,7 +80,7 @@ pub enum PrivateChannelEscrowProgramError {
     MintProfileChanged,
 
     /// (18) Deposit requested or received zero tokens
-    #[error("Deposit amount must be greater than zero")]
+    #[error("Deposit requested or received zero tokens")]
     ZeroAmount,
 
     /// (19) Deposit landed less than the mint's minimum set at AllowMint

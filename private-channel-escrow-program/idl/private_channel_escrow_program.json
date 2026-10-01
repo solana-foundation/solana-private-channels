@@ -702,7 +702,7 @@
       {
         "code": 18,
         "kind": "errorNode",
-        "message": "Deposit amount must be greater than zero",
+        "message": "Deposit requested or received zero tokens",
         "name": "zeroAmount"
       },
       {

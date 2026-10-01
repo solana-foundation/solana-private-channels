@@ -280,7 +280,9 @@ mod tests {
 
     #[test]
     fn test_process_deposit_empty_accounts() {
-        let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // 8 amount + 1 recipient option; the entrypoint has already stripped the
+        // discriminator. Non-zero amount so the zero-amount guard does not fire first.
+        let instruction_data = vec![1, 0, 0, 0, 0, 0, 0, 0, 0];
         let accounts = [];
 
         let result = process_deposit(
@@ -290,6 +292,26 @@ mod tests {
         );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
+    }
+
+    // With no accounts there is nothing to transfer from, so ZeroAmount here
+    // proves the guard runs before the CPI. The post-transfer check would also
+    // catch a zero request, which is why an end-to-end test cannot pin this.
+    #[test]
+    fn test_process_deposit_zero_amount_rejected_before_accounts() {
+        let instruction_data = vec![0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let accounts = [];
+
+        let result = process_deposit(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
+
+        assert_eq!(
+            result.err(),
+            Some(PrivateChannelEscrowProgramError::ZeroAmount.into())
+        );
     }
 
     // has_recipient flag = 1 signals that 32 more bytes follow for the recipient key.
