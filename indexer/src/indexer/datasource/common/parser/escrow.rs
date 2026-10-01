@@ -693,13 +693,17 @@ mod tests {
 
     const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
     const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
+    const ALLOW_MINT_MIN_DEPOSIT_AMOUNT: u64 = 2_345_678;
 
     /// Create minimal valid Borsh-encoded data for AllowMint instruction
-    /// AllowMintIxData { bump: u8, withdraw_fee: u64, min_withdraw_amount: u64 }
+    /// AllowMintIxData { bump: u8, withdraw_fee: u64, min_withdraw_amount: u64,
+    /// min_deposit_amount: u64 }. The indexer does not read the deposit
+    /// minimum, so this pins that the trailing field still parses.
     fn create_allow_mint_borsh_data() -> Vec<u8> {
         let mut data = vec![123]; // bump
         data.extend_from_slice(&ALLOW_MINT_WITHDRAW_FEE.to_le_bytes());
         data.extend_from_slice(&ALLOW_MINT_MIN_WITHDRAW_AMOUNT.to_le_bytes());
+        data.extend_from_slice(&ALLOW_MINT_MIN_DEPOSIT_AMOUNT.to_le_bytes());
         data
     }
 

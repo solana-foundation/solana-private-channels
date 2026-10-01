@@ -95,6 +95,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
   mint: USDC_MINT,
   withdrawFee: 10_000n, // 0.01 USDC per channel withdrawal, in base units
   minWithdrawAmount: 1_000_000n, // smallest channel withdrawal, 1 USDC
+  minDepositAmount: 1_000_000n, // smallest deposit the escrow accepts, 1 USDC
 });
 
 // Sign and send transaction with payer and admin as signers
@@ -109,11 +110,12 @@ const allowMintIx = await getAllowMintInstructionAsync({
   - **Zero fee.** `0` is the admin's explicit opt-in to the old unbounded behavior: the operator pays every release, whatever the minimum. A user can loop a withdrawal to a refusing destination, or withdraw and redeposit, and every round costs the operator SOL. Use `0` only where every participant is known and accountable, for example a permissioned channel whose users are onboarded, so an account that loops can be identified and cut off. The remaining controls are the withdrawal pre-flight and blocking withdrawals for the mint.
   - **Changing it later.** A fee can go from `0` to a nonzero value, or back, at any time. It is an ordinary reprice with the procedure below, and needs no other setup: every deposit already creates the treasury's token account, even at `0`. Until the next deposit of the mint lands, withdrawals keep paying the old fee, which for a mint at `0` means nothing. To switch a fee on urgently, block withdrawals first, then reprice and make a small deposit yourself.
 - `minWithdrawAmount` is required and may be `0`. It limits how many releases one balance can queue at once, not the total: the amount returns on Solana and can be redeposited, so only the fee bounds it. The operator admin, as treasury, has no minimum. It reprices with the fee.
+- `minDepositAmount` is required and may be `0`. `Deposit` rejects with `BelowMinimumDeposit` any deposit that lands less, measured net of a transfer fee. Every deposit costs the operator a channel mint and possibly a recipient token account, so size it to cover that; `0` lets a user create that work with dust. Unlike the fee and withdrawal minimum it is enforced by the escrow, so a reprice applies from the AllowMint itself.
 
   AllowMint is the only way to reprice, and calling it again does three things beyond changing the fee and minimum:
   - **Re-opens both gates.** To keep the mint blocked, send a `BlockMint` in a later transaction, once the AllowMint is confirmed. Not in the same one: both would share a slot, the indexer records one status per mint and slot, and it would keep the AllowMint's, so its mirror would read open while the chain is blocked.
   - **Re-pins the mint profile.** Any profile change since the last allow is accepted silently, so `MintProfileChanged` no longer catches it. Review the mint before repricing.
-  - **Applies on the next deposit.** The operator writes the fee and minimum to the channel with each deposit, so until one lands withdrawals follow the old values. Make a small deposit yourself to apply them now.
+  - **Applies on the next deposit.** The operator writes the fee and withdrawal minimum to the channel with each deposit, so until one lands withdrawals follow the old values. Make a small deposit yourself to apply them now.
 
   If a mint is under attack, block withdrawals first: parked withdrawals send no release and spend no SOL, so the reprice can wait for the procedure above
 - Records the mint's `decimals`, `token_program`, extension set and whether it has a freeze authority as the reviewed profile. `Deposit` rejects the mint with `MintProfileChanged` if any of them changes, which an admin clears by blocking and re-allowing (a re-allow also re-opens both gates). Freeze authority is checked in one direction only — revoking one is fine, gaining one is not. The metadata, group and group-member bits are recorded but not compared, since an issuer adds them to a live mint as a routine step. A decimals change also needs the channel mint re-created, since re-allow leaves it on the old decimals

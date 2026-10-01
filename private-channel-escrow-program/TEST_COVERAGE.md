@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**63 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **102 integration tests** (end-to-end behavior).
+**63 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **108 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -33,13 +33,14 @@
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
 
-### AllowMint (12 integration tests)
+### AllowMint (13 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
 - `test_allow_mint_twice_repins_instead_of_failing` — since BlockMint stopped closing the PDA, a second AllowMint re-pins the profile and re-opens both gates; expires the blockhash so the second transaction is not dropped as a replay
 - `test_allow_mint_invalid_pda` — wrong PDA rejected
-- `test_allow_mint_zero_fee_and_minimum_accepted` — a zero `withdraw_fee` and `min_withdraw_amount` are allowed and create the AllowedMint PDA
-- `test_allow_mint_event_records_fee_and_minimum` — the emitted 90-byte `AllowMintEvent` carries both values from the instruction data
+- `test_allow_mint_zero_fee_and_minimum_accepted` — a zero `withdraw_fee`, `min_withdraw_amount` and `min_deposit_amount` are allowed and create the AllowedMint PDA
+- `test_allow_mint_event_records_fee_and_minimums` — the emitted 98-byte `AllowMintEvent` carries all three values from the instruction data
+- `test_allow_mint_native_mint_rejected` — the spl-token native mint is rejected with InvalidMint, and with InvalidAccountOwner under a token program that does not own it
 - `test_allow_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_allow_mint_invalid_admin` — wrong admin rejected
 - `test_allow_mint_invalid_instance_account_owner` — wrong owner rejected
@@ -90,7 +91,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (24 integration tests)
+### Deposit (27 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -105,6 +106,9 @@
 - `test_deposit_token_2022_transfer_fee_success` — the escrow credits the measured balance delta, so the depositor is credited net of the fee
 - `test_deposit_rejects_zero_amount` — ZeroAmount; SPL Token accepts a zero transfer, so without the guard an empty ATA emits free DepositEvents
 - `test_deposit_rejects_zero_received_amount` — ZeroAmount; a 1-unit deposit on a 1% fee mint lands nothing, so the received amount is checked too
+- `test_deposit_below_minimum_rejected_at_minimum_lands` — BelowMinimumDeposit one unit under the AllowMint minimum; exactly the minimum lands
+- `test_deposit_minimum_repriced_by_reallow` — a re-allow with a lower minimum admits a deposit the first AllowMint rejected
+- `test_deposit_below_minimum_net_of_transfer_fee_rejected` — BelowMinimumDeposit; a request of exactly the minimum on a 1% fee mint lands 990 of 1_000, so the check is on the received amount
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData
@@ -163,7 +167,7 @@
 **Instruction data parsing** (processor modules):
 
 - `create_instance`: 4 tests (valid data, insufficient data, empty data, payload missing the bitmap bump)
-- `allow_mint`: 3 tests (valid bump and fee, bump without fee, empty data)
+- `allow_mint`: 3 tests (valid bump, fee and both minimums, payload missing the deposit minimum, empty data)
 - `deposit`: 6 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `rotate_bitmap`: 1 test (empty accounts)

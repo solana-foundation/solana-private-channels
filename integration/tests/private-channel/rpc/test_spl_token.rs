@@ -21,7 +21,9 @@ use {
     spl_associated_token_account::get_associated_token_address_with_program_id,
     spl_token::state::Account as TokenAccount,
     std::time::Duration,
-    test_utils::mint_helper::{TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE},
+    test_utils::mint_helper::{
+        TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+    },
     tokio::time::sleep,
 };
 
@@ -211,6 +213,7 @@ async fn allow_mint_on_escrow_instance(
         .bump(allowed_mint_bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();

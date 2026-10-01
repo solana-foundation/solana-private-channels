@@ -158,6 +158,11 @@ pub fn process_deposit(
         return Err(PrivateChannelEscrowProgramError::ZeroAmount.into());
     }
 
+    // Checked net of any transfer fee, since that is what the channel mints.
+    if received < allowed_mint.min_deposit_amount {
+        return Err(PrivateChannelEscrowProgramError::BelowMinimumDeposit.into());
+    }
+
     let recipient = args.recipient.unwrap_or(*user_info.address());
     let event = DepositEvent::new(
         instance.instance_seed,

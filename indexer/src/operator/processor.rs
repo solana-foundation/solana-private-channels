@@ -1464,8 +1464,8 @@ mod tests {
 
     /// On-wire bytes of an `AllowedMint`: discriminator, bump, one byte per gate,
     /// decimals, token_program, then the pinned profile — extensions bitmask and
-    /// has_freeze_authority. The token program is legacy SPL, which never carries
-    /// extensions, so the mask stays zero.
+    /// has_freeze_authority — and min_deposit_amount (0). The token program is
+    /// legacy SPL, which never carries extensions, so the mask stays zero.
     fn allowed_mint_bytes(
         deposits_blocked: bool,
         withdrawals_blocked: bool,
@@ -1481,6 +1481,7 @@ mod tests {
         data.extend_from_slice(spl_token::id().as_ref());
         data.extend_from_slice(&0u64.to_le_bytes());
         data.push(has_freeze_authority as u8);
+        data.extend_from_slice(&0u64.to_le_bytes());
         data
     }
 
@@ -1521,6 +1522,7 @@ mod tests {
         data.extend_from_slice(spl_token_2022::id().as_ref());
         data.extend_from_slice(&extensions.to_le_bytes());
         data.push(0u8);
+        data.extend_from_slice(&0u64.to_le_bytes());
         data
     }
 

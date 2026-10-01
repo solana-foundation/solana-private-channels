@@ -82,6 +82,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (18) Deposit requested or received zero tokens
     #[error("Deposit amount must be greater than zero")]
     ZeroAmount,
+
+    /// (19) Deposit landed less than the mint's minimum set at AllowMint
+    #[error("Deposit received less than the mint's minimum deposit")]
+    BelowMinimumDeposit,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -122,6 +126,7 @@ mod tests {
             (WithdrawalsBlockedForMint, 16),
             (MintProfileChanged, 17),
             (ZeroAmount, 18),
+            (BelowMinimumDeposit, 19),
         ];
 
         for (error, expected_code) in cases {

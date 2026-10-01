@@ -18,7 +18,8 @@ const EXPECTED_SIZE =
     1 + // decimals
     32 + // tokenProgram
     8 + // extensions
-    1; // hasFreezeAuthority
+    1 + // hasFreezeAuthority
+    8; // minDepositAmount
 
 describe('AllowedMint Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -32,6 +33,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0n,
                 hasFreezeAuthority: false,
+                minDepositAmount: 0n,
             };
 
             // Test encoding
@@ -57,6 +59,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0x0000_0000_0400_000an,
                 hasFreezeAuthority: true,
+                minDepositAmount: 2_345_678n,
             };
 
             // Test combined codec
@@ -81,6 +84,7 @@ describe('AllowedMint Account', () => {
                     tokenProgram: TOKEN_PROGRAM,
                     extensions: 0n,
                     hasFreezeAuthority: false,
+                    minDepositAmount: 0n,
                 };
 
                 const codec = getAllowedMintCodec();
@@ -107,6 +111,7 @@ describe('AllowedMint Account', () => {
                     tokenProgram: TOKEN_PROGRAM,
                     extensions,
                     hasFreezeAuthority: false,
+                    minDepositAmount: 0n,
                 };
 
                 const codec = getAllowedMintCodec();
@@ -128,6 +133,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0n,
                 hasFreezeAuthority: false,
+                minDepositAmount: 0n,
             };
 
             // Verify all required fields are present
@@ -139,6 +145,7 @@ describe('AllowedMint Account', () => {
             expect(testAllowedMint).toHaveProperty('tokenProgram');
             expect(testAllowedMint).toHaveProperty('extensions');
             expect(testAllowedMint).toHaveProperty('hasFreezeAuthority');
+            expect(testAllowedMint).toHaveProperty('minDepositAmount');
         });
 
         it('should validate allowedMint structure field types', () => {
@@ -151,6 +158,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0n,
                 hasFreezeAuthority: false,
+                minDepositAmount: 0n,
             };
 
             // Verify field types
@@ -162,11 +170,12 @@ describe('AllowedMint Account', () => {
             expect(typeof testAllowedMint.tokenProgram).toBe('string');
             expect(typeof testAllowedMint.extensions).toBe('bigint');
             expect(typeof testAllowedMint.hasFreezeAuthority).toBe('boolean');
+            expect(typeof testAllowedMint.minDepositAmount).toBe('bigint');
         });
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (46 bytes)', () => {
+        it('should report correct account size (54 bytes)', () => {
             const accountSize = getAllowedMintEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -181,6 +190,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0n,
                 hasFreezeAuthority: false,
+                minDepositAmount: 0n,
             };
 
             const encoder = getAllowedMintEncoder();
@@ -204,6 +214,7 @@ describe('AllowedMint Account', () => {
                     tokenProgram: TOKEN_PROGRAM,
                     extensions: 0n,
                     hasFreezeAuthority: false,
+                    minDepositAmount: 0n,
                 },
                 {
                     discriminator: 255,
@@ -214,6 +225,7 @@ describe('AllowedMint Account', () => {
                     tokenProgram: TOKEN_PROGRAM,
                     extensions: (1n << 64n) - 1n,
                     hasFreezeAuthority: true,
+                    minDepositAmount: (1n << 64n) - 1n,
                 },
                 {
                     discriminator: 127,
@@ -224,6 +236,7 @@ describe('AllowedMint Account', () => {
                     tokenProgram: TOKEN_PROGRAM,
                     extensions: 1n << 14n,
                     hasFreezeAuthority: false,
+                    minDepositAmount: 1_000n,
                 },
             ];
 
@@ -247,6 +260,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: 0n,
                 hasFreezeAuthority: false,
+                minDepositAmount: 0n,
             };
 
             const codec = getAllowedMintCodec();
@@ -266,6 +280,7 @@ describe('AllowedMint Account', () => {
                 tokenProgram: TOKEN_PROGRAM,
                 extensions: (1n << 64n) - 1n,
                 hasFreezeAuthority: true,
+                minDepositAmount: (1n << 64n) - 1n,
             };
 
             const codec = getAllowedMintCodec();
