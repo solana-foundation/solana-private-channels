@@ -78,7 +78,12 @@ async fn insert_mint_row_at_slot(
     mint: &str,
     effective_slot: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mint_row = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
+    let mint_row = DbMint::new(
+        mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        effective_slot,
+    );
     storage.upsert_mints_batch(&[mint_row]).await?;
     storage
         .insert_mint_statuses_batch(&[

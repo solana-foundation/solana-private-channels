@@ -21,6 +21,7 @@ pub async fn seed_allowed_mint(
             mint_address.to_string(),
             decimals,
             token_program.to_string(),
+            effective_slot,
         )])
         .await?;
     storage

@@ -761,7 +761,7 @@ async fn seed_withdrawal_side(db_url: &str) {
 /// A deposit, a mints row and the escrow checkpoint.
 async fn seed_escrow_side(db_url: &str) {
     seed_tx(db_url, "dep-seed", "deposit", "completed").await;
-    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program) VALUES ('seed_mint', 6, 'token')").await;
+    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program, profile_slot) VALUES ('seed_mint', 6, 'token', 0)").await;
     seed_sql(
         db_url,
         "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('escrow', 111)",

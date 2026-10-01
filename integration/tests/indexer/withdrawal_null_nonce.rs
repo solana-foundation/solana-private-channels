@@ -175,7 +175,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     // 2. Instance + operator + whitelisted mint.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string(), 0);
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {

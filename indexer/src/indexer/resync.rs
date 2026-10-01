@@ -1031,7 +1031,12 @@ mod tests {
         mock.set_checkpoint("withdraw", 1_000);
         mock.mints.lock().unwrap().insert(
             "mint".to_string(),
-            crate::storage::common::models::DbMint::new("mint".to_string(), 6, "token".to_string()),
+            crate::storage::common::models::DbMint::new(
+                "mint".to_string(),
+                6,
+                "token".to_string(),
+                0,
+            ),
         );
         let storage = Arc::new(Storage::Mock(mock.clone()));
         (mock, storage)

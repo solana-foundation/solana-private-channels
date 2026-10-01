@@ -197,6 +197,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            0,
         )])
         .await?;
     storage
@@ -363,6 +364,7 @@ async fn setup_gate_env(db_name: &str) -> Result<GateEnv, Box<dyn std::error::Er
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            0,
         )])
         .await?;
     storage
