@@ -25,9 +25,9 @@ use crate::{
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -95,6 +95,9 @@ pub struct TransactionProcessor {
     // Resync's pre-drop pass: derive rows and check them against `consumed`, but write
     // nothing and send no checkpoint, so the live database is left as it was.
     validate_only: bool,
+    // Filled with each derived row's mint in the validate-only pass, so resync knows which
+    // receipt mints' histories to scan. Ignored on every other path.
+    row_mints: Option<Arc<Mutex<BTreeSet<String>>>>,
 }
 
 impl TransactionProcessor {
@@ -108,6 +111,7 @@ impl TransactionProcessor {
             retry: WriteRetryPolicy::default(),
             consumed: None,
             validate_only: false,
+            row_mints: None,
         }
     }
 
@@ -129,6 +133,12 @@ impl TransactionProcessor {
     /// Inject the pre-drop consumed-set so the rebuild reconciles each row in place.
     pub fn with_consumed_set(mut self, consumed: Arc<ConsumedSet>) -> Self {
         self.consumed = Some(consumed);
+        self
+    }
+
+    /// Collect each derived row's mint into `sink` during the validate-only pass.
+    pub fn with_row_mint_sink(mut self, sink: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.row_mints = Some(sink);
         self
     }
 
@@ -316,6 +326,17 @@ impl TransactionProcessor {
         }
 
         if self.validate_only {
+            if let Some(row_mints) = &self.row_mints {
+                // A poisoned set of strings is still complete, and dropping it would skip mints.
+                row_mints
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(
+                        transactions
+                            .iter()
+                            .map(|transaction| transaction.mint.clone()),
+                    );
+            }
             return self.validate_against_consumed(&transactions);
         }
 
@@ -696,15 +717,22 @@ fn convert_to_db_models(
                     )
                 }
                 EscrowInstruction::AllowMint {
-                    accounts, event, ..
+                    accounts,
+                    data,
+                    event,
                 } => {
                     let mint_address = accounts.mint.to_string();
                     (
-                        Some(DbMint::new(
-                            mint_address.clone(),
-                            event.decimals as i16,
-                            accounts.token_program.to_string(),
-                        )),
+                        Some(DbMint {
+                            min_withdraw_amount: TokenAmount(data.min_withdraw_amount),
+                            allow_mint_slot: instruction_meta.slot as i64,
+                            ..DbMint::new(
+                                mint_address.clone(),
+                                event.decimals as i16,
+                                accounts.token_program.to_string(),
+                                TokenAmount(data.withdraw_fee),
+                            )
+                        }),
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
@@ -870,7 +898,14 @@ mod tests {
         }
     }
 
-    fn make_allow_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
+
+    fn make_allow_mint_instruction(
+        slot: u64,
+        sig: Option<String>,
+        decimals: u8,
+    ) -> InstructionWithMetadata {
         InstructionWithMetadata {
             instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::AllowMint {
                 accounts: AllowMintAccounts {
@@ -886,8 +921,12 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
-                event: AllowMintEvent { decimals: 6 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
+                event: AllowMintEvent { decimals },
             })),
             slot,
             program_type: ProgramType::Escrow,
@@ -1080,7 +1119,7 @@ mod tests {
 
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
-        let ix = make_allow_mint_instruction(200, Some("sig3".to_string()));
+        let ix = make_allow_mint_instruction(200, Some("sig3".to_string()), 6);
         let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
         let status = status.expect("AllowMint must emit a status change");
@@ -1093,6 +1132,15 @@ mod tests {
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
+        assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
+        assert_eq!(
+            mint.min_withdraw_amount,
+            TokenAmount(ALLOW_MINT_MIN_WITHDRAW_AMOUNT)
+        );
+        assert_eq!(
+            mint.allow_mint_slot, 200,
+            "the fee is stamped with its AllowMint's slot"
+        );
     }
 
     #[test]
@@ -1237,7 +1285,11 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
                 event: AllowMintEvent { decimals: 6 },
             })),
             slot: 200,
@@ -1357,7 +1409,7 @@ mod tests {
     async fn finalize_with_mints_upserts_first() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
-        processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string())));
+        processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string()), 6));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
             .await
@@ -1373,6 +1425,40 @@ mod tests {
         assert_eq!(cp.slot, 200);
     }
 
+    /// A gap repair finalizing an older AllowMint after a live one must not regress the profile.
+    #[tokio::test]
+    async fn finalize_keeps_newer_mint_profile_over_older_slot() {
+        let (mut processor, _checkpoint_rx, mock) = make_processor_with_mock(allow_mint_instance());
+        let live_slot = 106;
+        let live_decimals = 9;
+        let repaired_slot = 103;
+
+        processor.buffer(make_allow_mint_instruction(
+            live_slot,
+            Some("sig-live".to_string()),
+            live_decimals,
+        ));
+        processor
+            .finalize_and_checkpoint(live_slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        processor.buffer(make_allow_mint_instruction(
+            repaired_slot,
+            Some("sig-repaired".to_string()),
+            6,
+        ));
+        processor
+            .finalize_and_checkpoint(repaired_slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let mints = mock.mints.lock().unwrap();
+        let row = &mints[&make_pubkey(2).to_string()];
+        assert_eq!(row.decimals, live_decimals as i16);
+        assert_eq!(row.allow_mint_slot, live_slot as i64);
+    }
+
     #[tokio::test]
     async fn finalize_writes_mint_status_history_on_allow_mint() {
         let (mut processor, mut checkpoint_rx, mock) =
@@ -1380,6 +1466,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             200,
             Some("sig-allow-1".to_string()),
+            6,
         ));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
@@ -1406,7 +1493,12 @@ mod tests {
         // Seed the allowed mints row the prior AllowMint would have created.
         mock.mints.lock().unwrap().insert(
             make_pubkey(2).to_string(),
-            DbMint::new(make_pubkey(2).to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(
+                make_pubkey(2).to_string(),
+                6,
+                spl_token::id().to_string(),
+                TokenAmount(ALLOW_MINT_WITHDRAW_FEE),
+            ),
         );
         processor.buffer(make_block_mint_instruction(
             250,
@@ -1644,6 +1736,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             201,
             Some("sig-allow-2".to_string()),
+            6,
         ));
         let result = processor
             .finalize_and_checkpoint(201, ProgramType::Escrow)
@@ -1666,6 +1759,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             202,
             Some("sig-allow-3".to_string()),
+            6,
         ));
         processor.buffer(make_deposit_instruction_on_instance(
             202,
@@ -1693,7 +1787,7 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("upsert_mints_batch", true);
-        processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string())));
+        processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string()), 6));
         let result = processor
             .finalize_and_checkpoint(300, ProgramType::Escrow)
             .await;
@@ -1863,6 +1957,7 @@ mod tests {
         tx.send(ProcessorMessage::Instruction(make_allow_mint_instruction(
             SLOT_S,
             Some("allow".to_string()),
+            6,
         )))
         .await
         .unwrap();
@@ -2230,7 +2325,7 @@ mod tests {
     }
 
     /// The pre-drop validation pass derives rows exactly as the rebuild does but must
-    /// leave the live database untouched: no rows, no checkpoint.
+    /// leave the live database untouched: no rows, no checkpoint. It reports each row's mint.
     #[tokio::test]
     async fn validate_only_writes_nothing() {
         let mut consumed = ConsumedSet::new();
@@ -2245,7 +2340,10 @@ mod tests {
         );
         let (processor, mut checkpoint_rx, mock) =
             make_processor_with_consumed(deposit_instance(), consumed);
-        let mut processor = processor.validate_only();
+        let row_mints = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let mut processor = processor
+            .validate_only()
+            .with_row_mint_sink(row_mints.clone());
         processor.buffer(make_deposit_instruction(
             RECONCILE_SLOT,
             Some(SERVICED_DEPOSIT_SIG.to_string()),
@@ -2261,6 +2359,11 @@ mod tests {
         assert!(
             checkpoint_rx.try_recv().is_err(),
             "no checkpoint may be sent"
+        );
+        assert_eq!(
+            *row_mints.lock().unwrap(),
+            std::collections::BTreeSet::from([make_pubkey(2).to_string()]),
+            "the sink must hold exactly the rebuilt row's mint"
         );
     }
 

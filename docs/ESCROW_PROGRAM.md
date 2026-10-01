@@ -57,12 +57,16 @@ The bitmap is created here, so every instance has one by construction. It is
 #### AllowMint
 Allows new token mints for the instance (admin-only).
 
+The spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidMint`, because the channel cannot create it. Passing it with a token program that does not own it fails the owner check first with `InvalidAccountOwner`.
+
 Discriminator: `1`
 
 **Parameters:**
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for allowed mint account |
+| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. `0` is allowed but leaves the operator paying every release; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The escrow records it in `AllowMintEvent`; the indexer reads it from the instruction data and the operator writes it to the channel's withdraw config on every deposit, so re-allowing with a new value (to or from `0`) reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
+| `min_withdraw_amount` | u64 | Smallest amount one channel withdrawal of this mint may move, `0` for none. Recorded, read and repriced the same way as `withdraw_fee` |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |

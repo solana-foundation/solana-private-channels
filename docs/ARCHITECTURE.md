@@ -45,7 +45,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 **Key Instructions**:
 - `CreateInstance`: Initialize a new escrow instance with admin
-- `AllowMint`/`BlockMint`: Manage whitelisted SPL token mints, with independent deposit and withdrawal gates
+- `AllowMint`/`BlockMint`: Manage whitelisted SPL token mints, with independent deposit and withdrawal gates. `AllowMint` also sets the mint's withdraw fee
 - `AddOperator`/`RemoveOperator`: Manage authorized operators
 - `Deposit`: Lock user tokens in escrow (permissionless)
 - `ReleaseFunds`: Withdraw funds, consuming the nonce's bit in the withdrawal bitmap
@@ -65,7 +65,10 @@ The core payment channel processes transactions through a five-stage pipeline op
 **Location**: `private-channel-withdraw-program/`
 
 **Key Instructions**:
-- `WithdrawFunds`: Burn tokens from payment channel and unlock them from the escrow program
+- `WithdrawFunds`: Burn tokens from payment channel and unlock them from the escrow program, paying the mint's withdraw fee to the treasury on top
+- `SetWithdrawConfig`: Create or overwrite a mint's withdraw config (mint authority only)
+
+**Withdraw fee and minimum**: The escrow admin sets a fee and a minimum withdrawal amount per mint at `AllowMint`. `0` is allowed for either in deployments whose participants are known, but gives up the bound described below; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The indexer stores both on the `mints` row, and the operator writes them to the channel's withdraw config in every deposit mint transaction, with its own admin as treasury. The fee is never reminted, so every accepted withdrawal pays for its own release. The minimum only limits how many releases a balance can queue at once. See [Withdraw Program](WITHDRAW_PROGRAM.md#treasury).
 
 ### Indexer & Operator
 

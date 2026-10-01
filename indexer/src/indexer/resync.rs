@@ -6,9 +6,9 @@ use crate::{
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
     },
     operator::{
-        enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda,
-        ConsumedMintKind, ConsumedSet, RetryConfig, RpcClientWithRetry, SourceEventId,
-        CONSUMED_SET_PAGE_SIZE,
+        enumerate_consumed_mints, extend_with_mint_history, fetch_consumed_nonces,
+        find_withdrawal_bitmap_pda, ConsumedMintKind, ConsumedSet, RetryConfig, RpcClientWithRetry,
+        SourceEventId, CONSUMED_SET_PAGE_SIZE,
     },
     shutdown_utils::WRITER_STOP_TIMEOUT,
     storage::common::models::{ResyncBlockers, ServicedRow},
@@ -21,7 +21,12 @@ use crate::{
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    str::FromStr,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -97,6 +102,37 @@ fn wipe_blocker(
         });
     }
     None
+}
+
+/// Client for the PrivateChannel RPC the consumed-set is read from.
+fn channel_rpc(reconcile: &ChannelReconcileConfig) -> RpcClientWithRetry {
+    RpcClientWithRetry::with_retry_config(
+        reconcile.channel_rpc_url.clone(),
+        RetryConfig::default(),
+        CommitmentConfig::confirmed(),
+    )
+}
+
+/// Refuse unless the channel still serves its whole history. The floor only rises, so a
+/// read after the last history read also covers every earlier one.
+async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), IndexerError> {
+    // Genesis is slot 0, so any other floor means lost history.
+    match channel_rpc.get_first_available_block().await {
+        Ok(0) => Ok(()),
+        Ok(floor) => Err(IndexerError::Reconciliation(
+            ReconciliationError::ConsumedSetUnavailable {
+                reason: format!(
+                    "channel history is pruned below slot {floor}, so the consumed-set \
+                     may miss serviced mints"
+                ),
+            },
+        )),
+        Err(e) => Err(IndexerError::Reconciliation(
+            ReconciliationError::ConsumedSetUnavailable {
+                reason: format!("channel first available block unreadable: {e}"),
+            },
+        )),
+    }
 }
 
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
@@ -178,7 +214,7 @@ impl ResyncService {
     /// The production entrypoint (run_resync) guarantees a channel RPC is configured and
     /// refuses to run otherwise, so the None branch below (warn + Ok(None)) only applies to
     /// direct/test construction.
-    async fn build_consumed_set(&self) -> Result<Option<Arc<ConsumedSet>>, IndexerError> {
+    async fn build_consumed_set(&self) -> Result<Option<ConsumedSet>, IndexerError> {
         let Some(reconcile) = self.channel_reconcile.as_ref() else {
             warn!(
                 "Resync running WITHOUT channel reconciliation (no channel RPC configured); \
@@ -191,11 +227,7 @@ impl ResyncService {
             "Building consumed-set from PrivateChannel authority {} before any destruction...",
             reconcile.authority
         );
-        let channel_rpc = RpcClientWithRetry::with_retry_config(
-            reconcile.channel_rpc_url.clone(),
-            RetryConfig::default(),
-            CommitmentConfig::confirmed(),
-        );
+        let channel_rpc = channel_rpc(reconcile);
         let set =
             enumerate_consumed_mints(&channel_rpc, &reconcile.authority, CONSUMED_SET_PAGE_SIZE)
                 .await
@@ -208,33 +240,55 @@ impl ResyncService {
                         reason,
                     })
                 })?;
-        // Read after enumerating: the floor only rises, so 0 here means nothing was pruned
-        // before or during it. Genesis is slot 0, so any other value means lost history.
-        match channel_rpc.get_first_available_block().await {
-            Ok(0) => {}
-            Ok(floor) => {
-                return Err(IndexerError::Reconciliation(
-                    ReconciliationError::ConsumedSetUnavailable {
-                        reason: format!(
-                            "channel history is pruned below slot {floor}, so the consumed-set \
-                             may miss serviced mints"
-                        ),
-                    },
-                ))
-            }
-            Err(e) => {
-                return Err(IndexerError::Reconciliation(
-                    ReconciliationError::ConsumedSetUnavailable {
-                        reason: format!("channel first available block unreadable: {e}"),
-                    },
-                ))
-            }
-        }
+        // Refuse early on a pruned history, before paying for the source replay.
+        ensure_unpruned(&channel_rpc).await?;
         info!(
             "Consumed-set built: {} serviced mint(s) on the channel",
             set.len()
         );
-        Ok(Some(Arc::new(set)))
+        Ok(Some(set))
+    }
+
+    /// Add the mints in each receipt mint's own history to `consumed`, and return how many
+    /// were added. A mint signed by a key since rotated out of the mint authority never
+    /// names the current authority, so only its mint's history lists it.
+    async fn extend_from_receipt_mints(
+        &self,
+        reconcile: &ChannelReconcileConfig,
+        consumed: &mut ConsumedSet,
+        mints: &BTreeSet<Pubkey>,
+    ) -> Result<usize, IndexerError> {
+        info!(
+            "Scanning the history of {} receipt mint(s) for serviced mints before any destruction...",
+            mints.len()
+        );
+        let channel_rpc = channel_rpc(reconcile);
+        let mut added = 0;
+        for mint in mints {
+            added += extend_with_mint_history(&channel_rpc, mint, CONSUMED_SET_PAGE_SIZE, consumed)
+                .await
+                .map_err(|reason| {
+                    error!(
+                        %mint,
+                        "Receipt mint history scan failed; aborting resync before drop: {reason}"
+                    );
+                    IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                        reason,
+                    })
+                })?;
+        }
+        // Also runs with no mints, so every run reads the floor after its last history read.
+        ensure_unpruned(&channel_rpc).await?;
+        if added > 0 {
+            warn!(
+                added,
+                "Receipt mint histories hold serviced mints the current authority did not sign; \
+                 the mint authority was rotated"
+            );
+        } else {
+            info!("Receipt mint histories add no serviced mint");
+        }
+        Ok(added)
     }
 
     /// Refuse unless every row this database already serviced is in the consumed-set.
@@ -277,14 +331,14 @@ impl ResyncService {
 
     /// Replay `(from_slot, to_slot]` through the rebuild's own event conversion without
     /// writing anything, and fail with `ConsumedMintMismatch` on the first channel mint
-    /// that names a rebuilt event but does not pay it. The live database is untouched.
+    /// that names a rebuilt event but does not pay it. Returns every rebuilt row's mint.
     async fn validate_before_drop(
         &self,
         backfill_service: &BackfillService,
         from_slot: u64,
         to_slot: u64,
         consumed: Arc<ConsumedSet>,
-    ) -> Result<(), IndexerError> {
+    ) -> Result<BTreeSet<Pubkey>, IndexerError> {
         info!(
             "Validating the consumed-set against source slots {}..={} before any destruction...",
             from_slot + 1,
@@ -293,8 +347,10 @@ impl ResyncService {
         let (instruction_tx, instruction_rx) = mpsc::channel(1000);
         // Validation sends no checkpoints; the receiver only keeps the type satisfied.
         let (checkpoint_tx, _checkpoint_rx) = mpsc::channel(1);
+        let row_mints = Arc::new(Mutex::new(BTreeSet::new()));
         let mut validator = TransactionProcessor::new(self.storage.clone(), checkpoint_tx)
             .with_consumed_set(consumed)
+            .with_row_mint_sink(row_mints.clone())
             .validate_only();
         if let Some(instance_id) = self.escrow_instance_id {
             validator = validator.with_escrow_instance_id(instance_id);
@@ -320,8 +376,24 @@ impl ResyncService {
             }
         }
         fill?;
-        info!("Consumed-set validated against every rebuilt event");
-        Ok(())
+
+        let row_mints =
+            std::mem::take(&mut *row_mints.lock().unwrap_or_else(PoisonError::into_inner));
+        let mints = row_mints
+            .iter()
+            .map(|mint| {
+                Pubkey::from_str(mint).map_err(|e| {
+                    IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                        reason: format!("rebuilt row mint {mint} is not a pubkey: {e}"),
+                    })
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        info!(
+            "Consumed-set validated against every rebuilt event, across {} receipt mint(s)",
+            mints.len()
+        );
+        Ok(mints)
     }
 
     /// Refuse a withdraw rebuild unless the chain has issued no nonce at all. The rebuild
@@ -569,15 +641,9 @@ impl ResyncService {
             }));
         }
 
-        // Pre-flight 4+5: channel reachability + consumed-set completeness + cross-scheme
+        // Pre-flight 4+5: channel reachability + the authority's history + cross-scheme
         // guard, all inside build_consumed_set, which returns Err on any of them.
         let consumed = self.build_consumed_set().await?;
-
-        // Pre-flight 5b: every serviced row must be in the set. Pre-flight 2 already refused
-        // rows below genesis, so every row checked here is one the rebuild re-creates.
-        if let Some(consumed) = &consumed {
-            self.refuse_if_serviced_rows_missing(consumed).await?;
-        }
 
         let backfill_service = BackfillService::new(
             self.storage.clone(),
@@ -598,12 +664,44 @@ impl ResyncService {
             .fixed_range(genesis_slot, current_slot)
             .await?;
 
-        // Pre-flight 6: every channel mint that names a rebuilt event must pay it. Needs
-        // the rebuilt rows, so it replays the source history once without writing.
-        if let Some(consumed) = &consumed {
-            self.validate_before_drop(&backfill_service, from_slot, to_slot, consumed.clone())
-                .await?;
-        }
+        let consumed = match (consumed, self.channel_reconcile.as_ref()) {
+            (Some(consumed), Some(reconcile)) => {
+                // Pre-flight 6: every channel mint that names a rebuilt event must pay it.
+                // Needs the rebuilt rows, so it replays the source history once without
+                // writing, and collects each rebuilt row's receipt mint on the way.
+                let consumed = Arc::new(consumed);
+                let mints = self
+                    .validate_before_drop(&backfill_service, from_slot, to_slot, consumed.clone())
+                    .await?;
+
+                // Pre-flight 7: add mints from each receipt mint's history, which also lists
+                // mints by keys rotated out of the mint authority, then re-check the floor.
+                let mut consumed = Arc::unwrap_or_clone(consumed);
+                let added = self
+                    .extend_from_receipt_mints(reconcile, &mut consumed, &mints)
+                    .await?;
+                let consumed = Arc::new(consumed);
+
+                // Pre-flight 8: entries only the mint scan found must pass the same check
+                // before the drop. With none, the set is the one pre-flight 6 validated.
+                if added > 0 {
+                    self.validate_before_drop(
+                        &backfill_service,
+                        from_slot,
+                        to_slot,
+                        consumed.clone(),
+                    )
+                    .await?;
+                }
+
+                // Pre-flight 9: every serviced row must be in the final set. Pre-flight 2
+                // already refused rows below genesis, so every row checked here is one the
+                // rebuild re-creates.
+                self.refuse_if_serviced_rows_missing(&consumed).await?;
+                Some(consumed)
+            }
+            _ => None,
+        };
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
         // A loss verdict that was wrong leaves the session alive and holding the lock, so
@@ -933,7 +1031,12 @@ mod tests {
         mock.set_checkpoint("withdraw", 1_000);
         mock.mints.lock().unwrap().insert(
             "mint".to_string(),
-            crate::storage::common::models::DbMint::new("mint".to_string(), 6, "token".to_string()),
+            crate::storage::common::models::DbMint::new(
+                "mint".to_string(),
+                6,
+                "token".to_string(),
+                crate::storage::common::amount::TokenAmount(1),
+            ),
         );
         let storage = Arc::new(Storage::Mock(mock.clone()));
         (mock, storage)
@@ -1763,7 +1866,8 @@ mod tests {
         assert_eq!(got, Some(("sig-a".to_string(), 2)));
     }
 
-    /// Escrow service over mock RPCs: a source tip, an empty and never-pruned channel.
+    /// Escrow service over mock RPCs: a source tip with no event to replay, and an empty,
+    /// never-pruned channel.
     async fn reconciling_escrow_service(
         storage: Arc<Storage>,
     ) -> (ResyncService, mockito::ServerGuard, mockito::ServerGuard) {
@@ -1776,6 +1880,8 @@ mod tests {
             .with_status(200)
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":200}"#)
             .create();
+        // The last block at or below the tip is the slot before genesis, so the replay is empty.
+        crate::test_utils::rpc_mocks::mock_get_blocks(&mut source, 99, 200, &[99]);
         let mut channel = mockito::Server::new_async().await;
         channel
             .mock("POST", "/")

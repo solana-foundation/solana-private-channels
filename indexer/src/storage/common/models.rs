@@ -205,11 +205,25 @@ pub struct DbMint {
     /// transition. Read per withdrawal so an admin blocking a live mint takes
     /// effect without restarting the operator.
     pub withdrawals_blocked: bool,
+    /// Per-withdrawal fee from the latest AllowMint. Read per deposit, so a
+    /// re-allow reprices the channel without restarting the operator.
+    pub withdraw_fee: TokenAmount,
+    /// Smallest channel withdrawal amount from the latest AllowMint, 0 for
+    /// none. Read and written with `withdraw_fee`.
+    pub min_withdraw_amount: TokenAmount,
+    /// Slot of the AllowMint this row came from. An upsert from an older slot
+    /// is ignored, so a replay or gap repair cannot restore older values.
+    pub allow_mint_slot: i64,
     pub created_at: DateTime<Utc>,
 }
 
 impl DbMint {
-    pub fn new(mint_address: String, decimals: i16, token_program: String) -> Self {
+    pub fn new(
+        mint_address: String,
+        decimals: i16,
+        token_program: String,
+        withdraw_fee: TokenAmount,
+    ) -> Self {
         Self {
             mint_address,
             decimals,
@@ -217,6 +231,11 @@ impl DbMint {
             // A DbMint is only ever constructed on the allow path.
             status: "allowed".to_string(),
             withdrawals_blocked: false,
+            withdraw_fee,
+            // The AllowMint path sets the real one; other callers want none.
+            min_withdraw_amount: TokenAmount(0),
+            // The indexer sets the AllowMint's slot; 0 loses to any real one.
+            allow_mint_slot: 0,
             created_at: Utc::now(),
         }
     }

@@ -20,7 +20,10 @@
 use private_channel_indexer::{
     operator::MintCache,
     storage::{
-        common::models::{DbMint, DbTransactionBuilder, TransactionType},
+        common::{
+            amount::TokenAmount,
+            models::{DbMint, DbTransactionBuilder, TransactionType},
+        },
         PostgresDb, Storage,
     },
     PostgresConfig,
@@ -78,7 +81,15 @@ async fn insert_mint_row_at_slot(
     mint: &str,
     effective_slot: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mint_row = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
+    let mint_row = DbMint {
+        allow_mint_slot: effective_slot,
+        ..DbMint::new(
+            mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[mint_row]).await?;
     storage
         .insert_mint_statuses_batch(&[

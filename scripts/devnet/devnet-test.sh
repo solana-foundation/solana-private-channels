@@ -25,6 +25,8 @@
 #   ESCROW_ADMIN_KEYPAIR    - Path to escrow admin keypair (default: ./keypairs/escrow-admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
+#   WITHDRAW_FEE            - Per-withdrawal fee set at AllowMint, in base units (default: 1000)
+#   MIN_WITHDRAW_AMOUNT     - Smallest withdrawal set at AllowMint, in base units (default: 1000)
 
 set -eo pipefail
 
@@ -49,6 +51,8 @@ PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:889
 ESCROW_ADMIN_KEYPAIR="${ESCROW_ADMIN_KEYPAIR:-./keypairs/escrow-admin.json}"
 MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
+WITHDRAW_FEE="${WITHDRAW_FEE:-1000}"
+MIN_WITHDRAW_AMOUNT="${MIN_WITHDRAW_AMOUNT:-1000}"
 : "${ADMIN_PRIVATE_KEY:?ADMIN_PRIVATE_KEY is required; \`make build-devnet\` writes it to .env}"
 
 if [ ! -f "$ESCROW_ADMIN_KEYPAIR" ]; then
@@ -147,7 +151,9 @@ cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin allow_mint -- 
   "$RPC_URL" \
   "$ESCROW_ADMIN_KEYPAIR" \
   "$INSTANCE_ID" \
-  "$MINT"
+  "$MINT" \
+  "$WITHDRAW_FEE" \
+  "$MIN_WITHDRAW_AMOUNT"
 
 echo ""
 echo "=== Step 4: Update .env ==="
@@ -342,7 +348,9 @@ EXPECTED_USER_AFTER_DEP34=$((EXPECTED_USER_AFTER_DEP12 - 200000))
 EXPECTED_INSTANCE_AFTER_DEP34=350000
 EXPECTED_USER_AFTER_WITHDRAW=$((EXPECTED_USER_AFTER_DEP34 + WITHDRAW_AMOUNT))
 EXPECTED_INSTANCE_AFTER_WITHDRAW=$((EXPECTED_INSTANCE_AFTER_DEP34 - WITHDRAW_AMOUNT))
-EXPECTED_PRIVATE_CHANNEL_AFTER_WITHDRAW=$((350000 - WITHDRAW_AMOUNT))
+# The fee is charged on top of the withdrawal on the channel; the Solana
+# release is only the amount.
+EXPECTED_PRIVATE_CHANNEL_AFTER_WITHDRAW=$((350000 - WITHDRAW_AMOUNT - WITHDRAW_FEE))
 
 # Helper to check if values match
 check() {
@@ -363,7 +371,7 @@ echo "=== Summary ==="
 echo "Instance ID: $INSTANCE_ID"
 echo "Start Slot: $SLOT"
 echo "Total deposited: 350000 (50k + 100k + 75k + 125k)"
-echo "Total withdrawn: $WITHDRAW_AMOUNT"
+echo "Total withdrawn: $WITHDRAW_AMOUNT (plus a $WITHDRAW_FEE withdraw fee on the channel)"
 
 echo ""
 echo "=== Cleanup ==="

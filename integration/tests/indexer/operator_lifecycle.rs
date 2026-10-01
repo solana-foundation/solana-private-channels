@@ -52,6 +52,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
 use std::time::Duration;
+use test_utils::mint_helper::TEST_WITHDRAW_FEE;
 use test_utils::operator_helper::same_host_fallback_url;
 use test_utils::operator_helper::start_solana_to_private_channel_operator;
 use test_utils::operator_helper::OperatorHandle;
@@ -370,6 +371,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
@@ -466,6 +468,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
@@ -555,8 +558,13 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
 
-    // Seed mint metadata so the withdrawal operator can build the instruction.
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    // Seed the mint row. The release itself builds from AllowedMint, not this.
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
@@ -696,6 +704,7 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
         bad_mint.pubkey().to_string(),
         6,
         spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[bad_mint_meta]).await?;
     seed_mint_status_allowed(&storage, &bad_mint.pubkey().to_string()).await?;
@@ -729,7 +738,12 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
     let bad_mint_pubkey = generate_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
-    let mint_meta = DbMint::new(bad_mint_pubkey.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        bad_mint_pubkey.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &bad_mint_pubkey.to_string()).await?;
     mint_to_owner(
@@ -838,6 +852,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
@@ -1007,7 +1022,12 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     let mint = env.mint;
     let instance = env.instance;
 
-    let mint_meta = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &mint.to_string()).await?;
 
@@ -1187,7 +1207,12 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     // Fresh instance: every bit in its bitmap is clear.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
@@ -1304,7 +1329,12 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
@@ -1416,7 +1446,12 @@ async fn test_second_release_of_same_nonce_moves_no_tokens(
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
@@ -1567,7 +1602,12 @@ async fn test_withdrawal_one_generation_early_succeeds_after_rotation(
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
@@ -1664,7 +1704,12 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 

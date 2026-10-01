@@ -41,6 +41,7 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_sdk::signature::{Keypair, Signature, Signer},
     std::{sync::Arc, time::Duration},
+    test_utils::mint_helper::TEST_WITHDRAW_FEE,
     test_utils::operator_helper::{same_host_fallback_url, OperatorHandle},
     test_utils::validator_helper::start_test_validator_no_geyser,
     testcontainers::runners::AsyncRunner,
@@ -175,7 +176,12 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     // 2. Instance + operator + whitelisted mint.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(
+        env.mint.to_string(),
+        6,
+        spl_token::id().to_string(),
+        TokenAmount(TEST_WITHDRAW_FEE),
+    );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {

@@ -5,8 +5,10 @@ use crate::{
     utils::{
         assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
         set_mint_2022_with_permanent_delegate, setup_hook_mint, TestContext,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        INVALID_ACCOUNT_DATA_ERROR, INVALID_ACCOUNT_OWNER_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_ALLOWED_MINT_ERROR, INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+        TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::AllowMintBuilder;
@@ -95,6 +97,8 @@ fn test_allow_mint_twice_repins_instead_of_failing() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     context
@@ -152,11 +156,132 @@ fn test_allow_mint_invalid_pda() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(1) // Wrong bump
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
     assert_program_error(result, INVALID_ALLOWED_MINT_ERROR);
+}
+
+// A zero fee and no minimum are a deliberate choice for permissioned
+// deployments, so the escrow must allow the mint rather than reject it.
+#[test]
+fn test_allow_mint_zero_fee_and_minimum_accepted() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let instance_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = AllowMintBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .withdraw_fee(0)
+        .min_withdraw_amount(0)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("AllowMint with a zero fee and no minimum should succeed");
+
+    assert_allow_mint_account(
+        &mut context,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        bump,
+        &TOKEN_PROGRAM_ID,
+    );
+}
+
+// The event is the on-chain record of what this AllowMint set on the channel,
+// so both values must reach it from the instruction data.
+#[test]
+fn test_allow_mint_event_records_fee_and_minimum() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let withdraw_fee = 1_234_567u64;
+    let min_withdraw_amount = 7_654_321u64;
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let instance_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = AllowMintBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .withdraw_fee(withdraw_fee)
+        .min_withdraw_amount(min_withdraw_amount)
+        .instruction();
+
+    let transaction_metadata = context
+        .send_transaction_with_signers_with_transaction_result(instruction, &[&admin], false, None)
+        .expect("AllowMint should succeed");
+
+    // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
+    // + 8 (withdraw_fee) + 8 (min_withdraw_amount)
+    let event_tag = [228, 69, 165, 46, 81, 203, 154, 29];
+    let allow_mint_discriminator = 1;
+    let event_data = transaction_metadata
+        .inner_instructions
+        .iter()
+        .flatten()
+        .map(|inner_instruction| &inner_instruction.instruction.data)
+        .find(|data| {
+            data.len() >= 9 && data[..8] == event_tag && data[8] == allow_mint_discriminator
+        })
+        .expect("AllowMint event should be emitted");
+
+    assert_eq!(event_data.len(), 90);
+    assert_eq!(&event_data[74..82], &withdraw_fee.to_le_bytes());
+    assert_eq!(&event_data[82..90], &min_withdraw_amount.to_le_bytes());
 }
 
 #[test]
@@ -202,6 +327,8 @@ fn test_allow_mint_invalid_admin_not_signer() {
 
     let mut data = vec![1]; // discriminator for AllowMint
     data.push(bump);
+    data.extend_from_slice(&TEST_WITHDRAW_FEE.to_le_bytes());
+    data.extend_from_slice(&TEST_MIN_WITHDRAW_AMOUNT.to_le_bytes());
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -254,6 +381,8 @@ fn test_allow_mint_invalid_admin() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&wrong_admin]);
@@ -299,11 +428,72 @@ fn test_allow_mint_invalid_instance_account_owner() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
     assert_program_error(result, INVALID_ACCOUNT_DATA_ERROR);
+}
+
+/// The spl-token native mint is refused with InvalidMint whichever token program owns it,
+/// or with InvalidAccountOwner when the passed token program is not its owner.
+#[test]
+fn test_allow_mint_native_mint_rejected() {
+    let native_mint = spl_token::native_mint::ID;
+    type SetMint = fn(&mut TestContext, &Pubkey);
+    let cases: [(SetMint, Pubkey, u32); 3] = [
+        (set_mint, TOKEN_PROGRAM_ID, INVALID_MINT_ERROR),
+        (
+            set_mint_2022_basic,
+            TOKEN_2022_PROGRAM_ID,
+            INVALID_MINT_ERROR,
+        ),
+        (set_mint, TOKEN_2022_PROGRAM_ID, INVALID_ACCOUNT_OWNER_ERROR),
+    ];
+
+    for (set_native_mint, token_program, expected_error) in cases {
+        let mut context = TestContext::new();
+        let admin = Keypair::new();
+        let instance_seed = Keypair::new();
+
+        set_native_mint(&mut context, &native_mint);
+
+        let (instance_pda, _) =
+            assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+                .expect("CreateInstance should succeed");
+
+        let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &native_mint);
+        let (event_authority_pda, _) = find_event_authority_pda();
+        let instance_ata =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &instance_pda,
+                &native_mint,
+                &token_program,
+            );
+
+        let instruction = AllowMintBuilder::new()
+            .payer(context.payer.pubkey())
+            .admin(admin.pubkey())
+            .instance(instance_pda)
+            .mint(native_mint)
+            .allowed_mint(allowed_mint_pda)
+            .instance_ata(instance_ata)
+            .system_program(SYSTEM_PROGRAM_ID)
+            .token_program(token_program)
+            .associated_token_program(ATA_PROGRAM_ID)
+            .event_authority(event_authority_pda)
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .bump(bump)
+            .withdraw_fee(TEST_WITHDRAW_FEE)
+            .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+            .instruction();
+
+        let result = context.send_transaction_with_signers(instruction, &[&admin]);
+
+        assert_program_error(result, expected_error);
+    }
 }
 
 // ============================================================================
@@ -429,6 +619,8 @@ fn test_allow_mint_token_2022_transfer_hook_allowed() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     context

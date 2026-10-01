@@ -1384,8 +1384,18 @@ mod tests {
 
         storage
             .upsert_mints_batch(&[
-                DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string()),
-                DbMint::new("mint_2".to_string(), 9, TOKEN_PROGRAM.to_string()),
+                DbMint::new(
+                    "mint_1".to_string(),
+                    6,
+                    TOKEN_PROGRAM.to_string(),
+                    TokenAmount(1),
+                ),
+                DbMint::new(
+                    "mint_2".to_string(),
+                    9,
+                    TOKEN_PROGRAM.to_string(),
+                    TokenAmount(1),
+                ),
             ])
             .await
             .unwrap();
@@ -1474,7 +1484,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_upsert_mints_batch_via_mock() {
         let (storage, mock) = make_mock_storage();
-        let mint = DbMint::new("test_mint".to_string(), 6, TOKEN_PROGRAM.to_string());
+        let mint = DbMint::new(
+            "test_mint".to_string(),
+            6,
+            TOKEN_PROGRAM.to_string(),
+            TokenAmount(1),
+        );
         storage.upsert_mints_batch(&[mint]).await.unwrap();
         assert!(mock.mints.lock().unwrap().contains_key("test_mint"));
     }
@@ -1483,7 +1498,12 @@ mod tests {
     async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
 
@@ -1520,7 +1540,12 @@ mod tests {
     async fn sync_mint_status_ignores_older_history_after_block() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
         storage
@@ -1547,7 +1572,12 @@ mod tests {
     async fn sync_mint_status_mirrors_the_withdrawal_gate_independently() {
         let (storage, _mock) = make_mock_storage();
         storage
-            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .upsert_mints_batch(&[DbMint::new(
+                "m1".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
             .await
             .unwrap();
 
@@ -1610,7 +1640,12 @@ mod tests {
     async fn dispatch_get_mint_via_mock() {
         let (storage, _mock) = make_mock_storage();
         // Populate with mints
-        let mint = DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string());
+        let mint = DbMint::new(
+            "mint_1".to_string(),
+            6,
+            TOKEN_PROGRAM.to_string(),
+            TokenAmount(1),
+        );
         storage
             .upsert_mints_batch(std::slice::from_ref(&mint))
             .await

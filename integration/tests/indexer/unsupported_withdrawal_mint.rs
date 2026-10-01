@@ -58,6 +58,7 @@ use {
         transaction::Transaction,
     },
     std::{sync::Arc, time::Duration},
+    test_utils::mint_helper::TEST_WITHDRAW_FEE,
     test_utils::operator_helper::{same_host_fallback_url, OperatorHandle},
     test_utils::validator_helper::start_test_validator_no_geyser,
     testcontainers::runners::AsyncRunner,
@@ -197,6 +198,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
     storage
@@ -363,6 +365,7 @@ async fn setup_gate_env(db_name: &str) -> Result<GateEnv, Box<dyn std::error::Er
             env.mint.to_string(),
             6,
             spl_token::id().to_string(),
+            TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
     storage

@@ -48,6 +48,12 @@ pub async fn get_signatures_for_address(
     }
 }
 
+// Shared with the test below so it plans the exact production query.
+const RESOLVE_CURSOR_SQL: &str = "SELECT slot, signature \
+     FROM address_signatures \
+     WHERE signature = $1 \
+     LIMIT 1";
+
 /// Resolves a pagination cursor signature to its `(slot, raw_signature_bytes)`
 /// position in `address_signatures`.
 ///
@@ -69,16 +75,11 @@ async fn resolve_cursor(
         Some(s) => s,
     };
 
-    let row = sqlx::query(
-        "SELECT slot, signature \
-         FROM address_signatures \
-         WHERE signature = $1 \
-         LIMIT 1",
-    )
-    .bind(sig.as_ref() as &[u8])
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to look up '{}' cursor: {}", label, e))?;
+    let row = sqlx::query(RESOLVE_CURSOR_SQL)
+        .bind(sig.as_ref() as &[u8])
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to look up '{}' cursor: {}", label, e))?;
 
     match row {
         Some(r) => Ok(Some((r.get("slot"), r.get("signature")))),
@@ -266,4 +267,47 @@ async fn get_signatures_for_address_postgres(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts::postgres::ensure_address_signatures_signature_index;
+    use crate::accounts::write_batch::AddressSignatureRow;
+    use crate::test_helpers::{flush_address_signatures_sync, start_test_postgres_raw};
+
+    /// The cursor lookup SQL must plan through the signature index, not a walk of the whole PK.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_cursor_sql_plans_through_signature_index() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
+        let rows: Vec<AddressSignatureRow> = (0..100)
+            .map(|slot| AddressSignatureRow {
+                address: Pubkey::new_unique().to_bytes().to_vec(),
+                slot,
+                signature: Signature::new_unique().as_ref().to_vec(),
+            })
+            .collect();
+        flush_address_signatures_sync(&AccountsDB::Postgres(db.clone()), &rows).await;
+
+        // Without this the planner seq-scans a table this small.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // A plain EXPLAIN plan does not depend on the bound value, so any signature works.
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {RESOLVE_CURSOR_SQL}"))
+            .bind(Signature::new_unique().as_ref() as &[u8])
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        let plan = plan.join("\n");
+
+        assert!(plan.contains("address_signatures_signature_idx"), "{plan}");
+        assert!(!plan.contains("address_signatures_pkey"), "{plan}");
+        assert!(plan.contains("Index Only Scan"), "{plan}");
+    }
 }

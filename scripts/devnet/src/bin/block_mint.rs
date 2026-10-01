@@ -36,7 +36,7 @@ fn main() -> Result<()> {
             args[0]
         );
         eprintln!("Both gates are absolute: passing false for one re-opens it.");
-        eprintln!("Example (stop deposits, keep withdrawals open): {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112 true false", args[0]);
+        eprintln!("Example (stop deposits, keep withdrawals open): {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU true false", args[0]);
         std::process::exit(1);
     }
 

@@ -69,9 +69,10 @@ use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use sqlx::{PgPool, Row};
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
     indexer_helper::{start_private_channel_indexer, start_solana_indexer_rpc_polling},
+    mint_helper::TEST_WITHDRAW_FEE,
     mock_rpc::{MockRpcServer, Reply},
     operator_helper::{
         default_operator_config, start_private_channel_to_solana_operator_with_config,
@@ -100,6 +101,8 @@ const RESYNC_TIMEOUT_SECS: u64 = 180;
 const RESYNC_ATTEMPTS: usize = 4;
 /// Channel mint authority the reconcile harness enumerates; scripted mints are signed by it.
 const CHANNEL_AUTHORITY: Pubkey = Pubkey::new_from_array([7u8; 32]);
+/// A channel admin rotated out before the resync; resync is never told about it.
+const OLD_AUTHORITY: Pubkey = Pubkey::new_from_array([8u8; 32]);
 /// Per-user SPL balance minted at setup, large enough to fund deposits.
 const USER_BALANCE: u64 = 1_000_000;
 /// Deposit amount used by single-deposit scenarios.
@@ -413,14 +416,19 @@ fn landed_mint_to(key: &RowKey, kind: ConsumedMintKind) -> ScriptedMintTo {
     }
 }
 
-/// The channel tx the authority landed for `key`: its memo and matching `MintTo`.
-fn authority_signed_mint(key: &RowKey, kind: ConsumedMintKind) -> Value {
+/// The channel tx `signer` landed for `key`: its memo and matching `MintTo` under `signer`.
+fn signed_mint(signer: &Pubkey, key: &RowKey, kind: ConsumedMintKind) -> Value {
     channel_transaction(
-        &CHANNEL_AUTHORITY,
+        signer,
         &Pubkey::new_unique(),
         &memo_for(&key.source_event_id(), kind),
         Some(&landed_mint_to(key, kind)),
     )
+}
+
+/// The channel tx the current authority landed for `key`.
+fn authority_signed_mint(key: &RowKey, kind: ConsumedMintKind) -> Value {
+    signed_mint(&CHANNEL_AUTHORITY, key, kind)
 }
 
 /// A non-idempotency filler entry (null memo) used only to pad a full page.
@@ -443,44 +451,91 @@ fn memo_for(id: &SourceEventId, kind: ConsumedMintKind) -> String {
     }
 }
 
-/// Enqueue one `getSignaturesForAddress` page that makes the channel report each
-/// `(key, kind, landed)` as an already-serviced mint, and the matching signed mint
-/// for each fetch. Reused by every reconcile case so per-test wire boilerplate stays
-/// a single line.
+/// Serve each address's history pages and each signature's transaction. The replies are
+/// looked up from the request, so a whole-run retry reads the same channel again instead
+/// of the next queued reply. Unknown addresses have an empty history.
+fn script_channel_histories(
+    mock: &MockRpcServer,
+    histories: &[(Pubkey, Vec<Vec<Value>>)],
+    transactions: &[(Signature, Value)],
+) {
+    let histories: Arc<HashMap<String, Vec<Vec<Value>>>> = Arc::new(
+        histories
+            .iter()
+            .map(|(address, pages)| (address.to_string(), pages.clone()))
+            .collect(),
+    );
+    let page_reply = Reply::dynamic(move |request| {
+        let address = request["params"][0].as_str().unwrap_or_default();
+        let before = request["params"][1]["before"].as_str();
+        let Some(pages) = histories.get(address) else {
+            return json!([]);
+        };
+        // The cursor is the last signature of the page before the one asked for.
+        let index = match before {
+            None => 0,
+            Some(cursor) => match pages
+                .iter()
+                .position(|page| page.last().and_then(|e| e["signature"].as_str()) == Some(cursor))
+            {
+                Some(previous) => previous + 1,
+                None => return json!([]),
+            },
+        };
+        pages.get(index).cloned().map_or(json!([]), Value::Array)
+    });
+    mock.enqueue_sequence(
+        "getSignaturesForAddress",
+        std::iter::repeat_n(page_reply, 256),
+    );
+
+    let transactions: Arc<HashMap<String, Value>> = Arc::new(
+        transactions
+            .iter()
+            .map(|(signature, transaction)| (signature.to_string(), transaction.clone()))
+            .collect(),
+    );
+    let transaction_reply = Reply::dynamic(move |request| {
+        let signature = request["params"][0].as_str().unwrap_or_default();
+        transactions.get(signature).cloned().unwrap_or(Value::Null)
+    });
+    mock.enqueue_sequence(
+        "getTransaction",
+        std::iter::repeat_n(transaction_reply, 256),
+    );
+}
+
+/// Make the current authority's history report each `(key, kind, landed)` as an
+/// already-serviced mint, with the matching signed mint behind each signature.
 fn script_channel_consumed(
     mock: &MockRpcServer,
     entries: &[(&RowKey, ConsumedMintKind, Signature)],
 ) {
-    for _ in 0..RESYNC_ATTEMPTS {
-        let page: Vec<Value> = entries
-            .iter()
-            .map(|(key, kind, landed)| {
-                channel_sig_entry(landed, &memo_for(&key.source_event_id(), *kind))
-            })
-            .collect();
-        mock.enqueue("getSignaturesForAddress", Reply::result(Value::Array(page)));
-        for (key, kind, _) in entries {
-            mock.enqueue(
-                "getTransaction",
-                Reply::result(authority_signed_mint(key, *kind)),
-            );
-        }
-    }
+    let page: Vec<Value> = entries
+        .iter()
+        .map(|(key, kind, landed)| {
+            channel_sig_entry(landed, &memo_for(&key.source_event_id(), *kind))
+        })
+        .collect();
+    let transactions: Vec<(Signature, Value)> = entries
+        .iter()
+        .map(|(key, kind, landed)| (*landed, authority_signed_mint(key, *kind)))
+        .collect();
+    script_channel_histories(mock, &[(CHANNEL_AUTHORITY, vec![page])], &transactions);
     script_channel_floor(mock);
 }
 
-/// Enqueue an empty channel history: no serviced mints. Used by the discovery
-/// run (which only needs the rebuilt rows' coordinates) and by IT-R12.
+/// An empty channel history: no serviced mints. Used by the discovery run (which only
+/// needs the rebuilt rows' coordinates) and by IT-R12.
 fn script_channel_empty(mock: &MockRpcServer) {
-    for _ in 0..RESYNC_ATTEMPTS {
-        mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
-    }
+    script_channel_histories(mock, &[], &[]);
     script_channel_floor(mock);
 }
 
-/// Report a never-pruned channel history on every resync attempt.
+/// Report a never-pruned channel history on every resync attempt. The floor is read once
+/// after the authority's history and once after the receipt mints' histories.
 fn script_channel_floor(mock: &MockRpcServer) {
-    for _ in 0..RESYNC_ATTEMPTS {
+    for _ in 0..RESYNC_ATTEMPTS * 2 {
         mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     }
 }
@@ -504,27 +559,18 @@ fn script_channel_consumed_on_page2(
     kind: ConsumedMintKind,
     landed: &Signature,
 ) {
-    for _ in 0..RESYNC_ATTEMPTS {
-        let mut page1 = Vec::with_capacity(CHANNEL_PAGE_LIMIT);
-        for _ in 0..CHANNEL_PAGE_LIMIT {
-            page1.push(channel_filler_entry());
-        }
-        mock.enqueue(
-            "getSignaturesForAddress",
-            Reply::result(Value::Array(page1)),
-        );
-        mock.enqueue(
-            "getSignaturesForAddress",
-            Reply::result(json!([channel_sig_entry(
-                landed,
-                &memo_for(&key.source_event_id(), kind)
-            )])),
-        );
-        mock.enqueue(
-            "getTransaction",
-            Reply::result(authority_signed_mint(key, kind)),
-        );
-    }
+    let page1: Vec<Value> = (0..CHANNEL_PAGE_LIMIT)
+        .map(|_| channel_filler_entry())
+        .collect();
+    let page2 = vec![channel_sig_entry(
+        landed,
+        &memo_for(&key.source_event_id(), kind),
+    )];
+    script_channel_histories(
+        mock,
+        &[(CHANNEL_AUTHORITY, vec![page1, page2])],
+        &[(*landed, authority_signed_mint(key, kind))],
+    );
     script_channel_floor(mock);
 }
 
@@ -716,7 +762,7 @@ async fn seed_withdrawal_side(db_url: &str) {
 /// A deposit, a mints row and the escrow checkpoint.
 async fn seed_escrow_side(db_url: &str) {
     seed_tx(db_url, "dep-seed", "deposit", "completed").await;
-    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program) VALUES ('seed_mint', 6, 'token')").await;
+    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee) VALUES ('seed_mint', 6, 'token', 1)").await;
     seed_sql(
         db_url,
         "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('escrow', 111)",
@@ -1578,38 +1624,36 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
     };
     let attacker = Pubkey::new_unique();
     let forged_memo = mint_idempotency_memo(&dep.source_event_id());
-    // (b) non-idempotency memo, (c) wrong-prefix memo, (d) forged memo. Enqueue one
-    // page per possible resync attempt (transient-block retries re-enumerate the channel).
-    for _ in 0..RESYNC_ATTEMPTS {
-        let page = json!([
-            channel_sig_entry(&Signature::new_unique(), &foreign_memo),
-            channel_sig_entry(&Signature::new_unique(), "just a normal user memo"),
-            channel_sig_entry(
-                &Signature::new_unique(),
-                &format!("private_channel:not-idempotency:{}", foreign_id.as_str())
+    // (b) non-idempotency memo, (c) wrong-prefix memo, (d) forged memo.
+    let (foreign_landed, forged_landed) = (Signature::new_unique(), Signature::new_unique());
+    let page = vec![
+        channel_sig_entry(&foreign_landed, &foreign_memo),
+        channel_sig_entry(&Signature::new_unique(), "just a normal user memo"),
+        channel_sig_entry(
+            &Signature::new_unique(),
+            &format!("private_channel:not-idempotency:{}", foreign_id.as_str()),
+        ),
+        channel_sig_entry(&forged_landed, &forged_memo),
+    ];
+    script_channel_histories(
+        &mock,
+        &[(CHANNEL_AUTHORITY, vec![page])],
+        &[
+            (
+                foreign_landed,
+                channel_transaction(
+                    &CHANNEL_AUTHORITY,
+                    &Pubkey::new_unique(),
+                    &foreign_memo,
+                    Some(&foreign_mint_to),
+                ),
             ),
-            channel_sig_entry(&Signature::new_unique(), &forged_memo),
-        ]);
-        mock.enqueue("getSignaturesForAddress", Reply::result(page));
-        mock.enqueue(
-            "getTransaction",
-            Reply::result(channel_transaction(
-                &CHANNEL_AUTHORITY,
-                &Pubkey::new_unique(),
-                &foreign_memo,
-                Some(&foreign_mint_to),
-            )),
-        );
-        mock.enqueue(
-            "getTransaction",
-            Reply::result(channel_transaction(
-                &attacker,
-                &CHANNEL_AUTHORITY,
-                &forged_memo,
-                None,
-            )),
-        );
-    }
+            (
+                forged_landed,
+                channel_transaction(&attacker, &CHANNEL_AUTHORITY, &forged_memo, None),
+            ),
+        ],
+    );
     script_channel_floor(&mock);
     h.run().await.expect("resync should succeed");
 
@@ -1942,6 +1986,241 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Reconcile-on-rebuild: channel admin rotation
+// ════════════════════════════════════════════════════════════════════════════
+
+/// One history page on `mint` listing each `(landed, memo)`.
+fn mint_history(mint: &str, entries: &[(Signature, String)]) -> (Pubkey, Vec<Vec<Value>>) {
+    let page = entries
+        .iter()
+        .map(|(landed, memo)| channel_sig_entry(landed, memo))
+        .collect();
+    (
+        Pubkey::from_str(mint).expect("row mint is a pubkey"),
+        vec![page],
+    )
+}
+
+/// A mint signed by a key rotated out of the mint authority never names the current one,
+/// so resync must read it from the receipt mint's own history. Covers an empty and a
+/// populated database, a double mint across keys, a wrong payment and a withdrawal remint.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("resync_rotation").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+    helpers::execute_user_withdrawal(&client, &env.users[0], env.mint, WITHDRAW_AMOUNT)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+
+    let escrow = |channel_url: String| Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Escrow,
+        instance: Some(env.instance),
+        channel_url,
+        genesis,
+    };
+
+    #[derive(Debug)]
+    enum Expect {
+        Completed,
+        DoubleMint,
+        Mismatch,
+    }
+    let cases = [
+        (
+            "1: empty database, old key only",
+            false,
+            false,
+            false,
+            Expect::Completed,
+        ),
+        (
+            "2: populated database, old key only",
+            true,
+            false,
+            false,
+            Expect::Completed,
+        ),
+        (
+            "3: old and current key mint one event",
+            false,
+            true,
+            false,
+            Expect::DoubleMint,
+        ),
+        (
+            "4: old key pays the wrong amount",
+            false,
+            false,
+            true,
+            Expect::Mismatch,
+        ),
+    ];
+    for (case, serviced_in_db, current_key_too, wrong_amount, expect) in cases {
+        let mock = MockRpcServer::start().await;
+        let h = escrow(mock.url());
+        // An earlier case left the deposit completed, which an empty-channel discovery refuses.
+        seed_sql(
+            &db_url,
+            "UPDATE transactions SET status = 'pending'::transaction_status, \
+             counterpart_signature = NULL WHERE transaction_type = 'deposit'",
+        )
+        .await;
+        // Discovery rebuilds every row pending, which is what an empty database gives the
+        // serviced-row check.
+        let dep = keys_of_type(&h.discover().await, "deposit")[0].clone();
+        if serviced_in_db {
+            seed_sql(
+                &db_url,
+                &format!(
+                    "UPDATE transactions SET status = 'completed'::transaction_status \
+                     WHERE signature = '{}'",
+                    dep.signature
+                ),
+            )
+            .await;
+        }
+
+        let memo = memo_for(&dep.source_event_id(), ConsumedMintKind::Deposit);
+        let (old_landed, current_landed) = (Signature::new_unique(), Signature::new_unique());
+        let old_mint_to = ScriptedMintTo {
+            amount: dep.amount + u64::from(wrong_amount),
+            ..landed_mint_to(&dep, ConsumedMintKind::Deposit)
+        };
+        let mut authority_page = Vec::new();
+        let mut on_mint = vec![(old_landed, memo.clone())];
+        let mut transactions = vec![(
+            old_landed,
+            channel_transaction(
+                &OLD_AUTHORITY,
+                &Pubkey::new_unique(),
+                &memo,
+                Some(&old_mint_to),
+            ),
+        )];
+        if current_key_too {
+            authority_page.push(channel_sig_entry(&current_landed, &memo));
+            on_mint.insert(0, (current_landed, memo.clone()));
+            transactions.push((
+                current_landed,
+                authority_signed_mint(&dep, ConsumedMintKind::Deposit),
+            ));
+        }
+        script_channel_histories(
+            &mock,
+            &[
+                (CHANNEL_AUTHORITY, vec![authority_page]),
+                mint_history(&dep.mint, &on_mint),
+            ],
+            &transactions,
+        );
+        script_channel_floor(&mock);
+        let sentinel = format!("rotation_sentinel_{}", &case[..1]);
+        seed_pending_deposit(&db_url, &sentinel).await;
+        let rows_before = row_count(&db_url).await;
+        let status_before = status_of(&db_url, &dep).await.status;
+
+        let result = h.run().await;
+        match (&expect, &result) {
+            (Expect::Completed, Ok(())) => {
+                let st = status_of(&db_url, &dep).await;
+                assert_eq!(st.status, "completed", "{case}");
+                assert_eq!(
+                    st.counterpart_signature.as_deref(),
+                    Some(old_landed.to_string().as_str()),
+                    "{case}: the old key's mint is the one that paid it"
+                );
+                assert_eq!(pending_count(&db_url).await, 0, "{case}");
+            }
+            (
+                Expect::DoubleMint,
+                Err(IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                    reason,
+                })),
+            ) => {
+                for landed in [old_landed, current_landed] {
+                    assert!(reason.contains(&landed.to_string()), "{case}: {reason}");
+                }
+            }
+            (
+                Expect::Mismatch,
+                Err(IndexerError::Reconciliation(ReconciliationError::ConsumedMintMismatch {
+                    ..
+                })),
+            ) => {}
+            (expect, other) => panic!("{case}: expected {expect:?}, got {other:?}"),
+        }
+        if !matches!(expect, Expect::Completed) {
+            assert_eq!(
+                row_count(&db_url).await,
+                rows_before,
+                "{case}: no row dropped"
+            );
+            assert_eq!(
+                status_of(&db_url, &dep).await.status,
+                status_before,
+                "{case}: the row keeps its pre-resync state"
+            );
+            assert_eq!(marker(&db_url).await, None, "{case}");
+        }
+        mock.shutdown().await;
+    }
+
+    // 5: a withdrawal the old key reminted rebuilds failed_reminted, not pending.
+    let mock = MockRpcServer::start().await;
+    let h = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Withdraw,
+        instance: Some(env.instance),
+        channel_url: mock.url(),
+        genesis,
+    };
+    let wd = keys_of_type(&h.discover().await, "withdrawal")[0].clone();
+    let memo = memo_for(&wd.source_event_id(), ConsumedMintKind::Remint);
+    let old_landed = Signature::new_unique();
+    script_channel_histories(
+        &mock,
+        &[mint_history(&wd.mint, &[(old_landed, memo)])],
+        &[(
+            old_landed,
+            signed_mint(&OLD_AUTHORITY, &wd, ConsumedMintKind::Remint),
+        )],
+    );
+    script_channel_floor(&mock);
+    h.run()
+        .await
+        .expect("5: the withdraw resync should succeed");
+    let st = status_of(&db_url, &wd).await;
+    assert_eq!(st.status, "failed_reminted", "5");
+    assert_eq!(
+        st.landed_remint_signature.as_deref(),
+        Some(old_landed.to_string().as_str()),
+        "5"
+    );
+    mock.shutdown().await;
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Reconcile-on-rebuild: pre-drop fail-closed gates (no real source needed)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2009,7 +2288,8 @@ async fn resync_aborts_when_channel_history_omits_a_completed_deposit_db_intact(
 }
 
 /// Pruned channel history, or an unreadable floor, cannot prove the consumed-set complete,
-/// so resync refuses with the database untouched.
+/// so resync refuses with the database untouched. The floor is read again after the receipt
+/// mints' histories, even when there is no rebuilt row and so no mint to scan.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_aborts_on_pruned_channel_history_db_intact(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2019,13 +2299,17 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
     wait_for_finalized_slot(&validator.rpc_url(), current_slot + 5).await;
 
     // One reply per retry of the default client config, so the floor read fails for good.
-    let cases: [(&str, Vec<Reply>); 2] = [
+    let cases: [(&str, Vec<Reply>); 3] = [
         ("floor 7", vec![Reply::result(json!(7))]),
         (
             "floor unreadable",
             std::iter::repeat_with(|| Reply::error(-32000, "floor rpc boom"))
                 .take(5)
                 .collect(),
+        ),
+        (
+            "floor 7 only after the mint scan",
+            vec![Reply::result(json!(0)), Reply::result(json!(7))],
         ),
     ];
     for (i, (label, floor)) in cases.into_iter().enumerate() {
@@ -2843,12 +3127,14 @@ impl Stack {
     }
 }
 
-/// An escrow resync reconciled against the real channel, retried while stopped workers' sessions close.
+/// An escrow resync reconciled against the real channel as `authority`, retried while stopped
+/// workers' sessions close.
 async fn escrow_resync(
     rpc_url: &str,
     db_url: &str,
     instance: Pubkey,
     genesis: u64,
+    authority: Pubkey,
 ) -> Result<(), IndexerError> {
     for _ in 0..40 {
         let service = make_channel_resync_service(
@@ -2857,7 +3143,7 @@ async fn escrow_resync(
             ProgramType::Escrow,
             Some(instance),
             rpc_url.to_string(),
-            admin().pubkey(),
+            authority,
         );
         match run_resync(&service, genesis).await {
             Err(IndexerError::Storage(StorageError::LiveStateLockHeld { .. })) => {
@@ -3094,6 +3380,7 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
 
     // The release fails because the destination has no token account, so the burn is reminted.
     let destination = Keypair::new().pubkey();
+    let user_before_withdrawal = token_balance(&client, user.pubkey(), env.mint).await;
     let withdrawal =
         helpers::execute_user_withdrawal_to(&client, user, env.mint, WITHDRAW_AMOUNT, destination)
             .await?;
@@ -3122,6 +3409,14 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
         row_of(&db_url, &withdrawal.signature).await.0,
         "failed_reminted"
     );
+    // The remint restores the burned amount but not the fee, so a withdrawal
+    // that cannot settle costs the user one fee each time it is retried. Both
+    // paths remint the indexed amount, so this holds whichever one ran.
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before_withdrawal - TEST_WITHDRAW_FEE,
+        "a failed release must still cost the withdraw fee"
+    );
     let (_, nonce, _) = row_of(&db_url, &withdrawal.signature).await;
     let nonce = nonce.expect("a withdrawal carries a nonce") as u64;
 
@@ -3138,7 +3433,7 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
     let custody_before = custody(&client, env.instance, env.mint).await;
     let user_before = token_balance(&client, user.pubkey(), env.mint).await;
 
-    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
         .await
         .expect("the escrow resync must succeed on a live database");
     let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
@@ -3209,7 +3504,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         "the withdraw indexer had a checkpoint"
     );
 
-    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
         .await
         .expect("the escrow resync must succeed on a busy database");
     assert_eq!(side_fingerprint(&db_url, "withdrawal").await, withdrawals);
@@ -3251,10 +3546,12 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         custody_before - (WITHDRAW_AMOUNT + 1),
         "only the downtime release leaves custody"
     );
+    // Burn and release net out on this one validator, leaving only the fee,
+    // which moved to the admin rather than out of supply.
     assert_eq!(
         token_balance(&client, user.pubkey(), env.mint).await,
-        user_before,
-        "burned and released once"
+        user_before - TEST_WITHDRAW_FEE,
+        "burned and released once, paying one withdraw fee"
     );
 
     // Custody against the rebuilt ledger. The single-validator harness cannot model separate
@@ -3278,9 +3575,15 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
 
     // A resync from after the AllowMint keeps the mint row, so reconciliation still sees
     // the rebuilt deposits and the kept withdrawals for this mint.
-    escrow_resync(&rpc_url, &db_url, env.instance, after_allow_mint)
-        .await
-        .expect("an escrow resync from after the AllowMint");
+    escrow_resync(
+        &rpc_url,
+        &db_url,
+        env.instance,
+        after_allow_mint,
+        admin().pubkey(),
+    )
+    .await
+    .expect("an escrow resync from after the AllowMint");
     assert_eq!(mint_row_count(&db_url, &env.mint.to_string()).await, 1);
     let balances = new_storage(&db_url)
         .await
@@ -3489,7 +3792,7 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
         "operator: {operator:?}"
     );
 
-    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
         .await
         .expect("a same-program rerun must finish the interrupted resync");
     assert_eq!(marker(&db_url).await, None);
@@ -3689,7 +3992,7 @@ async fn e2e_in_flight_mint_refuses_then_resync_succeeds() -> Result<(), Box<dyn
     wait_for_finalized_slot(&rpc_url, tip + 5).await;
 
     // Index the real deposit with a resync against the (still empty) channel.
-    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
         .await
         .expect("indexing resync");
     let pool = fresh_pool(&db_url).await;
@@ -3738,7 +4041,7 @@ async fn e2e_in_flight_mint_refuses_then_resync_succeeds() -> Result<(), Box<dyn
     .await;
 
     let before = side_fingerprint(&db_url, "deposit").await;
-    let refused = escrow_resync(&rpc_url, &db_url, env.instance, genesis).await;
+    let refused = escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey()).await;
     assert!(
         matches!(
             refused,
@@ -3762,7 +4065,7 @@ async fn e2e_in_flight_mint_refuses_then_resync_succeeds() -> Result<(), Box<dyn
         Some(landed.to_string())
     );
 
-    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
         .await
         .expect("the resync succeeds once the mint has settled");
     let (status, _, counterpart) = row_of(&db_url, &deposit.to_string()).await;
@@ -3777,6 +4080,94 @@ async fn e2e_in_flight_mint_refuses_then_resync_succeeds() -> Result<(), Box<dyn
         token_balance(&client, user.pubkey(), env.mint).await,
         user_after_mint,
         "exactly one mint for the deposit"
+    );
+    Ok(())
+}
+
+/// E2E: a deposit admin A minted stays serviced after a real `SetAuthority` hands the
+/// mint to B and the database is lost. B's history never names A's mint, so only the receipt
+/// mint's history can show it; without it the rebuilt row would be pending and minted again.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_resync_after_real_admin_rotation_does_not_reopen_deposit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_rotation").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    let deposit = do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&rpc_url, tip + 5).await;
+
+    // 1. Index the deposit to learn its source-event-id.
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis, admin().pubkey())
+        .await
+        .expect("the indexing resync must succeed");
+    let dep = keys_of_type(&all_row_keys(&db_url).await, "deposit")[0].clone();
+    assert_eq!(dep.signature, deposit.to_string());
+
+    // 2. Admin A services it, as the operator does.
+    let memo = mint_idempotency_memo(&dep.source_event_id());
+    let recipient = Pubkey::from_str(&dep.recipient)?;
+    let (landed, _) = send_memo_mint(&client, &memo, recipient, env.mint, dep.amount).await;
+
+    // 3. The documented rotation: A hands the mint authority to B.
+    let new_admin = Keypair::new();
+    let rotate = spl_token::instruction::set_authority(
+        &TOKEN_PROGRAM_ID,
+        &env.mint,
+        Some(&new_admin.pubkey()),
+        spl_token::instruction::AuthorityType::MintTokens,
+        &admin().pubkey(),
+        &[],
+    )?;
+    helpers::send_and_confirm_instructions(&client, &[rotate], &admin(), &[&admin()], "Rotate")
+        .await?;
+
+    // 4. B is only instruction data in SetAuthority, so its history holds no mint.
+    let b_history = client
+        .get_signatures_for_address(&new_admin.pubkey())
+        .await?;
+    assert!(
+        b_history.iter().all(|status| status.memo.is_none()),
+        "B's history must not list A's mint: {b_history:?}"
+    );
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&rpc_url, tip + 5).await;
+
+    // 5. The database is lost, and resync runs as B.
+    let (fresh_db, _fresh_storage, _fresh_pg) =
+        start_postgres_for_resync("e2e_rotation_fresh").await?;
+    escrow_resync(
+        &rpc_url,
+        &fresh_db,
+        env.instance,
+        genesis,
+        new_admin.pubkey(),
+    )
+    .await
+    .expect("the resync after the rotation must succeed");
+    let st = status_of(&fresh_db, &dep).await;
+    assert_eq!(
+        st.status, "completed",
+        "A's mint must keep the deposit serviced"
+    );
+    assert_eq!(
+        st.counterpart_signature.as_deref(),
+        Some(landed.to_string().as_str())
+    );
+    assert_eq!(
+        pending_count(&fresh_db).await,
+        0,
+        "nothing may be minted again"
     );
     Ok(())
 }

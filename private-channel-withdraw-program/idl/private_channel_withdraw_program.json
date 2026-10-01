@@ -2,7 +2,67 @@
   "additionalPrograms": [],
   "kind": "rootNode",
   "program": {
-    "accounts": [],
+    "accounts": [
+      {
+        "data": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "bump",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "fee",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "allowMintSlot",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "treasury",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "treasuryTokenAccount",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minWithdrawAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            }
+          ],
+          "kind": "structTypeNode"
+        },
+        "kind": "accountNode",
+        "name": "withdrawConfig"
+      }
+    ],
     "definedTypes": [
       {
         "kind": "definedTypeNode",
@@ -42,6 +102,42 @@
         "kind": "errorNode",
         "message": "Withdrawal amount must be greater than zero",
         "name": "zeroAmount"
+      },
+      {
+        "code": 2,
+        "kind": "errorNode",
+        "message": "Invalid withdraw config",
+        "name": "invalidWithdrawConfig"
+      },
+      {
+        "code": 3,
+        "kind": "errorNode",
+        "message": "Withdraw config not initialized",
+        "name": "withdrawConfigNotInitialized"
+      },
+      {
+        "code": 4,
+        "kind": "errorNode",
+        "message": "Signer is not the mint authority",
+        "name": "invalidMintAuthority"
+      },
+      {
+        "code": 5,
+        "kind": "errorNode",
+        "message": "Invalid treasury token account",
+        "name": "invalidTreasuryAccount"
+      },
+      {
+        "code": 6,
+        "kind": "errorNode",
+        "message": "Invalid system program",
+        "name": "invalidSystemProgram"
+      },
+      {
+        "code": 7,
+        "kind": "errorNode",
+        "message": "Withdrawal amount is below the mint's minimum",
+        "name": "amountBelowMinimum"
       }
     ],
     "instructions": [
@@ -91,6 +187,24 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "associatedTokenProgram"
+          },
+          {
+            "docs": [
+              "Withdraw config PDA for the mint"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "withdrawConfig"
+          },
+          {
+            "docs": [
+              "Treasury token account the fee is paid to"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "treasuryTokenAccount"
           }
         ],
         "arguments": [
@@ -142,6 +256,105 @@
         ],
         "kind": "instructionNode",
         "name": "withdrawFunds"
+      },
+      {
+        "accounts": [
+          {
+            "docs": [
+              "Mint authority, also pays for the config"
+            ],
+            "isSigner": true,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "authority"
+          },
+          {
+            "docs": [
+              "Token mint"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mint"
+          },
+          {
+            "docs": [
+              "Withdraw config PDA for the mint"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "withdrawConfig"
+          },
+          {
+            "docs": [
+              "System program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "systemProgram"
+          }
+        ],
+        "arguments": [
+          {
+            "defaultValue": {
+              "kind": "numberValueNode",
+              "number": 1
+            },
+            "defaultValueStrategy": "omitted",
+            "kind": "instructionArgumentNode",
+            "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "fee",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "allowMintSlot",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "treasury",
+            "type": {
+              "kind": "publicKeyTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "minWithdrawAmount",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          }
+        ],
+        "discriminators": [
+          {
+            "kind": "fieldDiscriminatorNode",
+            "name": "discriminator",
+            "offset": 0
+          }
+        ],
+        "kind": "instructionNode",
+        "name": "setWithdrawConfig"
       }
     ],
     "kind": "programNode",

@@ -17,7 +17,8 @@ pub async fn run_feepayer_monitor(
     program_type: ProgramType,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
-    let feepayer_pubkey = SignerUtil::get_operator_pubkey();
+    // The admin signs releases first, so it pays their fees, not the operator.
+    let feepayer_pubkey = SignerUtil::get_admin_pubkey();
     let label = program_type.as_label();
 
     info!(

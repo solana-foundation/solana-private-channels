@@ -11,6 +11,7 @@
 //! 4. Real tokens minted to escrow ATA, DB matches → passes with strict threshold.
 //! 5. Extra tokens minted to escrow ATA with no DB row (attacker surplus) → passes
 //!    with strict threshold, since a surplus is benign and never blocks startup.
+//! 6. An instance ATA opened for a mint nobody allowed → ignored, so startup passes.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -48,7 +49,6 @@ mod multi_instruction_pipeline;
 mod liability_reconciliation;
 
 use helpers::{generate_mint, mint_to_owner, setup_wallets};
-use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
@@ -56,6 +56,7 @@ use private_channel_indexer::{
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
+use setup::{allow_mint_for_program, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
@@ -69,15 +70,6 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Derive the escrow instance PDA from a seed pubkey.
-fn instance_pda(seed: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"instance", seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-    )
-    .0
-}
 
 /// Slot the seeded rows below are written at.
 const SEEDED_ROW_SLOT: u64 = 1;
@@ -112,8 +104,8 @@ async fn seed_mint_and_deposit(
     amount: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, created_at)
-         VALUES ($1, 6, $2, NOW())",
+        "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee, created_at)
+         VALUES ($1, 6, $2, 1, NOW())",
     )
     .bind(mint_address)
     .bind(spl_token::id().to_string())
@@ -285,10 +277,12 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     let mint_keypair = Keypair::new();
     let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
-    // Derive the escrow instance PDA and mint tokens directly to its ATA.
-    let seed_keypair = Keypair::new();
-    let pda = instance_pda(&seed_keypair.pubkey());
+    // A real instance with the mint allowed; startup ignores custody of unapproved mints.
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
 
+    // Mint tokens directly to the instance ATA.
     const AMOUNT: u64 = 1_000_000;
     mint_to_owner(
         client.as_ref(),
@@ -374,10 +368,12 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
     let mint_keypair = Keypair::new();
     let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
-    // Derive the escrow instance PDA and mint the balanced amount to its ATA.
-    let seed_keypair = Keypair::new();
-    let pda = instance_pda(&seed_keypair.pubkey());
+    // A real instance with the mint allowed; startup ignores custody of unapproved mints.
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
 
+    // Mint the balanced amount to the instance ATA.
     const AMOUNT: u64 = 1_000_000;
     const ATTACKER_EXTRA: u64 = 500_000;
     mint_to_owner(
@@ -445,6 +441,111 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
     assert!(
         result.is_ok(),
         "attacker-induced surplus must not block startup: {:?}",
+        result
+    );
+    Ok(())
+}
+
+/// Anyone can open the instance ATA for a mint nobody allowed. That mint must stay out of
+/// startup reconciliation. This harness reads channel supply from the same node, so the
+/// unapproved mint's supply would read as unbacked by custody and stop the boot.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconciliation_ignores_an_unapproved_mint() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (test_validator, faucet_keypair, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        test_validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let authority = Keypair::new();
+    setup_wallets(client.as_ref(), &faucet_keypair, &[&authority]).await?;
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+
+    // The attacker's mint: never allowed, with supply held in the attacker's own wallet.
+    const UNAPPROVED_SUPPLY: u64 = 250_000;
+    let unapproved_mint =
+        generate_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        unapproved_mint,
+        authority.pubkey(),
+        &authority,
+        UNAPPROVED_SUPPLY,
+    )
+    .await?;
+    // Opens the instance ATA for it through the ATA program, holding nothing.
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        unapproved_mint,
+        pda,
+        &authority,
+        0,
+    )
+    .await?;
+
+    // An allowed, balanced mint. Funded last so that once its balance is finalized, the
+    // attacker's accounts are too.
+    const AMOUNT: u64 = 1_000_000;
+    let allowed_mint =
+        generate_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, allowed_mint, spl_token::id()).await?;
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        allowed_mint,
+        pda,
+        &authority,
+        AMOUNT,
+    )
+    .await?;
+    seed_mint_and_deposit(&pool, &allowed_mint.to_string(), AMOUNT as i64).await?;
+
+    {
+        let finalized_client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::finalized());
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &pda,
+            &allowed_mint,
+            &spl_token::id(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let balance = finalized_client.get_token_account_balance(&ata).await;
+            if let Ok(b) = balance {
+                if b.amount.parse::<u64>().unwrap_or(0) == AMOUNT {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out waiting for finalized ATA balance"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let result = run_startup_reconciliation(
+        &ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        },
+        ProgramType::Escrow,
+        &storage,
+        &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
+        &pda,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "an unapproved mint must not stop startup: {:?}",
         result
     );
     Ok(())

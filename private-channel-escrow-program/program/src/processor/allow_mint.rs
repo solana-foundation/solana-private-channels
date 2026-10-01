@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use crate::{
-    constants::ALLOWED_MINT_SEED,
+    constants::{ALLOWED_MINT_SEED, SPL_NATIVE_MINT},
     error::PrivateChannelEscrowProgramError,
     events::AllowMintEvent,
     processor::{
@@ -43,6 +43,10 @@ use pinocchio::{
 ///
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the allowed mint PDA
+/// * `withdraw_fee` (u64) - Per-withdrawal fee on the channel, 0 allowed.
+///   Recorded in `AllowMintEvent`; the indexer reads it from the instruction data.
+/// * `min_withdraw_amount` (u64) - Smallest channel withdrawal amount, 0 for
+///   none. Recorded and read the same way as `withdraw_fee`.
 pub fn process_allow_mint(
     program_id: &Address,
     accounts: &[AccountView],
@@ -66,6 +70,13 @@ pub fn process_allow_mint(
     validate_event_authority!(event_authority_info);
 
     verify_account_owner(mint_info, token_program_info.address())?;
+
+    // The channel cannot create the native mint, so deposits of it could never
+    // be minted there. Checked by address whichever token program owns it, before
+    // any side effect. Reuses InvalidMint to keep the error ABI unchanged.
+    if mint_info.address() == &SPL_NATIVE_MINT {
+        return Err(PrivateChannelEscrowProgramError::InvalidMint.into());
+    }
 
     // Also proves the account is a mint: the decimals below come from this
     // parse rather than an unchecked cast.
@@ -140,7 +151,13 @@ pub fn process_allow_mint(
         .try_borrow_mut()?
         .copy_from_slice(&allowed_mint_data);
 
-    let event = AllowMintEvent::new(instance.instance_seed, *mint_info.address(), mint_decimals);
+    let event = AllowMintEvent::new(
+        instance.instance_seed,
+        *mint_info.address(),
+        mint_decimals,
+        args.withdraw_fee,
+        args.min_withdraw_amount,
+    );
     emit_event(
         program_id,
         event_authority_info,
@@ -153,11 +170,30 @@ pub fn process_allow_mint(
 
 struct AllowMintArgs {
     bump: u8,
+    withdraw_fee: u64,
+    min_withdraw_amount: u64,
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<AllowMintArgs, ProgramError> {
-    require_len!(data, 1);
-    Ok(AllowMintArgs { bump: data[0] })
+    require_len!(data, 1 + 8 + 8);
+
+    let withdraw_fee = u64::from_le_bytes(
+        data[1..9]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+
+    let min_withdraw_amount = u64::from_le_bytes(
+        data[9..17]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+
+    Ok(AllowMintArgs {
+        bump: data[0],
+        withdraw_fee,
+        min_withdraw_amount,
+    })
 }
 
 #[cfg(test)]
@@ -167,14 +203,30 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn test_process_allow_mint_valid_bump() {
-        // Test with valid bump
-        let instruction_data = vec![123]; // bump = 123
+    fn test_process_allow_mint_valid_bump_fee_and_minimum() {
+        let bump = 123;
+        let withdraw_fee = 1_234_567u64;
+        let min_withdraw_amount = 7_654_321u64;
+        let mut instruction_data = vec![bump];
+        instruction_data.extend_from_slice(&withdraw_fee.to_le_bytes());
+        instruction_data.extend_from_slice(&min_withdraw_amount.to_le_bytes());
+
+        let args = process_instruction_data(&instruction_data).unwrap();
+
+        assert_eq!(args.bump, bump);
+        assert_eq!(args.withdraw_fee, withdraw_fee);
+        assert_eq!(args.min_withdraw_amount, min_withdraw_amount);
+    }
+
+    // The pre-minimum layout carried only the bump and the fee.
+    #[test]
+    fn test_process_allow_mint_missing_minimum() {
+        let mut instruction_data = vec![123];
+        instruction_data.extend_from_slice(&1_234_567u64.to_le_bytes());
 
         let result = process_instruction_data(&instruction_data);
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().bump, 123);
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
     }
 
     #[test]

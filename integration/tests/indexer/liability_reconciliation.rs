@@ -24,6 +24,7 @@ use private_channel_indexer::indexer::reconciliation::{
 use private_channel_indexer::operator::escrow_sweep::fetch_escrow_balances_by_mint;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
+use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbTransactionBuilder, TransactionType,
 };
@@ -1240,6 +1241,7 @@ async fn unreadable_custody_halts_without_quarantine() {
             mint.to_string(),
             MINT_DECIMALS as i16,
             spl_token::id().to_string(),
+            TokenAmount(1),
         )])
         .await
         .expect("seed mint");

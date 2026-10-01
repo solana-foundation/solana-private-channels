@@ -15,6 +15,7 @@
 //!
 //! PrivateChannel (write-node):
 //!   7. Initialize the same mint on PrivateChannel (same pubkey, implicit account creation).
+//!      Then write its withdraw config, with the admin as treasury.
 //!   8. Create PrivateChannel ATAs for each withdrawer account.
 //!   9. Mint `initial_balance` tokens to each PrivateChannel ATA.
 //!
@@ -26,7 +27,10 @@ use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
         setup_deposit::{find_instance_pda, find_withdrawal_bitmap_pda},
-        types::{BenchState, WithdrawConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
+        types::{
+            BenchState, WithdrawConfig, BENCH_MIN_WITHDRAW_AMOUNT, BENCH_WITHDRAW_FEE,
+            MINT_DECIMALS, SETUP_BATCH_SIZE,
+        },
     },
     anyhow::{Context, Result},
     private_channel_core::client::{
@@ -38,6 +42,10 @@ use {
             CreateInstance, CreateInstanceInstructionArgs,
         },
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    },
+    private_channel_withdraw_program_client::{
+        instructions::SetWithdrawConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        WITHDRAW_CONFIG_SEED,
     },
     rayon::prelude::*,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
@@ -405,7 +413,11 @@ pub async fn run_setup_withdraw_phase(
                         event_authority,
                         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
-                    .instruction(AllowMintInstructionArgs { bump: allow_bump });
+                    .instruction(AllowMintInstructionArgs {
+                        bump: allow_bump,
+                        withdraw_fee: BENCH_WITHDRAW_FEE,
+                        min_withdraw_amount: BENCH_MIN_WITHDRAW_AMOUNT,
+                    });
                     let tx = Transaction::new_signed_with_payer(
                         &[allow_ix],
                         Some(&admin_keypair.pubkey()),
@@ -658,6 +670,88 @@ pub async fn run_setup_withdraw_phase(
     info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on PrivateChannel");
 
     // ------------------------------------------------------------------
+    // Task 9b: Write the mint's withdraw config on PrivateChannel
+    //
+    // The operator writes it on every deposit, but this setup mints without
+    // deposits, so it does the same once: create the admin's ATA (the
+    // treasury) and set the fee and minimum the AllowMint above carried. Without it every
+    // withdrawal fails with WithdrawConfigNotInitialized.
+    // ------------------------------------------------------------------
+    let t9b = Instant::now();
+    let (withdraw_config, _) = Pubkey::find_program_address(
+        &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
+        &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    );
+    let treasury_token_account = get_associated_token_address(&admin_keypair.pubkey(), &mint);
+    let withdraw_config_sig = 'send: {
+        let mut last_err = String::new();
+        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
+            match private_channel_rpc.get_latest_blockhash().await {
+                Err(e) => {
+                    warn!(attempt, err = %e,
+                        "get_latest_blockhash failed (withdraw config), retrying in {delay_secs}s");
+                    last_err = e.to_string();
+                }
+                Ok(blockhash) => {
+                    let create_treasury_ata_ix =
+                        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                            &admin_keypair.pubkey(),
+                            &admin_keypair.pubkey(),
+                            &mint,
+                            &spl_token::id(),
+                        );
+                    let set_withdraw_config_ix = SetWithdrawConfigBuilder::new()
+                        .authority(admin_keypair.pubkey())
+                        .mint(mint)
+                        .withdraw_config(withdraw_config)
+                        .fee(BENCH_WITHDRAW_FEE)
+                        .allow_mint_slot(0)
+                        .treasury(admin_keypair.pubkey())
+                        .min_withdraw_amount(BENCH_MIN_WITHDRAW_AMOUNT)
+                        .instruction();
+                    let tx = Transaction::new_signed_with_payer(
+                        &[create_treasury_ata_ix, set_withdraw_config_ix],
+                        Some(&admin_keypair.pubkey()),
+                        &[admin_keypair.as_ref()],
+                        blockhash,
+                    );
+                    match private_channel_rpc.send_transaction(&tx).await {
+                        Ok(sig) => break 'send sig,
+                        Err(e) => {
+                            warn!(attempt, err = %e, "withdraw config send failed, retrying");
+                            last_err = e.to_string();
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        return Err(anyhow::anyhow!(
+            "withdraw config: all retries exhausted: {last_err}"
+        ));
+    };
+    let retry = poll_confirmations(
+        &private_channel_rpc,
+        &[Some(withdraw_config_sig)],
+        "withdraw_config",
+        0,
+        1,
+    )
+    .await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!(
+            "withdraw_config failed to confirm on-chain"
+        ));
+    }
+    info!(
+        %withdraw_config,
+        %treasury_token_account,
+        fee = BENCH_WITHDRAW_FEE,
+        elapsed_ms = t9b.elapsed().as_millis(),
+        "Withdraw config written on PrivateChannel",
+    );
+
+    // ------------------------------------------------------------------
     // Tasks 10 + 11: Create PrivateChannel ATAs and mint tokens in batches
     // ------------------------------------------------------------------
     let total = keypairs.len();
@@ -807,6 +901,8 @@ pub async fn run_setup_withdraw_phase(
     Ok(WithdrawConfig {
         mint,
         keypairs,
+        withdraw_config,
+        treasury_token_account,
         state,
     })
 }

@@ -173,7 +173,12 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     // production AllowMint dual-write.
     harness.storage.mints.lock().unwrap().insert(
         mint_pk.to_string(),
-        DbMint::new(mint_pk.to_string(), 6, spl_token::id().to_string()),
+        DbMint::new(
+            mint_pk.to_string(),
+            6,
+            spl_token::id().to_string(),
+            TokenAmount(1),
+        ),
     );
     harness
         .storage

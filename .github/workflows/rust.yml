@@ -549,8 +549,11 @@ jobs:
         with:
           name: ci-build-artifacts
 
+      # `-m` stamps extraction time. The client sits outside this project's
+      # root, so rust-cache keeps its rlib; archived mtimes can predate it and
+      # cargo would link the stale client instead of rebuilding.
       - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
+        run: tar -xzmf ci-build-artifacts.tgz
 
       - name: Run fuzz harnesses
         run: make -C private-channel-escrow-program fuzz
