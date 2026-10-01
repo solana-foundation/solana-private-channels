@@ -53,6 +53,10 @@ auth_port: 8903
 # no health probe. Compose services reach it as http://gateway:<this>.
 gateway_internal_port: 8904
 
+# --- Gateway tuning ---
+# Max seconds one forwarded request may wait on the write or read node (1 to 3600).
+gateway_upstream_timeout_secs: 30
+
 # --- Health phase tuning ---
 # Per-service probe budget. With backoff inside the retry loop this gives
 # ~30s of hysteresis per service before the phase fails.
