@@ -132,12 +132,16 @@ async fn drain_unless_lock_lost<T>(
 const PROCESSOR_ROOT_CAUSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Turn a failed fill into the processor's ending when the processor caused it.
-/// A send failure means the receiver is gone, so the processor gets a bounded wait.
+/// A send failure means the receiver is gone, so the processor gets a bounded wait,
+/// which a lost live-state lock cuts short by stopping the writers.
 async fn attribute_backfill_failure(
     fill_err: IndexerError,
     processor: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
     wait: std::time::Duration,
-) -> Supervision {
+    lock_lost: &CancellationToken,
+    cancellation_token: &CancellationToken,
+    writers: &[tokio::task::AbortHandle],
+) -> Result<Supervision, IndexerError> {
     use crate::error::BackfillError::ChannelSend;
     let send_failed = matches!(
         fill_err,
@@ -145,14 +149,27 @@ async fn attribute_backfill_failure(
             | IndexerError::DataSource(DataSourceError::Backfill(ChannelSend(_)))
     );
     if !send_failed && !processor.is_finished() {
-        return Supervision::BackfillFailed(fill_err);
+        return Ok(Supervision::BackfillFailed(fill_err));
     }
-    match tokio::time::timeout(wait, &mut *processor).await {
+    let waited = drain_unless_lock_lost(
+        lock_lost,
+        cancellation_token,
+        writers,
+        tokio::time::timeout(wait, &mut *processor),
+    )
+    .await
+    .inspect_err(|_| {
+        error!(
+            "Startup backfill failed before the lock was lost: {}",
+            fill_err
+        )
+    })?;
+    Ok(match waited {
         // A clean stop cannot happen while run() holds a sender; keep the fill error.
         Ok(Ok(Ok(()))) => Supervision::ProcessorEnded(Ok(Err(fill_err))),
         Ok(res) => Supervision::ProcessorEnded(res),
         Err(_) => Supervision::BackfillFailed(fill_err),
-    }
+    })
 }
 
 /// Race the processor against the shutdown signal and the startup fill, in that biased order.
@@ -1093,7 +1110,19 @@ pub async fn run(
     // A fill that failed because the processor died is reported as the processor's ending.
     let outcome = match outcome {
         Supervision::BackfillFailed(e) => {
-            attribute_backfill_failure(e, &mut processor_handle, PROCESSOR_ROOT_CAUSE_WAIT).await
+            let writers = [
+                processor_handle.abort_handle(),
+                checkpoint_handle.abort_handle(),
+            ];
+            attribute_backfill_failure(
+                e,
+                &mut processor_handle,
+                PROCESSOR_ROOT_CAUSE_WAIT,
+                &processor_end_lock_lost,
+                &cancellation_token,
+                &writers,
+            )
+            .await?
         }
         other => other,
     };
@@ -1658,8 +1687,12 @@ mod tests {
                 fill_err,
                 &mut processor,
                 std::time::Duration::from_secs(5),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                &[],
             )
-            .await;
+            .await
+            .expect("the lock is held");
 
             assert!(
                 matches!(
@@ -1687,10 +1720,14 @@ mod tests {
                 unavailable_slot(),
                 &mut processor,
                 std::time::Duration::from_secs(60),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                &[],
             ),
         )
         .await
-        .expect("a genuine fill error must not wait on the processor");
+        .expect("a genuine fill error must not wait on the processor")
+        .expect("the lock is held");
 
         match outcome {
             Supervision::BackfillFailed(error) => {
@@ -1715,10 +1752,14 @@ mod tests {
                 IndexerError::Backfill(crate::error::BackfillError::ChannelSend("closed".into())),
                 &mut processor,
                 std::time::Duration::from_millis(50),
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+                &[],
             ),
         )
         .await
-        .expect("the wait on the processor must be bounded");
+        .expect("the wait on the processor must be bounded")
+        .expect("the lock is held");
 
         assert!(
             matches!(
@@ -1730,6 +1771,56 @@ mod tests {
             "a processor that never ends must fall back to the fill error"
         );
         processor.abort();
+    }
+
+    /// A lock lost while waiting on the processor stops the writers at once, without a flush.
+    #[tokio::test]
+    async fn backfill_attribution_wait_stops_writers_when_the_lock_is_lost() {
+        let (flushed, tx, checkpoint) = checkpoint_writer_stub();
+        let mut processor = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+        let writers = [processor.abort_handle(), checkpoint.abort_handle()];
+        let lost = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let canceller = lost.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            attribute_backfill_failure(
+                IndexerError::Backfill(crate::error::BackfillError::ChannelSend("closed".into())),
+                &mut processor,
+                std::time::Duration::from_secs(60),
+                &lost,
+                &shutdown,
+                &writers,
+            ),
+        )
+        .await
+        .expect("a lost lock must cut the wait short");
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+            ),
+            "a lock lost during the wait must report the lost lock"
+        );
+        assert!(
+            writers.iter().all(|w| w.is_finished()),
+            "both writers must be stopped"
+        );
+        assert!(
+            !flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "no checkpoint flush may land after the lock is lost"
+        );
     }
 
     /// A drain under a held lock runs to completion and the writer flushes.
