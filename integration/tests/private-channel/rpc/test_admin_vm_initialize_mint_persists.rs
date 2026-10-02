@@ -81,11 +81,7 @@ fn assert_balances_aligned(tx_json: &serde_json::Value, label: &str) {
 }
 
 /// Fetch and unpack the on-chain Mint at `pubkey`, asserting its decimals.
-async fn assert_mint_decimals(
-    ctx: &PrivateChannelContext,
-    pubkey: &solana_sdk::pubkey::Pubkey,
-    label: &str,
-) {
+async fn assert_mint_decimals(ctx: &PrivateChannelContext, pubkey: &Pubkey, label: &str) {
     let account = ctx
         .read_client
         .get_account(pubkey)

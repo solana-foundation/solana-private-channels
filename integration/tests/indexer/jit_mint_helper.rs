@@ -655,9 +655,11 @@ async fn jit_returns_manual_review_when_backoff_recovers_with_authority_mismatch
 // Backoff exhausts with uninit reads — Transient.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Wall-clock note: this is the only test that pays the full
-// 4 × BACKOFF_MS = ~750 ms for the backoff loop; do not duplicate this
-// shape elsewhere.
+// Wall-clock note: this and
+// `jit_returns_transient_when_post_confirm_backoff_exhausts_with_reserved`
+// are the only tests that pay the full 4 × BACKOFF_MS = ~750 ms for the
+// backoff loop. They cover the unconfirmed and confirmed branches, which
+// end with different messages. Do not duplicate this shape elsewhere.
 #[tokio::test]
 async fn jit_returns_transient_when_backoff_exhausts_with_uninit() {
     let Fixture {
@@ -808,6 +810,47 @@ async fn jit_post_confirm_polls_past_reserved_account() {
         "1 pre-check + 2 post-confirm reads"
     );
     assert_eq!(mock.call_count("sendTransaction"), 1);
+    mock.shutdown().await;
+}
+
+// InitializeMint confirmed, but every backoff read still sees the dataless
+// System account. JIT cannot confirm the mint, so the deposit is re-armed.
+#[tokio::test]
+async fn jit_returns_transient_when_post_confirm_backoff_exhausts_with_reserved() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    mock.enqueue("getSignatureStatuses", confirmed_status_reply());
+    for _ in 0..4 {
+        mock.enqueue(
+            "getAccountInfo",
+            account_info_reply_owned_by(&[], &system_program::ID),
+        );
+    }
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    match outcome {
+        JitOutcome::Transient(reason) => {
+            assert!(reason.contains("reads as uninitialized"), "got {reason:?}");
+        }
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
+    }
+    assert_eq!(
+        mock.call_count("getAccountInfo"),
+        5,
+        "1 pre-check + 4 post-confirm reads"
+    );
     mock.shutdown().await;
 }
 
