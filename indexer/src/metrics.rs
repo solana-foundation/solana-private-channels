@@ -403,6 +403,7 @@ pub fn init_labels(program_type: &str) {
         "jit_missing_claim_lease",
         "malformed_status_response",
         "status_poll_rpc_error",
+        "alert_queue_full",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }

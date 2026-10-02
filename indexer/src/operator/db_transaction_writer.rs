@@ -10,11 +10,11 @@ use private_channel_metrics::MetricLabel;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Webhook posts allowed in flight at once; past this an alert is dropped.
-const MAX_ALERTS_IN_FLIGHT: usize = 32;
+/// Alerts waiting for the webhook; past this an alert is dropped.
+const ALERT_QUEUE_CAPACITY: usize = 1024;
 
 /// DbTransactionWriter that receives transaction status updates from sender
 /// and writes them to the database
@@ -24,7 +24,9 @@ pub struct DbTransactionWriter {
     webhook_client: WebhookClient,
     webhook_url: Option<String>,
     program_type: ProgramType,
-    alert_permits: Arc<Semaphore>,
+    alert_tx: mpsc::Sender<TransactionStatusUpdate>,
+    /// Taken by `start`, which drains it beside the writes.
+    alert_rx: Option<mpsc::Receiver<TransactionStatusUpdate>>,
 }
 
 impl DbTransactionWriter {
@@ -39,13 +41,15 @@ impl DbTransactionWriter {
             WebhookRetryConfig::single_attempt(),
         )
         .expect("Failed to build webhook HTTP client");
+        let (alert_tx, alert_rx) = mpsc::channel(ALERT_QUEUE_CAPACITY);
         Self {
             storage,
             update_rx,
             webhook_client,
             webhook_url,
             program_type,
-            alert_permits: Arc::new(Semaphore::new(MAX_ALERTS_IN_FLIGHT)),
+            alert_tx,
+            alert_rx: Some(alert_rx),
         }
     }
 
@@ -53,15 +57,20 @@ impl DbTransactionWriter {
     pub async fn start(mut self) -> Result<(), StorageError> {
         info!("Starting StorageWriter");
 
-        while let Some(update) = self.update_rx.recv().await {
-            self.handle_update(update).await;
-        }
-
-        // Wait out posts still in flight, so a drain delivers every alert it accepted.
-        let _ = self
-            .alert_permits
-            .acquire_many(MAX_ALERTS_IN_FLIGHT as u32)
-            .await;
+        // Delivery runs beside the writes in this task, so a slow endpoint never
+        // delays a status write and an abort stops both.
+        let deliveries = Self::deliver_alerts(
+            self.webhook_client.clone(),
+            self.webhook_url.clone(),
+            self.alert_rx.take(),
+        );
+        let writes = async move {
+            while let Some(update) = self.update_rx.recv().await {
+                self.handle_update(update).await;
+            }
+            // Dropping the writer here closes the alert queue, so delivery drains it and stops.
+        };
+        tokio::join!(writes, deliveries);
 
         info!("StorageWriter stopped");
         Ok(())
@@ -143,23 +152,30 @@ impl DbTransactionWriter {
                 error!("Transaction {} error: {}", update.transaction_id, err_msg);
             }
 
-            // Posted off the write path, so a slow endpoint never delays the next update.
-            if let Some(webhook_url) = &self.webhook_url {
-                match Arc::clone(&self.alert_permits).try_acquire_owned() {
-                    Ok(permit) => {
-                        let client = self.webhook_client.clone();
-                        let webhook_url = webhook_url.clone();
-                        tokio::spawn(async move {
-                            Self::send_webhook_alert(&client, &webhook_url, &update).await;
-                            drop(permit);
-                        });
-                    }
-                    Err(_) => warn!(
-                        transaction_id = update.transaction_id,
-                        "Alert webhook saturated; alert dropped"
-                    ),
+            // Queued off the write path, so a slow endpoint never delays the next update.
+            if self.webhook_url.is_some() {
+                let transaction_id = update.transaction_id;
+                if self.alert_tx.try_send(update).is_err() {
+                    warn!(transaction_id, "Alert queue full; alert dropped");
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "alert_queue_full"])
+                        .inc();
                 }
             }
+        }
+    }
+
+    /// Post queued alerts one at a time until the queue closes and drains.
+    async fn deliver_alerts(
+        client: WebhookClient,
+        webhook_url: Option<String>,
+        alerts: Option<mpsc::Receiver<TransactionStatusUpdate>>,
+    ) {
+        let (Some(webhook_url), Some(mut alerts)) = (webhook_url, alerts) else {
+            return;
+        };
+        while let Some(update) = alerts.recv().await {
+            Self::send_webhook_alert(&client, &webhook_url, &update).await;
         }
     }
 
@@ -647,6 +663,66 @@ mod tests {
             .unwrap();
 
         mock.assert();
+    }
+
+    /// A burst larger than the posts in flight still reaches a healthy endpoint
+    /// in full; a halt drain pages this way.
+    #[tokio::test]
+    async fn a_burst_of_alerts_is_delivered_in_full() {
+        let burst = 40;
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(burst as usize)
+            .create_async()
+            .await;
+
+        let (tx, rx) = mpsc::channel(burst as usize);
+        for transaction_id in 1..=burst {
+            tx.send(TransactionStatusUpdate {
+                transaction_id,
+                ..create_test_update(TransactionStatus::ManualReview)
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Withdraw)
+            .start()
+            .await
+            .unwrap();
+
+        mock.assert();
+    }
+
+    /// With the queue full, the next alert is dropped and counted, never waited on.
+    #[tokio::test]
+    async fn a_full_alert_queue_drops_the_overflow_and_counts_it() {
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        // Never started, so nothing drains the queue.
+        let writer = DbTransactionWriter::new(
+            storage,
+            rx,
+            Some("http://unused.invalid".to_string()),
+            ProgramType::Withdraw,
+        );
+
+        let dropped = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["withdraw", "alert_queue_full"]);
+        let before = dropped.get();
+        for transaction_id in 0..=ALERT_QUEUE_CAPACITY as i64 {
+            writer
+                .handle_update(TransactionStatusUpdate {
+                    transaction_id,
+                    ..create_test_update(TransactionStatus::ManualReview)
+                })
+                .await;
+        }
+
+        assert_eq!(dropped.get() - before, 1.0);
     }
 
     /// A webhook that accepts the connection but never answers must not hold

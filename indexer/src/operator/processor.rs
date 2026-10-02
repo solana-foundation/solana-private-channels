@@ -172,11 +172,13 @@ async fn quarantine_single(
     .await;
     match quarantined {
         Ok(true) => {}
+        // Both log the reason: with no alert sent, this line is its only record.
         Ok(false) => {
             warn!(
                 txn_id = transaction.id,
                 trace_id = %transaction.trace_id,
-                "Row moved past this incarnation before it was quarantined; leaving it"
+                reason = %error_message,
+                "Row is no longer this incarnation's Processing row; not alerting"
             );
             return;
         }
@@ -184,6 +186,7 @@ async fn quarantine_single(
             error!(
                 txn_id = transaction.id,
                 trace_id = %transaction.trace_id,
+                reason = %error_message,
                 "Quarantine write failed, leaving the row Processing for recovery: {e}"
             );
             return;
