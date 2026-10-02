@@ -148,7 +148,7 @@ const MR_AUTHORITY_MISMATCH_PRECHECK: &str =
 const MR_AUTHORITY_MISMATCH_POSTINIT: &str =
     "Mint instruction failed after JIT: mint_authority mismatch — race with concurrent admin rotation during InitializeMint";
 const MR_CORRUPT_MINT_STATE: &str =
-    "Mint instruction failed after JIT: corrupt mint state on-chain — decode failed";
+    "Mint instruction failed after JIT: corrupt mint state on-chain, not an SPL Mint";
 
 /// Attempt JIT mint initialization. Returns a `JitOutcome` verdict for the
 /// caller to dispatch (Retry / ManualReview / Transient).
@@ -296,15 +296,12 @@ pub(super) async fn try_jit_mint_initialization(
             // on this builder remaps to `Confirmed` without an RPC re-check.
             info!("InitializeMint transaction confirmed: {}", sig);
 
-            // Re-fetch and check authority — catches the race where another
+            // Re-fetch and check authority. Catches the race where another
             // party initialized the same mint with a different authority
-            // during our send window.
-            let check = match state.rpc_client.get_account(&mint).await {
-                Ok(account) => classify_mint_account(&account, &admin_pubkey),
-                Err(_) => {
-                    mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await
-                }
-            };
+            // during our send window. The backoff absorbs read lag, whether
+            // the stale read shows no account or the squatted one.
+            let check =
+                mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await;
             jit_verdict(check, instruction, &mint, None)
         }
         _ => {
@@ -386,12 +383,11 @@ fn jit_verdict(
     }
 }
 
-/// Read the mint on-chain with backoff, returning the `AuthorityCheck`
-/// from the first successful decode. Absorbs read-RPC lag after a racing
-/// InitializeMint. On exhausted attempts with no successful decode,
-/// returns `Uninitialized` (the most conservative "I couldn't confirm
-/// it's there" reading — caller maps this to Transient on the
-/// fallback path).
+/// Read the mint account from the private channel with backoff, returning the
+/// first `AuthorityCheck` that is not `Uninitialized`. Absorbs channel read
+/// lag after InitializeMint, whether it confirmed or not. On exhausted
+/// attempts, returns `Uninitialized` (the most conservative "I couldn't
+/// confirm it's there" reading, which both callers map to Transient).
 async fn mint_authority_check_with_backoff(
     rpc_client: &RpcClientWithRetry,
     mint: &Pubkey,
@@ -412,10 +408,7 @@ async fn mint_authority_check_with_backoff(
             }
             Err(e) => {
                 if attempt + 1 == ATTEMPTS {
-                    warn!(
-                        "RPC error re-checking mint {} after failed JIT init: {}",
-                        mint, e
-                    );
+                    warn!("RPC error re-checking mint {} after JIT init: {}", mint, e);
                 }
             }
         }

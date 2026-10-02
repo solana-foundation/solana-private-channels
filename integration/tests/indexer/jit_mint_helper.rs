@@ -3,7 +3,7 @@
 //! `test_hooks::jit_mint_init` wrapper.
 //!
 //! Drives the production helper against a scripted `MockRpcServer`, so the
-//! full code path — on-chain probe, `decode_and_check_authority` branching,
+//! full code path — on-chain probe, `classify_mint_account` branching,
 //! `InitializeMint` send, confirmation poll, post-init authority recheck,
 //! and backoff fallback — is exercised end-to-end rather than replayed by
 //! hand at the wire layer.
@@ -768,10 +768,10 @@ async fn jit_initializes_over_reserved_account_then_returns_retry() {
     mock.shutdown().await;
 }
 
-// Post-confirm re-read still sees the dataless System account. That is RPC
-// lag, not a broken mint, so the deposit is re-armed.
+// Post-confirm re-read still sees the dataless System account because the
+// read RPC lags. It keeps polling, and the next read finds the admin mint.
 #[tokio::test]
-async fn jit_returns_transient_when_post_confirm_reads_reserved_account() {
+async fn jit_post_confirm_polls_past_reserved_account() {
     let Fixture {
         mut state,
         mock,
@@ -790,15 +790,23 @@ async fn jit_returns_transient_when_post_confirm_reads_reserved_account() {
         "getAccountInfo",
         account_info_reply_owned_by(&[], &system_program::ID),
     );
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_owned_initialized_mint_bytes()),
+    );
 
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
-    match outcome {
-        JitOutcome::Transient(reason) => {
-            assert!(reason.contains("reads as uninitialized"), "got {reason:?}");
-        }
-        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
-    }
+    assert!(
+        matches!(outcome, JitOutcome::Retry(_)),
+        "expected Retry, got {:?}",
+        debug_outcome(&outcome)
+    );
+    assert_eq!(
+        mock.call_count("getAccountInfo"),
+        3,
+        "1 pre-check + 2 post-confirm reads"
+    );
     assert_eq!(mock.call_count("sendTransaction"), 1);
     mock.shutdown().await;
 }
