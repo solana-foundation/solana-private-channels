@@ -495,6 +495,11 @@ async fn run_resync(
     let common: CommonSection = figment.extract_inner("common")?;
     let storage: StorageSection = figment.extract_inner("storage")?;
     let indexer: IndexerSection = figment.extract_inner("indexer")?;
+    // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
+    private_channel_indexer::config::validate_rpc_batch_size(
+        "indexer.backfill.batch_size",
+        indexer.backfill.batch_size,
+    )?;
 
     // Get DATABASE_URL from environment
     let database_url =
