@@ -1361,21 +1361,6 @@ impl Gateway {
             "unknown"
         };
 
-        // --- RBAC enforcement ---
-        // Skipped on the internal listener: the operator services carry no JWT,
-        // and they need the raw errors their confirmation handling routes on.
-        let params = json.get("params").cloned().unwrap_or(Value::Null);
-        let call_policy = match access {
-            Access::Internal => CallPolicy::passthrough(),
-            Access::Public => match self
-                .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
-                .await
-            {
-                Ok(policy) => policy,
-                Err(rejection) => return Ok(rejection),
-            },
-        };
-
         // isBlockhashValid must answer from the writer's own admission window.
         let (target_url, target_label) =
             if method == "sendTransaction" || method == "isBlockhashValid" {
@@ -1387,7 +1372,8 @@ impl Gateway {
             };
 
         // Public reads past the cap are shed at once, so a stalled read node can't fill the
-        // slots writes need. The permit lives as long as the exchange, streamed body included.
+        // slots writes need. Taken before auth, so the ownership fetch counts too, and held
+        // until the exchange ends, streamed body included.
         let read_permit = if access == Access::Public && target_label == "read" {
             match Arc::clone(&self.read_slots).try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -1408,6 +1394,21 @@ impl Gateway {
             }
         } else {
             None
+        };
+
+        // --- RBAC enforcement ---
+        // Skipped on the internal listener: the operator services carry no JWT,
+        // and they need the raw errors their confirmation handling routes on.
+        let params = json.get("params").cloned().unwrap_or(Value::Null);
+        let call_policy = match access {
+            Access::Internal => CallPolicy::passthrough(),
+            Access::Public => match self
+                .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
+                .await
+            {
+                Ok(policy) => policy,
+                Err(rejection) => return Ok(rejection),
+            },
         };
 
         let uri = match target_url.parse::<hyper::Uri>() {
@@ -2753,6 +2754,40 @@ mod tests {
             elapsed >= Duration::from_millis(250),
             "expected the fetch deadline to fire, got a reply after {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ownership_fetch_counts_against_the_read_cap() {
+        // A gated read stalls in its ownership fetch while holding the only read slot.
+        let backend = start_black_hole_backend().await;
+        let addr = start_auth_gateway(
+            &format!("http://{backend}"),
+            Limits {
+                max_connections: NonZeroUsize::new(2).unwrap(),
+                auth_fetch_timeout: Duration::from_secs(5),
+                ..one_read_slot()
+            },
+        )
+        .await;
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(gated_request(&user_token()).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A second gated read is shed at once instead of queuing a second fetch.
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        shed.write_all(gated_request(&user_token()).as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut shed).await, 503);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // That leaves the second connection slot for a write; 502 means it was served,
+        // since this gateway's write node is unreachable.
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 502);
     }
 
     #[tokio::test]
