@@ -12,6 +12,8 @@
 //!      exists with the declared decimals/authority, and the spl_token program
 //!      account is not clobbered.
 //!   2. One admin tx with two InitializeMint instructions - both mints persist.
+//!   3. Someone sends lamports to the mint address first. InitializeMint still
+//!      lands over that dataless System account and keeps its lamport.
 
 use {
     super::{
@@ -25,6 +27,8 @@ use {
         signature::{Keypair, Signer},
         transaction::Transaction,
     },
+    solana_sdk_ids::system_program,
+    solana_system_interface::instruction as system_instruction,
     spl_token::state::Mint,
     std::time::Duration,
 };
@@ -34,6 +38,7 @@ pub async fn run_admin_vm_initialize_mint_persists_test(ctx: &PrivateChannelCont
 
     case_single_mint_persists(ctx).await;
     case_two_mints_persist(ctx).await;
+    case_reserved_target_initializes(ctx).await;
 
     println!("✓ AdminVm mint-persistence tests passed");
 }
@@ -203,4 +208,55 @@ async fn case_two_mints_persist(ctx: &PrivateChannelContext) {
     assert_mint_decimals(ctx, &mint_a.pubkey(), "case 2 mint_a").await;
     assert_mint_decimals(ctx, &mint_b.pubkey(), "case 2 mint_b").await;
     println!("  ✓ case 2: two InitializeMint instructions both persist");
+}
+
+/// Someone sends 1 lamport to a future mint address, leaving a dataless System
+/// account there. The admin's InitializeMint still lands and keeps the lamport.
+async fn case_reserved_target_initializes(ctx: &PrivateChannelContext) {
+    let mint = Keypair::new();
+    let wait = Duration::from_secs(SEND_AND_CHECK_DURATION_SECONDS);
+
+    // Execution is gasless, so any fresh key can do this.
+    let squatter = Keypair::new();
+    let blockhash = ctx.get_blockhash().await.unwrap();
+    let squat_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &squatter.pubkey(),
+            &mint.pubkey(),
+            1,
+        )],
+        Some(&squatter.pubkey()),
+        &[&squatter],
+        blockhash,
+    );
+    ctx.send_and_check(&squat_tx, wait)
+        .await
+        .expect("send_and_check should not error")
+        .expect("squat transfer should land");
+    let reserved = ctx
+        .read_client
+        .get_account(&mint.pubkey())
+        .await
+        .expect("case 3: the squat must leave an account at the mint address");
+    assert_eq!(*reserved.owner(), system_program::ID);
+    assert!(reserved.data().is_empty());
+
+    let blockhash = ctx.get_blockhash().await.unwrap();
+    let init_tx = setup::create_mint_account_transaction(
+        &ctx.operator_key,
+        &mint,
+        &ctx.operator_key.pubkey(),
+        MINT_DECIMALS,
+        blockhash,
+    );
+    ctx.send_and_check(&init_tx, wait)
+        .await
+        .expect("send_and_check should not error")
+        .expect("InitializeMint should land");
+
+    assert_mint_decimals(ctx, &mint.pubkey(), "case 3").await;
+    let account = ctx.read_client.get_account(&mint.pubkey()).await.unwrap();
+    assert_eq!(*account.owner(), spl_token::id());
+    assert_eq!(account.lamports(), 1, "the squatted lamport is kept");
+    println!("  ✓ case 3: InitializeMint lands over a squatted mint address");
 }

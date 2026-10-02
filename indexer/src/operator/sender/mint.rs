@@ -10,9 +10,11 @@ use crate::operator::{
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
 use solana_keychain::SolanaSigner;
+use solana_sdk::account::Account;
 use solana_sdk::program_option::COption;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::parse_instruction::ParsedInstruction;
 use solana_transaction_status::{
     EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiParsedInstruction,
@@ -71,12 +73,13 @@ pub(super) enum AuthorityCheck {
     /// error context. Quarantine to ManualReview.
     Mismatch(Pubkey),
     /// Mint decoded but `is_initialized = false`. The account is allocated
-    /// and SPL-Token-owned but not yet a mint. JIT proceeds to
-    /// InitializeMint.
+    /// and SPL-Token-owned but not yet a mint. Also a dataless System
+    /// account. JIT proceeds to InitializeMint.
     Uninitialized,
-    /// Decode failed: data length wrong, COption discriminant invalid, or
-    /// other corruption. Quarantine to ManualReview — the operator cannot
-    /// recover this without engineering intervention.
+    /// Not SPL-Token-owned, or decode failed: data length wrong, COption
+    /// discriminant invalid, or other corruption. Quarantine to
+    /// ManualReview — the operator cannot recover this without engineering
+    /// intervention.
     CorruptData,
 }
 
@@ -120,6 +123,23 @@ pub(super) fn decode_and_check_authority(
     }
 }
 
+/// Classify the account at a mint address. Mirrors the targets AdminVm
+/// accepts: a dataless System account, which anyone can leave there by
+/// sending it lamports, reads as `Uninitialized`. Any other owner but SPL
+/// Token is `CorruptData`.
+pub(super) fn classify_mint_account(
+    account: &Account,
+    expected_authority: &Pubkey,
+) -> AuthorityCheck {
+    if account.owner == SYSTEM_PROGRAM_ID && account.data.is_empty() {
+        return AuthorityCheck::Uninitialized;
+    }
+    if account.owner != spl_token::id() {
+        return AuthorityCheck::CorruptData;
+    }
+    decode_and_check_authority(&account.data, expected_authority)
+}
+
 // Operator-visible error_message literals constructed in this file.
 // Pinned by `drill_1_error_message_contracts_present_in_source` and the
 // runbook dispatch tables in `docs/runbooks/deposit_manual_review.md`.
@@ -154,8 +174,8 @@ pub(super) async fn try_jit_mint_initialization(
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
     // 2. Pre-check on-chain mint state.
-    match state.rpc_client.get_account_data(&mint).await {
-        Ok(data) => match decode_and_check_authority(&data, &admin_pubkey) {
+    match state.rpc_client.get_account(&mint).await {
+        Ok(account) => match classify_mint_account(&account, &admin_pubkey) {
             AuthorityCheck::Match => return JitOutcome::Retry(instruction),
             AuthorityCheck::Mismatch(actual) => {
                 warn!(
@@ -165,10 +185,7 @@ pub(super) async fn try_jit_mint_initialization(
                 return JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_PRECHECK.to_string());
             }
             AuthorityCheck::CorruptData => {
-                warn!(
-                    "JIT pre-check: mint {} bytes do not decode as SPL Mint",
-                    mint
-                );
+                warn!("JIT pre-check: mint {} is not an SPL Mint", mint);
                 return JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string());
             }
             AuthorityCheck::Uninitialized => {
@@ -282,8 +299,8 @@ pub(super) async fn try_jit_mint_initialization(
             // Re-fetch and check authority — catches the race where another
             // party initialized the same mint with a different authority
             // during our send window.
-            let check = match state.rpc_client.get_account_data(&mint).await {
-                Ok(data) => decode_and_check_authority(&data, &admin_pubkey),
+            let check = match state.rpc_client.get_account(&mint).await {
+                Ok(account) => classify_mint_account(&account, &admin_pubkey),
                 Err(_) => {
                     mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await
                 }
@@ -342,7 +359,7 @@ fn jit_verdict(
             JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_POSTINIT.to_string())
         }
         AuthorityCheck::CorruptData => {
-            warn!("JIT: mint {} bytes do not decode as SPL Mint", mint);
+            warn!("JIT: mint {} is not an SPL Mint", mint);
             JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string())
         }
         AuthorityCheck::Uninitialized => match fallback_result {
@@ -385,9 +402,9 @@ async fn mint_authority_check_with_backoff(
 
     let mut last_check = AuthorityCheck::Uninitialized;
     for attempt in 0..ATTEMPTS {
-        match rpc_client.get_account_data(mint).await {
-            Ok(data) => {
-                let check = decode_and_check_authority(&data, expected_authority);
+        match rpc_client.get_account(mint).await {
+            Ok(account) => {
+                let check = classify_mint_account(&account, expected_authority);
                 if !matches!(check, AuthorityCheck::Uninitialized) {
                     return check;
                 }
@@ -959,16 +976,18 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_and_check_authority, AuthorityCheck};
+    use super::{
+        classify_mint_account, decode_and_check_authority, AuthorityCheck, SYSTEM_PROGRAM_ID,
+    };
+    use solana_sdk::account::Account;
     use solana_sdk::pubkey::Pubkey;
     use spl_token::solana_program::program_option::COption;
     use spl_token::solana_program::program_pack::Pack;
     use spl_token::state::Mint;
 
-    // Tests for `decode_and_check_authority`, the pure helper that drives
-    // the JIT pre-check, post-confirm re-check, and fallback backoff. Four
-    // variants must each be reachable: Match / Mismatch / Uninitialized /
-    // CorruptData.
+    // Tests for `decode_and_check_authority`, the byte decoder behind
+    // `classify_mint_account`. Four variants must each be reachable:
+    // Match / Mismatch / Uninitialized / CorruptData.
 
     fn pack_mint(is_initialized: bool, authority: COption<Pubkey>) -> Vec<u8> {
         let mint = Mint {
@@ -1073,6 +1092,57 @@ mod tests {
         assert_eq!(
             decode_and_check_authority(&data, &admin),
             AuthorityCheck::CorruptData
+        );
+    }
+
+    // Tests for `classify_mint_account`, which adds the owner checks.
+
+    fn account_with(owner: Pubkey, data: Vec<u8>) -> Account {
+        Account {
+            lamports: 1,
+            data,
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// Anyone can leave a dataless System account at a mint address by
+    /// sending it lamports. The mint is still not created.
+    #[test]
+    fn classify_mint_account_system_dataless_returns_uninitialized() {
+        let account = account_with(SYSTEM_PROGRAM_ID, vec![]);
+        assert_eq!(
+            classify_mint_account(&account, &Pubkey::new_unique()),
+            AuthorityCheck::Uninitialized
+        );
+    }
+
+    /// Any other account not owned by SPL Token is not a mint, and AdminVm
+    /// would refuse to initialize over it.
+    #[test]
+    fn classify_mint_account_non_token_owner_returns_corrupt() {
+        let admin = Pubkey::new_unique();
+        let program_owned = account_with(Pubkey::new_unique(), vec![]);
+        let system_with_data = account_with(SYSTEM_PROGRAM_ID, vec![0u8; Mint::LEN]);
+        assert_eq!(
+            classify_mint_account(&program_owned, &admin),
+            AuthorityCheck::CorruptData
+        );
+        assert_eq!(
+            classify_mint_account(&system_with_data, &admin),
+            AuthorityCheck::CorruptData
+        );
+    }
+
+    /// A token-owned account is decoded as before.
+    #[test]
+    fn classify_mint_account_token_owned_mint_returns_match() {
+        let admin = Pubkey::new_unique();
+        let account = account_with(spl_token::id(), pack_mint(true, COption::Some(admin)));
+        assert_eq!(
+            classify_mint_account(&account, &admin),
+            AuthorityCheck::Match
         );
     }
 }
