@@ -343,10 +343,16 @@ impl IndexerConfig {
             return Err("backfill.backfill_only requires backfill.enabled to be true".to_string());
         }
 
-        if let Some(rpc_polling) = &self.rpc_polling {
-            validate_rpc_batch_size("indexer.rpc_polling.batch_size", rpc_polling.batch_size)?;
+        // Each batch size is checked only where it feeds RPC batches. Yellowstone gap repair
+        // fills with the backfill batch size even when backfill itself is off.
+        if self.datasource_type == DatasourceType::RpcPolling {
+            if let Some(rpc_polling) = &self.rpc_polling {
+                validate_rpc_batch_size("indexer.rpc_polling.batch_size", rpc_polling.batch_size)?;
+            }
         }
-        validate_rpc_batch_size("indexer.backfill.batch_size", self.backfill.batch_size)?;
+        if self.backfill.enabled || self.datasource_type == DatasourceType::Yellowstone {
+            validate_rpc_batch_size("indexer.backfill.batch_size", self.backfill.batch_size)?;
+        }
 
         Ok(())
     }
@@ -789,6 +795,39 @@ mod tests {
                 "error must give the reason, got: {err}"
             );
         }
+    }
+
+    /// A batch size no RPC batch can use does not block startup; the one gap repair uses still does.
+    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+    #[test]
+    fn validate_checks_each_batch_size_only_where_it_is_used() {
+        let mut polling = create_indexer_config();
+        polling.backfill.enabled = false;
+        polling.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+        assert!(
+            polling.validate().is_ok(),
+            "backfill is off and the live poller ignores its batch size"
+        );
+
+        let mut streaming = create_indexer_config();
+        streaming.datasource_type = DatasourceType::Yellowstone;
+        streaming.yellowstone = Some(YellowstoneConfig {
+            endpoint: "http://localhost:10000".to_string(),
+            x_token: None,
+            commitment: "finalized".to_string(),
+        });
+        streaming.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE + 1;
+        assert!(
+            streaming.validate().is_ok(),
+            "the Yellowstone datasource never runs the live poller"
+        );
+
+        streaming.backfill.enabled = false;
+        streaming.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+        let err = streaming
+            .validate()
+            .expect_err("gap repair reads the backfill batch size even with backfill off");
+        assert!(err.contains("indexer.backfill.batch_size"), "got: {err}");
     }
 
     /// The defaults and the ceiling itself are accepted.
