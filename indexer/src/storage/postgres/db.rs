@@ -2213,6 +2213,30 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// CAS `Processing` → `Failed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_fail_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'failed',
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
     ///
     /// The optional signature arrays are persisted by the same statement rather

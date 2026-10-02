@@ -53,6 +53,7 @@ pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_complete_stalled_withdrawal;
+pub mod try_fail_processing;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -641,6 +642,15 @@ impl Storage {
             release_signatures,
         )
         .await
+    }
+
+    /// CAS `Processing` → `Failed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_fail_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_fail_processing::try_fail_processing(self, transaction_id, expected_updated_at).await
     }
 
     /// CAS a stalled withdrawal (`ManualReview` or `PendingRemint`) to
