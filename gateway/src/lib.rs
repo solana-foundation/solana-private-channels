@@ -34,6 +34,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
@@ -176,9 +177,9 @@ pub struct Args {
     )]
     pub auth_fetch_timeout_secs: u64,
 
-    /// Seconds a request may take from authorization until the client has the whole body,
-    /// 1 to 3600, so a slow client download can hit it even when the node answered promptly.
-    /// Past it: a 504, or a closed connection mid-body.
+    /// Seconds a request may take, from authorization until its response is written to the
+    /// client, 1 to 3600. A stalled node and a client that reads slowly or not at all hit it
+    /// alike: the caller gets a 504, or the connection is closed and its slots released.
     #[arg(
         long,
         env = "GATEWAY_UPSTREAM_TIMEOUT_SECS",
@@ -254,8 +255,8 @@ pub struct Limits {
     /// covering the request and the response body together. A hung read node
     /// fails the gated request with 503 instead of parking it.
     pub auth_fetch_timeout: Duration,
-    /// Max time for one request, from authorization through the upstream exchange. It includes
-    /// the client's download, so a slow client can trip `upstream_timeout` with a healthy node.
+    /// Max time per request, from authorization until the response is written to the client. A
+    /// client that reads slowly or stops reading can trip `upstream_timeout` with a healthy node.
     pub upstream_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
@@ -508,6 +509,103 @@ impl Body for DeadlineBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// Deadline for the response being written on one client connection.
+type WriteDeadline = Arc<Mutex<Option<tokio::time::Instant>>>;
+
+/// Client socket whose writes fail once the current response's deadline passes. hyper stops
+/// polling the response body while a client isn't reading, so the deadline has to fire here.
+struct DeadlineIo<T> {
+    inner: T,
+    deadline: WriteDeadline,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> DeadlineIo<T> {
+    fn new(inner: T, deadline: WriteDeadline) -> Self {
+        Self {
+            inner,
+            deadline,
+            sleep: None,
+        }
+    }
+
+    /// Passes a write result through, failing it if it is stuck past the deadline. A stuck
+    /// write also arms a timer, so the connection is woken to fail even if nothing else happens.
+    fn bound<R>(
+        &mut self,
+        polled: Poll<std::io::Result<R>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<R>> {
+        if polled.is_ready() {
+            return polled;
+        }
+        let Some(deadline) = *self.deadline.lock().unwrap() else {
+            return polled;
+        };
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if sleep.deadline() != deadline {
+            sleep.as_mut().reset(deadline);
+        }
+        if sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client did not read the response before the deadline",
+            )));
+        }
+        polled
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for DeadlineIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for DeadlineIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.bound(polled, cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.bound(polled, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_flush(cx);
+        this.bound(polled, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.bound(polled, cx)
     }
 }
 
@@ -1139,9 +1237,13 @@ impl Gateway {
         rate_key: IpAddr,
         rate_limiter: Arc<IpRateLimiter>,
         access: Access,
+        write_deadline: WriteDeadline,
     ) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>>, hyper::Error>
     {
         let start = Instant::now();
+        // Every response must reach the client within the timeout, or the connection is closed.
+        *write_deadline.lock().unwrap() =
+            Some(tokio::time::Instant::now() + self.limits.upstream_timeout);
 
         if req.method() == hyper::Method::OPTIONS {
             return Ok(Response::builder()
@@ -1406,6 +1508,7 @@ impl Gateway {
         // One deadline covers authorization and the upstream exchange, so a stalled auth
         // database can't hold the connection or read permit any longer than a stalled node.
         let deadline = tokio::time::Instant::now() + self.limits.upstream_timeout;
+        *write_deadline.lock().unwrap() = Some(deadline);
         let call_policy = match access {
             Access::Internal => CallPolicy::passthrough(),
             Access::Public => {
@@ -1691,7 +1794,8 @@ pub async fn serve(
             warn!("Failed to set TCP keepalive for {ip}: {e}");
         }
 
-        let io = TokioIo::new(stream);
+        let write_deadline: WriteDeadline = Arc::new(Mutex::new(None));
+        let io = TokioIo::new(DeadlineIo::new(stream, Arc::clone(&write_deadline)));
         let gateway = Arc::clone(&gateway);
         let rate_limiter = Arc::clone(&rate_limiter);
 
@@ -1703,9 +1807,10 @@ pub async fn serve(
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
                 let rate_limiter = Arc::clone(&rate_limiter);
+                let write_deadline = Arc::clone(&write_deadline);
                 async move {
                     gateway
-                        .handle_request(req, rate_key, rate_limiter, access)
+                        .handle_request(req, rate_key, rate_limiter, access, write_deadline)
                         .await
                 }
             });
@@ -2841,6 +2946,7 @@ mod tests {
         )
         .await;
 
+        let timeouts_before = errors_recorded(AUTH_TIMEOUT);
         let mut stalled = TcpStream::connect(addr).await.unwrap();
         let start = Instant::now();
         stalled
@@ -2849,6 +2955,7 @@ mod tests {
             .unwrap();
         assert_status(&read_to_close(&mut stalled).await, 504);
         assert_deadline_fired(start.elapsed());
+        assert!(errors_recorded(AUTH_TIMEOUT) > timeouts_before);
 
         // The read slot it held is free again.
         let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
@@ -2883,6 +2990,13 @@ mod tests {
 
         let response = send_raw(addr, gated_request(&user_token()).as_bytes()).await;
         assert_status(&response, 403);
+    }
+
+    /// Current value of an error-type counter; tests run in parallel, so only compare for growth.
+    fn errors_recorded(error_type: &str) -> f64 {
+        metrics::GATEWAY_ERRORS_TOTAL
+            .with_label_values(&[error_type])
+            .get()
     }
 
     /// Upstream deadline used by the stall tests below.
@@ -2931,6 +3045,12 @@ mod tests {
 
     /// Spawn a backend that sends headers and 10 of 64 body bytes, then stalls.
     async fn start_stalled_body_backend() -> SocketAddr {
+        start_partial_body_backend(true).await
+    }
+
+    /// Spawn a backend that sends headers and 10 of 64 body bytes, then stalls if `hold`,
+    /// or closes the connection if not.
+    async fn start_partial_body_backend(hold: bool) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -2944,11 +3064,184 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"jsonrpc\"",
                     )
                     .await;
-                held.push(stream);
+                if hold {
+                    held.push(stream);
+                }
             }
         });
 
         addr
+    }
+
+    #[tokio::test]
+    async fn redacted_body_read_failure_records_502() {
+        // The node closes mid-body, so collecting the page for redaction fails.
+        let backend = start_partial_body_backend(false).await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), Limits::default()).await;
+        let recorded = |status: &str| {
+            metrics::GATEWAY_REQUESTS_TOTAL
+                .with_label_values(&["getSignatureStatuses", "read", status])
+                .get()
+        };
+        let (ok_before, failed_before) = (recorded("200"), recorded("502"));
+
+        let response = send_raw(addr, rpc_request("getSignatureStatuses").as_bytes()).await;
+
+        assert_status(&response, 502);
+        assert!(recorded("502") > failed_before);
+        assert_eq!(recorded("200"), ok_before);
+    }
+
+    /// Body size large enough to fill every buffer between the gateway and a client that stops reading.
+    const LARGE_BODY: usize = 64 * 1024 * 1024;
+
+    /// Spawn a backend that answers every request with `len` bytes, sent as fast as the gateway takes them.
+    async fn start_large_body_backend(len: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'0'; 64 * 1024];
+                    let mut sent = 0;
+                    while sent < len {
+                        let n = chunk.len().min(len - sent);
+                        if stream.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        sent += n;
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    /// Connects with a small receive buffer, so the gateway's writes back up quickly.
+    async fn connect_small_window(addr: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.connect(addr).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn client_that_stops_reading_releases_its_slot() {
+        let read_node = start_large_body_backend(LARGE_BODY).await;
+        // One connection slot and one read slot, so a later read proves both were released.
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(1).unwrap(),
+                max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+                upstream_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Ask for a large body, then never read it.
+        let mut stuck = connect_small_window(addr).await;
+        stuck
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+
+        // Past the deadline the stuck exchange is gone, so an ordinary read is served.
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        next.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), next.read(&mut buf))
+            .await
+            .expect("the read should be served, not left waiting")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+        drop(next);
+
+        // The stuck client's connection was closed by the gateway, not left open.
+        read_to_close(&mut stuck).await;
+    }
+
+    #[tokio::test]
+    async fn slow_steady_reader_within_the_deadline_gets_the_whole_body() {
+        const BODY: usize = 8 * 1024 * 1024;
+        let read_node = start_large_body_backend(BODY).await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                upstream_timeout: Duration::from_secs(20),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A small window plus pauses keeps the gateway's writes waiting on this client.
+        let mut conn = connect_small_window(addr).await;
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut received = Vec::with_capacity(BODY + 1024);
+        let mut buf = vec![0u8; 64 * 1024];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a steady reader should finish well inside the deadline");
+
+        let head_end = received
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head")
+            + 4;
+        assert_eq!(
+            received.len() - head_end,
+            BODY,
+            "the body must arrive whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_keep_alive_outlives_the_write_deadline() {
+        // Every request arms the write deadline, but it only acts on a response waiting on the client.
+        let addr =
+            start_gateway_with_limits("http://127.0.0.1:1", "http://127.0.0.1:1", stall_limits())
+                .await;
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        conn.write_all(request).await.unwrap();
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // Idle well past the deadline, then reuse the same connection.
+        tokio::time::sleep(DEADLINE * 3).await;
+        conn.write_all(request).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("the idle connection should still answer")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
     }
 
     #[tokio::test]
@@ -2962,6 +3255,18 @@ mod tests {
                 ("http://127.0.0.1:1", stalled.as_str())
             };
             let addr = start_gateway_with_limits(write_url, read_url, stall_limits()).await;
+
+            let target = if method == "sendTransaction" {
+                "write"
+            } else {
+                "read"
+            };
+            let recorded = || {
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method, target, "504"])
+                    .get()
+            };
+            let timeouts_before = recorded();
 
             // Two pipelined requests: the 504 must close the connection and drop the second.
             let mut conn = TcpStream::connect(addr).await.unwrap();
@@ -2979,6 +3284,7 @@ mod tests {
                 "{method}: the pipelined request must not be served: {response}"
             );
             assert_deadline_fired(start.elapsed());
+            assert!(recorded() > timeouts_before);
         }
     }
 
@@ -2992,12 +3298,14 @@ mod tests {
         )
         .await;
 
+        let timeouts_before = errors_recorded(UPSTREAM_TIMEOUT);
         let mut conn = TcpStream::connect(addr).await.unwrap();
         let start = Instant::now();
         conn.write_all(rpc_request("getSlot").as_bytes())
             .await
             .unwrap();
         let response = read_to_close(&mut conn).await;
+        assert!(errors_recorded(UPSTREAM_TIMEOUT) > timeouts_before);
 
         // Headers were already sent, so the only signal left is a body shorter than declared.
         assert_status(&response, 200);
@@ -3098,6 +3406,9 @@ mod tests {
         )
         .await;
         let _held = hold_read_slot(addr).await;
+        let shed_before = metrics::GATEWAY_REJECTED_TOTAL
+            .with_label_values(&[READ_CAPACITY])
+            .get();
 
         let mut conn = TcpStream::connect(addr).await.unwrap();
         let start = Instant::now();
@@ -3108,6 +3419,12 @@ mod tests {
 
         // Shed at once and closed, not queued behind the stalled read.
         assert_status(&response, 503);
+        assert!(
+            metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&[READ_CAPACITY])
+                .get()
+                > shed_before
+        );
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "an over-capacity read must be shed at once, took {:?}",
@@ -3353,6 +3670,32 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
             Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"x")))))
         }
+    }
+
+    #[tokio::test]
+    async fn write_deadline_closes_a_connection_whose_client_stopped_reading() {
+        // A small pipe the client never reads, and a body that always has data, so hyper's
+        // write buffer fills and it stops polling the body.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let deadline: WriteDeadline = Arc::new(Mutex::new(Some(
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        )));
+        let service = service_fn(|_req| async {
+            Ok::<_, std::convert::Infallible>(Response::new(EndlessBody))
+        });
+        let conn = http1::Builder::new()
+            .serve_connection(TokioIo::new(DeadlineIo::new(server, deadline)), service);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(2), conn)
+            .await
+            .expect("the connection should end once the write deadline passes");
+        assert!(result.is_err(), "a stuck write must fail the connection");
+        assert!(start.elapsed() >= Duration::from_millis(150));
     }
 
     #[tokio::test]

@@ -63,7 +63,7 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | `--write-url` | `GATEWAY_WRITE_URL` | — | Write node URL |
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
-| `--upstream-timeout-secs` | `GATEWAY_UPSTREAM_TIMEOUT_SECS` | `30` | Max seconds (1 to 3600) for one request, from authorization (auth database and ownership fetch) through the write or read node's headers and body; past it the caller gets a 504, or a closed connection if the body had started. It runs until the client has the whole body, so a slow client download can hit it and show as `upstream_timeout` even when the node answered promptly |
+| `--upstream-timeout-secs` | `GATEWAY_UPSTREAM_TIMEOUT_SECS` | `30` | Max seconds (1 to 3600) per request, from authorization (auth database and ownership fetch) until the response has been written to the client's socket. Past it the caller gets a 504, or, once the body has started, the connection is closed; either way the read slot, connection slot and upstream socket are released. It applies whether the node stalls or the client reads slowly or stops reading, so a slow client can show as `upstream_timeout` even when the node answered promptly |
 | `--max-forwarded-reads` | `GATEWAY_MAX_FORWARDED_READS` | `768` | Max public requests in flight to the read node; more are shed at once with a 503 and a closed connection, so writes keep free connection slots. Must be below `GATEWAY_MAX_CONNECTIONS` |
 
 Routes `sendTransaction` and `isBlockhashValid` to the write node; all other RPC methods go to the read node.
