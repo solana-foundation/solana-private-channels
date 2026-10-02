@@ -45,6 +45,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Metric error type for a forwarded request that ran past `Limits::upstream_timeout`.
 const UPSTREAM_TIMEOUT: &str = "upstream_timeout";
 
+/// Metric error type for authorization that ran past `Limits::upstream_timeout`.
+const AUTH_TIMEOUT: &str = "auth_timeout";
+
 /// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
 const READ_CAPACITY: &str = "read_capacity";
 
@@ -173,9 +176,9 @@ pub struct Args {
     )]
     pub auth_fetch_timeout_secs: u64,
 
-    /// Seconds a forwarded request may take, headers and body, 1 to 3600. It runs until the
-    /// client has the whole body, so a slow client download can hit it even when the node
-    /// answered promptly. Past it: a 504, or a closed connection mid-body.
+    /// Seconds a request may take from authorization until the client has the whole body,
+    /// 1 to 3600, so a slow client download can hit it even when the node answered promptly.
+    /// Past it: a 504, or a closed connection mid-body.
     #[arg(
         long,
         env = "GATEWAY_UPSTREAM_TIMEOUT_SECS",
@@ -251,8 +254,8 @@ pub struct Limits {
     /// covering the request and the response body together. A hung read node
     /// fails the gated request with 503 instead of parking it.
     pub auth_fetch_timeout: Duration,
-    /// Max time for one forwarded request's exchange, headers and body. It includes the
-    /// client's download, so a slow client can trip `upstream_timeout` with a healthy node.
+    /// Max time for one request, from authorization through the upstream exchange. It includes
+    /// the client's download, so a slow client can trip `upstream_timeout` with a healthy node.
     pub upstream_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
@@ -1400,15 +1403,33 @@ impl Gateway {
         // Skipped on the internal listener: the operator services carry no JWT,
         // and they need the raw errors their confirmation handling routes on.
         let params = json.get("params").cloned().unwrap_or(Value::Null);
+        // One deadline covers authorization and the upstream exchange, so a stalled auth
+        // database can't hold the connection or read permit any longer than a stalled node.
+        let deadline = tokio::time::Instant::now() + self.limits.upstream_timeout;
         let call_policy = match access {
             Access::Internal => CallPolicy::passthrough(),
-            Access::Public => match self
-                .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
-                .await
-            {
-                Ok(policy) => policy,
-                Err(rejection) => return Ok(rejection),
-            },
+            Access::Public => {
+                let auth =
+                    self.enforce_auth(auth_header.as_deref(), method, method_label, &params, start);
+                match tokio::time::timeout_at(deadline, auth).await {
+                    Ok(Ok(policy)) => policy,
+                    Ok(Err(rejection)) => return Ok(rejection),
+                    Err(_) => {
+                        warn!(
+                            "Authorization for {} did not finish within {:?}",
+                            method, self.limits.upstream_timeout
+                        );
+                        Self::record_metrics(
+                            Some(AUTH_TIMEOUT),
+                            method_label,
+                            "none",
+                            "504",
+                            start.elapsed().as_secs_f64(),
+                        );
+                        return Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None));
+                    }
+                }
+            }
         };
 
         let uri = match target_url.parse::<hyper::Uri>() {
@@ -1458,8 +1479,6 @@ impl Gateway {
             }
         };
 
-        // One deadline covers the headers and the body, so a stalled node can't pin the connection.
-        let deadline = tokio::time::Instant::now() + self.limits.upstream_timeout;
         match tokio::time::timeout_at(deadline, self.client.request(forwarded_req)).await {
             Ok(Ok(response)) => {
                 let status = response.status().as_u16().to_string();
@@ -2647,13 +2666,25 @@ mod tests {
     /// Start a gateway with auth enforcement on. The auth pool is lazy and never
     /// connects: every path these tests exercise rejects before any DB query.
     async fn start_auth_gateway(read_url: &str, limits: Limits) -> SocketAddr {
+        start_auth_gateway_with_db(
+            read_url,
+            "postgres://postgres:password@127.0.0.1:1/unused",
+            limits,
+        )
+        .await
+    }
+
+    /// Like `start_auth_gateway`, with the auth database at `db_url`.
+    async fn start_auth_gateway_with_db(
+        read_url: &str,
+        db_url: &str,
+        limits: Limits,
+    ) -> SocketAddr {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
-        let auth_db = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:password@127.0.0.1:1/unused")
-            .unwrap();
+        let auth_db = PgPoolOptions::new().connect_lazy(db_url).unwrap();
         let gateway = Arc::new(
             Gateway::new(
                 "http://127.0.0.1:1".to_string(),
@@ -2677,9 +2708,14 @@ mod tests {
     /// Mint a User-role JWT the gateway accepts, so a gated request gets as far
     /// as the ownership account fetch.
     fn user_token() -> String {
+        token_with_role("user")
+    }
+
+    /// Mint a JWT the gateway accepts for `role`.
+    fn token_with_role(role: &str) -> String {
         let claims = json!({
             "sub": "11111111-1111-4111-8111-111111111111",
-            "role": "user",
+            "role": role,
             "exp": (Utc::now().timestamp() + 3600) as usize,
             "iss": "private-channel-auth",
             "aud": "private-channel-gateway",
@@ -2788,6 +2824,35 @@ mod tests {
         // since this gateway's write node is unreachable.
         let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
         assert_status(&response, 502);
+    }
+
+    #[tokio::test]
+    async fn stalled_auth_database_is_bounded_by_the_deadline() {
+        // The auth database accepts connections and never answers, so the operator role check hangs.
+        let auth_db = start_black_hole_backend().await;
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let addr = start_auth_gateway_with_db(
+            &format!("http://{read_node}"),
+            &format!("postgres://postgres:password@{auth_db}/unused"),
+            Limits {
+                max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+                ..stall_limits()
+            },
+        )
+        .await;
+
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        stalled
+            .write_all(gated_request(&token_with_role("operator")).as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut stalled).await, 504);
+        assert_deadline_fired(start.elapsed());
+
+        // The read slot it held is free again.
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
     }
 
     #[tokio::test]
