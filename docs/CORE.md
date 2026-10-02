@@ -229,6 +229,8 @@ The AdminVM (used for operator mint operations) only supports SPL Token `Initial
 
 An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, a second guard behind the ingress check that refuses any transaction listing the native mint.
 
+An `InitializeMint` over a System-owned account with no data, which anyone can create by sending the address lamports, succeeds and keeps the account's lamports.
+
 **Source**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 
 ## Limitations
