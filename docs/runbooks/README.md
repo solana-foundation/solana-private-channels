@@ -63,7 +63,9 @@ dispatch table below routes by webhook + `transaction_type`.
 The **alert webhook** in `db_transaction_writer.rs` is the only
 configured paging mechanism today. It fires on `Failed`,
 `FailedReminted`, and `ManualReview` status transitions (single attempt,
-no retries). All dispatch below is keyed on the webhook payload.
+no retries). Posts run off the status-write path, at most 32 at once; past
+that an alert is dropped, but its ERROR log line still fires. All dispatch
+below is keyed on the webhook payload.
 
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|
