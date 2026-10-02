@@ -129,6 +129,21 @@ pub fn floor_operator_commitment(level: CommitmentLevel) -> Result<CommitmentLev
     }
 }
 
+/// Largest `batch_size` for any batch of RPC block reads; the request deadline is sized for this.
+pub const MAX_RPC_BATCH_SIZE: usize = 100;
+
+/// Rejects a batch size larger than the request deadline was sized for.
+pub fn validate_rpc_batch_size(field: &str, batch_size: usize) -> Result<(), String> {
+    if batch_size > MAX_RPC_BATCH_SIZE {
+        return Err(format!(
+            "{field} = {batch_size} exceeds {MAX_RPC_BATCH_SIZE}: every RPC request has a fixed \
+             deadline sized for a batch of at most {MAX_RPC_BATCH_SIZE} blocks, so a larger batch \
+             would time out on every retry"
+        ));
+    }
+    Ok(())
+}
+
 /// Backfill configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackfillConfig {
@@ -327,6 +342,11 @@ impl IndexerConfig {
         if self.backfill.exit_after_backfill && !self.backfill.enabled {
             return Err("backfill.backfill_only requires backfill.enabled to be true".to_string());
         }
+
+        if let Some(rpc_polling) = &self.rpc_polling {
+            validate_rpc_batch_size("indexer.rpc_polling.batch_size", rpc_polling.batch_size)?;
+        }
+        validate_rpc_batch_size("indexer.backfill.batch_size", self.backfill.batch_size)?;
 
         Ok(())
     }
@@ -745,6 +765,45 @@ mod tests {
 
         config.backfill.enabled = true;
         assert!(config.validate().is_ok(), "the enabled pair must validate");
+    }
+
+    /// Every batch fed to the RPC poller is capped, and the error names the deadline as the reason.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_rpc_batches_above_the_ceiling() {
+        let mut live = create_indexer_config();
+        live.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE + 1;
+        let mut backfill = create_indexer_config();
+        backfill.backfill.batch_size = MAX_RPC_BATCH_SIZE + 1;
+
+        for (field, config) in [
+            ("indexer.rpc_polling.batch_size", live),
+            ("indexer.backfill.batch_size", backfill),
+        ] {
+            let err = config
+                .validate()
+                .expect_err("a batch above the ceiling must not validate");
+            assert!(err.contains(field), "error must name {field}, got: {err}");
+            assert!(
+                err.contains("deadline"),
+                "error must give the reason, got: {err}"
+            );
+        }
+    }
+
+    /// The defaults and the ceiling itself are accepted.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_accepts_rpc_batches_up_to_the_ceiling() {
+        let mut config = create_indexer_config();
+        assert!(config.validate().is_ok(), "the defaults must validate");
+
+        config.rpc_polling.as_mut().unwrap().batch_size = MAX_RPC_BATCH_SIZE;
+        config.backfill.batch_size = MAX_RPC_BATCH_SIZE;
+        assert!(
+            config.validate().is_ok(),
+            "the ceiling itself must validate"
+        );
     }
 
     // ── operator operational commitment floor ───────────────────────────

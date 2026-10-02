@@ -526,6 +526,23 @@ pub mod stall_server {
         stall_first: usize,
         upstream: Option<String>,
     ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, upstream, move |index| index < stall_first).await
+    }
+
+    /// Like `stall_server`, but the first `forward_first` connections pipe to `upstream` and the rest hang.
+    pub async fn stall_server_after(
+        stall: Stall,
+        forward_first: usize,
+        upstream: String,
+    ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, Some(upstream), move |index| index >= forward_first).await
+    }
+
+    async fn serve(
+        stall: Stall,
+        upstream: Option<String>,
+        stalls: impl Fn(usize) -> bool + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -533,10 +550,10 @@ pub mod stall_server {
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 // Decided at accept time so a forwarded connection is never read here first.
-                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let stalled = stalls(counter.fetch_add(1, Ordering::SeqCst));
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
-                    if index < stall_first {
+                    if stalled {
                         hang(socket, stall).await;
                     } else if let Some(upstream) = upstream {
                         forward(socket, &upstream).await;

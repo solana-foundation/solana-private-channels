@@ -23,8 +23,9 @@ pub(crate) const MAX_LOOKAHEAD_SLOTS: u64 = MAX_IDLE_GAP_SLOTS * 10;
 /// instead of skipping it. https://solana.com/upgrades/larger-transaction-sizes
 const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
 
-/// Whole-request deadline, body included, so a stalled response becomes an error the caller retries.
-/// Sized from the measured worst case 100-block mainnet getBlock batch, about 30s, times 2.
+/// Whole-request deadline, body included, so a stalled response becomes an ordinary transport error.
+/// Sized for the largest allowed batch, `MAX_RPC_BATCH_SIZE`: a measured worst case of about 30s
+/// for 100 full mainnet blocks, times 2.
 #[cfg(not(test))]
 pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Tests stall a local socket, so the real deadline would cost a minute per case.
