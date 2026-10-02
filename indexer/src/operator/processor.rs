@@ -155,8 +155,8 @@ impl BailReason {
 }
 
 /// Move one row to `ManualReview` and alert on it. Returns whether the park
-/// counts: false when the row belongs to a later incarnation or the write could
-/// not be verified, in which case recovery redoes it.
+/// counts: false when the row has moved past this incarnation or the write
+/// could not be verified, which recovery redoes only if it never committed.
 ///
 /// The write is a CAS on the fetch-time `updated_at`, so a park for an
 /// incarnation recovery already requeued cannot terminalize the next one. The
@@ -3682,6 +3682,10 @@ mod tests {
         assert_eq!(update.error_message.as_deref(), Some("bad row"));
         assert_eq!(update.remint_signature, None);
         assert!(!update.remint_attempted);
+        assert_eq!(
+            row_status(&storage, txn.id),
+            Some(TransactionStatus::ManualReview)
+        );
     }
 
     /// A closed `storage_tx` is observable at startup-shutdown race — we

@@ -45,9 +45,11 @@ where
 ///
 /// On `Ok(false)` the row is re-read. A row already in `status` is most likely
 /// this write landing on an attempt whose reply was lost, so it pages; a
-/// duplicate is harmless. Any other row belongs to a later incarnation and stays
-/// silent. A write or re-read that still fails after its retries sends nothing:
-/// the row is left for recovery, which redoes the work and pages then.
+/// duplicate is harmless. Any other row has moved past this incarnation and
+/// stays silent. A write or re-read that still fails after its retries sends
+/// nothing. If the write never committed, the row is still Processing and
+/// recovery redoes it; if it committed with its reply lost, nothing retries it
+/// and the ERROR line is its only record.
 pub(crate) async fn fenced_terminal_write<F, Fut>(
     storage: &Storage,
     op_name: &str,
@@ -62,7 +64,7 @@ where
 {
     let verified = match with_storage_backoff(op_name, transaction_id, write).await {
         Ok(true) => return true,
-        Ok(false) => with_storage_backoff(op_name, transaction_id, || {
+        Ok(false) => with_storage_backoff(&format!("{op_name} re-read"), transaction_id, || {
             storage.get_transaction_status(transaction_id)
         })
         .await
@@ -75,14 +77,14 @@ where
             warn!(
                 transaction_id,
                 reason,
-                "{op_name}: the row belongs to a later incarnation; not writing or alerting"
+                "{op_name}: the row has moved past this incarnation; not writing or alerting"
             );
             false
         }
         Err(e) => {
             error!(
                 transaction_id,
-                reason, "{op_name} could not be verified; leaving the row for recovery: {e}"
+                reason, "{op_name} could not be verified; if it committed, nothing retries it: {e}"
             );
             false
         }
