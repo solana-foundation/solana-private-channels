@@ -597,6 +597,7 @@ async fn resolve_chain_ahead_nonce(
         error_message: Some(reason),
         remint_signature: None,
         remint_attempted: false,
+        alert_only: false,
     };
     send_guaranteed(storage_tx, update, "transaction status update")
         .await
@@ -652,6 +653,7 @@ impl SenderState {
                 error_message: Some(format!("recovery failed: {}", reason)),
                 remint_signature: None,
                 remint_attempted: false,
+                alert_only: false,
             },
             "transaction status update",
         )

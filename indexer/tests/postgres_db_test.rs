@@ -1831,6 +1831,33 @@ async fn try_requeue_processing_increments_recovery_counter(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn try_fail_processing_refuses_an_earlier_incarnation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("fail_fence", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let stale = updated_at_of(&pool, id).await;
+    assert!(storage.try_requeue_processing(id, stale).await?);
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    assert!(
+        !storage.try_fail_processing(id, stale).await?,
+        "a lease from the earlier incarnation must not fail the row"
+    );
+    assert_eq!(status_of(&pool, id).await, "processing");
+
+    let current = updated_at_of(&pool, id).await;
+    assert!(storage.try_fail_processing(id, current).await?);
+    assert_eq!(status_of(&pool, id).await, "failed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;

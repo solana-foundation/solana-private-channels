@@ -1219,6 +1219,28 @@ impl MockStorage {
         Ok(false)
     }
 
+    pub async fn try_fail_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_fail_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Failed;
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn try_complete_processing(
         &self,
         transaction_id: i64,
