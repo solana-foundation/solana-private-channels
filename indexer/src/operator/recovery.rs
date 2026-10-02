@@ -976,6 +976,7 @@ async fn route_outcome(
                         error_message: Some(reason),
                         remint_signature: None,
                         remint_attempted: false,
+                        alert_only: true,
                     };
                     // Closed channel = on-call alert lost; surface it loudly.
                     if let Err(e) =
@@ -1898,6 +1899,7 @@ mod tests {
             update.error_message.as_deref(),
             Some("withdrawal row missing nonce")
         );
+        assert!(update.alert_only, "recovery already wrote the row");
     }
 
     /// A quarantined withdrawal must keep its release signatures on the row,

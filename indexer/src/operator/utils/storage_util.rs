@@ -39,17 +39,39 @@ where
     Err(last_err.expect("loop body runs at least once"))
 }
 
-/// Run a terminal write fenced to one incarnation of the row, and return
-/// whether the caller should send its status update, which is what pages.
-/// `reason` is the caller's error message, logged whenever nothing is sent.
+/// What a fenced terminal write did, which decides whether the caller alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FencedWrite {
+    /// The row holds the target status: this write applied, or an earlier attempt did.
+    Applied,
+    /// The row has moved past this incarnation, so nothing is sent.
+    Stale,
+    /// Still failing after retries. It may have committed, and nothing retries a
+    /// committed write, so the caller alerts anyway, without writing.
+    Unverified,
+}
+
+impl FencedWrite {
+    /// The alert's error message, flagged when the write could not be verified.
+    pub(crate) fn alert_message(self, reason: &str) -> String {
+        match self {
+            FencedWrite::Unverified => {
+                format!("{reason} (status write unverified; check the row)")
+            }
+            FencedWrite::Applied | FencedWrite::Stale => reason.to_string(),
+        }
+    }
+}
+
+/// Run a terminal write fenced to one incarnation of the row, and report what
+/// it did. `reason` is the caller's error message, logged unless it applied.
 ///
 /// On `Ok(false)` the row is re-read. A row already in `status` is most likely
-/// this write landing on an attempt whose reply was lost, so it pages; a
-/// duplicate is harmless. Any other row has moved past this incarnation and
-/// stays silent. A write or re-read that still fails after its retries sends
-/// nothing. If the write never committed, the row is still Processing and
-/// recovery redoes it; if it committed with its reply lost, nothing retries it
-/// and the ERROR line is its only record.
+/// this write landing on an attempt whose reply was lost, so it counts as
+/// applied; a duplicate page is harmless. Any other row has moved past this
+/// incarnation. A write or re-read that still fails after its retries is
+/// unverified. If that write never committed, the row is still Processing and
+/// recovery redoes it, paging again.
 pub(crate) async fn fenced_terminal_write<F, Fut>(
     storage: &Storage,
     op_name: &str,
@@ -57,13 +79,13 @@ pub(crate) async fn fenced_terminal_write<F, Fut>(
     status: TransactionStatus,
     reason: &str,
     write: F,
-) -> bool
+) -> FencedWrite
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<bool, StorageError>>,
 {
     let verified = match with_storage_backoff(op_name, transaction_id, write).await {
-        Ok(true) => return true,
+        Ok(true) => return FencedWrite::Applied,
         Ok(false) => with_storage_backoff(&format!("{op_name} re-read"), transaction_id, || {
             storage.get_transaction_status(transaction_id)
         })
@@ -72,21 +94,21 @@ where
         Err(e) => Err(e),
     };
     match verified {
-        Ok(true) => true,
+        Ok(true) => FencedWrite::Applied,
         Ok(false) => {
             warn!(
                 transaction_id,
                 reason,
                 "{op_name}: the row has moved past this incarnation; not writing or alerting"
             );
-            false
+            FencedWrite::Stale
         }
         Err(e) => {
             error!(
                 transaction_id,
-                reason, "{op_name} could not be verified; if it committed, nothing retries it: {e}"
+                reason, "{op_name} could not be verified; alerting without writing: {e}"
             );
-            false
+            FencedWrite::Unverified
         }
     }
 }

@@ -8,7 +8,9 @@ use crate::operator::instruction_util::{
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
 use crate::operator::utils::mint_util::{HookExtras, MintCache};
-use crate::operator::utils::storage_util::{fenced_terminal_write, with_storage_backoff};
+use crate::operator::utils::storage_util::{
+    fenced_terminal_write, with_storage_backoff, FencedWrite,
+};
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
     MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
@@ -155,19 +157,19 @@ impl BailReason {
 }
 
 /// Move one row to `ManualReview` and alert on it. Returns whether the park
-/// counts: false when the row has moved past this incarnation or the write
-/// could not be verified, which recovery redoes only if it never committed.
+/// counts: false when the row has moved past this incarnation, which sends
+/// nothing, or the write could not be verified, which still alerts.
 ///
 /// The write is a CAS on the fetch-time `updated_at`, so a park for an
 /// incarnation recovery already requeued cannot terminalize the next one. The
-/// update sent afterwards only fires the alert: the row is already `ManualReview`.
+/// update sent afterwards only fires the alert and never writes the row.
 async fn quarantine_single(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     transaction: &DbTransaction,
     error_message: String,
 ) -> bool {
-    let alert = fenced_terminal_write(
+    let outcome = fenced_terminal_write(
         storage,
         "quarantine",
         transaction.id,
@@ -176,7 +178,7 @@ async fn quarantine_single(
         || storage.try_quarantine_processing(transaction.id, transaction.updated_at, None, None),
     )
     .await;
-    if !alert {
+    if outcome == FencedWrite::Stale {
         return false;
     }
 
@@ -186,9 +188,10 @@ async fn quarantine_single(
         status: TransactionStatus::ManualReview,
         counterpart_signature: None,
         processed_at: Some(Utc::now()),
-        error_message: Some(error_message),
+        error_message: Some(outcome.alert_message(&error_message)),
         remint_signature: None,
         remint_attempted: false,
+        alert_only: true,
     };
     // send_guaranteed: this send is the park's only alert.
     if let Err(e) = send_guaranteed(storage_tx, update, "quarantine status update").await {
@@ -200,7 +203,7 @@ async fn quarantine_single(
             "Failed to send quarantine update (storage writer down): {}", e
         );
     }
-    true
+    outcome == FencedWrite::Applied
 }
 
 /// Park one row in `ManualReview` and record why, leaving the pipeline running.
@@ -3682,6 +3685,7 @@ mod tests {
         assert_eq!(update.error_message.as_deref(), Some("bad row"));
         assert_eq!(update.remint_signature, None);
         assert!(!update.remint_attempted);
+        assert!(update.alert_only, "the park already wrote the row");
         assert_eq!(
             row_status(&storage, txn.id),
             Some(TransactionStatus::ManualReview)
@@ -3765,11 +3769,11 @@ mod tests {
         assert_eq!(row.updated_at, current.updated_at);
     }
 
-    /// A park whose write cannot reach the database is left Processing for
-    /// recovery, which parks the row again and pages then. Nothing may reach the
-    /// unfenced writer.
+    /// A park whose write cannot be verified may have committed, and nothing
+    /// retries a committed park, so it still pages. The alert writes nothing, so
+    /// a park that never committed stays Processing for recovery.
     #[tokio::test]
-    async fn a_park_that_cannot_reach_the_database_is_left_for_recovery() {
+    async fn an_unverified_park_still_pages_without_writing() {
         let txn = make_db_transaction(
             1,
             &Pubkey::new_unique().to_string(),
@@ -3783,7 +3787,7 @@ mod tests {
         seed_processing_row(&storage, &txn);
         let (storage_tx, mut storage_rx) = mpsc::channel(1);
 
-        quarantine_single(
+        let counted = quarantine_single(
             &storage,
             &storage_tx,
             &txn,
@@ -3791,10 +3795,14 @@ mod tests {
         )
         .await;
 
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "an unverified park must not reach the writer"
-        );
+        let update = storage_rx
+            .try_recv()
+            .expect("an unverified park must still page");
+        assert!(update.alert_only, "the writer must not write it");
+        assert!(update
+            .error_message
+            .is_some_and(|message| message.contains("unverified")));
+        assert!(!counted, "only a verified park counts");
         assert_eq!(
             row_status(&storage, txn.id),
             Some(TransactionStatus::Processing)

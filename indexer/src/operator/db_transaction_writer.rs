@@ -67,6 +67,7 @@ impl DbTransactionWriter {
             self.webhook_client.clone(),
             self.webhook_url.clone(),
             self.alert_rx.take(),
+            self.program_type,
         );
         let writes = async move {
             while let Some(update) = self.update_rx.recv().await {
@@ -98,61 +99,66 @@ impl DbTransactionWriter {
         );
         let trace_id = update.trace_id.as_deref().unwrap_or("none");
         let pt = self.program_type.as_label();
-        match self
-            .storage
-            .update_transaction_status(
-                update.transaction_id,
-                update.status,
-                update.counterpart_signature.clone(),
-                update.processed_at.unwrap_or_else(Utc::now),
-                // The release_signatures column exists and is migrated, but nothing
-                // reads it yet. It is provenance only, and adopting it means a new
-                // field on every TransactionStatusUpdate, so it is deferred, not dropped.
-                None,
-            )
-            .await
-        {
-            Ok(true) => {
-                info!(
-                    trace_id = trace_id,
-                    "Updated transaction {} to status {:?}", update.transaction_id, update.status
-                );
-                metrics::OPERATOR_DB_UPDATES
-                    .with_label_values(&[pt, &format!("{:?}", update.status)])
-                    .inc();
-            }
-            // A skipped Completed is unrecoverable: the release landed on chain and
-            // validate_bitmap_consistency refuses the next boot once Completed rows
-            // and bitmap bits diverge. Every other status is routine recovery churn.
-            Ok(false) if update.status == TransactionStatus::Completed => {
-                error!(
-                    trace_id = trace_id,
-                    "Transaction {} already past Processing; Completed status write LOST",
-                    update.transaction_id
-                );
-                metrics::OPERATOR_DB_UPDATE_SKIPPED
-                    .with_label_values(&[pt, &format!("{:?}", update.status)])
-                    .inc();
-            }
-            Ok(false) => {
-                // Row already off Processing (recovery or a processor park wrote it
-                // and sent this only to alert); the webhook still fires.
-                info!(
-                    trace_id = trace_id,
-                    "Transaction {} already past Processing; status write skipped",
-                    update.transaction_id
-                );
-            }
-            Err(e) => {
-                error!(
-                    trace_id = trace_id,
-                    "Failed to update transaction {} status: {}", update.transaction_id, e
-                );
-                metrics::OPERATOR_DB_UPDATE_ERRORS
-                    .with_label_values(&[pt])
-                    .inc();
-                if let Some(err_msg) = &update.error_message {
-                    error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
+        // Already written under its incarnation's fence. The row may have been
+        // re-armed and claimed again since, so this one only alerts.
+        if !update.alert_only {
+            match self
+                .storage
+                .update_transaction_status(
+                    update.transaction_id,
+                    update.status,
+                    update.counterpart_signature.clone(),
+                    update.processed_at.unwrap_or_else(Utc::now),
+                    // The release_signatures column exists and is migrated, but nothing
+                    // reads it yet. It is provenance only, and adopting it means a new
+                    // field on every TransactionStatusUpdate, so it is deferred, not dropped.
+                    None,
+                )
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        trace_id = trace_id,
+                        "Updated transaction {} to status {:?}",
+                        update.transaction_id,
+                        update.status
+                    );
+                    metrics::OPERATOR_DB_UPDATES
+                        .with_label_values(&[pt, &format!("{:?}", update.status)])
+                        .inc();
+                }
+                // A skipped Completed is unrecoverable: the release landed on chain and
+                // validate_bitmap_consistency refuses the next boot once Completed rows
+                // and bitmap bits diverge. Every other status is routine recovery churn.
+                Ok(false) if update.status == TransactionStatus::Completed => {
+                    error!(
+                        trace_id = trace_id,
+                        "Transaction {} already past Processing; Completed status write LOST",
+                        update.transaction_id
+                    );
+                    metrics::OPERATOR_DB_UPDATE_SKIPPED
+                        .with_label_values(&[pt, &format!("{:?}", update.status)])
+                        .inc();
+                }
+                Ok(false) => {
+                    // Row off Processing (recovery moved it); webhook still fires.
+                    info!(
+                        trace_id = trace_id,
+                        "Transaction {} already past Processing; status write skipped",
+                        update.transaction_id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        trace_id = trace_id,
+                        "Failed to update transaction {} status: {}", update.transaction_id, e
+                    );
+                    metrics::OPERATOR_DB_UPDATE_ERRORS
+                        .with_label_values(&[pt])
+                        .inc();
+                    if let Some(err_msg) = &update.error_message {
+                        error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
+                    }
                 }
             }
         }
@@ -183,6 +189,7 @@ impl DbTransactionWriter {
         client: WebhookClient,
         webhook_url: Option<String>,
         alerts: Option<mpsc::Receiver<TransactionStatusUpdate>>,
+        program_type: ProgramType,
     ) {
         let (Some(webhook_url), Some(mut alerts)) = (webhook_url, alerts) else {
             return;
@@ -196,10 +203,20 @@ impl DbTransactionWriter {
             }
             let deadline = *drain_deadline.get_or_insert(Instant::now() + ALERT_DRAIN_TIMEOUT);
             if timeout_at(deadline, post).await.is_err() {
-                warn!(
-                    undelivered = alerts.len() + 1,
-                    "Alert drain timed out; queued alerts dropped"
+                // The cut-off post is undelivered too. The ids are the on-call's
+                // list of rows to review, since nothing replays these alerts.
+                let mut undelivered = vec![update.transaction_id];
+                while let Ok(remaining) = alerts.try_recv() {
+                    undelivered.push(remaining.transaction_id);
+                }
+                error!(
+                    undelivered = undelivered.len(),
+                    transaction_ids = ?undelivered,
+                    "Alert drain timed out; these transactions were not paged"
                 );
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), "alert_drain_dropped"])
+                    .inc_by(undelivered.len() as f64);
                 return;
             }
         }
@@ -281,6 +298,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         }
     }
 
@@ -463,6 +481,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: Some("remint_sig_abc".to_string()),
             remint_attempted: true,
+            alert_only: false,
         };
 
         DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
@@ -497,6 +516,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
+            alert_only: false,
         };
 
         DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
@@ -532,6 +552,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         };
 
         DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
@@ -567,6 +588,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
+            alert_only: false,
         };
 
         DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
@@ -659,6 +681,45 @@ mod tests {
         assert_eq!(skipped_count("withdraw", "Failed") - before, 0.0);
     }
 
+    /// An alert-only update was already written under its incarnation's fence.
+    /// By the time the writer reads it the row may have been re-armed and claimed
+    /// again, so writing it would park the new incarnation. It must only alert.
+    #[tokio::test]
+    async fn an_alert_only_update_never_writes_the_row() {
+        let txn_id = 12345;
+        let mock = MockStorage::new();
+        // The re-armed row, claimed again by the fetcher.
+        seed_withdrawal(&mock, txn_id, TransactionStatus::Processing);
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut writer = DbTransactionWriter::new(
+            storage,
+            rx,
+            Some("http://unused.invalid".to_string()),
+            ProgramType::Withdraw,
+        );
+        let mut alerts = writer.alert_rx.take().expect("alert queue present");
+
+        writer
+            .handle_update(TransactionStatusUpdate {
+                transaction_id: txn_id,
+                alert_only: true,
+                ..create_test_update(TransactionStatus::ManualReview)
+            })
+            .await;
+
+        let row_status = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == txn_id)
+            .map(|txn| txn.status);
+        assert_eq!(row_status, Some(TransactionStatus::Processing));
+        let alert = alerts.try_recv().expect("the alert must still be queued");
+        assert_eq!(alert.transaction_id, txn_id);
+    }
+
     // ── webhook delivery ──────────────────────────────────────────────
 
     /// A draining writer posts every alert it accepted before `start` returns.
@@ -723,7 +784,8 @@ mod tests {
     }
 
     /// A stopped writer gives queued alerts one bounded drain, so a hanging
-    /// endpoint cannot hold a refused boot for 10s per alert.
+    /// endpoint cannot hold a refused boot for 10s per alert, and counts what
+    /// the drain drops.
     #[tokio::test(start_paused = true)]
     async fn a_stopped_writer_bounds_the_drain_of_queued_alerts() {
         // Bound but never accepted, so every post hangs until its 10s timeout.
@@ -744,6 +806,10 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let writer =
             DbTransactionWriter::new(storage, rx, Some(webhook_url), ProgramType::Withdraw);
+        // Only this test drops on drain under this label, so no parallel test moves it.
+        let dropped = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["withdraw", "alert_drain_dropped"]);
+        let before = dropped.get();
 
         let started = tokio::time::Instant::now();
         writer.start().await.unwrap();
@@ -753,6 +819,13 @@ mod tests {
             started.elapsed() <= Duration::from_secs(20),
             "drain took {:?}",
             started.elapsed()
+        );
+        // The first post's own timeout lands on the deadline's tick, so it may
+        // count as attempted rather than dropped.
+        let dropped_count = dropped.get() - before;
+        assert!(
+            dropped_count >= (queued - 1) as f64 && dropped_count <= queued as f64,
+            "dropped {dropped_count} of {queued}"
         );
     }
 

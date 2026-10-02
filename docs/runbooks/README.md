@@ -70,8 +70,10 @@ configured paging mechanism today. It fires on `Failed`,
 `FailedReminted`, and `ManualReview` status transitions (single attempt,
 no retries). Alerts are queued off the status-write path (up to 1024) and
 posted one at a time; when the queue is full an alert is dropped and counted
-as `reason="alert_queue_full"`, but its ERROR log line still fires. All
-dispatch below is keyed on the webhook payload.
+as `error_reason="alert_queue_full"`, which pages through the Grafana
+`alerts-dropped` rule, and its ERROR log line still fires. A shutdown drain
+gets 10s; what it cannot post is counted as `alert_drain_dropped` and its ids
+are logged at ERROR. All dispatch below is keyed on the webhook payload.
 
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|
