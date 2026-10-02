@@ -27,6 +27,8 @@ const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const WITHDRAW_FEE: u64 = 1_000;
 /// Smallest withdrawal amount in base units for the generated mint.
 const MIN_WITHDRAW_AMOUNT: u64 = 1;
+/// Smallest deposit amount in base units for the generated mint, 0 for none.
+const MIN_DEPOSIT_AMOUNT: u64 = 0;
 
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -111,6 +113,7 @@ async fn send_allow_mint(
         .bump(bump)
         .withdraw_fee(WITHDRAW_FEE)
         .min_withdraw_amount(MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     let signature =

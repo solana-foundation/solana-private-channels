@@ -27,6 +27,7 @@
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
 #   WITHDRAW_FEE            - Per-withdrawal fee set at AllowMint, in base units (default: 1000)
 #   MIN_WITHDRAW_AMOUNT     - Smallest withdrawal set at AllowMint, in base units (default: 1000)
+#   MIN_DEPOSIT_AMOUNT      - Smallest deposit set at AllowMint, in base units (default: 0, none)
 
 set -eo pipefail
 
@@ -53,6 +54,7 @@ MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
 WITHDRAW_FEE="${WITHDRAW_FEE:-1000}"
 MIN_WITHDRAW_AMOUNT="${MIN_WITHDRAW_AMOUNT:-1000}"
+MIN_DEPOSIT_AMOUNT="${MIN_DEPOSIT_AMOUNT:-0}"
 : "${ADMIN_PRIVATE_KEY:?ADMIN_PRIVATE_KEY is required; \`make build-devnet\` writes it to .env}"
 
 if [ ! -f "$ESCROW_ADMIN_KEYPAIR" ]; then
@@ -153,7 +155,8 @@ cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin allow_mint -- 
   "$INSTANCE_ID" \
   "$MINT" \
   "$WITHDRAW_FEE" \
-  "$MIN_WITHDRAW_AMOUNT"
+  "$MIN_WITHDRAW_AMOUNT" \
+  "$MIN_DEPOSIT_AMOUNT"
 
 echo ""
 echo "=== Step 4: Update .env ==="

@@ -17,6 +17,10 @@ pub const TEST_WITHDRAW_FEE: u64 = 1_000;
 /// amount these suites withdraw stays valid.
 pub const TEST_MIN_WITHDRAW_AMOUNT: u64 = 1;
 
+/// Minimum deposit the e2e harnesses allow mints with. 0 so every amount these
+/// suites deposit stays valid.
+pub const TEST_MIN_DEPOSIT_AMOUNT: u64 = 0;
+
 /// Test helper: seed a mint AND a slot-0 `allowed` history entry so the
 /// operator gate (`assert_mint_allowed_at_slot`) and the reconciliation
 /// orphan query both treat the mint as allowed for any deposit slot.
