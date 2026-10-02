@@ -225,16 +225,9 @@ ADMIN_PRIVKEY_JSON=$(tr -d '[:space:]' < "${ADMIN_KEYPAIR_FILE}")
 
 echo "Admin pubkey: ${ADMIN_PUBKEY}"
 
-# patch_env KEY VALUE — updates or appends a KEY=VALUE line in .env in-place.
-# Using sed with the | delimiter avoids breakage if VALUE contains slashes.
+# patch_env KEY VALUE updates or appends a KEY=VALUE line in .env, which holds secrets, so it stays 0600.
 patch_env() {
-    local key="$1"
-    local value="$2"
-    if grep -q "^${key}=" "${BENCH_ENV}"; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "${BENCH_ENV}"
-    else
-        echo "${key}=${value}" >> "${BENCH_ENV}"
-    fi
+    "${REPO_ROOT}/scripts/upsert-env.sh" "${BENCH_ENV}" "$1" "$2"
 }
 
 patch_env "PRIVATE_CHANNEL_ADMIN_KEYS" "${ADMIN_PUBKEY}"
