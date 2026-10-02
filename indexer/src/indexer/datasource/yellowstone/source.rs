@@ -62,8 +62,7 @@ pub struct YellowstoneSource {
     #[cfg(feature = "datasource-rpc")]
     startup_floor: Option<u64>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
-    /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
-    /// (mainly so tests can drive the reconnect path without a 120s wait).
+    /// How long the stream may go without chain progress; overridable so tests need not wait 120s.
     stall_timeout: std::time::Duration,
 }
 
@@ -103,7 +102,7 @@ impl YellowstoneSource {
         self
     }
 
-    /// Override the silent-stream watchdog window (mainly for tests).
+    /// Override the no-progress window (mainly for tests); a value near Duration::MAX panics.
     pub fn with_stall_timeout(mut self, stall_timeout: std::time::Duration) -> Self {
         self.stall_timeout = stall_timeout;
         self
@@ -154,13 +153,38 @@ const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Tear the connection down if a keepalive PING goes unanswered this long.
 const GRPC_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Application-level watchdog: force a reconnect if no message of ANY kind (a block or
-/// a server ping) arrives within this window. Backstops the h2 keepalive for a server
-/// that keeps the socket up but wedges mid-stream. When escrow is idle, server pings are
-/// the only regular signal, so this sits well above any reasonable ping cadence to avoid
-/// tearing down a healthy but quiet stream. If idle false-reconnects ever show up in the
-/// reconnect metric, subscribe to slots for a per-slot heartbeat instead of widening this.
+/// Reconnect when no new Slot or Block arrives in this window; pings alone do not count.
 const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Stall deadline that only chain progress restarts. A Slot or Block above the highest slot
+/// seen on this connection restarts it; any other Slot or Block only gives back the time spent
+/// handling it, so a slow processor is never mistaken for a silent stream. Pings never move it.
+struct ProgressWatchdog {
+    window: std::time::Duration,
+    highest: Option<u64>,
+    deadline: tokio::time::Instant,
+}
+
+impl ProgressWatchdog {
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            highest: None,
+            deadline: tokio::time::Instant::now() + window,
+        }
+    }
+
+    /// Call once a Slot or Block for `slot`, received at `arrived`, has been fully handled.
+    fn handled(&mut self, slot: u64, arrived: tokio::time::Instant) {
+        let now = tokio::time::Instant::now();
+        if self.highest.is_none_or(|highest| slot > highest) {
+            self.highest = Some(slot);
+            self.deadline = now + self.window;
+        } else {
+            self.deadline += now - arrived;
+        }
+    }
+}
 
 /// Terminal states of the reconnect gap repair; there is no error variant because
 /// failures retry inside the loop instead of falling through to a resubscribe.
@@ -682,6 +706,7 @@ async fn connect_and_stream(
     // Highest slot the gap-fill covers, and the last block forwarded; both reset per connection.
     let mut gate_target: Option<u64> = None;
     let mut last_forwarded: Option<ForwardedBlock> = None;
+    let mut progress = ProgressWatchdog::new(stall_timeout);
 
     loop {
         tokio::select! {
@@ -692,23 +717,22 @@ async fn connect_and_stream(
                 info!("Yellowstone gRPC connection closed");
                 break;
             }
-            // Fresh timer each iteration, so any inbound message resets it. Fires only
-            // when the stream goes fully silent; returns Err to take the reconnect +
-            // gap-fill path (which replays whatever slots were missed while wedged).
-            _ = tokio::time::sleep(stall_timeout) => {
+            // No chain progress in the window: Err takes the reconnect and gap-fill path.
+            _ = tokio::time::sleep_until(progress.deadline) => {
                 warn!(
-                    "Yellowstone stream stalled: no message in {:?}, forcing reconnect",
+                    "Yellowstone stream stalled: no chain progress in {:?}, forcing reconnect",
                     stall_timeout
                 );
                 metrics::INDEXER_RPC_ERRORS
                     .with_label_values(&[program_type.as_label(), "stall"])
                     .inc();
                 return Err(DataSourceRpcError::Protocol {
-                    reason: format!("stream stalled: no message in {stall_timeout:?}"),
+                    reason: format!("stream stalled: no chain progress in {stall_timeout:?}"),
                 }
                 .into());
             }
             message = stream.next() => {
+                let arrived = tokio::time::Instant::now();
                 match message {
                     None => break,
                     Some(message) => match message {
@@ -738,8 +762,7 @@ async fn connect_and_stream(
                             gate_target = Some(target);
                         }
                     }
-                    #[cfg(not(feature = "datasource-rpc"))]
-                    let _ = slot_update;
+                    progress.handled(slot_update.slot, arrived);
                 }
                 Some(UpdateOneof::Block(block)) => {
                     metrics::INDEXER_CHAIN_TIP_SLOT
@@ -865,6 +888,7 @@ async fn connect_and_stream(
                         error!("Error handling block: {}", e);
                         return Err(DataSourceError::Rpc(e));
                     }
+                    progress.handled(forwarded.slot, arrived);
                     // A late block from inside the gap-fill range must not move the chain back.
                     if last_forwarded
                         .as_ref()
@@ -1766,6 +1790,41 @@ mod tests {
         cancel.cancel();
         if let Some(h) = prev.take() {
             let _ = h.await;
+        }
+    }
+
+    /// Only a new highest slot restarts the window; anything else gives back its handling time.
+    #[tokio::test(start_paused = true)]
+    async fn progress_watchdog_moves_only_on_progress() {
+        enum Expect {
+            Restart,
+            GiveBack,
+        }
+        use Expect::*;
+        let window = Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        let mut watchdog = ProgressWatchdog::new(window);
+        assert_eq!(watchdog.deadline, tokio::time::Instant::now() + window);
+
+        // (silence before the message, time spent handling it, slot, expected effect)
+        let rows = [
+            (ms(10), ms(0), 0, Restart),
+            (ms(10), ms(50), 0, GiveBack),
+            (ms(10), ms(50), 5, Restart),
+            (ms(10), ms(20), 3, GiveBack),
+            (ms(10), ms(0), 6, Restart),
+        ];
+        for (silence, handling, slot, expect) in rows {
+            tokio::time::advance(silence).await;
+            let arrived = tokio::time::Instant::now();
+            tokio::time::advance(handling).await;
+            let before = watchdog.deadline;
+            watchdog.handled(slot, arrived);
+            let want = match expect {
+                Restart => tokio::time::Instant::now() + window,
+                GiveBack => before + handling,
+            };
+            assert_eq!(watchdog.deadline, want, "slot {slot}");
         }
     }
 
