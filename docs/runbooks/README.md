@@ -43,6 +43,11 @@ dispatch table below routes by webhook + `transaction_type`.
 > crash-loop, recognized by that marker in the indexer logs; see
 > [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
 >
+> A **startup backfill** that cannot fetch or decode a slot also exits and is
+> restarted in a loop, usually too fast for `indexer-block-unavailable` to fire.
+> Recognize it by `Startup backfill failed` in the indexer logs; see
+> [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
+>
 > **One node condition crash-loops instead of alerting.** A row in the node's
 > `accounts` table that will not deserialize makes the executor refuse to run any
 > batch touching it, so the node exits and is restarted in a loop. It marks no

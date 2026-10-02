@@ -5,10 +5,12 @@
 //! the chain tip when no startup backfill resolved a boundary, and the boundary's floor
 //! when one did. Picking the top of the resolved range instead would durably claim the
 //! slots backfill has not fetched yet, which is the loss the anchor exists to prevent.
+//! The same harness also pins that a failed startup fill stops `run` and a restart refills it.
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig, RpcPollingConfig, YellowstoneConfig},
+    error::{BackfillError, IndexerError},
     indexer::run,
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
@@ -35,6 +37,8 @@ const START_SLOT: u64 = 898;
 const COLD_START_TIP: u64 = 910;
 /// A durable checkpoint the mock RPC node has not caught up to, so the floor lands above it.
 const LAGGING_CHECKPOINT: u64 = 1_000;
+/// Producer the failing fill cannot fetch; the slot below it completes first.
+const UNSERVED_SLOT: u64 = 899;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -558,4 +562,108 @@ async fn run_starts_when_the_rpc_node_lags_the_durable_checkpoint() {
 
     handle.abort();
     ys.shutdown().await;
+}
+
+/// Same settings as `indexer_config`, on RPC polling when no geyser endpoint is given.
+fn fill_test_config(geyser_endpoint: Option<String>, backfill: BackfillConfig) -> IndexerConfig {
+    match geyser_endpoint {
+        Some(endpoint) => indexer_config(endpoint, backfill),
+        None => IndexerConfig {
+            datasource_type: DatasourceType::RpcPolling,
+            yellowstone: None,
+            ..indexer_config(String::new(), backfill)
+        },
+    }
+}
+
+/// A fill that fails part way must stop `run` instead of leaving the gap unfilled behind a live
+/// source. The flush on the way out keeps the slot that completed and nothing past the failure,
+/// and a restart against a healthy node refills the rest from that checkpoint.
+async fn failed_startup_fill_exits_and_restart_refills(datasource: DatasourceType, db: &str) {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres(db).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _slot = mock_get_slot(&mut rpc, TIP).await;
+    let _producers = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [898, 899, 900], "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _served_below = mock_block_ok(&mut rpc, START_SLOT).await;
+    let _served_tip = mock_block_ok(&mut rpc, TIP).await;
+    let unserved = mock_block_pruned(&mut rpc, UNSERVED_SLOT).await;
+
+    let ys = match datasource {
+        DatasourceType::Yellowstone => Some(MockYellowstoneServer::start().await),
+        _ => None,
+    };
+    let backfill = BackfillConfig {
+        enabled: true,
+        exit_after_backfill: false,
+        rpc_url: rpc.url(),
+        batch_size: 100,
+        max_gap_slots: 1_000,
+        start_slot: Some(START_SLOT),
+    };
+    let indexer = fill_test_config(ys.as_ref().map(|ys| ys.url()), backfill);
+    let common = common_config(postgres, rpc.url());
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        run(common.clone(), indexer.clone(), None),
+    )
+    .await
+    .expect("a failed startup fill must stop run instead of leaving the gap unfilled")
+    .expect_err("a failed startup fill must surface as an error");
+    assert!(
+        matches!(
+            err,
+            IndexerError::Backfill(BackfillError::SlotUnavailable {
+                slot: UNSERVED_SLOT
+            })
+        ),
+        "run must return the fill's own error, got: {err:?}"
+    );
+    assert!(
+        unserved.matched_async().await,
+        "the fill must have tried the unserved slot"
+    );
+    assert_eq!(
+        anchor_of(&pool, "withdraw").await,
+        Some(START_SLOT),
+        "the exit flush must keep the completed slot and stop below the failed one"
+    );
+
+    // The node now serves the slot, so a restart has to refill it from the checkpoint.
+    unserved.remove_async().await;
+    let _served_now = mock_block_ok(&mut rpc, UNSERVED_SLOT).await;
+    let handle = tokio::spawn(async move {
+        if let Err(e) = run(common, indexer, None).await {
+            eprintln!("indexer run exited: {e}");
+        }
+    });
+    wait_for_checkpoint(&pool, "withdraw", TIP, 60).await;
+
+    handle.abort();
+    if let Some(ys) = ys {
+        ys.shutdown().await;
+    }
+}
+
+/// RPC polling is the datasource the shipped withdraw indexer runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_startup_fill_exits_and_restart_refills_rpc_polling() {
+    failed_startup_fill_exits_and_restart_refills(DatasourceType::RpcPolling, "failed_fill_rpc")
+        .await;
+}
+
+/// Yellowstone shares the same startup branch, and also writes an anchor below the fill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_startup_fill_exits_and_restart_refills_yellowstone() {
+    failed_startup_fill_exits_and_restart_refills(DatasourceType::Yellowstone, "failed_fill_ys")
+        .await;
 }
