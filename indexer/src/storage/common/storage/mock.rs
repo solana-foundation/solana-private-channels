@@ -447,7 +447,7 @@ impl MockStorage {
                     history
                         .iter()
                         .filter(|record| &record.mint_address == addr)
-                        .max_by_key(|record| record.effective_slot)
+                        .max_by_key(|record| block_position(record))
                         .map(|record| {
                             (
                                 addr.clone(),
@@ -480,12 +480,15 @@ impl MockStorage {
     ) -> Result<(), StorageError> {
         self.check_should_fail("insert_mint_statuses_batch")?;
         let mut store = self.mint_status_history.lock().unwrap();
-        for s in statuses {
-            let exists = store
-                .iter()
-                .any(|r| r.mint_address == s.mint_address && r.effective_slot == s.effective_slot);
+        for status in statuses {
+            // Mirrors the Postgres unique key: one row per source instruction.
+            let exists = store.iter().any(|record| {
+                record.signature == status.signature
+                    && record.instruction_index == status.instruction_index
+                    && record.inner_index == status.inner_index
+            });
             if !exists {
-                store.push(s.clone());
+                store.push(status.clone());
             }
         }
         Ok(())
@@ -497,16 +500,24 @@ impl MockStorage {
         slot: i64,
     ) -> Result<MintStatusAtSlot, StorageError> {
         let store = self.mint_status_history.lock().unwrap();
-        let latest = store
+        // The status coming into the slot, plus every change inside it.
+        let before = store
             .iter()
-            .filter(|r| r.mint_address == mint_address && r.effective_slot <= slot)
-            .max_by_key(|r| r.effective_slot);
-        match latest {
-            Some(r) if r.status == "allowed" => Ok(MintStatusAtSlot::Allowed),
-            Some(r) if r.status == "blocked" => Ok(MintStatusAtSlot::Blocked),
-            // Mirror the postgres path: an unrecognized status fails closed to Blocked.
-            Some(_) => Ok(MintStatusAtSlot::Blocked),
-            None => Ok(MintStatusAtSlot::NeverAllowed),
+            .filter(|record| record.mint_address == mint_address && record.effective_slot < slot)
+            .max_by_key(|record| block_position(record));
+        let within = store
+            .iter()
+            .filter(|record| record.mint_address == mint_address && record.effective_slot == slot);
+        let statuses: Vec<&DbMintStatus> = before.into_iter().chain(within).collect();
+
+        // A deposit row proves the gate was open when it ran, so any allow passes it.
+        if statuses.iter().any(|record| record.status == "allowed") {
+            Ok(MintStatusAtSlot::Allowed)
+        } else if statuses.is_empty() {
+            Ok(MintStatusAtSlot::NeverAllowed)
+        } else {
+            // Blocked, or an unrecognized status, which fails closed like Postgres.
+            Ok(MintStatusAtSlot::Blocked)
         }
     }
 
@@ -1690,4 +1701,15 @@ impl MockStorage {
 fn map_contains_signature(map: &ReleaseSignatureMap, signature: &str) -> bool {
     map.values()
         .any(|sigs| sigs.iter().any(|s| s.signature == signature))
+}
+
+/// Where a history row sits in the chain. `None < Some` matches Postgres'
+/// `COALESCE(inner_index, -1)`.
+fn block_position(record: &DbMintStatus) -> (i64, i32, i32, Option<i32>) {
+    (
+        record.effective_slot,
+        record.transaction_index,
+        record.instruction_index,
+        record.inner_index,
+    )
 }

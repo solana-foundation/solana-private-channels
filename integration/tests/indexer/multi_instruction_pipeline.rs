@@ -107,6 +107,7 @@ fn deposit_meta(
         slot,
         program_type: ProgramType::Escrow,
         signature: Some(signature.to_string()),
+        transaction_index: 0,
         instruction_index,
         inner_index: None,
     }
@@ -142,6 +143,7 @@ fn withdraw_meta(
         slot,
         program_type: ProgramType::Withdraw,
         signature: Some(signature.to_string()),
+        transaction_index: 0,
         instruction_index,
         inner_index: None,
     }

@@ -1149,9 +1149,9 @@ pub async fn process_deposit_funds(
                 }
             })?;
 
-            // Refuse to mint when the mint was not in `allowed` status at
-            // the deposit's slot, per `mint_status_history`. If we minted
-            // anyway, two things would break:
+            // Refuse to mint when the mint was not allowed coming into the
+            // deposit's slot or by a change inside it, per `mint_status_history`.
+            // If we minted anyway, two things would break:
             //   1. We'd issue PrivateChannel tokens with no Mainnet escrow
             //      backing them.
             //   2. Reconciliation wouldn't catch it: the balance check
@@ -1352,6 +1352,9 @@ mod tests {
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot: 0,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-seed-{mint}"),
                 created_at: chrono::Utc::now(),
             },
@@ -4627,6 +4630,9 @@ mod tests {
                 mint_address: unknown_fee_mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot: 0,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-seed-{unknown_fee_mint}"),
                 created_at: chrono::Utc::now(),
             },

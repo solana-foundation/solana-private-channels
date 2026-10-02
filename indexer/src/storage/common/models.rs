@@ -241,15 +241,23 @@ impl DbMint {
     }
 }
 
-/// Status transition row recording an Allow/Block decision for a mint at a slot.
+/// Status transition row recording an Allow/Block decision for a mint. Rows are
+/// ordered by block position (slot, transaction, instruction, inner instruction),
+/// so two changes in one slot are both kept and ordered.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DbMintStatus {
     pub mint_address: String,
     pub status: String,
-    /// Withdrawal gate as of this transition. Slot-ordered like `status`, so a
+    /// Withdrawal gate as of this transition. Ordered like `status`, so a
     /// replayed or out-of-order BlockMint cannot clobber the current gate.
     pub withdrawals_blocked: bool,
     pub effective_slot: i64,
+    /// Position of the transaction in its block.
+    pub transaction_index: i32,
+    /// Position of the instruction in its transaction.
+    pub instruction_index: i32,
+    /// Position within the parent's inner instructions; `None` for a top-level one.
+    pub inner_index: Option<i32>,
     pub signature: String,
     pub created_at: DateTime<Utc>,
 }

@@ -938,6 +938,7 @@ mod tests {
     use serde_json::json;
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
+    use std::str::FromStr;
     use tokio::sync::mpsc;
 
     /// An empty block whose parent link names the previous slot, so a run of these
@@ -2336,6 +2337,36 @@ mod tests {
         }
     }
 
+    /// Rows carry the block position Yellowstone reports, not a count of what reached
+    /// us: the block filter has already dropped the unrelated transactions.
+    #[tokio::test]
+    async fn block_rows_carry_the_reported_transaction_index() {
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // The only transaction left after filtering, at position 5 in the full block.
+        let reported_index: u64 = 5;
+        let mut tx_info = withdraw_tx_update(vec![1u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        tx_info.index = reported_index;
+        let block = block_update(500, vec![tx_info]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        match rx.recv().await {
+            Some(ProcessorMessage::Instruction(instruction_meta)) => {
+                assert_eq!(
+                    u64::from(instruction_meta.transaction_index),
+                    reported_index
+                )
+            }
+            other => panic!("expected an instruction, got {other:?}"),
+        }
+    }
+
     /// A tx targeting a foreign program is soft-skipped, yet the slot still completes.
     #[tokio::test]
     async fn block_with_foreign_tx_skips_but_completes() {
@@ -3087,6 +3118,10 @@ async fn handle_transaction_info(
     escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
+    // Position in the whole block as Yellowstone reports it. Never count it here: the
+    // block filter already dropped unrelated transactions. A block is far below u32 max.
+    let transaction_index = tx_info.index as u32;
+
     // A tx without meta cannot be proven successful or in scope (it loses its revert status,
     // CPI events, and v0 ALT keys), so fail closed rather than index it: the slot is not
     // checkpointed and gap-fill replays it, the same guard the getBlock backfill applies.
@@ -3185,6 +3220,7 @@ async fn handle_transaction_info(
             program_type,
             escrow_instance_id,
             slot,
+            transaction_index,
             &signature,
             channel,
         )
@@ -3218,6 +3254,7 @@ async fn handle_transaction_info(
                 program_type,
                 escrow_instance_id,
                 slot,
+                transaction_index,
                 &signature,
                 channel,
             )
@@ -3447,6 +3484,7 @@ async fn parse_and_send(
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
     slot: u64,
+    transaction_index: u32,
     signature: &str,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
@@ -3507,6 +3545,7 @@ async fn parse_and_send(
         slot,
         program_type,
         signature: Some(signature.to_string()),
+        transaction_index,
         // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
         instruction_index: location.top_level_index,
         inner_index,
