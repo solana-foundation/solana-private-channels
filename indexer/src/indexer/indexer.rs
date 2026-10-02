@@ -102,8 +102,61 @@ async fn abandon_writers_on_lost_lock(
     true
 }
 
+/// Run a drain, but stop the writers with no flush as soon as the live-state lock is lost.
+/// The writers are aborted inside the lock branch, before the drain is dropped, because
+/// dropping it releases the checkpoint sender and would cue the flush being prevented.
+async fn drain_unless_lock_lost<T>(
+    lock_lost: &CancellationToken,
+    cancellation_token: &CancellationToken,
+    writers: &[tokio::task::AbortHandle],
+    drain: impl std::future::Future<Output = T>,
+) -> Result<T, IndexerError> {
+    tokio::select! {
+        biased;
+        _ = async {
+            lock_lost.cancelled().await;
+            for writer in writers {
+                writer.abort();
+            }
+        } => {
+            error!("Live-state lock lost during shutdown; stopping without draining");
+            cancellation_token.cancel();
+            crate::shutdown_utils::abort_and_await_writers(writers).await;
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        }
+        result = drain => Ok(result),
+    }
+}
+
+/// How long a fill that failed to send waits for the processor it suspects of dying.
+const PROCESSOR_ROOT_CAUSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Turn a failed fill into the processor's ending when the processor caused it.
+/// A send failure means the receiver is gone, so the processor gets a bounded wait.
+async fn attribute_backfill_failure(
+    fill_err: IndexerError,
+    processor: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
+    wait: std::time::Duration,
+) -> Supervision {
+    use crate::error::BackfillError::ChannelSend;
+    let send_failed = matches!(
+        fill_err,
+        IndexerError::Backfill(ChannelSend(_))
+            | IndexerError::DataSource(DataSourceError::Backfill(ChannelSend(_)))
+    );
+    if !send_failed && !processor.is_finished() {
+        return Supervision::BackfillFailed(fill_err);
+    }
+    match tokio::time::timeout(wait, &mut *processor).await {
+        // A clean stop cannot happen while run() holds a sender; keep the fill error.
+        Ok(Ok(Ok(()))) => Supervision::ProcessorEnded(Ok(Err(fill_err))),
+        Ok(res) => Supervision::ProcessorEnded(res),
+        Err(_) => Supervision::BackfillFailed(fill_err),
+    }
+}
+
 /// Race the processor against the shutdown signal and the startup fill, in that biased order.
-/// A processor error is the root cause, and a lost lock must never get a failed fill's drain.
+/// A processor error is the root cause, and a lock seen lost here never reaches a drain.
 async fn supervise(
     processor_handle: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
     shutdown: impl std::future::Future<Output = std::io::Result<StopReason>>,
@@ -1037,15 +1090,32 @@ pub async fn run(
     if let Some(handle) = &backfill_task {
         handle.abort();
     }
+    // A fill that failed because the processor died is reported as the processor's ending.
+    let outcome = match outcome {
+        Supervision::BackfillFailed(e) => {
+            attribute_backfill_failure(e, &mut processor_handle, PROCESSOR_ROOT_CAUSE_WAIT).await
+        }
+        other => other,
+    };
     match outcome {
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
             // from the latest durable point, unless the lock is gone and the flush would
-            // land on a rebuild.
+            // land on a rebuild. A loss mid-flush aborts the writer; `res` below reports it.
             cancellation_token.cancel();
             drop(instruction_tx);
-            finish_checkpoint_writer(&processor_end_lock_lost, checkpoint_tx, checkpoint_handle)
-                .await;
+            let writer = [checkpoint_handle.abort_handle()];
+            let _ = drain_unless_lock_lost(
+                &processor_end_lock_lost,
+                &cancellation_token,
+                &writer,
+                finish_checkpoint_writer(
+                    &processor_end_lock_lost,
+                    checkpoint_tx,
+                    checkpoint_handle,
+                ),
+            )
+            .await;
 
             match res {
                 Ok(Ok(())) => {
@@ -1088,18 +1158,27 @@ pub async fn run(
 
             info!("Shutdown signal received, initiating graceful shutdown...");
 
-            // 10. Graceful shutdown
-            shutdown_indexer(
-                cancellation_token,
-                storage,
-                datasource,
-                datasource_handle,
-                instruction_tx,
-                checkpoint_tx,
-                checkpoint_handle,
-                processor_handle,
-            )
-            .await
+            // 10. Graceful shutdown, cut short without a flush if the lock is lost mid-way
+            let shutdown_token = cancellation_token.clone();
+            let writers = [
+                processor_handle.abort_handle(),
+                checkpoint_handle.abort_handle(),
+            ];
+            drain_unless_lock_lost(&processor_end_lock_lost, &shutdown_token, &writers, async {
+                shutdown_indexer(
+                    cancellation_token,
+                    storage,
+                    datasource,
+                    datasource_handle,
+                    instruction_tx,
+                    checkpoint_tx,
+                    checkpoint_handle,
+                    processor_handle,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await?
             .map_err(|_| IndexerError::ShutdownChannelSend)?;
         }
         Supervision::BackfillFailed(e) => {
@@ -1108,7 +1187,7 @@ pub async fn run(
                 e
             );
 
-            // A lost lock gets no drain, since a resync may be rebuilding these tables.
+            // A lock already seen lost gets no drain; a later loss is caught by the drain itself.
             cancellation_token.cancel();
             if abandon_writers_on_lost_lock(
                 &processor_end_lock_lost,
@@ -1123,17 +1202,27 @@ pub async fn run(
             }
 
             // A graceful flush is safe here: the gate holds the checkpoint below the unfilled slot.
-            if let Err(shutdown_err) = shutdown_indexer(
-                cancellation_token,
-                storage,
-                datasource,
-                datasource_handle,
-                instruction_tx,
-                checkpoint_tx,
-                checkpoint_handle,
-                processor_handle,
-            )
-            .await
+            let shutdown_token = cancellation_token.clone();
+            let writers = [
+                processor_handle.abort_handle(),
+                checkpoint_handle.abort_handle(),
+            ];
+            if let Err(shutdown_err) =
+                drain_unless_lock_lost(&processor_end_lock_lost, &shutdown_token, &writers, async {
+                    shutdown_indexer(
+                        cancellation_token,
+                        storage,
+                        datasource,
+                        datasource_handle,
+                        instruction_tx,
+                        checkpoint_tx,
+                        checkpoint_handle,
+                        processor_handle,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                })
+                .await?
             {
                 error!(
                     "Shutdown after the failed backfill reported: {}",
@@ -1545,6 +1634,170 @@ mod tests {
         assert!(
             flushed.load(std::sync::atomic::Ordering::SeqCst),
             "a held lock must still let the writer flush"
+        );
+    }
+
+    /// A processor that dies on a write makes the fill fail to send; report the processor.
+    #[tokio::test]
+    async fn backfill_send_failure_reports_the_dead_processors_error() {
+        let send_failures = [
+            IndexerError::Backfill(crate::error::BackfillError::ChannelSend("closed".into())),
+            IndexerError::DataSource(DataSourceError::Backfill(
+                crate::error::BackfillError::ChannelSend("closed".into()),
+            )),
+        ];
+        for fill_err in send_failures {
+            let mut processor = tokio::spawn(async {
+                Err(IndexerError::Storage(StorageError::DatabaseError {
+                    message: "disk full".into(),
+                }))
+            });
+            wait_finished(&processor).await;
+
+            let outcome = attribute_backfill_failure(
+                fill_err,
+                &mut processor,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    Supervision::ProcessorEnded(Ok(Err(IndexerError::Storage(
+                        StorageError::DatabaseError { .. }
+                    ))))
+                ),
+                "the processor's database error must be reported, not the send failure"
+            );
+        }
+    }
+
+    /// A genuine fill error with a healthy processor is reported as is, without waiting.
+    #[tokio::test]
+    async fn backfill_rpc_failure_is_reported_unchanged() {
+        let mut processor = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            attribute_backfill_failure(
+                unavailable_slot(),
+                &mut processor,
+                std::time::Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("a genuine fill error must not wait on the processor");
+
+        match outcome {
+            Supervision::BackfillFailed(error) => {
+                assert!(is_unavailable_slot(&error), "got {error:?}")
+            }
+            _ => panic!("a genuine fill error must stay a fill failure"),
+        }
+        processor.abort();
+    }
+
+    /// A send failure with a processor that never ends falls back to the fill error in time.
+    #[tokio::test]
+    async fn backfill_send_failure_gives_up_waiting_on_a_live_processor() {
+        let mut processor = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            attribute_backfill_failure(
+                IndexerError::Backfill(crate::error::BackfillError::ChannelSend("closed".into())),
+                &mut processor,
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the wait on the processor must be bounded");
+
+        assert!(
+            matches!(
+                outcome,
+                Supervision::BackfillFailed(IndexerError::Backfill(
+                    crate::error::BackfillError::ChannelSend(_)
+                ))
+            ),
+            "a processor that never ends must fall back to the fill error"
+        );
+        processor.abort();
+    }
+
+    /// A drain under a held lock runs to completion and the writer flushes.
+    #[tokio::test]
+    async fn drain_completes_and_flushes_while_the_lock_is_held() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+        let writer = handle.abort_handle();
+
+        let result = drain_unless_lock_lost(
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+            &[writer],
+            async move {
+                drop(tx);
+                let _ = handle.await;
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "a held lock must let the drain finish");
+        assert!(
+            flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a held lock must let the writer flush"
+        );
+    }
+
+    /// A lock lost mid-drain stops both writers before the drain can cue a flush.
+    #[tokio::test]
+    async fn drain_stops_writers_without_a_flush_when_the_lock_is_lost_mid_way() {
+        let (flushed, tx, checkpoint) = checkpoint_writer_stub();
+        let processor = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let writers = [processor.abort_handle(), checkpoint.abort_handle()];
+        let lost = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let canceller = lost.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+
+        // Holds the checkpoint sender like the real drain, so dropping it would cue a flush.
+        let result = drain_unless_lock_lost(&lost, &shutdown, &writers, async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(tx);
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+            ),
+            "a lock lost mid-drain must report the lost lock"
+        );
+        assert!(
+            writers.iter().all(|w| w.is_finished()),
+            "both writers must be stopped"
+        );
+        assert!(
+            !flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "no checkpoint flush may land after the lock is lost"
+        );
+        assert!(
+            shutdown.is_cancelled(),
+            "the live source must be told to stop"
         );
     }
 
