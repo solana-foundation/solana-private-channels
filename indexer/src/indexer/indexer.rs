@@ -1666,9 +1666,10 @@ mod tests {
         );
     }
 
-    /// A processor that dies on a write makes the fill fail to send; report the processor.
+    /// The fill's send fails before the dying processor is marked finished; report the processor.
+    /// Covers both send failures, including the SlotComplete one an empty slot makes.
     #[tokio::test]
-    async fn backfill_send_failure_reports_the_dead_processors_error() {
+    async fn backfill_send_failure_waits_for_a_processor_still_dying() {
         let send_failures = [
             IndexerError::Backfill(crate::error::BackfillError::ChannelSend("closed".into())),
             IndexerError::DataSource(DataSourceError::Backfill(
@@ -1677,11 +1678,15 @@ mod tests {
         ];
         for fill_err in send_failures {
             let mut processor = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 Err(IndexerError::Storage(StorageError::DatabaseError {
                     message: "disk full".into(),
                 }))
             });
-            wait_finished(&processor).await;
+            assert!(
+                !processor.is_finished(),
+                "the race needs a running processor"
+            );
 
             let outcome = attribute_backfill_failure(
                 fill_err,
@@ -1704,6 +1709,38 @@ mod tests {
                 "the processor's database error must be reported, not the send failure"
             );
         }
+    }
+
+    /// Any fill error after the processor has already ended reports the processor's error.
+    #[tokio::test]
+    async fn backfill_failure_after_the_processor_ended_reports_the_processor() {
+        let mut processor = tokio::spawn(async {
+            Err(IndexerError::Storage(StorageError::DatabaseError {
+                message: "disk full".into(),
+            }))
+        });
+        wait_finished(&processor).await;
+
+        let outcome = attribute_backfill_failure(
+            unavailable_slot(),
+            &mut processor,
+            std::time::Duration::from_secs(5),
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+            &[],
+        )
+        .await
+        .expect("the lock is held");
+
+        assert!(
+            matches!(
+                outcome,
+                Supervision::ProcessorEnded(Ok(Err(IndexerError::Storage(
+                    StorageError::DatabaseError { .. }
+                ))))
+            ),
+            "a processor that already ended must be reported over the fill error"
+        );
     }
 
     /// A genuine fill error with a healthy processor is reported as is, without waiting.
@@ -1848,7 +1885,8 @@ mod tests {
     }
 
     /// A lock lost mid-drain stops both writers before the drain can cue a flush.
-    #[tokio::test]
+    /// Multi-threaded so the writer could run, and flush, while the dropped drain releases it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_stops_writers_without_a_flush_when_the_lock_is_lost_mid_way() {
         let (flushed, tx, checkpoint) = checkpoint_writer_stub();
         let processor = tokio::spawn(async {
@@ -1863,10 +1901,19 @@ mod tests {
             canceller.cancel();
         });
 
-        // Holds the checkpoint sender like the real drain, so dropping it would cue a flush.
+        // Holds the checkpoint sender like the real drain. Releasing it on drop cues a flush,
+        // and the pause gives the writer time to run it unless it was already aborted.
+        struct SlowRelease(Option<mpsc::Sender<CheckpointMsg>>);
+        impl Drop for SlowRelease {
+            fn drop(&mut self) {
+                self.0.take();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let sender = SlowRelease(Some(tx));
         let result = drain_unless_lock_lost(&lost, &shutdown, &writers, async move {
+            let _sender = sender;
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            drop(tx);
         })
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
