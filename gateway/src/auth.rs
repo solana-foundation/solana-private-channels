@@ -62,7 +62,13 @@ pub struct Claims {
 
 /// Methods that require a valid JWT with the Operator role.
 /// Callers without a token receive 401; callers with a User-role JWT receive 403.
-const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulateTransaction"];
+/// `getAddressIndexSlot` is channel internals only resync needs, via the internal listener.
+const OPERATOR_ONLY_METHODS: &[&str] = &[
+    "getBlock",
+    "getTransaction",
+    "simulateTransaction",
+    "getAddressIndexSlot",
+];
 
 /// Methods that require a valid JWT. For User-role callers an ownership check
 /// is also performed (the requested pubkey must be in their verified wallets).
@@ -822,6 +828,25 @@ mod tests {
     fn operator_only_operator_role_proceeds() {
         let decision = check_request_auth(Some(&claims(Role::Operator)), "getBlock", &json!([]));
         assert!(matches!(decision, AuthDecision::Proceed));
+    }
+
+    /// Resync reads index progress through the internal listener, so nothing
+    /// outside the operator's own services needs it on the public one.
+    #[test]
+    fn address_index_slot_is_operator_only() {
+        let method = "getAddressIndexSlot";
+        assert!(matches!(
+            check_request_auth(None, method, &json!([])),
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::User)), method, &json!([])),
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::Operator)), method, &json!([])),
+            AuthDecision::Proceed
+        ));
     }
 
     #[test]

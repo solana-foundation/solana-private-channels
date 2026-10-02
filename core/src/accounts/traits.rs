@@ -132,6 +132,16 @@ impl AccountsDB {
         super::get_transaction_count::get_transaction_count(self).await
     }
 
+    /// Address index watermark and newest block slot, from Postgres in both
+    /// variants: the index lives only there, and both must share one snapshot.
+    pub async fn get_address_index_progress(&self) -> Result<Option<(i64, u64)>> {
+        let pool = match self {
+            AccountsDB::Postgres(postgres_db) => &postgres_db.pool,
+            AccountsDB::Redis(redis_db) => &redis_db.fallback.pool,
+        };
+        Ok(super::address_index_watermark::get_address_index_progress(pool).await?)
+    }
+
     pub async fn get_first_available_block(&self) -> Result<u64> {
         super::get_first_available_block::get_first_available_block(self).await
     }

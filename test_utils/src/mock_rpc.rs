@@ -138,7 +138,22 @@ impl MockRpcServer {
     /// Bind to `127.0.0.1:0` and start the dispatcher. Returns when the
     /// server is ready to accept connections.
     pub async fn start() -> Self {
-        let state = Arc::new(MockState::default());
+        Self::start_with_state(MockState::default()).await
+    }
+
+    /// Like `start`, but a method with no scripted reply is forwarded to
+    /// `upstream` instead of failing, so a test can override a few methods of
+    /// a real node. Forwarded calls still count in `call_count`.
+    pub async fn start_with_upstream(upstream: String) -> Self {
+        Self::start_with_state(MockState {
+            upstream: Some(upstream),
+            ..MockState::default()
+        })
+        .await
+    }
+
+    async fn start_with_state(state: MockState) -> Self {
+        let state = Arc::new(state);
         let stop = Arc::new(Notify::new());
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -274,6 +289,8 @@ struct MockState {
     calls: Mutex<HashMap<String, usize>>,
     /// Timestamp of each dispatch per method (for timing assertions).
     timestamps: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Node that answers unscripted methods, if any.
+    upstream: Option<String>,
 }
 
 async fn handle_request(
@@ -306,10 +323,13 @@ async fn handle_request(
     };
 
     let response = if let Some(arr) = req_value.as_array() {
-        let replies: Vec<Value> = arr.iter().map(|req| dispatch(&state, req)).collect();
+        let mut replies = Vec::with_capacity(arr.len());
+        for req in arr {
+            replies.push(reply_to(&state, req).await);
+        }
         serde_json::Value::Array(replies)
     } else {
-        dispatch(&state, &req_value)
+        reply_to(&state, &req_value).await
     };
 
     let body = serde_json::to_vec(&response).expect("serialize mock response");
@@ -320,7 +340,50 @@ async fn handle_request(
         .expect("response builder"))
 }
 
-fn dispatch(state: &MockState, req: &Value) -> Value {
+/// The scripted reply, else the upstream's, else the no-script error.
+async fn reply_to(state: &MockState, req: &Value) -> Value {
+    if let Some(reply) = dispatch(state, req) {
+        return reply;
+    }
+    let id = req.get("id").cloned().unwrap_or(json!(null));
+    let method = req
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    if let Some(upstream) = &state.upstream {
+        let forwarded = async {
+            reqwest::Client::new()
+                .post(upstream)
+                .json(req)
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        };
+        return match forwarded.await {
+            Ok(reply) => reply,
+            Err(e) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32603,
+                    "message": format!("mock rpc: upstream failed for method `{method}`: {e}"),
+                },
+            }),
+        };
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32603,
+            "message": format!("mock rpc: no scripted response for method `{}`", method),
+        },
+    })
+}
+
+/// Record the call and pop its scripted reply, or `None` when nothing is scripted.
+fn dispatch(state: &MockState, req: &Value) -> Option<Value> {
     let method = req
         .get("method")
         .and_then(Value::as_str)
@@ -353,13 +416,14 @@ fn dispatch(state: &MockState, req: &Value) -> Value {
         }
     });
 
-    match reply {
-        Some(Reply::Result(value)) => json!({
+    let reply = reply?;
+    Some(match reply {
+        Reply::Result(value) => json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": value,
         }),
-        Some(Reply::Dynamic(handler)) => {
+        Reply::Dynamic(handler) => {
             let value = handler(req);
             json!({
                 "jsonrpc": "2.0",
@@ -367,11 +431,11 @@ fn dispatch(state: &MockState, req: &Value) -> Value {
                 "result": value,
             })
         }
-        Some(Reply::Error {
+        Reply::Error {
             code,
             message,
             data,
-        }) => {
+        } => {
             let mut err_obj = json!({"code": code, "message": message});
             if let Some(d) = data {
                 err_obj["data"] = d;
@@ -382,15 +446,7 @@ fn dispatch(state: &MockState, req: &Value) -> Value {
                 "error": err_obj,
             })
         }
-        None => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32603,
-                "message": format!("mock rpc: no scripted response for method `{}`", method),
-            },
-        }),
-    }
+    })
 }
 
 fn http_error(status: StatusCode, code: i32, message: &str) -> Response<Full<Bytes>> {
@@ -505,5 +561,30 @@ mod tests {
             gap >= std::time::Duration::from_millis(40),
             "gap should be ~50ms, got {gap:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_unscripted_methods_to_upstream() {
+        let upstream = MockRpcServer::start().await;
+        upstream.enqueue("getSlot", Reply::result(json!(7)));
+        let mock = MockRpcServer::start_with_upstream(upstream.url()).await;
+        mock.enqueue("getX", Reply::result(json!(1)));
+
+        let scripted = post(
+            &mock.url(),
+            &json!({"jsonrpc":"2.0","id":1,"method":"getX"}),
+        )
+        .await;
+        assert_eq!(scripted["result"], json!(1));
+        let forwarded = post(
+            &mock.url(),
+            &json!({"jsonrpc":"2.0","id":2,"method":"getSlot"}),
+        )
+        .await;
+        assert_eq!(forwarded["result"], json!(7));
+        assert_eq!(forwarded["id"], json!(2));
+        assert_eq!(mock.call_count("getSlot"), 1);
+        assert_eq!(upstream.call_count("getSlot"), 1);
+        assert_eq!(upstream.call_count("getX"), 0);
     }
 }

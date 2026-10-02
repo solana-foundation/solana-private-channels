@@ -47,6 +47,13 @@ pub const STALE_HOLDER_GRACE: Duration = LIVE_LOCK_HEARTBEAT_INTERVAL
     .saturating_add(WRITER_STOP_TIMEOUT)
     .saturating_add(Duration::from_secs(5));
 
+/// How long resync waits for the channel address index to reach its newest block.
+/// Under load the index trails by one flush; at idle it catches up within a second.
+const INDEX_CATCH_UP_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often resync re-reads the channel address index progress while it waits.
+const INDEX_CATCH_UP_POLL: Duration = Duration::from_millis(500);
+
 /// How many serviced rows the completeness check reads per query.
 const SERVICED_ROWS_PAGE_SIZE: i64 = 10_000;
 
@@ -135,6 +142,49 @@ async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), Indexer
     }
 }
 
+/// Refuse unless the channel address index covers the channel's newest block, so its
+/// history is not short. Compares against the block in the same snapshot, not `getSlot`,
+/// because idle ticks run ahead of blocks. Reads at least once, even with a zero budget.
+async fn ensure_index_caught_up(
+    channel_rpc: &RpcClientWithRetry,
+    budget: Duration,
+) -> Result<(), IndexerError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let (watermark, latest_block) =
+            channel_rpc.get_address_index_slot().await.map_err(|e| {
+                IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                    reason: format!(
+                        "channel address index progress unreadable: {e}. The channel RPC must be \
+                     the operators' read node running a core that serves getAddressIndexSlot; \
+                     see docs/runbooks/resync_consumed_mint_mismatch.md"
+                    ),
+                })
+            })?;
+        if watermark >= latest_block {
+            info!(
+                watermark,
+                latest_block, "Channel address index is caught up"
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::ConsumedSetUnavailable {
+                    reason: format!(
+                        "channel address index is at slot {watermark}, behind the newest block \
+                         {latest_block}, so its history may miss serviced mints. The write \
+                         node must be running and the channel RPC must be the operators' read \
+                         node; rerun once it catches up, see \
+                         docs/runbooks/resync_consumed_mint_mismatch.md"
+                    ),
+                },
+            ));
+        }
+        tokio::time::sleep(INDEX_CATCH_UP_POLL).await;
+    }
+}
+
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
 #[derive(Clone, Debug)]
 pub struct ChannelReconcileConfig {
@@ -161,6 +211,8 @@ pub struct ResyncService {
     lock_heartbeat_interval: Duration,
     // How long to wait after taking the lock before reading anything. Only tests override it.
     stale_holder_grace: Duration,
+    // How long to wait for the channel address index to catch up. Only tests override it.
+    index_catch_up_budget: Duration,
 }
 
 impl ResyncService {
@@ -181,6 +233,7 @@ impl ResyncService {
             withdrawal_bitmap_rpc_url: None,
             lock_heartbeat_interval: LIVE_LOCK_HEARTBEAT_INTERVAL,
             stale_holder_grace: STALE_HOLDER_GRACE,
+            index_catch_up_budget: INDEX_CATCH_UP_BUDGET,
         }
     }
 
@@ -194,6 +247,12 @@ impl ResyncService {
     /// Wait `grace` instead of the production grace after taking the lock, so tests stay fast.
     pub fn with_stale_holder_grace(mut self, grace: Duration) -> Self {
         self.stale_holder_grace = grace;
+        self
+    }
+
+    /// Wait at most `budget` for the channel address index to catch up, so tests stay fast.
+    pub fn with_index_catch_up_budget(mut self, budget: Duration) -> Self {
+        self.index_catch_up_budget = budget;
         self
     }
 
@@ -228,6 +287,7 @@ impl ResyncService {
             reconcile.authority
         );
         let channel_rpc = channel_rpc(reconcile);
+        ensure_index_caught_up(&channel_rpc, self.index_catch_up_budget).await?;
         let set =
             enumerate_consumed_mints(&channel_rpc, &reconcile.authority, CONSUMED_SET_PAGE_SIZE)
                 .await
@@ -642,7 +702,8 @@ impl ResyncService {
         }
 
         // Pre-flight 4+5: channel reachability + the authority's history + cross-scheme
-        // guard, all inside build_consumed_set, which returns Err on any of them.
+        // guard, all inside build_consumed_set, which returns Err on any of them. It
+        // first waits for the channel address index to cover its newest block.
         let consumed = self.build_consumed_set().await?;
 
         let backfill_service = BackfillService::new(
@@ -1866,11 +1927,23 @@ mod tests {
         assert_eq!(got, Some(("sig-a".to_string(), 2)));
     }
 
+    /// A channel whose address index covers its newest block.
+    const INDEX_CAUGHT_UP: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"watermark":200,"latestBlock":200}}"#;
+
     /// Escrow service over mock RPCs: a source tip with no event to replay, and an empty,
-    /// never-pruned channel.
+    /// never-pruned channel answering `index_reply` for its index progress. Returns the
+    /// channel's history mock, expecting no read unless `history_read`.
     async fn reconciling_escrow_service(
         storage: Arc<Storage>,
-    ) -> (ResyncService, mockito::ServerGuard, mockito::ServerGuard) {
+        index_reply: &str,
+        history_read: bool,
+    ) -> (
+        ResyncService,
+        mockito::ServerGuard,
+        mockito::ServerGuard,
+        mockito::Mock,
+    ) {
         let mut source = mockito::Server::new_async().await;
         source
             .mock("POST", "/")
@@ -1886,11 +1959,23 @@ mod tests {
         channel
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAddressIndexSlot""#.into(),
+            ))
+            .with_status(200)
+            .with_body(index_reply)
+            .create();
+        let history = channel
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
             ))
             .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":[]}"#)
-            .create();
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":[]}"#);
+        let history = if history_read {
+            history.create()
+        } else {
+            history.expect(0).create()
+        };
         channel
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -1920,11 +2005,12 @@ mod tests {
             Some(Pubkey::new_unique()),
         )
         .with_stale_holder_grace(Duration::ZERO)
+        .with_index_catch_up_budget(Duration::ZERO)
         .with_channel_reconcile(ChannelReconcileConfig {
             channel_rpc_url: channel.url(),
             authority: Pubkey::new_unique(),
         });
-        (service, source, channel)
+        (service, source, channel, history)
     }
 
     /// Regression #25: an unlisted completed deposit would be minted again, so resync refuses.
@@ -1937,8 +2023,12 @@ mod tests {
             TransactionType::Deposit,
             TransactionStatus::Completed,
         );
-        let (service, _source, _channel) =
-            reconciling_escrow_service(Arc::new(Storage::Mock(mock.clone()))).await;
+        let (service, _source, _channel, _history) = reconciling_escrow_service(
+            Arc::new(Storage::Mock(mock.clone())),
+            INDEX_CAUGHT_UP,
+            true,
+        )
+        .await;
         match service.run(100).await {
             Err(IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
                 reason,
@@ -1963,13 +2053,62 @@ mod tests {
     async fn serviced_rows_read_error_refuses() {
         let mock = MockStorage::new();
         mock.set_should_fail("get_serviced_rows", true);
-        let (service, _source, _channel) =
-            reconciling_escrow_service(Arc::new(Storage::Mock(mock.clone()))).await;
+        let (service, _source, _channel, _history) = reconciling_escrow_service(
+            Arc::new(Storage::Mock(mock.clone())),
+            INDEX_CAUGHT_UP,
+            true,
+        )
+        .await;
         match service.run(100).await {
             Err(IndexerError::Storage(_)) => {}
             other => panic!("an unreadable serviced-row list must refuse, got: {other:?}"),
         }
         assert_eq!(mock.calls("wipe_program"), 0);
         assert!(mock.unfinished_resync.lock().unwrap().is_none());
+    }
+
+    /// A lagging or unreadable channel index refuses before any history read or wipe,
+    /// since a short history would rebuild a serviced deposit as pending.
+    #[tokio::test]
+    async fn index_gate_refuses_before_wipe() {
+        let cases = [
+            (
+                "behind",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"watermark":150,"latestBlock":200}}"#,
+            ),
+            (
+                "server error",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"address index progress unavailable"}}"#,
+            ),
+            (
+                "old core",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+            ),
+        ];
+        for (name, index_reply) in cases {
+            let mock = MockStorage::new();
+            let (service, _source, _channel, history) = reconciling_escrow_service(
+                Arc::new(Storage::Mock(mock.clone())),
+                index_reply,
+                false,
+            )
+            .await;
+            match service.run(100).await {
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedSetUnavailable { reason },
+                )) => {
+                    if name == "behind" {
+                        assert!(
+                            reason.contains("150") && reason.contains("200"),
+                            "{name}: reason must name both slots: {reason}"
+                        );
+                    }
+                }
+                other => panic!("{name}: a lagging index must refuse, got: {other:?}"),
+            }
+            assert_eq!(mock.calls("wipe_program"), 0, "{name}");
+            assert!(mock.unfinished_resync.lock().unwrap().is_none(), "{name}");
+            history.assert_async().await;
+        }
     }
 }
