@@ -11,10 +11,14 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::{timeout_at, Instant};
 use tracing::{error, info, warn};
 
 /// Alerts waiting for the webhook; past this an alert is dropped.
 const ALERT_QUEUE_CAPACITY: usize = 1024;
+
+/// How long a stopped writer keeps posting what is still queued.
+const ALERT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DbTransactionWriter that receives transaction status updates from sender
 /// and writes them to the database
@@ -68,7 +72,15 @@ impl DbTransactionWriter {
             while let Some(update) = self.update_rx.recv().await {
                 self.handle_update(update).await;
             }
-            // Dropping the writer here closes the alert queue, so delivery drains it and stops.
+            // Logged before any drain timeout, so it survives a detached shutdown.
+            let queued = self.alert_tx.max_capacity() - self.alert_tx.capacity();
+            if queued > 0 {
+                warn!(
+                    queued,
+                    "Writer stopped with alerts still queued; draining them"
+                );
+            }
+            // Dropping the writer here closes the alert queue, which starts the bounded drain.
         };
         tokio::join!(writes, deliveries);
 
@@ -165,7 +177,8 @@ impl DbTransactionWriter {
         }
     }
 
-    /// Post queued alerts one at a time until the queue closes and drains.
+    /// Post queued alerts one at a time until the queue closes and drains. Once
+    /// the writer has stopped, what is left shares one `ALERT_DRAIN_TIMEOUT`.
     async fn deliver_alerts(
         client: WebhookClient,
         webhook_url: Option<String>,
@@ -174,8 +187,21 @@ impl DbTransactionWriter {
         let (Some(webhook_url), Some(mut alerts)) = (webhook_url, alerts) else {
             return;
         };
+        let mut drain_deadline = None;
         while let Some(update) = alerts.recv().await {
-            Self::send_webhook_alert(&client, &webhook_url, &update).await;
+            let post = Self::send_webhook_alert(&client, &webhook_url, &update);
+            if !alerts.is_closed() {
+                post.await;
+                continue;
+            }
+            let deadline = *drain_deadline.get_or_insert(Instant::now() + ALERT_DRAIN_TIMEOUT);
+            if timeout_at(deadline, post).await.is_err() {
+                warn!(
+                    undelivered = alerts.len() + 1,
+                    "Alert drain timed out; queued alerts dropped"
+                );
+                return;
+            }
         }
     }
 
@@ -665,8 +691,7 @@ mod tests {
         mock.assert();
     }
 
-    /// A burst larger than the posts in flight still reaches a healthy endpoint
-    /// in full; a halt drain pages this way.
+    /// A halt-sized burst still reaches a healthy endpoint in full.
     #[tokio::test]
     async fn a_burst_of_alerts_is_delivered_in_full() {
         let burst = 40;
@@ -695,6 +720,40 @@ mod tests {
             .unwrap();
 
         mock.assert();
+    }
+
+    /// A stopped writer gives queued alerts one bounded drain, so a hanging
+    /// endpoint cannot hold a refused boot for 10s per alert.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_writer_bounds_the_drain_of_queued_alerts() {
+        // Bound but never accepted, so every post hangs until its 10s timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let webhook_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let queued = 5;
+        let (tx, rx) = mpsc::channel(queued as usize);
+        for transaction_id in 1..=queued {
+            tx.send(TransactionStatusUpdate {
+                transaction_id,
+                ..create_test_update(TransactionStatus::ManualReview)
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer =
+            DbTransactionWriter::new(storage, rx, Some(webhook_url), ProgramType::Withdraw);
+
+        let started = tokio::time::Instant::now();
+        writer.start().await.unwrap();
+
+        // At most one post in flight plus the drain, not one timeout per alert.
+        assert!(
+            started.elapsed() <= Duration::from_secs(20),
+            "drain took {:?}",
+            started.elapsed()
+        );
     }
 
     /// With the queue full, the next alert is dropped and counted, never waited on.
