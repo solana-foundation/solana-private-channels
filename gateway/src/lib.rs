@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -44,6 +44,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Metric error type for a forwarded request that ran past `Limits::upstream_timeout`.
 const UPSTREAM_TIMEOUT: &str = "upstream_timeout";
+
+/// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
+const READ_CAPACITY: &str = "read_capacity";
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -134,6 +137,11 @@ pub struct Args {
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS_PER_IP", default_value = "64")]
     pub max_connections_per_ip: NonZeroUsize,
 
+    /// Maximum public requests forwarded to the read node at once. Must be below
+    /// max_connections, so writes always find a free connection slot.
+    #[arg(long, env = "GATEWAY_MAX_FORWARDED_READS", default_value = "768")]
+    pub max_forwarded_reads: NonZeroUsize,
+
     /// Seconds a client may take to send the full request header block before
     /// the connection is closed (slowloris protection). Must be non-zero; a
     /// zero timeout would fail every request instantly.
@@ -165,8 +173,9 @@ pub struct Args {
     )]
     pub auth_fetch_timeout_secs: u64,
 
-    /// Seconds a forwarded request may spend on the write or read node, headers and
-    /// body together, before it fails with 504 or a closed connection. 1 to 3600.
+    /// Seconds a forwarded request may take, headers and body, 1 to 3600. It runs until the
+    /// client has the whole body, so a slow client download can hit it even when the node
+    /// answered promptly. Past it: a 504, or a closed connection mid-body.
     #[arg(
         long,
         env = "GATEWAY_UPSTREAM_TIMEOUT_SECS",
@@ -229,6 +238,9 @@ pub struct Limits {
     /// Max concurrent connections from a single client IP, so one host cannot
     /// consume the whole global connection budget.
     pub max_connections_per_ip: NonZeroUsize,
+    /// Max public requests in flight to the read node. Reads past it get a 503,
+    /// so a stalled read node can't take the slots writes need.
+    pub max_forwarded_reads: NonZeroUsize,
     /// Max time a client may take to send the full request header block.
     /// Slowloris header-trickle connections are closed after this.
     pub header_read_timeout: Duration,
@@ -239,7 +251,8 @@ pub struct Limits {
     /// covering the request and the response body together. A hung read node
     /// fails the gated request with 503 instead of parking it.
     pub auth_fetch_timeout: Duration,
-    /// Max time for one forwarded request's upstream exchange, headers and body.
+    /// Max time for one forwarded request's exchange, headers and body. It includes the
+    /// client's download, so a slow client can trip `upstream_timeout` with a healthy node.
     pub upstream_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
@@ -256,6 +269,7 @@ impl Default for Limits {
         Self {
             max_connections: NonZeroUsize::new(1024).unwrap(),
             max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
+            max_forwarded_reads: NonZeroUsize::new(768).unwrap(),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             auth_fetch_timeout: Duration::from_secs(3),
@@ -289,6 +303,8 @@ pub struct Gateway {
     /// Cached auth-DB role confirmations, keyed by user id. Lets a token's
     /// Operator claim be re-checked without a DB lookup on every request.
     role_cache: Arc<Mutex<HashMap<Uuid, CachedRole>>>,
+    /// Permits for public requests in flight to the read node, sized by `max_forwarded_reads`.
+    read_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy)]
@@ -440,16 +456,20 @@ impl Drop for IpConnGuard {
 struct DeadlineBody {
     inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
     sleep: Pin<Box<tokio::time::Sleep>>,
+    /// Held until the body ends, so a streaming read keeps its read slot.
+    _read_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl DeadlineBody {
     fn new(
         inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
         deadline: tokio::time::Instant,
+        read_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             inner,
             sleep: Box::pin(tokio::time::sleep_until(deadline)),
+            _read_permit: read_permit,
         }
     }
 }
@@ -486,6 +506,17 @@ impl Body for DeadlineBody {
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
+}
+
+/// Rejects limits that would let reads take every connection slot.
+fn check_limits(limits: &Limits) -> Result<(), String> {
+    if limits.max_forwarded_reads >= limits.max_connections {
+        return Err(format!(
+            "GATEWAY_MAX_FORWARDED_READS ({}) must be below GATEWAY_MAX_CONNECTIONS ({})",
+            limits.max_forwarded_reads, limits.max_connections
+        ));
+    }
+    Ok(())
 }
 
 /// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
@@ -623,12 +654,14 @@ impl Gateway {
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
             role_cache: Arc::new(Mutex::new(HashMap::new())),
+            read_slots: Arc::new(Semaphore::new(Limits::default().max_forwarded_reads.get())),
         }
     }
 
     /// Overrides the default resource limits.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self.read_slots = Arc::new(Semaphore::new(limits.max_forwarded_reads.get()));
         self
     }
 
@@ -831,11 +864,13 @@ impl Gateway {
         }
     }
 
-    /// 504 that also closes the connection, so pipelined requests can't queue behind a stalled node.
-    fn gateway_timeout_response(
+    /// Error that also closes the connection, so pipelined requests can't queue behind a stalled node.
+    fn closing_error_response(
         &self,
+        status: StatusCode,
+        body: Option<Bytes>,
     ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
-        let mut response = self.error_response(StatusCode::GATEWAY_TIMEOUT, None);
+        let mut response = self.error_response(status, body);
         response.headers_mut().insert(
             hyper::header::CONNECTION,
             hyper::header::HeaderValue::from_static("close"),
@@ -1066,6 +1101,9 @@ impl Gateway {
             &status.as_u16().to_string(),
             start.elapsed().as_secs_f64(),
         );
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(self.closing_error_response(status, Some(body)));
+        }
         Err(self.error_response(status, Some(body)))
     }
 
@@ -1348,6 +1386,30 @@ impl Gateway {
                 (&self.read_url, "read")
             };
 
+        // Public reads past the cap are shed at once, so a stalled read node can't fill the
+        // slots writes need. The permit lives as long as the exchange, streamed body included.
+        let read_permit = if access == Access::Public && target_label == "read" {
+            match Arc::clone(&self.read_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    warn!("Read capacity reached, shedding {}", method);
+                    metrics::GATEWAY_REJECTED_TOTAL
+                        .with_label_values(&[READ_CAPACITY])
+                        .inc();
+                    Self::record_metrics(
+                        Some(READ_CAPACITY),
+                        method_label,
+                        target_label,
+                        "503",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(self.closing_error_response(StatusCode::SERVICE_UNAVAILABLE, None));
+                }
+            }
+        } else {
+            None
+        };
+
         let uri = match target_url.parse::<hyper::Uri>() {
             Ok(uri) => uri,
             Err(e) => {
@@ -1405,13 +1467,6 @@ impl Gateway {
                     target_url,
                     response.status()
                 );
-                Self::record_metrics(
-                    None,
-                    method_label,
-                    target_label,
-                    &status,
-                    start.elapsed().as_secs_f64(),
-                );
 
                 let (mut parts, body) = response.into_parts();
                 parts.headers.insert(
@@ -1429,8 +1484,19 @@ impl Gateway {
                     ),
                 );
                 if !call_policy.redact_errors {
-                    let body =
-                        DeadlineBody::new(body.map_err(BoxError::from).boxed_unsync(), deadline);
+                    // The status line goes out now; a later body abort counts as upstream_timeout.
+                    Self::record_metrics(
+                        None,
+                        method_label,
+                        target_label,
+                        &status,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    let body = DeadlineBody::new(
+                        body.map_err(BoxError::from).boxed_unsync(),
+                        deadline,
+                        read_permit,
+                    );
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -1439,6 +1505,13 @@ impl Gateway {
                     Ok(Ok(collected)) => collected.to_bytes(),
                     Ok(Err(e)) => {
                         error!("Failed to read response from {}: {}", target_url, e);
+                        Self::record_metrics(
+                            Some("backend_error"),
+                            method_label,
+                            target_label,
+                            "502",
+                            start.elapsed().as_secs_f64(),
+                        );
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
                     }
                     Err(_) => {
@@ -1446,12 +1519,24 @@ impl Gateway {
                             "Response from {} stalled past {:?}",
                             target_url, self.limits.upstream_timeout
                         );
-                        metrics::GATEWAY_ERRORS_TOTAL
-                            .with_label_values(&[UPSTREAM_TIMEOUT])
-                            .inc();
-                        return Ok(self.gateway_timeout_response());
+                        Self::record_metrics(
+                            Some(UPSTREAM_TIMEOUT),
+                            method_label,
+                            target_label,
+                            "504",
+                            start.elapsed().as_secs_f64(),
+                        );
+                        return Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None));
                     }
                 };
+                // Recorded once the body is in, so status and duration match what the client gets.
+                Self::record_metrics(
+                    None,
+                    method_label,
+                    target_label,
+                    &status,
+                    start.elapsed().as_secs_f64(),
+                );
                 let rewritten = redact_transaction_errors(collected);
 
                 // Rewriting changes the length, so let hyper re-frame the body.
@@ -1487,7 +1572,7 @@ impl Gateway {
                     "504",
                     start.elapsed().as_secs_f64(),
                 );
-                Ok(self.gateway_timeout_response())
+                Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None))
             }
         }
     }
@@ -1683,6 +1768,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let limits = Limits {
         max_connections: args.max_connections,
         max_connections_per_ip: args.max_connections_per_ip,
+        max_forwarded_reads: args.max_forwarded_reads,
         header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
         body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
         auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
@@ -1692,6 +1778,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         rate_limit_per_second: args.rate_limit_per_second,
         rate_limit_burst: args.rate_limit_burst,
     };
+    check_limits(&limits)?;
 
     let gateway = Arc::new(
         Gateway::new(
@@ -2653,16 +2740,10 @@ mod tests {
             .await
             .unwrap();
 
-        // With the deadline the gateway answers ~300ms in. Without it the ownership
-        // fetch waits on the hung read node forever and this read hangs; the 3s
-        // bound turns that regression into a failure, not a stuck test.
-        let mut buf = vec![0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf))
-            .await
-            .expect("gateway should give up on the hung read node, not hang")
-            .unwrap();
+        // With the deadline the gateway answers ~300ms in and closes, so pipelined
+        // requests can't queue behind the hung node. Without either, this read hangs.
+        let response = read_to_close(&mut conn).await;
         let elapsed = start.elapsed();
-        let response = String::from_utf8_lossy(&buf[..n]);
 
         assert_status(&response, 503);
         // The backend holds the connection open, so the deadline is the only way
@@ -2834,6 +2915,12 @@ mod tests {
         // collected before anything is sent, and no DB query runs.
         let backend = start_stalled_body_backend().await;
         let addr = start_auth_gateway(&format!("http://{backend}"), stall_limits()).await;
+        let recorded = |status: &str| {
+            metrics::GATEWAY_REQUESTS_TOTAL
+                .with_label_values(&["getSignatureStatuses", "read", status])
+                .get()
+        };
+        let (ok_before, timeout_before) = (recorded("200"), recorded("504"));
 
         let mut conn = TcpStream::connect(addr).await.unwrap();
         let start = Instant::now();
@@ -2844,6 +2931,9 @@ mod tests {
 
         assert_status(&response, 504);
         assert_deadline_fired(start.elapsed());
+        // Recorded as the 504 the client got, not the 200 the node's headers carried.
+        assert_eq!(recorded("200"), ok_before);
+        assert!(recorded("504") > timeout_before);
     }
 
     #[tokio::test]
@@ -2876,6 +2966,199 @@ mod tests {
             response.contains("sig123"),
             "write should reach the healthy node: {response}"
         );
+    }
+
+    /// One read slot and a deadline long enough to outlast each read-shedding test.
+    fn one_read_slot() -> Limits {
+        Limits {
+            max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+            upstream_timeout: Duration::from_secs(5),
+            ..Default::default()
+        }
+    }
+
+    /// Sends a read that sits on a stalled node, taking the only read slot.
+    async fn hold_read_slot(addr: SocketAddr) -> TcpStream {
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        // Let the gateway take the permit and reach the upstream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn
+    }
+
+    #[tokio::test]
+    async fn read_over_capacity_gets_fast_503_and_close() {
+        let read_node = start_black_hole_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            one_read_slot(),
+        )
+        .await;
+        let _held = hold_read_slot(addr).await;
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+
+        // Shed at once and closed, not queued behind the stalled read.
+        assert_status(&response, 503);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "an over-capacity read must be shed at once, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_transaction_succeeds_while_reads_are_shed() {
+        let read_node = start_black_hole_backend().await;
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        // Two connection slots and one read slot: the shed read must leave a slot for the write.
+        let addr = start_gateway_with_limits(
+            &format!("http://{write_node}"),
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(2).unwrap(),
+                ..one_read_slot()
+            },
+        )
+        .await;
+        let _held = hold_read_slot(addr).await;
+
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        shed.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut shed).await, 503);
+
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("sig123"),
+            "write should reach the healthy node: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_read_keeps_its_slot_until_the_body_ends() {
+        let read_node = start_stalled_body_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                upstream_timeout: Duration::from_secs(1),
+                ..one_read_slot()
+            },
+        )
+        .await;
+
+        // The first read has its headers back and is mid-body.
+        let mut streaming = TcpStream::connect(addr).await.unwrap();
+        streaming
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = streaming.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // Its handler has returned, but the streaming body still holds the slot.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut second).await, 503);
+
+        // Once the body ends, the slot is free again.
+        read_to_close(&mut streaming).await;
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        third
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+            .await
+            .expect("a read should be forwarded once the slot is free")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    /// Serves `access` with every read slot already taken.
+    async fn start_gateway_with_reads_exhausted(
+        write_url: &str,
+        read_url: &str,
+        access: Access,
+    ) -> (SocketAddr, OwnedSemaphorePermit) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let gateway = Arc::new(
+            Gateway::new(
+                write_url.to_string(),
+                read_url.to_string(),
+                "*".to_string(),
+                None,
+                None,
+            )
+            .with_limits(one_read_slot()),
+        );
+        let all_reads = Arc::clone(&gateway.read_slots).try_acquire_owned().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, access).await;
+        });
+        (addr, all_reads)
+    }
+
+    #[tokio::test]
+    async fn writes_never_take_read_slots() {
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        let (addr, _all_reads) = start_gateway_with_reads_exhausted(
+            &format!("http://{write_node}"),
+            "http://127.0.0.1:1",
+            Access::Public,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn internal_reads_are_not_shed() {
+        // The cap guards public connection slots; operator reads on the internal listener skip it.
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let (addr, _all_reads) = start_gateway_with_reads_exhausted(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Access::Internal,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[test]
+    fn forwarded_read_limit_must_stay_below_max_connections() {
+        let limits = |reads, connections| Limits {
+            max_forwarded_reads: NonZeroUsize::new(reads).unwrap(),
+            max_connections: NonZeroUsize::new(connections).unwrap(),
+            ..Default::default()
+        };
+        assert!(check_limits(&Limits::default()).is_ok());
+        assert!(check_limits(&limits(1023, 1024)).is_ok());
+        assert!(check_limits(&limits(1024, 1024)).is_err());
+        assert!(check_limits(&limits(2000, 1024)).is_err());
     }
 
     #[test]
@@ -2925,7 +3208,7 @@ mod tests {
         let far = tokio::time::Instant::now() + Duration::from_secs(60);
 
         // A known length must survive the wrapper, or hyper would switch to chunked.
-        let body = DeadlineBody::new(full_body("abc"), far);
+        let body = DeadlineBody::new(full_body("abc"), far, None);
         assert_eq!(body.size_hint().exact(), Some(3));
         assert!(!body.is_end_stream());
         assert_eq!(&body.collect().await.unwrap().to_bytes()[..], b"abc");
@@ -2933,6 +3216,7 @@ mod tests {
         let empty = DeadlineBody::new(
             Empty::new().map_err(|never| match never {}).boxed_unsync(),
             far,
+            None,
         );
         assert!(empty.is_end_stream());
     }
@@ -2943,6 +3227,7 @@ mod tests {
         let mut body = DeadlineBody::new(
             PendingBody.boxed_unsync(),
             tokio::time::Instant::now() + Duration::from_millis(200),
+            None,
         );
 
         let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
@@ -2976,6 +3261,7 @@ mod tests {
         let mut body = DeadlineBody::new(
             EndlessBody.boxed_unsync(),
             tokio::time::Instant::now() + Duration::from_millis(200),
+            None,
         );
 
         // Frames never stop, so only the deadline can end this loop.
