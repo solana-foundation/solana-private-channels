@@ -33,9 +33,12 @@ const FLUSH_RETRY_BACKOFF_MS: [u64; 4] = [250, 1000, 3000, 5000];
 /// writer further behind than this is one the node is about to exit on anyway.
 pub(crate) const MAX_QUEUED_ADDRESS_ROWS: usize = 512_000;
 
-/// One block's address-index rows, carrying the queue budget they occupy.
+/// One block's address-index rows, carrying the queue budget they occupy. An
+/// empty block sends no rows, only its slot, so the watermark reaches idle blocks.
 pub struct AddressSignatureBatch {
     pub rows: Vec<AddressSignatureRow>,
+    /// The block's slot. Batches arrive in slot order.
+    pub slot: i64,
     /// Returns the rows' share of the budget to the settler when dropped.
     pub permit: OwnedSemaphorePermit,
 }
@@ -79,7 +82,8 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
 
         // Buffer accumulates whatever recv_many delivers per tick.
         let mut buf: Vec<AddressSignatureBatch> = Vec::with_capacity(64);
-        let mut flat: Vec<AddressSignatureRow> = Vec::with_capacity(flush_chunk_size * 2);
+        let mut fold = Fold::new(flush_chunk_size);
+        let mut last_written: Option<i64> = None;
 
         loop {
             // Last stage in the drain, so it exits only when the settler has
@@ -98,39 +102,42 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
             let depth = rows_rx.max_capacity().saturating_sub(rows_rx.capacity());
             metrics.address_signatures_queue_depth(depth);
 
-            for AddressSignatureBatch { rows, permit } in buf.drain(..) {
-                flat.extend(rows);
+            for AddressSignatureBatch { rows, slot, permit } in buf.drain(..) {
+                // Flush in chunk-sized COMMITs so a single tick worth
+                // of work never produces an oversized transaction.
+                let flushes = fold.push(rows, slot);
                 // The rows are ours now, so hand their budget back before the
                 // flush rather than holding the settler off across a COMMIT.
                 drop(permit);
-                // Flush in chunk-sized COMMITs so a single tick worth
-                // of work never produces an oversized transaction.
-                while flat.len() >= flush_chunk_size {
-                    let take = flat.split_off(flush_chunk_size);
-                    let chunk = std::mem::replace(&mut flat, take);
-                    if let Err(e) =
-                        flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
-                    {
-                        error!(?e, "address_signatures flush failed; exiting");
-                        return;
+                for (chunk, watermark) in flushes {
+                    match flush_and_record(&pool, &chunk, watermark, &metrics, &heartbeat).await {
+                        Ok(true) => last_written = watermark.or(last_written),
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!(?e, "address_signatures flush failed; exiting");
+                            return;
+                        }
                     }
                 }
             }
-            if !flat.is_empty() {
-                let chunk = std::mem::take(&mut flat);
-                if let Err(e) = flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await {
-                    error!(?e, "address_signatures flush failed; exiting");
-                    return;
+            if let Some((chunk, watermark)) = fold.finish(last_written) {
+                match flush_and_record(&pool, &chunk, watermark, &metrics, &heartbeat).await {
+                    Ok(true) => last_written = watermark.or(last_written),
+                    Ok(false) => {}
+                    Err(e) => {
+                        error!(?e, "address_signatures flush failed; exiting");
+                        return;
+                    }
                 }
             }
         }
 
         // Drain anything still buffered after shutdown / channel close.
         while let Ok(batch) = rows_rx.try_recv() {
-            flat.extend(batch.rows);
+            fold.flat.extend(batch.rows);
         }
-        if !flat.is_empty() {
-            if let Err(e) = flush_and_record(&pool, &flat, &[], &metrics, &heartbeat).await {
+        if !fold.flat.is_empty() {
+            if let Err(e) = flush_and_record(&pool, &fold.flat, None, &metrics, &heartbeat).await {
                 error!(?e, "address_signatures final flush failed; exiting");
                 return;
             }
@@ -142,31 +149,87 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
     WorkerHandle::new("AddressIndexWriter".to_string(), handle)
 }
 
+/// Returns whether the flush was written. A watermark-only flush is tried once
+/// and never fatal: it carries no rows, and the next empty block retries it.
 async fn flush_and_record(
     pool: &PgPool,
     chunk: &[AddressSignatureRow],
-    remaining: &[AddressSignatureRow],
+    watermark: Option<i64>,
     metrics: &SharedMetrics,
     heartbeat: &StageHeartbeat,
-) -> Result<(), sqlx::Error> {
-    let watermark = pick_watermark(chunk, remaining);
-    flush_chunk_with_retry(pool, chunk, watermark, metrics).await?;
+) -> Result<bool, sqlx::Error> {
+    if chunk.is_empty() {
+        if flush_chunk_once(pool, chunk, watermark, metrics)
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+    } else {
+        flush_chunk_with_retry(pool, chunk, watermark, metrics).await?;
+    }
     heartbeat.record_progress();
-    Ok(())
+    Ok(true)
 }
 
-/// Watermark advance; assumes monotonic slots.
-fn pick_watermark(chunk: &[AddressSignatureRow], remaining: &[AddressSignatureRow]) -> Option<i64> {
-    if chunk.is_empty() {
-        return None;
+/// Flush planning for the drain loop, kept free of I/O so the watermark that
+/// rides with each flush can be tested at batch boundaries.
+struct Fold {
+    flat: Vec<AddressSignatureRow>,
+    /// Slot of the newest batch folded into `flat`, never one still unfolded.
+    seen: Option<i64>,
+    chunk_size: usize,
+}
+
+impl Fold {
+    fn new(chunk_size: usize) -> Self {
+        Self {
+            flat: Vec::with_capacity(chunk_size * 2),
+            seen: None,
+            chunk_size,
+        }
     }
+
+    /// Fold one block in and return the chunk flushes it fills, each with its watermark.
+    fn push(
+        &mut self,
+        rows: Vec<AddressSignatureRow>,
+        slot: i64,
+    ) -> Vec<(Vec<AddressSignatureRow>, Option<i64>)> {
+        self.flat.extend(rows);
+        self.seen = Some(slot);
+        let mut flushes = Vec::new();
+        while self.flat.len() >= self.chunk_size {
+            let take = self.flat.split_off(self.chunk_size);
+            let chunk = std::mem::replace(&mut self.flat, take);
+            flushes.push((chunk, pick_watermark(&self.flat, self.seen)));
+        }
+        flushes
+    }
+
+    /// The end-of-tick flush: leftover rows, or only a newer watermark.
+    fn finish(
+        &mut self,
+        last_written: Option<i64>,
+    ) -> Option<(Vec<AddressSignatureRow>, Option<i64>)> {
+        if self.flat.is_empty() && self.seen == last_written {
+            return None;
+        }
+        let chunk = std::mem::take(&mut self.flat);
+        Some((chunk, pick_watermark(&[], self.seen)))
+    }
+}
+
+/// Every block at or below the returned slot is fully flushed once this flush
+/// commits; assumes monotonic slots.
+fn pick_watermark(remaining: &[AddressSignatureRow], seen: Option<i64>) -> Option<i64> {
     match remaining.first() {
         // Slots below `remaining`'s first are fully flushed. Guard slot 0: a
         // negative watermark sorts above all positives under big-endian bytea
         // compare and would pin it permanently.
         Some(r) if r.slot > 0 => Some(r.slot - 1),
         Some(_) => None,
-        None => chunk.last().map(|r| r.slot),
+        None => seen,
     }
 }
 
@@ -249,7 +312,17 @@ mod tests {
     /// budget so tests that are not about the budget do not have to build one.
     fn rows_msg(rows: Vec<AddressSignatureRow>) -> AddressSignatureBatch {
         AddressSignatureBatch {
+            slot: rows.last().map_or(0, |r| r.slot),
             rows,
+            permit: crate::stages::test_permit(),
+        }
+    }
+
+    /// An empty block's slot-only marker.
+    fn marker_msg(slot: i64) -> AddressSignatureBatch {
+        AddressSignatureBatch {
+            rows: Vec::new(),
+            slot,
             permit: crate::stages::test_permit(),
         }
     }
@@ -479,7 +552,7 @@ mod tests {
                 .acquire(rows.len(), &tx)
                 .await
                 .expect("the budget has room for three rows");
-            tx.send(AddressSignatureBatch { rows, permit })
+            tx.send(AddressSignatureBatch { rows, slot, permit })
                 .await
                 .unwrap();
         }
@@ -532,35 +605,148 @@ mod tests {
         assert_eq!(wm, Some(12), "watermark should advance to max flushed slot");
     }
 
-    #[test]
-    fn pick_watermark_no_remaining_returns_chunk_max() {
-        let chunk = vec![
-            AddressSignatureRow {
-                address: vec![1; 32],
-                slot: 5,
-                signature: vec![1; 64],
-            },
-            AddressSignatureRow {
-                address: vec![2; 32],
-                slot: 7,
-                signature: vec![2; 64],
-            },
-        ];
-        assert_eq!(pick_watermark(&chunk, &[]), Some(7));
+    /// An empty block moves the watermark on its own, so an idle channel's
+    /// watermark reaches its newest block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marker_batches_advance_the_watermark_without_rows() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let (tx, rx) = mpsc::channel(8);
+        let handle = start_address_index_writer(AddressIndexWriterArgs {
+            rows_rx: rx,
+            accountsdb_connection_url: url.clone(),
+            flush_chunk_size: 100,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: StageHeartbeat::new(),
+        })
+        .await;
+
+        tx.send(rows_msg(vec![make_row(1, 10, 1), make_row(2, 10, 2)]))
+            .await
+            .unwrap();
+        tx.send(marker_msg(11)).await.unwrap();
+        tx.send(marker_msg(15)).await.unwrap();
+        drop(tx);
+
+        let join = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(join.is_ok(), "writer should exit after channel close");
+        assert_eq!(count_rows(&url).await, 2);
+        assert_eq!(read_watermark(&url).await, Some(15));
+    }
+
+    /// A watermark-only flush that fails must not take the writer down: at idle
+    /// the next marker retries, while a rows flush keeps its retry-then-exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_only_flush_failure_is_not_fatal() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE metadata")
+            .execute(&admin)
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel(4);
+        let handle = start_address_index_writer(AddressIndexWriterArgs {
+            rows_rx: rx,
+            accountsdb_connection_url: url.clone(),
+            flush_chunk_size: 100,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: StageHeartbeat::new(),
+        })
+        .await;
+
+        tx.send(marker_msg(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+
+        assert!(
+            !handle.handle.is_finished(),
+            "a failed watermark-only flush must not exit the writer"
+        );
+        assert!(
+            tx.send(marker_msg(6)).await.is_ok(),
+            "the writer must still be receiving"
+        );
+    }
+
+    /// Plan one tick: each step is a block (slot, row count) or a finish with
+    /// the last written watermark. Returns every flush as (rows, watermark).
+    fn plan_flushes(chunk: usize, steps: &[Step]) -> Vec<Planned> {
+        let mut fold = Fold::new(chunk);
+        let mut flushes = Vec::new();
+        let mut sig = 0u8;
+        for step in steps {
+            match *step {
+                Step::Block(slot, n) => {
+                    let rows = (0..n)
+                        .map(|_| {
+                            sig += 1;
+                            make_row(sig, slot, sig)
+                        })
+                        .collect();
+                    flushes.extend(fold.push(rows, slot).into_iter().map(|(c, w)| (c.len(), w)));
+                }
+                Step::Finish(last_written) => {
+                    flushes.extend(fold.finish(last_written).map(|(c, w)| (c.len(), w)));
+                }
+            }
+        }
+        flushes
+    }
+
+    /// One planned flush as (row count, watermark).
+    type Planned = (usize, Option<i64>);
+
+    enum Step {
+        Block(i64, usize),
+        Finish(Option<i64>),
     }
 
     #[test]
-    fn pick_watermark_with_remaining_uses_min_minus_one() {
-        let chunk = vec![AddressSignatureRow {
-            address: vec![1; 32],
-            slot: 5,
-            signature: vec![1; 64],
-        }];
-        let remaining = vec![AddressSignatureRow {
-            address: vec![3; 32],
-            slot: 8,
-            signature: vec![3; 64],
-        }];
-        assert_eq!(pick_watermark(&chunk, &remaining), Some(7));
+    fn fold_plans_flushes_cases() {
+        use Step::*;
+        let cases: [(&str, usize, Vec<Step>, Vec<Planned>); 4] = [
+            (
+                "a chunk filled exactly by one block never names a later block",
+                2,
+                vec![Block(10, 2), Block(11, 1), Block(12, 0), Finish(None)],
+                vec![(2, Some(10)), (1, Some(12))],
+            ),
+            (
+                "a block split across chunks stops one below itself",
+                2,
+                vec![Block(10, 3), Finish(None)],
+                vec![(2, Some(9)), (1, Some(10))],
+            ),
+            (
+                "a marker alone writes a watermark-only flush",
+                2,
+                vec![Block(15, 0), Finish(Some(14))],
+                vec![(0, Some(15))],
+            ),
+            (
+                "nothing new since the last write flushes nothing",
+                2,
+                vec![Block(15, 0), Finish(Some(15))],
+                vec![],
+            ),
+        ];
+        for (name, chunk, steps, expected) in cases {
+            assert_eq!(plan_flushes(chunk, &steps), expected, "{name}");
+        }
+
+        assert_eq!(
+            pick_watermark(&[make_row(1, 0, 1)], Some(3)),
+            None,
+            "a remaining row at slot 0 leaves nothing fully flushed"
+        );
+        assert_eq!(pick_watermark(&[make_row(1, 8, 1)], Some(9)), Some(7));
+        assert_eq!(pick_watermark(&[], Some(9)), Some(9));
     }
 }

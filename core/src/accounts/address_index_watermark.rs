@@ -1,3 +1,4 @@
+use super::get_latest_slot::LATEST_SLOT_KEY;
 use sqlx::{PgPool, Postgres, Transaction};
 
 pub const ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY: &str = "address_signatures_flushed_slot";
@@ -21,6 +22,34 @@ pub async fn get_address_signatures_flushed_slot(pool: &PgPool) -> sqlx::Result<
         let arr: [u8; 8] = b.as_slice().try_into().ok()?;
         Some(i64::from_be_bytes(arr))
     }))
+}
+
+/// The watermark and the newest committed block slot, read in one statement so
+/// both come from the same snapshot. `None` if either is missing: a caller that
+/// gates on this must refuse rather than guess.
+pub async fn get_address_index_progress(pool: &PgPool) -> sqlx::Result<Option<(i64, u64)>> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT key, value FROM metadata WHERE key = ANY($1)",
+    )
+    .bind(vec![
+        ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY.to_string(),
+        LATEST_SLOT_KEY.to_string(),
+    ])
+    .fetch_all(pool)
+    .await?;
+
+    let mut watermark = None;
+    let mut latest_block = None;
+    for (key, value) in rows {
+        if key == ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY {
+            watermark = <[u8; 8]>::try_from(value.as_slice())
+                .ok()
+                .map(i64::from_be_bytes);
+        } else {
+            latest_block = super::counter::decode(&value);
+        }
+    }
+    Ok(watermark.zip(latest_block))
 }
 
 /// Monotonic UPSERT; never rewinds.
