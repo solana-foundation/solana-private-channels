@@ -144,23 +144,31 @@ async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), Indexer
 
 /// Refuse unless the channel address index covers the channel's newest block, so its
 /// history is not short. Compares against the block in the same snapshot, not `getSlot`,
-/// because idle ticks run ahead of blocks. Reads at least once, even with a zero budget.
+/// because idle ticks run ahead of blocks. Each read is bounded by what is left of the budget.
 async fn ensure_index_caught_up(
     channel_rpc: &RpcClientWithRetry,
     budget: Duration,
 ) -> Result<(), IndexerError> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let (watermark, latest_block) =
-            channel_rpc.get_address_index_slot().await.map_err(|e| {
-                IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
-                    reason: format!(
-                        "channel address index progress unreadable: {e}. The channel RPC must be \
+        // One poll interval at least, so a zero budget still gets a real read.
+        let remaining = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(INDEX_CATCH_UP_POLL);
+        let reply =
+            match tokio::time::timeout(remaining, channel_rpc.get_address_index_slot()).await {
+                Ok(reply) => reply.map_err(|e| e.to_string()),
+                Err(_) => Err(format!("no reply within {remaining:?}")),
+            };
+        let (watermark, latest_block) = reply.map_err(|e| {
+            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                reason: format!(
+                    "channel address index progress unreadable: {e}. The channel RPC must be \
                      the operators' read node running a core that serves getAddressIndexSlot; \
                      see docs/runbooks/resync_consumed_mint_mismatch.md"
-                    ),
-                })
-            })?;
+                ),
+            })
+        })?;
         if watermark >= latest_block {
             info!(
                 watermark,
@@ -2110,5 +2118,42 @@ mod tests {
             assert!(mock.unfinished_resync.lock().unwrap().is_none(), "{name}");
             history.assert_async().await;
         }
+    }
+
+    /// A channel that accepts but never answers refuses within the budget, not after
+    /// every client retry and timeout.
+    #[tokio::test]
+    async fn index_gate_bounds_a_hung_read_by_the_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Hold every connection open without replying.
+        let _hung = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let rpc = RpcClientWithRetry::with_retry_config(
+            url,
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            ensure_index_caught_up(&rpc, Duration::from_secs(1)),
+        )
+        .await
+        .expect("the gate must give up within its budget");
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedSetUnavailable { .. }
+                ))
+            ),
+            "a hung channel must refuse, got: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
