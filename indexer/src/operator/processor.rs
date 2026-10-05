@@ -549,11 +549,12 @@ fn build_release_funds(
 /// lifetime answers for a mint that may no longer be the one at that address. The
 /// returned account is the operator's only source for those properties, so the
 /// pre-flight and hook resolution take it from here instead of resolving the mint
-/// themselves.
+/// themselves. It comes with the slot the read answered at, which the pre-flight
+/// reads bind to.
 async fn read_withdrawal_allowed_mint(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
-) -> Result<Result<AllowedMint, BailReason>, OperatorError> {
+) -> Result<Result<(AllowedMint, u64), BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
         reason: e.to_string(),
@@ -572,10 +573,9 @@ async fn read_withdrawal_allowed_mint(
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
     let commitment = rpc.rpc_client.commitment();
 
-    // Anchor on the tip and require the read to answer at or past it, so a lagging
-    // backend errors instead of answering with a gate or allowlist state an admin has
-    // since changed. The existence floor is no substitute: it can predate a block and
-    // reopen, and the pause read inherits the slot recorded below.
+    // Require the read to answer at or past the tip, so a backend behind it errors
+    // instead of serving gate state an admin has since changed. A lagging replica that
+    // also served the tip still passes.
     let min_slot = rpc
         .get_latest_blockhash_with_context(commitment)
         .await
@@ -620,12 +620,13 @@ async fn read_withdrawal_allowed_mint(
     }
 
     // Creating that account required the escrow to read the mint, so the mint existed
-    // at or before this slot. Later mint reads bind to it, which is what lets a
+    // at or before this slot. The pre-flight reads bind to it, which is what lets a
     // missing mint be permanent instead of a node that has not caught up.
+    let gate_slot = response.context.slot;
     processor_state
         .mint_cache
-        .record_existence_floor(&mint, response.context.slot);
-    Ok(Ok(allowed_mint))
+        .record_existence_floor(&mint, gate_slot);
+    Ok(Ok((allowed_mint, gate_slot)))
 }
 
 /// `ExtensionType` discriminants, as the escrow program folds them into
@@ -663,12 +664,15 @@ async fn check_withdrawal_preflights(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     // The reads below only report a mint absent once the node has passed the slot that
     // allowlisted it, so the account was closed rather than merely not yet visible.
     // Neither that nor a drifted profile is fixed by retrying, so both park the row
     // instead of restarting us.
-    match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint).await {
+    match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint, gate_slot)
+        .await
+    {
         Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
             Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_TARGET_MINT_MISSING,
@@ -697,6 +701,7 @@ async fn check_withdrawal_preflights_inner(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
@@ -722,7 +727,7 @@ async fn check_withdrawal_preflights_inner(
     if allowed_mint.has_freeze_authority
         && processor_state
             .mint_cache
-            .is_ata_frozen(&instance_ata)
+            .is_ata_frozen(&instance_ata, gate_slot)
             .await?
     {
         return Ok(Some(BailReason::new(
@@ -742,7 +747,12 @@ async fn check_withdrawal_preflights_inner(
     let has_permanent_delegate =
         has_extension(allowed_mint.extensions, EXTENSION_BIT_PERMANENT_DELEGATE);
 
-    if is_pausable && processor_state.mint_cache.check_paused(&mint).await? {
+    if is_pausable
+        && processor_state
+            .mint_cache
+            .check_paused(&mint, gate_slot)
+            .await?
+    {
         return Ok(Some(BailReason::new(
             metrics::BAIL_REASON_MINT_PAUSED,
             format!("mint paused: {mint}"),
@@ -816,6 +826,7 @@ async fn attach_hook_extras(
     transaction: &DbTransaction,
     release_funds_tx: &mut TransactionBuilder,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
         return Ok(None);
@@ -861,6 +872,7 @@ async fn attach_hook_extras(
             &instance_pda,
             transaction.amount.value(),
             MAX_HOOK_EXTRAS_LEGACY_TX,
+            gate_slot,
         )
         .await?
     {
@@ -917,9 +929,9 @@ pub async fn process_release_funds(
             // target-chain lookup that would read as an infrastructure failure.
             // The account also carries the reviewed mint profile, which the steps
             // below read instead of resolving the mint themselves.
-            let allowed_mint =
+            let (allowed_mint, gate_slot) =
                 match read_withdrawal_allowed_mint(processor_state, &transaction).await? {
-                    Ok(allowed_mint) => allowed_mint,
+                    Ok(gate_read) => gate_read,
                     Err(bail) => {
                         park_row(&storage_tx, pt_label, &transaction, bail).await;
                         return Ok(());
@@ -939,7 +951,8 @@ pub async fn process_release_funds(
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
             if let Some(bail) =
-                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint).await?
+                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint, gate_slot)
+                    .await?
             {
                 park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
@@ -952,6 +965,7 @@ pub async fn process_release_funds(
                 &transaction,
                 &mut release_funds_tx,
                 &allowed_mint,
+                gate_slot,
             )
             .await?
             {
@@ -2127,6 +2141,69 @@ mod tests {
             "an unpaused mint must not park the row: {:?}",
             update.and_then(|parked| parked.error_message)
         );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The issuer froze and then thawed the escrow ATA while the operator kept
+    /// running. A backend that has not seen the thaw still reports it frozen, so the
+    /// ATA read has to carry the slot the gate read answered at. Only a read bound to
+    /// that slot is answered here.
+    #[tokio::test]
+    async fn a_thawed_escrow_is_read_at_the_gate_slot() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let instance_pda = release_funds_state.instance_pda;
+        let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
+        let instance_ata =
+            get_associated_token_address_with_program_id(&instance_pda, &mint, &spl_token::id());
+        let gate_slot = 1_000;
+
+        // Token account, 165-byte base layout: state at 108, 1 means Initialized.
+        let mut thawed_ata = vec![0u8; 165];
+        thawed_ata[108] = 1;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, gate_slot);
+        // Pinned with a freeze authority, which is what makes the pre-flight read
+        // the escrow ATA.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, true),
+            gate_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &instance_ata,
+            &spl_token::id(),
+            thawed_ata,
+            gate_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "the escrow ATA read must carry the gate slot: {outcome:?}"
+        );
+        assert!(update.is_none(), "a thawed escrow must not park the row");
         assert!(
             matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
             "the withdrawal must be dispatched"
