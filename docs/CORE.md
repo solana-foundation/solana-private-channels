@@ -117,8 +117,9 @@ keeps what it loads, so BOB is capped by entry count (1,000,000) and by bytes
 clean entries first and the byte cap the largest, each until the cache is back
 under 90% of its cap. The accounts the preload was asked for are never evicted,
 and neither are unsettled writes, so every account the batch reads reaches the
-SVM, and resident entries and account data each stay within the cap plus one
-preload. Rows are decoded as they stream in, so a preload briefly costs about
+SVM. Resident entries and account data each stay within the cap plus one preload
+plus the writes the settler has not yet acknowledged, since only clean entries
+can be evicted. Rows are decoded as they stream in, so a preload briefly costs about
 1.07 times the bytes it fetches. Results leaving the executor
 keep writable account data and every account's lamports but drop readonly data,
 which nothing downstream reads; otherwise a result would keep an evicted account

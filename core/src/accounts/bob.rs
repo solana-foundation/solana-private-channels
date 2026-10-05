@@ -65,9 +65,9 @@ use {
 // TODO: Make this a config parameter
 const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
 
-/// Upper bound on resident cache entries. Once exceeded, the oldest clean entries
-/// are evicted down to a low watermark. The preload's own keys are spared, so the
-/// cap can be exceeded by one working set. Large accounts need the byte cap too.
+/// Upper bound on resident cache entries; the oldest clean entries go first. Dirty entries
+/// and the preload's own keys are never evicted, so unsettled writes plus one working set
+/// can exceed it. Large accounts need the byte cap too.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 1_000_000;
 
 /// Upper bound on resident account-data bytes. Without it a stream of large
