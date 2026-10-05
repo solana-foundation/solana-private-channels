@@ -2,7 +2,9 @@
 
 use {
     crate::{
-        nodes::node::WorkerHandle, stage_metrics::SharedMetrics, transactions::is_admin_instruction,
+        nodes::node::WorkerHandle,
+        stage_metrics::SharedMetrics,
+        transactions::{is_admin_instruction, requires_admin_signer},
     },
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
     std::{
@@ -69,6 +71,18 @@ fn is_signed_by_admin(transaction: &SanitizedTransaction, admin_keys: &[Pubkey])
         .any(|pubkey| admin_keys.contains(pubkey))
 }
 
+/// True when any instruction exercises a mint or freeze authority.
+fn needs_admin_signer(transaction: &SanitizedTransaction) -> bool {
+    transaction
+        .message()
+        .program_instructions_iter()
+        .any(|(program_id, instruction)| {
+            instruction.data.first().is_some_and(|instruction_type| {
+                requires_admin_signer(program_id, *instruction_type)
+            })
+        })
+}
+
 /// Classifies a transaction into one TransactionType enum
 fn classify_transaction(transaction: &SanitizedTransaction) -> TransactionType {
     let mut num_admin_ix = 0;
@@ -127,7 +141,11 @@ pub async fn sigverify_transaction(
                 return SigverifyResult::NotSignedByAdmin;
             }
         }
-        TransactionType::Normal => {}
+        TransactionType::Normal => {
+            if needs_admin_signer(transaction) && !is_signed_by_admin(transaction, admin_keys) {
+                return SigverifyResult::NotSignedByAdmin;
+            }
+        }
     }
 
     // Verify signature
@@ -202,7 +220,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                             SigverifyResult::NotSignedByAdmin => {
                                 metrics.sigverify_rejected("not_admin");
                                 warn!(
-                                    "Worker {} rejected admin transaction not signed by admin: {}",
+                                    "Worker {} rejected transaction not signed by admin: {}",
                                     worker_id,
                                     transaction.signature()
                                 );
@@ -331,6 +349,87 @@ mod tests {
             matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
             "expected Valid(Admin), got {result}"
         );
+    }
+
+    /// A mint names its own authorities, so a key dropped from `admin_keys` can still
+    /// hold them on chain. Minting, freezing and thawing need a configured admin signer.
+    #[tokio::test]
+    async fn authority_instructions_require_configured_admin_signer() {
+        let admin = Keypair::new();
+        let retired_admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_account = Pubkey::new_unique();
+        let amount = 1_000;
+        let decimals = 6;
+
+        for (signer, signed_by_admin) in [(&admin, true), (&retired_admin, false)] {
+            let authority = signer.pubkey();
+            let instructions = [
+                (
+                    "MintTo",
+                    spl_token::instruction::mint_to(
+                        &spl_token::id(),
+                        &mint,
+                        &token_account,
+                        &authority,
+                        &[],
+                        amount,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "MintToChecked",
+                    spl_token::instruction::mint_to_checked(
+                        &spl_token::id(),
+                        &mint,
+                        &token_account,
+                        &authority,
+                        &[],
+                        amount,
+                        decimals,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "FreezeAccount",
+                    spl_token::instruction::freeze_account(
+                        &spl_token::id(),
+                        &token_account,
+                        &mint,
+                        &authority,
+                        &[],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "ThawAccount",
+                    spl_token::instruction::thaw_account(
+                        &spl_token::id(),
+                        &token_account,
+                        &mint,
+                        &authority,
+                        &[],
+                    )
+                    .unwrap(),
+                ),
+            ];
+
+            for (label, instruction) in instructions {
+                let tx = sanitize(&[instruction], signer, &[signer]);
+                let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+                if signed_by_admin {
+                    assert!(
+                        matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+                        "{label} signed by an admin must pass, got {result}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, SigverifyResult::NotSignedByAdmin),
+                        "{label} signed by a retired admin must be rejected, got {result}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

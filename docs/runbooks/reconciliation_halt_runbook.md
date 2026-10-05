@@ -256,8 +256,8 @@ pipelines.
 Rotating the channel admin means migrating every receipt mint's authority to the
 new key with SPL `SetAuthority` first. The old key stays the on-chain
 `mint_authority` until you do, so deposits fail with `OwnerMismatch`
-(see [`deposit_failed.md`](deposit_failed.md)) and the old key keeps the ability to
-mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
+(see [`deposit_failed.md`](deposit_failed.md)). The old key can no longer mint,
+freeze or thaw once it is out of `PRIVATE_CHANNEL_ADMIN_KEYS`. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
 rotates on its own. Resync reads each receipt mint's own history as well as the
 new admin's, so deposits the old key minted before the rotation stay terminal.
 

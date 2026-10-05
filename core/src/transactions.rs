@@ -22,6 +22,22 @@ pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {
         .is_some_and(|set| set.contains(&instruction_type))
 }
 
+const SPL_MINT_TO: u8 = 7;
+const SPL_FREEZE_ACCOUNT: u8 = 10;
+const SPL_THAW_ACCOUNT: u8 = 11;
+const SPL_MINT_TO_CHECKED: u8 = 14;
+
+/// Mint and freeze authority instructions. They run as normal transactions, but the
+/// mint names its own authorities, so a key dropped from the admin set could still sign
+/// them. Requiring a configured admin signer ends that key's power at rotation.
+pub fn requires_admin_signer(program_id: &Pubkey, instruction_type: u8) -> bool {
+    *program_id == spl_token::id()
+        && matches!(
+            instruction_type,
+            SPL_MINT_TO | SPL_FREEZE_ACCOUNT | SPL_THAW_ACCOUNT | SPL_MINT_TO_CHECKED
+        )
+}
+
 // TODO: Make this configurable at startup
 /// Checks if an instruction is allowed. Currently, only SPL instructions are
 /// allowed
