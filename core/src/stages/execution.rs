@@ -879,11 +879,12 @@ fn enforce_lamport_conservation(
         if shortfall > created
             || (shortfall > 0 && (credited || created > MAX_FLOAT_FUNDED_CREATIONS))
         {
-            // Nothing legitimate trips this, so every hit is worth an alert.
+            // Only a leak or more creations than the cap trips this, so every hit is worth a look.
             warn!(
                 sig = %tx.signature(),
                 shortfall,
                 created,
+                burned = burned.len(),
                 credited,
                 "execution: failing tx that does not account for its fabricated fee-payer lamports"
             );
@@ -2284,6 +2285,17 @@ mod tests {
                 }
             }
         }
+
+        // The cap counts creations, not missing float: 1 short, 5 created, 4 of
+        // them paid by an existing account, is still rejected.
+        let existing = Pubkey::new_unique();
+        let mut accounts = vec![
+            (payer, dataless_account(FLOAT - 1)),
+            (existing, dataless_account(1)),
+        ];
+        accounts.extend((0..5).map(|_| (Pubkey::new_unique(), data_account(1))));
+        let out = run_conservation(&[(existing, dataless_account(5))], accounts, &[payer]);
+        assert!(out.rejected(), "status was {:?}", out.status);
     }
 
     /// A pre-existing account credited by another pre-existing account keeps
@@ -2605,9 +2617,9 @@ mod tests {
         Err(solana_transaction_error::TransactionError::UnbalancedTransaction)
     }
 
-    /// Direct exploit: a fabricated payer transfers its whole float to R. The
-    /// loan is unrepaid beyond the single lamport R's creation allows, so the
-    /// transaction is rejected and nothing persists.
+    /// Direct exploit: a fabricated payer transfers its whole float to R. R is a
+    /// new wallet, so it is burned and earns no allowance; the loan is unrepaid,
+    /// so the transaction is rejected and nothing persists.
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2630,8 +2642,8 @@ mod tests {
         );
     }
 
-    /// Partial spend (5 of the float lands on R): still short by more than the
-    /// one lamport R's creation allows, so it is rejected too.
+    /// Partial spend (5 of the float lands on R): R is burned and earns no
+    /// allowance, so the tx is short and rejected too.
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2681,8 +2693,8 @@ mod tests {
         );
     }
 
-    /// Synthetic fee payer is dropped: this tx is rejected, so nothing it
-    /// touched persists, the payer included.
+    /// Synthetic fee payer is dropped: after a successful tx the payer is wiped,
+    /// so it is never persisted.
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2691,8 +2703,8 @@ mod tests {
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
-        let r = Pubkey::new_unique();
-        let _ = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 1)]).await;
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &a.pubkey(), 0)]).await;
+        assert_eq!(regular_status(&result, 0), Ok(()), "the tx must succeed");
         assert!(
             bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic fee payer must not be persisted"
@@ -2866,7 +2878,7 @@ mod tests {
     /// A transfer of pre-existing lamports keeps the sender's debit, while a
     /// recipient the channel has never seen is burned rather than created.
     #[tokio::test(flavor = "multi_thread")]
-    async fn real_transfer_persists_both_sides() {
+    async fn real_transfer_debits_sender_and_burns_new_recipient() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;

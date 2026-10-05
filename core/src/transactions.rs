@@ -41,6 +41,17 @@ pub fn is_allowed_program_instruction(program_id: &Pubkey, _data: &[u8]) -> bool
         || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
 }
 
+/// Rejection reason for a transaction with a top-level instruction outside the allowlist.
+pub const PROGRAM_NOT_ALLOWED: &str =
+    "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted";
+
+/// Whether every top-level instruction of `tx` passes the admission policy.
+pub fn all_instructions_allowed(tx: &SanitizedTransaction) -> bool {
+    tx.message()
+        .program_instructions_iter()
+        .all(|(program_id, ix)| is_allowed_program_instruction(program_id, &ix.data))
+}
+
 /// Rejection reason for a transaction that lists the spl-token native mint.
 pub const NATIVE_MINT_UNSUPPORTED: &str = "The native mint (wSOL) is not supported on this channel";
 

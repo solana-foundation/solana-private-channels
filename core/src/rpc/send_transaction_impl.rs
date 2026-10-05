@@ -4,8 +4,8 @@ use crate::rpc::{
     WriteDeps,
 };
 use crate::transactions::{
-    has_address_table_lookups, is_allowed_program_instruction, lists_native_mint,
-    ADDRESS_LOOKUP_UNSUPPORTED, NATIVE_MINT_UNSUPPORTED,
+    all_instructions_allowed, has_address_table_lookups, is_allowed_program_instruction,
+    lists_native_mint, ADDRESS_LOOKUP_UNSUPPORTED, NATIVE_MINT_UNSUPPORTED, PROGRAM_NOT_ALLOWED,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -69,12 +69,7 @@ pub async fn send_transaction_impl(
     }
 
     // Admission is per instruction; the System program is refused outright.
-    let is_allowed_transaction = sanitized_tx
-        .message()
-        .program_instructions_iter()
-        .all(|(program_id, ix)| is_allowed_program_instruction(program_id, &ix.data));
-
-    if !is_allowed_transaction {
+    if !all_instructions_allowed(&sanitized_tx) {
         // Name the program and its leading tag bytes so the log identifies the
         // offending instruction, not just the transaction.
         let offenders: Vec<String> = sanitized_tx
@@ -91,10 +86,7 @@ pub async fn send_transaction_impl(
             sanitized_tx.signature(),
             offenders
         );
-        return Err(custom_error(
-            INVALID_PARAMS_CODE,
-            "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted",
-        ));
+        return Err(custom_error(INVALID_PARAMS_CODE, PROGRAM_NOT_ALLOWED));
     }
 
     // Get the signature before sending to channel
