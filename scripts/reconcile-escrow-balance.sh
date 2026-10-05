@@ -129,7 +129,8 @@ else
             --arg text "Escrow balance mismatch! On-chain: ${ONCHAIN_BALANCE}, Expected: ${DB_EXPECTED}, Delta: ${DELTA}, Owner: ${ESCROW_OWNER}, Mint: ${MINT}" \
             --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{text: $text, timestamp: $ts}')
-        HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ALERT_WEBHOOK}" \
+        # The webhook URL holds its token, so curl reads it from stdin, not argv.
+        HTTP_CODE=$(printf 'url = "%s"\n' "$ALERT_WEBHOOK" | curl -sS -K - -o /dev/null -w '%{http_code}' -X POST \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD") || {
             echo "ERROR: Alert webhook request failed (curl error)."

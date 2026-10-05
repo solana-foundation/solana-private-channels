@@ -23,6 +23,9 @@ db_name="private_channel"
 db_password="reconcile-test-password"
 db_url="postgresql://indexer:${db_password}@localhost:5432/${db_name}"
 expected_balance="1000"
+drifted_onchain_balance="1500"
+alert_webhook_token="reconcile-test-webhook-token"
+alert_webhook="https://hooks.example.test/services/${alert_webhook_token}"
 escrow_owner="EscrowOwnerPda111"
 mint="MintAddress111"
 
@@ -33,19 +36,21 @@ chmod 600 "$pgpass_file"
 # Record the argv of every command run through PATH. PATH holds only the shims,
 # so a command nobody shimmed fails with "command not found" instead of running
 # unrecorded; one called by absolute path is not seen. The fake spl-token and
-# psql both report expected_balance, so the balances match. The fake psql also
-# saves its args, stdin and libpq env so the query and connection can be checked.
+# psql both report expected_balance, so the balances match unless a run sets
+# FAKE_ONCHAIN_BALANCE. The fake psql also saves its args, stdin and libpq env so
+# the query and connection can be checked. The fake curl saves its stdin and answers 200.
 argv_log="$workdir/argv.log"
 psql_args="$workdir/psql.args"
 psql_stdin="$workdir/psql.stdin"
 psql_env="$workdir/psql.env"
+curl_stdin="$workdir/curl.stdin"
 shim_dir="$workdir/bin"
 mkdir -p "$shim_dir"
 real_bash="$(command -v bash)"
 cat > "$shim_dir/spl-token" <<EOF
 #!$real_bash
 printf '%s\n' "spl-token \$*" >> "$argv_log"
-printf '{"amount":"%s"}\n' "$expected_balance"
+printf '{"amount":"%s"}\n' "\${FAKE_ONCHAIN_BALANCE:-$expected_balance}"
 EOF
 cat > "$shim_dir/psql" <<EOF
 #!$real_bash
@@ -55,7 +60,13 @@ printf '%s\n' "\$(</dev/stdin)" > "$psql_stdin"
 printf 'PGDATABASE=%s\nPGPASSFILE=%s\n' "\${PGDATABASE:-}" "\${PGPASSFILE:-}" > "$psql_env"
 printf '%s\n' "$expected_balance"
 EOF
-chmod +x "$shim_dir/spl-token" "$shim_dir/psql"
+cat > "$shim_dir/curl" <<EOF
+#!$real_bash
+printf '%s\n' "curl \$*" >> "$argv_log"
+printf '%s\n' "\$(</dev/stdin)" > "$curl_stdin"
+printf '200'
+EOF
+chmod +x "$shim_dir/spl-token" "$shim_dir/psql" "$shim_dir/curl"
 for command_name in date jq tr; do
   real_path="$(command -v "$command_name")" || continue
   cat > "$shim_dir/$command_name" <<EOF
@@ -105,4 +116,17 @@ if grep -qE -e '^(-d|--dbname(=.*)?)$|://|password=' "$psql_args"; then
   fail "psql was given a connection string"
 fi
 
-echo "PASS: the DB password stays off every PATH command line, and psql gets the query on stdin with the mint bound and its connection from the libpq env"
+# 5. On a mismatch the alert webhook URL, which holds its token, reaches curl on
+# stdin and never its argv.
+mismatch_status=0
+PATH="$shim_dir" PGDATABASE="$db_name" PGPASSFILE="$pgpass_file" \
+  FAKE_ONCHAIN_BALANCE="$drifted_onchain_balance" ALERT_WEBHOOK="$alert_webhook" \
+  "$real_bash" "$script" "$escrow_owner" "$mint" < /dev/null > /dev/null || mismatch_status=$?
+[[ "$mismatch_status" == 1 ]] || fail "mismatch run exited $mismatch_status, expected 1"
+grep -q '^curl ' "$argv_log" || fail "curl was never invoked"
+if grep -qF "$alert_webhook_token" "$argv_log"; then
+  fail "the alert webhook token appeared in a child process argv"
+fi
+grep -qxF "url = \"$alert_webhook\"" "$curl_stdin" || fail "the alert webhook URL did not reach curl on stdin"
+
+echo "PASS: the DB password and alert webhook stay off every PATH command line, and psql gets the query on stdin with the mint bound and its connection from the libpq env"
