@@ -26,8 +26,9 @@ admin_private_key="$(tr -d '\n' < "$admin_keypair")"
 # Public key -> tracked template (safe to commit).
 "$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$admin_pubkey"
 
-# Private key -> gitignored runtime file only.
-"$script_dir/upsert-env.sh" "$runtime_env_file" "ADMIN_PRIVATE_KEY" "$admin_private_key"
+# Private key -> gitignored runtime file only, on stdin via the printf builtin
+# so it never sits in a child argv.
+printf '%s' "$admin_private_key" | "$script_dir/upsert-env.sh" "$runtime_env_file" "ADMIN_PRIVATE_KEY"
 
 echo "Updated $env_file with PRIVATE_CHANNEL_ADMIN_KEYS=$admin_pubkey"
 echo "Wrote ADMIN_PRIVATE_KEY to $runtime_env_file (gitignored)"
