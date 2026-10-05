@@ -47,8 +47,8 @@ pub const STALE_HOLDER_GRACE: Duration = LIVE_LOCK_HEARTBEAT_INTERVAL
     .saturating_add(WRITER_STOP_TIMEOUT)
     .saturating_add(Duration::from_secs(5));
 
-/// How long resync waits for the channel address index to reach its newest block.
-/// Under load the index trails by one flush; at idle it catches up within a second.
+/// How long resync waits for the channel address index to reach the block that was newest
+/// when it started waiting. The index trails that block by one flush.
 const INDEX_CATCH_UP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How often resync re-reads the channel address index progress while it waits.
@@ -142,14 +142,15 @@ async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), Indexer
     }
 }
 
-/// Refuse unless the channel address index covers the channel's newest block, so its
-/// history is not short. Compares against the block in the same snapshot, not `getSlot`,
-/// because idle ticks run ahead of blocks. Each read is bounded by what is left of the budget.
+/// Refuse unless the channel address index covers the block that was newest at the first
+/// read, so its history holds every mint landed before resync took the lock. A pinned
+/// target, not `getSlot` or a moving tip, so idle ticks and live traffic cannot outrun it.
 async fn ensure_index_caught_up(
     channel_rpc: &RpcClientWithRetry,
     budget: Duration,
 ) -> Result<(), IndexerError> {
     let deadline = tokio::time::Instant::now() + budget;
+    let mut target = None;
     loop {
         // One poll interval at least, so a zero budget still gets a real read.
         let remaining = deadline
@@ -169,19 +170,17 @@ async fn ensure_index_caught_up(
                 ),
             })
         })?;
-        if watermark >= latest_block {
-            info!(
-                watermark,
-                latest_block, "Channel address index is caught up"
-            );
+        let target = *target.get_or_insert(latest_block);
+        if watermark >= target {
+            info!(watermark, target, "Channel address index is caught up");
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(IndexerError::Reconciliation(
                 ReconciliationError::ConsumedSetUnavailable {
                     reason: format!(
-                        "channel address index is at slot {watermark}, behind the newest block \
-                         {latest_block}, so its history may miss serviced mints. The write \
+                        "channel address index is at slot {watermark}, behind block {target}, \
+                         the newest when resync started waiting, so its history may miss serviced mints. The write \
                          node must be running and the channel RPC must be the operators' read \
                          node; rerun once it catches up, see \
                          docs/runbooks/resync_consumed_mint_mismatch.md"
@@ -711,7 +710,7 @@ impl ResyncService {
 
         // Pre-flight 4+5: channel reachability + the authority's history + cross-scheme
         // guard, all inside build_consumed_set, which returns Err on any of them. It
-        // first waits for the channel address index to cover its newest block.
+        // first waits for the channel address index to cover the channel's newest block.
         let consumed = self.build_consumed_set().await?;
 
         let backfill_service = BackfillService::new(
@@ -2155,5 +2154,37 @@ mod tests {
             "a hung channel must refuse, got: {result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// Under sustained load the index trails a moving tip by a block or two on every read.
+    /// The gate waits for the block that was newest at its first read, so it still passes.
+    #[tokio::test]
+    async fn index_gate_passes_while_the_tip_keeps_moving() {
+        let mut channel = mockito::Server::new_async().await;
+        let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&reads);
+        channel
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let latest = 5_000 + 5 * n;
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"watermark":{},"latestBlock":{latest}}}}}"#,
+                    latest - 2
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            channel.url(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        ensure_index_caught_up(&rpc, Duration::from_secs(2))
+            .await
+            .expect("the index passed the first read's newest block, so the gate must pass");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

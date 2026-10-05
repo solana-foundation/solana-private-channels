@@ -115,13 +115,13 @@ wipe, so the database is untouched.
 
 ```
 consumed-set unavailable, resync aborted before drop: channel address index is at
-slot <watermark>, behind the newest block <latest>, so its history may miss
-serviced mints
+slot <watermark>, behind block <target>, the newest when resync started waiting,
+so its history may miss serviced mints
 ```
 
 or `channel address index progress unreadable: ...`. The channel writes its
 address index after each block commits, and resync waits up to 30s for it to
-cover the newest block before reading any history. A refusal means it did not:
+cover the block that was newest at its first read before reading any history. A refusal means it did not:
 the write node is down or its index writer is stuck, or the channel RPC is a
 node that does not serve `getAddressIndexSlot` (an older core). Check that the
 write node is running (it rebuilds missing index rows at startup), that
@@ -162,22 +162,29 @@ already paid. Resync is not supported on a truncated channel. Escalate
 
 With no rows, the missing-row check has nothing to compare. The address index
 check above covers lag on the node resync reads, but it cannot see a different
-node. So before resyncing an empty database, or rerunning a resync that was
-interrupted after its wipe:
+node, and a lagging read replica looks complete against itself. So before
+resyncing an empty database, or rerunning a resync that was interrupted after
+its wipe:
 
 1. Point `--channel-rpc-url` at the same single read node the operators confirm
    mints through: not a load balancer, and not a freshly restored replica.
-2. Keep the write node running, or the index check may refuse until it restarts.
+2. Confirm that read node's database has replayed up to the primary:
+   `pg_last_wal_replay_lsn()` on the replica is at or past `pg_current_wal_lsn()`
+   read on the primary just before. This covers mints the operators never saw
+   confirmed, which step 1 does not.
+3. Keep the write node running, or the index check may refuse until it restarts.
+
+Waiting a fixed time is not a substitute: replica lag has no bound.
 
 ### Failed deposits
 
 The missing-row check covers `completed` deposits only. A `failed` deposit keeps
 no mint signature (its broadcast journal is deleted once the row is terminal),
 so resync cannot tell a mint that never landed from one that landed after the
-confirmation timed out. The address index check stops index lag from hiding a
-mint that already landed, but a mint signed before the operators stopped can
-still land after resync reads the history, until its blockhash expires. Before
-any escrow resync, triage every `failed` deposit with
+confirmation timed out. The address index check stops index lag on the node
+resync reads from hiding a mint that already landed, but a mint signed before
+the operators stopped can still land after resync reads the history, until its
+blockhash expires. Before any escrow resync, triage every `failed` deposit with
 [`deposit_failed.md`](deposit_failed.md): a `LANDED` verdict makes the row
 `completed`, and the missing-row check then covers it.
 

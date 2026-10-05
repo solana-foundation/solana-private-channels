@@ -64,7 +64,7 @@ Ordered from most divergent → closest match.
 | `getTransaction` **[auth]** | Real lookup. A storage or decode failure returns `-32000`, never a `null`. Only other difference from Solana is the JWT requirement. |
 | `getTransactionCount` | Backed by SPC's own counter. |
 | `getFirstAvailableBlock` | Returns the earliest slot SPC has stored. |
-| `getAddressIndexSlot` **[auth]** | SPC-only, not a Solana method. Takes no params and returns `{"watermark": W, "latestBlock": B}`, both read from Postgres in one statement. Every block at or below `W` is fully in the `getSignaturesForAddress` index, and `B` is the newest committed block, so `W >= B` means that history is complete. Errors with `-32000` when either value is missing. Indexer resync waits for `W >= B` before it reads channel history. Operator-only, since only the operator's own services need it. |
+| `getAddressIndexSlot` **[auth]** | SPC-only, not a Solana method. Takes no params and returns `{"watermark": W, "latestBlock": B}`, both read from Postgres in one statement. Every block at or below `W` is fully in the `getSignaturesForAddress` index, and `B` is the newest committed block, so `W >= B` means that history is complete on the node that answered. Errors with `-32000` when either value is missing. Indexer resync waits until `W` reaches the `B` of its first read before it reads channel history. Operator-only, since only the operator's own services need it. |
 | `getBlockTime` | Returns `Option<i64>` from SPC's stored block data. Reads the same row as `getBlock`, so a storage or decode failure returns `-32000`, never a `null`. |
 
 ---

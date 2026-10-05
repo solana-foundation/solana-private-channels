@@ -154,7 +154,7 @@ if anything fails. It is guarded these ways.
 8. **The channel history must be complete.** The channel writes its address index after
    each block commits, so its history can briefly miss a mint that is already final.
    Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
-   the index covers the channel's newest block, and refuses before anything is deleted
+   the index covers the block that was newest at its first read, and refuses before anything is deleted
    if it never does or the method is unavailable. Deploy core and the gateway before
    the indexer.
 

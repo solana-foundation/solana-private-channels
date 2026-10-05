@@ -80,6 +80,55 @@ mod tests {
     use crate::test_helpers::start_test_postgres_raw;
     use sqlx::postgres::PgPoolOptions;
 
+    /// The two keys use different byte orders, so a swapped decoder would read a huge
+    /// slot and pass every gate. A block committed through the real write path pins both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_progress_reads_the_watermark_and_the_committed_block() {
+        use crate::{accounts::traits::AccountsDB, test_helpers::create_test_block_info};
+        use solana_sdk::hash::Hash;
+
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let pool = postgres_db.pool.clone();
+        assert_eq!(db.get_address_index_progress().await.unwrap(), None);
+
+        db.write_batch(
+            &[],
+            vec![],
+            Some(create_test_block_info(300, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            None,
+            "a missing watermark must read as None, not 0"
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        upsert_address_signatures_flushed_slot_in_tx(&mut tx, 200)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            Some((200, 300))
+        );
+
+        sqlx::query("DELETE FROM metadata WHERE key = $1")
+            .bind(LATEST_SLOT_KEY)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            None,
+            "a missing newest block must read as None"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn get_watermark_returns_none_when_unset() {
         let (db, _pg) = start_test_postgres_raw().await;
