@@ -48,6 +48,9 @@ pub async fn seed_allowed_mint(
             status: "allowed".to_string(),
             withdrawals_blocked: false,
             effective_slot,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_address}"),
             created_at: chrono::Utc::now(),
         }])

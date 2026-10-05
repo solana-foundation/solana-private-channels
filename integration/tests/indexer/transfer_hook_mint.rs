@@ -381,6 +381,9 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_pubkey}"),
             created_at: Utc::now(),
         }])

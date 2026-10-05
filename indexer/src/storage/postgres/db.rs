@@ -873,12 +873,14 @@ impl PostgresDb {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS mint_status_history (
-                mint_address    TEXT       NOT NULL,
-                status          TEXT       NOT NULL CHECK (status IN ('allowed','blocked')),
-                effective_slot  BIGINT     NOT NULL,
-                signature       TEXT       NOT NULL,
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (mint_address, effective_slot)
+                mint_address      TEXT       NOT NULL,
+                status            TEXT       NOT NULL CHECK (status IN ('allowed','blocked')),
+                effective_slot    BIGINT     NOT NULL,
+                transaction_index INTEGER    NOT NULL,
+                instruction_index INTEGER    NOT NULL,
+                inner_index       INTEGER,
+                signature         TEXT       NOT NULL,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
         )
@@ -897,6 +899,15 @@ impl PostgresDb {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_mint_status_history_lookup
              ON mint_status_history (mint_address, effective_slot DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // One row per source instruction, so a replay is skipped but two changes
+        // in one slot are both kept.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mint_status_history_source
+             ON mint_status_history (signature, instruction_index, COALESCE(inner_index, -1))",
         )
         .execute(&self.pool)
         .await?;
@@ -3024,8 +3035,8 @@ impl PostgresDb {
                     withdraw_fee = EXCLUDED.withdraw_fee,
                     min_withdraw_amount = EXCLUDED.min_withdraw_amount,
                     allow_mint_slot = EXCLUDED.allow_mint_slot
-                -- Slot-ordered like mint_status_history: a backfill or resync
-                -- replaying an older AllowMint cannot restore older values.
+                -- Slot-ordered: a backfill or resync replaying an older
+                -- AllowMint cannot restore older values.
                 WHERE mints.allow_mint_slot <= EXCLUDED.allow_mint_slot
                 "#,
             )
@@ -3045,7 +3056,7 @@ impl PostgresDb {
     }
 
     /// Set each mint's `status` mirror to its latest `mint_status_history`
-    /// transition (highest `effective_slot`); a mint with no row is untouched.
+    /// transition by block position; a mint with no row is untouched.
     pub async fn sync_mint_status_internal(
         &self,
         mint_addresses: &[String],
@@ -3064,7 +3075,8 @@ impl PostgresDb {
                     mint_address, status, withdrawals_blocked
                 FROM mint_status_history
                 WHERE mint_address = ANY($1)
-                ORDER BY mint_address, effective_slot DESC
+                ORDER BY mint_address, effective_slot DESC, transaction_index DESC,
+                         instruction_index DESC, COALESCE(inner_index, -1) DESC
             ) h
             WHERE m.mint_address = h.mint_address
             "#,
@@ -3090,15 +3102,19 @@ impl PostgresDb {
             sqlx::query(
                 r#"
                 INSERT INTO mint_status_history
-                    (mint_address, status, withdrawals_blocked, effective_slot, signature)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (mint_address, effective_slot) DO NOTHING
+                    (mint_address, status, withdrawals_blocked, effective_slot,
+                     transaction_index, instruction_index, inner_index, signature)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (signature, instruction_index, COALESCE(inner_index, -1)) DO NOTHING
                 "#,
             )
             .bind(&status.mint_address)
             .bind(&status.status)
             .bind(status.withdrawals_blocked)
             .bind(status.effective_slot)
+            .bind(status.transaction_index)
+            .bind(status.instruction_index)
+            .bind(status.inner_index)
             .bind(&status.signature)
             .execute(&mut *tx)
             .await?;
@@ -3113,34 +3129,41 @@ impl PostgresDb {
         mint_address: &str,
         slot: i64,
     ) -> Result<MintStatusAtSlot, StorageError> {
-        let row: Option<(String,)> = sqlx::query_as(
+        // The status coming into the slot, plus every change inside it.
+        let statuses: Vec<(String,)> = sqlx::query_as(
             r#"
+            (SELECT status FROM mint_status_history
+             WHERE mint_address = $1 AND effective_slot < $2
+             ORDER BY effective_slot DESC, transaction_index DESC,
+                      instruction_index DESC, COALESCE(inner_index, -1) DESC
+             LIMIT 1)
+            UNION ALL
             SELECT status FROM mint_status_history
-            WHERE mint_address = $1 AND effective_slot <= $2
-            ORDER BY effective_slot DESC
-            LIMIT 1
+            WHERE mint_address = $1 AND effective_slot = $2
             "#,
         )
         .bind(mint_address)
         .bind(slot)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        match row {
-            Some((s,)) if s == "allowed" => Ok(MintStatusAtSlot::Allowed),
-            Some((s,)) if s == "blocked" => Ok(MintStatusAtSlot::Blocked),
-            // Unrecognized status is data corruption; fail closed to `Blocked` and log loudly.
-            Some((other,)) => {
-                warn!(
-                    mint_address,
-                    slot,
-                    status = %other,
-                    "Unrecognized mint status in mint_status_history; treating as Blocked"
-                );
-                Ok(MintStatusAtSlot::Blocked)
-            }
-            None => Ok(MintStatusAtSlot::NeverAllowed),
+        // A deposit row proves the gate was open when it ran, so any allow passes it.
+        if statuses.iter().any(|(status,)| status == "allowed") {
+            return Ok(MintStatusAtSlot::Allowed);
         }
+        if statuses.is_empty() {
+            return Ok(MintStatusAtSlot::NeverAllowed);
+        }
+        // Unrecognized status is data corruption; fail closed to `Blocked` and log loudly.
+        if let Some((other,)) = statuses.iter().find(|(status,)| status != "blocked") {
+            warn!(
+                mint_address,
+                slot,
+                status = %other,
+                "Unrecognized mint status in mint_status_history; treating as Blocked"
+            );
+        }
+        Ok(MintStatusAtSlot::Blocked)
     }
 
     pub async fn get_mint_internal(
@@ -3278,8 +3301,8 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// `transactions.id` for every `deposit` row whose mint was not in
-    /// `allowed` status at the deposit's slot, per `mint_status_history`.
+    /// `transactions.id` for every `deposit` row whose mint was not allowed
+    /// coming into the deposit's slot or by a change inside it.
     pub async fn get_orphan_deposit_ids_internal(&self) -> Result<Vec<i64>, sqlx::Error> {
         let rows: Vec<(i64,)> = sqlx::query_as(
             r#"
@@ -3289,12 +3312,21 @@ impl PostgresDb {
                 SELECT status
                 FROM mint_status_history h
                 WHERE h.mint_address = t.mint
-                  AND h.effective_slot <= t.slot
-                ORDER BY h.effective_slot DESC
+                  AND h.effective_slot < t.slot
+                ORDER BY h.effective_slot DESC, h.transaction_index DESC,
+                         h.instruction_index DESC, COALESCE(h.inner_index, -1) DESC
                 LIMIT 1
-            ) latest ON true
+            ) coming_in ON true
             WHERE t.transaction_type = 'deposit'
-              AND (latest.status IS NULL OR latest.status = 'blocked')
+              -- Same rule as the gate: allowed coming into the slot, or any allow inside it.
+              AND coming_in.status IS DISTINCT FROM 'allowed'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM mint_status_history h
+                  WHERE h.mint_address = t.mint
+                    AND h.effective_slot = t.slot
+                    AND h.status = 'allowed'
+              )
             ORDER BY t.id ASC
             "#,
         )

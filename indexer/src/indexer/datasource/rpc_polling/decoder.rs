@@ -173,14 +173,17 @@ fn parse_block(
             true,
         )?
         .into_iter()
-        .map(|(signature, location, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Escrow(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        })
+        .map(
+            |(signature, location, ix, transaction_index)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Escrow(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                transaction_index,
+                instruction_index: location.top_level_index,
+                inner_index: location.inner.map(|i| i.inner_index),
+            },
+        )
         .collect()),
         ProgramType::Withdraw => Ok(parse_block_for_program::<WithdrawInstruction>(
             block,
@@ -191,14 +194,17 @@ fn parse_block(
             false,
         )?
         .into_iter()
-        .map(|(signature, location, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Withdraw(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        })
+        .map(
+            |(signature, location, ix, transaction_index)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Withdraw(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                transaction_index,
+                instruction_index: location.top_level_index,
+                inner_index: location.inner.map(|i| i.inner_index),
+            },
+        )
         .collect()),
     }
 }
@@ -314,8 +320,8 @@ fn validate_transaction(
     Ok((account_pubkeys, signature.clone()))
 }
 
-/// Parse a block and return (signature, location, instruction) for every
-/// instruction of the given program.
+/// Parse a block and return (signature, location, instruction, transaction index) for
+/// every instruction of the given program.
 fn parse_block_for_program<T>(
     block: &RpcBlock,
     filter_program_id: &str,
@@ -323,7 +329,7 @@ fn parse_block_for_program<T>(
     inner_discriminator_excluded: fn(u8) -> bool,
     escrow_instance_id: Option<&Pubkey>,
     require_inner_instructions: bool,
-) -> Result<Vec<(String, InstructionLocation, T)>, SlotRejection>
+) -> Result<Vec<(String, InstructionLocation, T, u32)>, SlotRejection>
 where
     T: std::fmt::Debug,
 {
@@ -336,6 +342,7 @@ where
         return Ok(instructions);
     };
 
+    // Enumerate before the failed-tx skip so the index is the position in the whole block.
     for (tx_position, tx_with_meta) in block.transactions.iter().enumerate() {
         // Only an explicit `err: null` is a success; a failed or unreported one is skipped.
         if tx_with_meta
@@ -400,7 +407,7 @@ where
                     location,
                 ) {
                     Ok(Some(ix)) => {
-                        instructions.push((signature.clone(), location, ix));
+                        instructions.push((signature.clone(), location, ix, tx_position as u32));
                     }
                     Ok(None) => {
                         debug!("Skipped unsupported instruction");
@@ -455,7 +462,7 @@ where
                     location,
                 ) {
                     Ok(Some(ix)) => {
-                        instructions.push((signature.clone(), location, ix));
+                        instructions.push((signature.clone(), location, ix, tx_position as u32));
                     }
                     Ok(None) => {
                         debug!("Skipped unsupported inner instruction");
@@ -576,7 +583,7 @@ mod tests {
         )
         .expect("the mock parsers used here decode every instruction")
         .into_iter()
-        .map(|(sig, location, value)| (sig, location.top_level_index, value))
+        .map(|(sig, location, value, _)| (sig, location.top_level_index, value))
         .collect()
     }
 
@@ -1375,7 +1382,7 @@ mod tests {
         .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 1);
-        let (sig, location, data) = &result[0];
+        let (sig, location, data, _) = &result[0];
         assert_eq!(sig, &test_sig("sig_cpi"));
         assert_eq!(location.top_level_index, 0);
         assert_eq!(location.inner.unwrap().inner_index, 1);
@@ -2003,5 +2010,55 @@ mod tests {
         assert_eq!(data.transaction_nonce, 42);
 
         assert!(matches!(release(12), Err(SlotRejection::Undecodable(_))));
+    }
+
+    /// The transaction index is the position in the whole block, so failed and
+    /// unrelated transactions before ours still count. Yellowstone numbers them the same way.
+    #[test]
+    fn transaction_index_counts_every_transaction_in_the_block() {
+        // Escrow program at key 0; keys 1..12 fill the deposit's accounts.
+        let mut account_keys: Vec<String> =
+            (0u8..12).map(|key| test_pubkey(key).to_string()).collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        let deposit = create_instruction(
+            0,
+            (0u8..12).collect(),
+            bs58::encode(deposit_ix_bytes(1000, None)).into_string(),
+        );
+
+        let mut block = create_test_block();
+        // Position 0: a failed escrow transaction, which is skipped.
+        block.transactions.push(create_failed_transaction(
+            "sig_failed".to_string(),
+            account_keys.clone(),
+            vec![deposit.clone()],
+        ));
+        // Position 1: an unrelated transaction.
+        block.transactions.push(create_successful_transaction(
+            "sig_unrelated".to_string(),
+            create_account_keys_with_program(TEST_PROGRAM_ID, 0),
+            vec![create_instruction(0, vec![], "unrelated".to_string())],
+        ));
+        // Position 2: our deposit, with its event self-CPI.
+        let mut ours =
+            create_successful_transaction("sig_deposit".to_string(), account_keys, vec![deposit]);
+        ours.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 0,
+                        accounts: vec![],
+                        data: bs58::encode(deposit_event_bytes(1000)).into_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
+        block.transactions.push(ours);
+
+        let rows = parse_block(&block, 7, ProgramType::Escrow, None).expect("the deposit decodes");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transaction_index, 2);
     }
 }

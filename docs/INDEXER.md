@@ -188,6 +188,24 @@ Each indexed instruction is keyed on the triple **`(signature, instruction_index
 
 **Locations**: identity column [`indexer/src/storage/common/models.rs`](../indexer/src/storage/common/models.rs); position capture [`InstructionLocation`/`InnerLocation`](../indexer/src/indexer/datasource/common/types.rs); event scoping `parse_deposit` in [`escrow.rs`](../indexer/src/indexer/datasource/common/parser/escrow.rs).
 
+### Mint status history
+
+Each AllowMint and BlockMint writes one `mint_status_history` row, keyed on its source
+instruction and ordered by block position (slot, transaction, instruction, inner
+instruction). A BlockMint that leaves deposits open writes `allowed`. Status is read three ways:
+
+- **Deposit in a slot with changes**: allowed if the status coming into the slot is
+  `allowed` or any change inside it is. Order inside the slot is ignored: the program
+  refuses blocked deposits and only successful transactions are indexed, so a deposit
+  row proves the gate was open when it ran.
+- **Deposit in a later slot**: the last change by block position decides.
+- **`mints` mirror** (`status`, `withdrawals_blocked`): the last change by block position.
+
+The operator gate and the reconciliation orphan query use the same rule.
+
+**Locations**: `get_mint_status_at_slot_internal`, `get_orphan_deposit_ids_internal` and
+`sync_mint_status_internal` in [`db.rs`](../indexer/src/storage/postgres/db.rs).
+
 
 ## Operator Components
 
