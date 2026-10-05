@@ -55,6 +55,11 @@ pub fn process_deposit(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+
+    if args.amount == 0 {
+        return Err(PrivateChannelEscrowProgramError::ZeroAmount.into());
+    }
+
     if accounts.len() < FIXED_ACCOUNTS_LEN {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -147,6 +152,16 @@ pub fn process_deposit(
     let received = escrow_token_balance_after
         .checked_sub(escrow_token_balance_before)
         .ok_or(PrivateChannelEscrowProgramError::InvalidEscrowBalance)?;
+
+    // A transfer fee can consume a positive request entirely.
+    if received == 0 {
+        return Err(PrivateChannelEscrowProgramError::ZeroAmount.into());
+    }
+
+    // Checked net of any transfer fee, since that is what the channel mints.
+    if received < allowed_mint.min_deposit_amount {
+        return Err(PrivateChannelEscrowProgramError::BelowMinimumDeposit.into());
+    }
 
     let recipient = args.recipient.unwrap_or(*user_info.address());
     let event = DepositEvent::new(
@@ -265,7 +280,9 @@ mod tests {
 
     #[test]
     fn test_process_deposit_empty_accounts() {
-        let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // 8 amount + 1 recipient option; the entrypoint has already stripped the
+        // discriminator. Non-zero amount so the zero-amount guard does not fire first.
+        let instruction_data = vec![1, 0, 0, 0, 0, 0, 0, 0, 0];
         let accounts = [];
 
         let result = process_deposit(
@@ -275,6 +292,26 @@ mod tests {
         );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
+    }
+
+    // With no accounts there is nothing to transfer from, so ZeroAmount here
+    // proves the guard runs before the CPI. The post-transfer check would also
+    // catch a zero request, which is why an end-to-end test cannot pin this.
+    #[test]
+    fn test_process_deposit_zero_amount_rejected_before_accounts() {
+        let instruction_data = vec![0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let accounts = [];
+
+        let result = process_deposit(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
+
+        assert_eq!(
+            result.err(),
+            Some(PrivateChannelEscrowProgramError::ZeroAmount.into())
+        );
     }
 
     // has_recipient flag = 1 signals that 32 more bytes follow for the recipient key.

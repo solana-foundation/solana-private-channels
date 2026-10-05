@@ -3,9 +3,9 @@ use crate::{
     storage::common::{models::MintStatusAtSlot, storage::Storage},
 };
 
-/// Resolve a mint's status as of `slot` by reading the latest history row
-/// with `effective_slot <= slot`. Returns `NeverAllowed` when no such row
-/// exists (the mint has never been allowlisted at or before that slot).
+/// Resolve a mint's status for a deposit at `slot`: `Allowed` if the status
+/// coming into the slot is allowed or any change inside the slot is. Returns
+/// `NeverAllowed` when no history row exists at or before that slot.
 pub async fn get_mint_status_at_slot(
     storage: &Storage,
     mint_address: &str,

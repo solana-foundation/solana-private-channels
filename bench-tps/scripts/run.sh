@@ -227,7 +227,7 @@ echo "Admin pubkey: ${ADMIN_PUBKEY}"
 
 # patch_env KEY VALUE updates or appends a KEY=VALUE line in .env, which holds secrets, so it stays 0600.
 patch_env() {
-    "${REPO_ROOT}/scripts/upsert-env.sh" "${BENCH_ENV}" "$1" "$2"
+    printf '%s' "$2" | "${REPO_ROOT}/scripts/upsert-env.sh" "${BENCH_ENV}" "$1"
 }
 
 patch_env "PRIVATE_CHANNEL_ADMIN_KEYS" "${ADMIN_PUBKEY}"
