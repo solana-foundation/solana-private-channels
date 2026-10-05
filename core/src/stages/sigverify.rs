@@ -507,6 +507,46 @@ mod tests {
         );
     }
 
+    /// Rotation hands each mint from the retired authority to the configured admin, with
+    /// the admin co-signing as fee payer. Listing the admin without its signature is not enough.
+    #[tokio::test]
+    async fn mint_authority_migration_needs_the_admin_to_sign() {
+        let admin = Keypair::new();
+        let retired_admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let migrate = spl_token::instruction::set_authority(
+            &spl_token::id(),
+            &mint,
+            Some(&admin.pubkey()),
+            AuthorityType::MintTokens,
+            &retired_admin.pubkey(),
+            &[],
+        )
+        .unwrap();
+
+        let co_signed = sanitize(
+            std::slice::from_ref(&migrate),
+            &admin,
+            &[&admin, &retired_admin],
+        );
+        let result = sigverify_transaction(&co_signed, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "migration co-signed by the admin must pass, got {result}"
+        );
+
+        let mut admin_listed_unsigned = migrate;
+        admin_listed_unsigned
+            .accounts
+            .push(AccountMeta::new_readonly(admin.pubkey(), false));
+        let unsigned = sanitize(&[admin_listed_unsigned], &retired_admin, &[&retired_admin]);
+        let result = sigverify_transaction(&unsigned, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "migration listing the admin without its signature must be rejected, got {result}"
+        );
+    }
+
     /// Token account authority changes stay open to their owners: only the mint-side
     /// authority types need an admin signer.
     #[tokio::test]
