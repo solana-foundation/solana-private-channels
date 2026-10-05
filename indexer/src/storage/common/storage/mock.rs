@@ -1129,12 +1129,16 @@ impl MockStorage {
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, StorageError> {
         self.check_should_fail("try_requeue_prebroadcast")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
-            if txn.id == transaction_id && txn.status == TransactionStatus::Processing {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
                 // The capped write still matches the row, so the trigger bumps it.
                 if txn.recovery_requeue_attempts >= max_attempts {
                     txn.updated_at = Utc::now();

@@ -574,15 +574,22 @@ impl Storage {
         requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
     }
 
-    /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures
-    /// where the sender owns the Processing row. Enforces the requeue cap inside the
-    /// write; see `RequeueOutcome`.
+    /// Cap-gated CAS `Processing` → `Pending` on `updated_at` for pre-broadcast
+    /// failures, so only the incarnation the caller owns is requeued or capped.
+    /// Enforces the requeue cap inside the write; see `RequeueOutcome`.
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, StorageError> {
-        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id, max_attempts).await
+        try_requeue_prebroadcast::try_requeue_prebroadcast(
+            self,
+            transaction_id,
+            expected_updated_at,
+            max_attempts,
+        )
+        .await
     }
 
     /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.

@@ -2014,14 +2014,14 @@ impl PostgresDb {
     /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
     /// survives restarts.
     ///
-    /// Deliberately ungated on `updated_at`: it only ever re-arms a row that is
-    /// already going back in the queue, so the worst a stale caller can do is
-    /// requeue an incarnation someone else owns and spend one of its capped
-    /// attempts. It can never authorize a broadcast; that decision is gated by
-    /// `claim_and_persist_signature`, which does present the generational token.
+    /// Gated on `updated_at`, so a stale caller matches nothing. Even at the cap
+    /// the write bumps the row, which would fail the claim of an incarnation
+    /// someone else owns, and the bumped value it returns is only a lease
+    /// because the write proved the caller still owned the row.
     pub async fn try_requeue_prebroadcast_internal(
         &self,
         transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, sqlx::Error> {
         // One atomic write enforces the cap: the CASE requeues (and increments) only
@@ -2039,11 +2039,13 @@ impl PostgresDb {
                               ELSE recovery_requeue_attempts END
             WHERE id = $1
               AND status = 'processing'
+              AND updated_at = $3
             RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued, updated_at
             "#,
         )
         .bind(transaction_id)
         .bind(max_attempts)
+        .bind(expected_updated_at)
         .fetch_optional(&self.pool)
         .await?;
 

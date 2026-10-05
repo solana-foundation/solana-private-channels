@@ -300,7 +300,11 @@ async fn requeue_single_prebroadcast(
     transaction: &DbTransaction,
 ) {
     match storage
-        .try_requeue_prebroadcast(transaction.id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(
+            transaction.id,
+            transaction.updated_at,
+            MAX_RECOVERY_REQUEUE_ATTEMPTS,
+        )
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -327,7 +331,7 @@ async fn requeue_single_prebroadcast(
         Ok(RequeueOutcome::NotProcessing) => warn!(
             txn_id = transaction.id,
             trace_id = %transaction.trace_id,
-            "Pre-broadcast requeue skipped: row no longer Processing"
+            "Pre-broadcast requeue skipped: row has moved past this incarnation"
         ),
         Err(e) => warn!(
             txn_id = transaction.id,

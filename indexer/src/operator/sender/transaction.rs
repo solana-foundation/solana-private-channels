@@ -888,7 +888,14 @@ pub(super) fn handle_confirmation_result<'a>(
                     // mint alone. So there is no nonce-keyed state to unwind
                     // and no withdrawal remint to compensate here.
                     JitOutcome::Transient(reason) => {
-                        requeue_deposit_after_jit(state, txn_id, &signature, &reason).await;
+                        requeue_deposit_after_jit(
+                            state,
+                            txn_id,
+                            ctx.deposit_claim_lease,
+                            &signature,
+                            &reason,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1396,9 +1403,21 @@ pub(super) async fn requeue_or_fail_prebroadcast(
     // holding the rotation barrier. The next attempt puts it back.
     state.in_flight_withdrawals.remove(&nonce);
 
+    // Submission arms the lease for every release, so without one this sender
+    // cannot prove it owns the row and leaves it to recovery.
+    let Some(lease) = state.release_leases.get(&nonce).copied() else {
+        state.remint_cache.remove(&nonce);
+        warn!(
+            transaction_id,
+            nonce,
+            "No release lease for the pre-broadcast requeue, row left Processing for recovery"
+        );
+        return;
+    };
+
     match state
         .storage
-        .try_requeue_prebroadcast(transaction_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(transaction_id, lease, MAX_RECOVERY_REQUEUE_ATTEMPTS)
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -1427,7 +1446,7 @@ pub(super) async fn requeue_or_fail_prebroadcast(
             state.remint_cache.remove(&nonce);
             warn!(
                 transaction_id,
-                nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+                nonce, "Pre-broadcast requeue skipped: row has moved past this incarnation"
             );
         }
         Err(e) => {
@@ -1447,12 +1466,13 @@ pub(super) async fn requeue_or_fail_prebroadcast(
 /// still journaled; the helper only adds an `InitializeMint`, which moves no
 /// balance and is idempotent, so re-arming sends nothing value-bearing.
 ///
-/// No status is written on any branch: the cap, a raced row and a failed write
-/// all leave the row to the recovery sweep, which classifies the deposit
-/// on-chain before escalating to a human.
+/// No status is written on any branch: the cap, a raced row, a missing claim
+/// lease and a failed write all leave the row to the recovery sweep, which
+/// classifies the deposit on-chain before escalating to a human.
 pub(super) async fn requeue_deposit_after_jit(
     state: &mut SenderState,
     txn_id: i64,
+    claim_lease: Option<DateTime<Utc>>,
     signature: &Signature,
     reason: &str,
 ) {
@@ -1465,9 +1485,19 @@ pub(super) async fn requeue_deposit_after_jit(
     // its own builder, so the cached one would only go stale here.
     state.mint_builders.remove(&txn_id);
 
+    let Some(claim_lease) = claim_lease else {
+        leave_processing_for_recovery(
+            pt,
+            Some(txn_id),
+            signature,
+            &format!("JIT requeue has no claim lease to present ({reason})"),
+        );
+        return;
+    };
+
     match state
         .storage
-        .try_requeue_prebroadcast(txn_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(txn_id, claim_lease, MAX_RECOVERY_REQUEUE_ATTEMPTS)
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -3319,28 +3349,29 @@ mod tests {
     /// that an ordinary retry would settle.
     #[tokio::test]
     async fn build_failure_requeues_the_withdrawal_instead_of_escalating() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
-        state.in_flight_withdrawals.insert(7);
-        state.remint_cache.insert(7, make_remint_info(10));
+        let txn_id = 10;
+        let nonce = 7;
+        let mock = mock_with_processing_row(txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, lease);
+        state.in_flight_withdrawals.insert(nonce);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         send_and_confirm(
             &mut state,
             dummy_instruction(),
             None,
-            &withdrawal_ctx(10, 7),
+            &withdrawal_ctx(txn_id, nonce),
             RetryPolicy::Idempotent,
             &ExtraErrorCheckPolicy::None,
             &storage_tx,
         )
         .await;
 
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
         assert_eq!(
-            row_status(mock, 10),
+            row_status(&mock, txn_id),
             Some(TransactionStatus::Pending),
             "a withdrawal that never broadcast must go back on the queue"
         );
@@ -3349,7 +3380,7 @@ mod tests {
             "no terminal status may be written for a row that never left"
         );
         assert!(
-            !state.in_flight_withdrawals.contains(&7),
+            !state.in_flight_withdrawals.contains(&nonce),
             "an unsent nonce must not hold the rotation barrier"
         );
     }
@@ -3391,6 +3422,61 @@ mod tests {
             row_status(&mock, txn_id),
             Some(TransactionStatus::ManualReview),
             "the escalation must park the row, not requeue it"
+        );
+    }
+
+    /// An attempt that reaches the cap after recovery requeued its row and the
+    /// fetcher claimed it again holds a dead lease. Its requeue must match
+    /// nothing: a bump would fail the new claim, and adopting the bumped lease
+    /// would let the old attempt park work it no longer owns.
+    #[tokio::test]
+    async fn a_stale_attempt_at_the_requeue_cap_leaves_the_next_incarnation_alone() {
+        let txn_id = 14;
+        let nonce = 10;
+        let mock = mock_with_processing_row(txn_id);
+        mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
+            MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        // Recovery spends the last attempt, then the fetcher claims the row again.
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap();
+        let current_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, stale_lease);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the stale attempt must not park the claimed row"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+        assert_eq!(
+            row_updated_at(&mock, txn_id),
+            Some(current_lease),
+            "the stale attempt must not bump the row, or the new claim fails"
         );
     }
 
@@ -3437,14 +3523,18 @@ mod tests {
     /// waiting for the recovery sweep to notice it.
     #[tokio::test]
     async fn read_failure_requeues_the_withdrawal_for_a_bounded_retry() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(13));
-        state.in_flight_withdrawals.insert(9);
+        let txn_id = 13;
+        let nonce = 9;
+        let mock = mock_with_processing_row(txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, lease);
+        state.in_flight_withdrawals.insert(nonce);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         route_builder_error(
             &mut state,
-            &withdrawal_ctx(13, 9),
+            &withdrawal_ctx(txn_id, nonce),
             &storage_tx,
             crate::error::StorageError::DatabaseError {
                 message: "transient".to_string(),
@@ -3453,11 +3543,8 @@ mod tests {
         )
         .await;
 
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
         assert_eq!(
-            row_status(mock, 13),
+            row_status(&mock, txn_id),
             Some(TransactionStatus::Pending),
             "an unreadable chain or database must not freeze the row"
         );
@@ -3465,7 +3552,7 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "a read failure is not a terminal outcome"
         );
-        assert!(!state.in_flight_withdrawals.contains(&9));
+        assert!(!state.in_flight_withdrawals.contains(&nonce));
     }
 
     // ── handle_success ──────────────────────────────────────────────
