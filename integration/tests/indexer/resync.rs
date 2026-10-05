@@ -71,6 +71,7 @@ use spl_token::ID as TOKEN_PROGRAM_ID;
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
+    channel_shim::ChannelShim,
     indexer_helper::{start_private_channel_indexer, start_solana_indexer_rpc_polling},
     mint_helper::TEST_WITHDRAW_FEE,
     mock_rpc::{MockRpcServer, Reply},
@@ -3052,13 +3053,18 @@ fn admin() -> Keypair {
 }
 
 /// Both indexers and both operators, wired to one validator as the single-node harness runs them.
-struct Stack(Vec<Worker>);
+struct Stack {
+    workers: Vec<Worker>,
+    // The validator has no status snapshot, so the escrow operator reads the channel through this.
+    _channel: ChannelShim,
+}
 
 impl Stack {
     /// Started one at a time: concurrent schema creation races in Postgres ("tuple concurrently
     /// updated"), which is a startup artefact of this harness, not of the resync.
     async fn start(rpc_url: &str, db_url: &str, instance: Pubkey) -> Self {
         let (rpc, db) = (rpc_url.to_string(), db_url.to_string());
+        let channel = ChannelShim::start(rpc_url).await;
         let mut workers = Vec::new();
         {
             let (rpc, db) = (rpc.clone(), db.clone());
@@ -3083,7 +3089,7 @@ impl Stack {
             );
         }
         {
-            let (rpc, db) = (rpc.clone(), db.clone());
+            let (rpc, db) = (channel.url(), db.clone());
             workers.push(
                 Worker::spawn(move || async move {
                     start_solana_to_private_channel_operator_with_config(
@@ -3117,11 +3123,14 @@ impl Stack {
             })
             .await,
         );
-        Self(workers)
+        Self {
+            workers,
+            _channel: channel,
+        }
     }
 
     async fn stop(self) {
-        for worker in self.0 {
+        for worker in self.workers {
             worker.stop().await;
         }
     }

@@ -127,8 +127,10 @@ See [`CONFIG.md`](CONFIG.md) for the full reference and restart procedure.
 
 ### 2. Read replicas (horizontal)
 
-- Add Postgres read replicas behind additional read nodes.
-- Front them with a load balancer, or use the gateway's built-in fanout.
+- The gateway reads from exactly one read node on one replica (`GATEWAY_READ_URL`). Load-balancing
+  several read nodes or replicas behind it is not supported, because the client re-sign rule
+  reads `getBlockHeight` and then `getSignatureStatuses` and needs both answers from the same
+  replica. See [`CONFIG.md`](CONFIG.md).
 
 ### 3. Indexer parallelism (horizontal)
 

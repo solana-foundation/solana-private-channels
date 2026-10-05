@@ -199,7 +199,7 @@ fn make_pending_remint_with_lvbh(
 //
 // Drives `execute_deferred_remint` directly. A write-ahead remint signature is
 // on record; `attempt_remint` classifies it on the source chain, the scripted
-// `getSignatureStatuses` reports it finalized, so the helper short-circuits
+// `getSignatureStatusSnapshot` reports it finalized, so the helper short-circuits
 // before sending and routes the confirmed arm to the `FailedReminted` status
 // emission. This is the crash-after-send path that prevents a duplicate mint.
 #[tokio::test]
@@ -227,9 +227,10 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
 
     // Classification on the source chain reports it finalized-success.
     mock.enqueue(
-        "getSignatureStatuses",
+        "getSignatureStatusSnapshot",
         Reply::result(json!({
-            "context": { "slot": 200 },
+            "blockHeight": 200,
+            "firstAvailableBlock": 0,
             "value": [{
                 "slot": 100,
                 "confirmations": null,

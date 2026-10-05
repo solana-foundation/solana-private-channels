@@ -4794,6 +4794,8 @@ mod tests {
                 .unwrap();
         }
         let mut state = sender_state_with_storage(&server.url(), mock);
+        // ReleaseFunds belongs to the withdraw role, whose destination is Solana.
+        state.program_type = ProgramType::Withdraw;
         state.instance_pda = Some(Pubkey::new_unique());
         state.remint_cache.insert(4, make_remint_info(70));
         if stash_signature {
@@ -4927,6 +4929,8 @@ mod tests {
             .create();
 
         let mut state = make_sender_state_with_server(&server.url());
+        // ReleaseFunds belongs to the withdraw role, whose destination is Solana.
+        state.program_type = ProgramType::Withdraw;
         state.instance_pda = Some(Pubkey::new_unique());
         // Nothing stashed in memory, everything on durable storage.
         state

@@ -1,3 +1,4 @@
+use crate::accounts::types::StoredTransaction;
 use crate::rpc::{
     constants::MAX_SIGNATURES,
     error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
@@ -27,9 +28,7 @@ pub async fn get_signature_statuses_impl(
         ));
     }
 
-    // Read the slot BEFORE the per-signature lookups. The lookups then observe a
-    // state at or after it, so the reported context understates freshness and a
-    // null can never claim to cover a block the response has not yet seen.
+    // A lower bound only on Postgres: a cached slot can run ahead of the store answering a miss.
     let current_slot = read_deps
         .accounts_db
         .get_current_slot()
@@ -65,29 +64,18 @@ pub async fn get_signature_statuses_impl(
 
         match stored_tx {
             Some(tx) => {
-                // Transaction found - return its status
-                // In PrivateChannel, all found transactions are confirmed (finalized)
                 debug!(
                     signature = %signature,
                     err = ?tx.meta.err,
                     "getSignatureStatuses transaction found"
                 );
-
-                let err = tx.meta.err.clone();
-                statuses.push(Some(TransactionStatus {
-                    slot: tx.slot,
-                    confirmations: None,
-                    status: err.clone().map_or(Ok(()), Err),
-                    err,
-                    confirmation_status: Some(TransactionConfirmationStatus::Finalized),
-                }));
+                statuses.push(Some(stored_status(&tx)));
             }
             None => {
                 debug!(
                     signature = %signature,
                     "getSignatureStatuses transaction not found"
                 );
-                // Transaction not found
                 statuses.push(None);
             }
         }
@@ -97,4 +85,16 @@ pub async fn get_signature_statuses_impl(
         context: RpcResponseContext::new(current_slot),
         value: statuses,
     })
+}
+
+/// A stored transaction's status; stored means settled, so it is always finalized.
+pub(super) fn stored_status(tx: &StoredTransaction) -> TransactionStatus {
+    let err = tx.meta.err.clone();
+    TransactionStatus {
+        slot: tx.slot,
+        confirmations: None,
+        status: err.clone().map_or(Ok(()), Err),
+        err,
+        confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+    }
 }

@@ -1,5 +1,8 @@
 use {
-    crate::rpc::get_signatures_for_address_impl::SignaturesForAddressConfig,
+    crate::rpc::{
+        get_signature_status_snapshot_impl::RpcStatusSnapshot,
+        get_signatures_for_address_impl::SignaturesForAddressConfig,
+    },
     jsonrpsee::{core::RpcResult, proc_macros::rpc},
     serde_json::Value,
     solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
@@ -92,6 +95,13 @@ pub trait PrivateChannelRpc {
         signatures: Vec<String>,
         config: Option<RpcSignatureStatusConfig>,
     ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>>;
+
+    /// Statuses, block height and ledger floor from one snapshot, for proving an absence
+    #[method(name = "getSignatureStatusSnapshot")]
+    async fn get_signature_status_snapshot(
+        &self,
+        signatures: Vec<String>,
+    ) -> RpcResult<RpcStatusSnapshot>;
 
     /// Get the current transaction count
     #[method(name = "getTransactionCount")]

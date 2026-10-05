@@ -26,6 +26,7 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signature::Signer;
 use solana_sdk::signer::SeedDerivable;
 use std::sync::{Arc, Once};
+use test_utils::channel_shim::ChannelShim;
 use test_utils::indexer_helper::{start_private_channel_indexer, start_solana_indexer};
 use test_utils::mint_helper::TEST_WITHDRAW_FEE;
 use test_utils::operator_helper::{
@@ -899,8 +900,10 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let operator_key = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).unwrap();
     println!("\n=== Starting Solana -> PrivateChannel Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    // The validator plays the channel but has no status snapshot, so the shim serves it.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        channel_shim.url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,

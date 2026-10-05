@@ -16,6 +16,9 @@ use {
             get_latest_blockhash_impl::get_latest_blockhash_impl,
             get_recent_blockhash_impl::get_recent_blockhash_impl,
             get_recent_performance_samples_impl::get_recent_performance_samples_impl,
+            get_signature_status_snapshot_impl::{
+                get_signature_status_snapshot_impl, RpcStatusSnapshot,
+            },
             get_signature_statuses_impl::get_signature_statuses_impl,
             get_signatures_for_address_impl::{
                 get_signatures_for_address_impl, SignaturesForAddressConfig,
@@ -176,6 +179,14 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_signature_statuses_impl(read_deps, signatures, _config).await
+    }
+
+    async fn get_signature_status_snapshot(
+        &self,
+        signatures: Vec<String>,
+    ) -> RpcResult<RpcStatusSnapshot> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_signature_status_snapshot_impl(read_deps, signatures).await
     }
 
     async fn get_transaction_count(&self, _config: Option<RpcContextConfig>) -> RpcResult<u64> {

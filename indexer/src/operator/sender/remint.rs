@@ -490,6 +490,8 @@ enum EndpointVerdict {
         /// Lowest journaled blockhash slot across those signatures, the exact
         /// bottom of the range. `None` if any of them predates the column.
         min_blockhash_slot: Option<u64>,
+        /// Ledger floor from the same snapshot as the statuses; `None` means read it separately.
+        floor: Option<u64>,
     },
 }
 
@@ -497,11 +499,8 @@ enum EndpointVerdict {
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
 /// proves retention.
 ///
-/// Sound on one endpoint whose state only moves forward, such as a lagging replica: height
-/// is read before status and the floor after, so no answer comes from an older state than
-/// the one before it. The channel's read cache keeps this, since it serves getBlockHeight
-/// from Postgres, the store that answers a status miss. Not sound behind a load balancer
-/// whose backends can disagree.
+/// Channel proofs read height, statuses and floor from one snapshot, so they hold on any topology.
+/// Solana proofs read them in order (height, status, floor) and need one forward-only endpoint.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
 /// with the broadcast. An attempt journaled before that column existed carries none, and
@@ -519,6 +518,7 @@ async fn ledger_coverage_verdict(
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
     min_blockhash_slot: Option<u64>,
+    snapshot_floor: Option<u64>,
     endpoint_label: &str,
 ) -> SigFinality {
     let chain = finality.chain.chain_label();
@@ -536,7 +536,11 @@ async fn ledger_coverage_verdict(
             ));
         }
     };
-    let floor = match rpc.get_first_available_block().await {
+    let floor = match snapshot_floor {
+        Some(floor) => Ok(floor),
+        None => rpc.get_first_available_block().await,
+    };
+    let floor = match floor {
         Ok(floor) => floor,
         Err(e) => {
             OPERATOR_ABSENCE_CLASSIFY
@@ -580,8 +584,8 @@ pub(crate) async fn classify_signatures(
     finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
-    let (primary_lvbh, primary_blockhash_slot) =
-        match classify_endpoint(finality.primary, sigs).await {
+    let (primary_lvbh, primary_blockhash_slot, primary_floor) =
+        match classify_endpoint(finality.primary, finality.chain, sigs).await {
             EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
             EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
             EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
@@ -591,14 +595,15 @@ pub(crate) async fn classify_signatures(
             EndpointVerdict::DeadByAbsence {
                 min_lvbh,
                 min_blockhash_slot,
-            } => (min_lvbh, min_blockhash_slot),
+                floor,
+            } => (min_lvbh, min_blockhash_slot, floor),
         };
 
     match finality.fallback {
         // Destination path: the primary is allowed to be pruned (that is why the
         // fallback exists), so we trust the fallback's verdict and coverage-check
         // the fallback, never the primary.
-        Some(fb) => match classify_endpoint(fb, sigs).await {
+        Some(fb) => match classify_endpoint(fb, finality.chain, sigs).await {
             EndpointVerdict::Landed(sig) => {
                 warn_fallback_override("Landed", &sig.to_string(), sigs);
                 SigFinality::Landed(sig)
@@ -612,9 +617,17 @@ pub(crate) async fn classify_signatures(
             EndpointVerdict::DeadByAbsence {
                 min_lvbh,
                 min_blockhash_slot,
+                floor,
             } => {
-                ledger_coverage_verdict(finality, fb, min_lvbh, min_blockhash_slot, "fallback ")
-                    .await
+                ledger_coverage_verdict(
+                    finality,
+                    fb,
+                    min_lvbh,
+                    min_blockhash_slot,
+                    floor,
+                    "fallback ",
+                )
+                .await
             }
         },
         // Source/escrow single endpoint: no second node can corroborate, so the
@@ -625,6 +638,7 @@ pub(crate) async fn classify_signatures(
                 finality.primary,
                 primary_lvbh,
                 primary_blockhash_slot,
+                primary_floor,
                 "",
             )
             .await
@@ -637,7 +651,7 @@ pub(crate) async fn classify_signatures(
 /// coverage gate `classify_signatures` adds.
 #[cfg(test)]
 pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
-    match classify_endpoint(rpc, sigs).await {
+    match classify_endpoint(rpc, Chain::Solana, sigs).await {
         EndpointVerdict::Landed(sig) => SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
@@ -647,35 +661,55 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
     }
 }
 
-/// Classify `sigs` against one endpoint's `getSignatureStatuses` history, distinguishing a
-/// finalized-failed `Dead` from an absence-based one so only the latter needs a proof.
-async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
+/// Classify `sigs` on one endpoint, telling a finalized-failed `Dead` from an unproven absence.
+async fn classify_endpoint(
+    rpc: &RpcClientWithRetry,
+    chain: Chain,
+    sigs: &[PendingSig],
+) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
-    // Height before status: on an endpoint whose state only moves forward, the status
-    // then comes from a state at least as new, so a null is never paired with an expiry
-    // its own view had not reached. Held as a Result so an outage only matters below.
-    let block_height = rpc.get_block_height().await;
-
-    let response = match rpc.get_signature_statuses_with_history(&flat).await {
-        Ok(r) => r,
-        Err(e) => {
-            return EndpointVerdict::Uncertain(format!("signature status RPC failed: {}", e));
+    let (block_height, statuses, snapshot_floor) = match chain {
+        // One snapshot, and no fallback to separate reads that could mix states.
+        Chain::Channel => match rpc.get_signature_status_snapshot(&flat).await {
+            Ok(snapshot) => (
+                Ok(snapshot.block_height),
+                snapshot.value,
+                Some(snapshot.first_available_block),
+            ),
+            Err(e) => {
+                return EndpointVerdict::Uncertain(format!(
+                    "signature status snapshot RPC failed: {e}"
+                ));
+            }
+        },
+        Chain::Solana => {
+            // Height before status, so a null never comes from an older state than its height.
+            let block_height = rpc.get_block_height().await.map_err(|e| e.to_string());
+            match rpc.get_signature_statuses_with_history(&flat).await {
+                Ok(response) => (block_height, response.value, None),
+                Err(e) => {
+                    return EndpointVerdict::Uncertain(format!(
+                        "signature status RPC failed: {}",
+                        e
+                    ));
+                }
+            }
         }
     };
 
     // RPC returns one status per signature in order; a length mismatch would
     // silently skip checks below, so treat it as uncertain.
-    if response.value.len() != flat.len() {
+    if statuses.len() != flat.len() {
         return EndpointVerdict::Uncertain(format!(
             "RPC returned {} statuses for {} signatures",
-            response.value.len(),
+            statuses.len(),
             flat.len()
         ));
     }
 
     // Any sig finalized successfully → the release landed.
-    let finalized_success_index = response.value.iter().position(|signature_status| {
+    let finalized_success_index = statuses.iter().position(|signature_status| {
         signature_status.as_ref().is_some_and(|status| {
             status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
         })
@@ -686,7 +720,7 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
 
     // Block height is needed only for the lvbh check on null-status sigs, so a
     // transient getBlockHeight outage isn't treated as uncertainty otherwise.
-    let current_height = if response.value.iter().any(|s| s.is_none()) {
+    let current_height = if statuses.iter().any(|s| s.is_none()) {
         match block_height {
             Ok(h) => h,
             Err(e) => {
@@ -706,9 +740,9 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
     let mut min_absent_blockhash_slot: Option<u64> = None;
     let mut absent_slot_unknown = false;
 
-    // Walk the sigs to see if any could still land (index-aligned with response.value).
+    // Walk the sigs to see if any could still land (index-aligned with statuses).
     for (index, pending_sig) in sigs.iter().enumerate() {
-        let signature_status = &response.value[index];
+        let signature_status = &statuses[index];
 
         if let Some(status) = signature_status.as_ref() {
             // Only `finalized` is definitive; success was handled above, so this is failure.
@@ -755,6 +789,7 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
         Some(min_lvbh) => EndpointVerdict::DeadByAbsence {
             min_lvbh,
             min_blockhash_slot: min_absent_blockhash_slot,
+            floor: snapshot_floor,
         },
         // No absence: every sig carried a finalized-failed status.
         None => EndpointVerdict::DeadFinalizedFailure,
@@ -2721,12 +2756,11 @@ mod tests {
         );
 
         // The journaled attempt finalized successfully on the source chain.
-        let _status = mock_rpc(
+        let _status = mock_status_snapshot(
             &mut rpc_server,
-            "getSignatureStatuses",
-            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
-                "slot":100,"confirmations":null,"err":null,
-                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+            r#"{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            200,
+            0,
         )
         .await;
         // A second broadcast here is the double credit this gate exists to stop.
@@ -3036,7 +3070,7 @@ mod tests {
     }
 
     /// Fail-closed: a journaled attempt that cannot be classified (here the
-    /// backend rejects getSignatureStatuses) might have landed, so attempt_remint
+    /// backend has no status snapshot) might have landed, so attempt_remint
     /// must refuse to mint and escalate rather than risk a duplicate remint.
     #[tokio::test]
     async fn execute_deferred_remint_fails_closed_when_a_journaled_attempt_is_unclassifiable() {
@@ -3053,10 +3087,10 @@ mod tests {
                 blockhash_slot: None,
             }],
         );
-        // The status lookup that would classify it is unavailable on this backend.
+        // The snapshot that would classify it is unavailable on this backend.
         let _statuses = mock_rpc(
             &mut rpc_server,
-            "getSignatureStatuses",
+            "getSignatureStatusSnapshot",
             r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
         )
         .await;
@@ -3719,7 +3753,8 @@ mod tests {
     #[tokio::test]
     async fn channel_absence_without_a_journaled_slot_is_uncertain() {
         let mut server = mockito::Server::new_async().await;
-        mock_dead(&mut server).await;
+        // Expired absence with a floor covering everything: only the missing slot blocks Dead.
+        let _snapshot = mock_status_snapshot(&mut server, "null", 1000, 0).await;
 
         let rpc = make_rpc(&server.url());
         let sigs = vec![PendingSig {
@@ -3727,13 +3762,13 @@ mod tests {
             last_valid_block_height: 100,
             blockhash_slot: None,
         }];
-        assert!(
-            matches!(
-                classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await,
-                SigFinality::Uncertain(_)
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Uncertain(reason) => assert!(
+                reason.contains("predates the journaled blockhash slot"),
+                "uncertain for the wrong reason: {reason}"
             ),
-            "a tunable window with no journaled slot must not resolve to Dead"
-        );
+            _ => panic!("a tunable window with no journaled slot must not resolve to Dead"),
+        }
     }
 
     // ── liveness gate paths ────────────────────────────────────────────
@@ -4069,10 +4104,107 @@ mod tests {
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
     }
 
-    /// One endpoint is not one snapshot: the channel read node serves a replica that can
-    /// lag and catch up between two calls. A status read on the lagging state paired with
-    /// a height read on the caught-up one proves a landed mint dead, and the deposit is
-    /// minted twice. Reading height first means status never comes from an older state.
+    /// Register a `getSignatureStatusSnapshot` reply: `status` is one JSON status or `null`.
+    async fn mock_status_snapshot(
+        server: &mut mockito::Server,
+        status: &str,
+        height: u64,
+        floor: u64,
+    ) -> mockito::Mock {
+        mock_rpc(
+            server,
+            "getSignatureStatusSnapshot",
+            &format!(
+                r#"{{"jsonrpc":"2.0","result":{{"blockHeight":{height},"firstAvailableBlock":{floor},"value":[{status}]}},"id":1}}"#
+            ),
+        )
+        .await
+    }
+
+    /// The separate reads that used to prove a landed mint dead; a channel proof must not hit them.
+    async fn mock_unused_separate_reads(server: &mut mockito::Server) -> Vec<mockito::Mock> {
+        let null_status = mock_rpc(
+            server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1300},"value":[null]},"id":1}"#,
+        )
+        .await
+        .expect(0);
+        let height = mock_rpc(
+            server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1300,"id":1}"#,
+        )
+        .await
+        .expect(0);
+        let floor = mock_ledger_floor(server, 400).await.expect(0);
+        vec![null_status, height, floor]
+    }
+
+    fn channel_attempt() -> Vec<PendingSig> {
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 1150,
+            blockhash_slot: Some(1000),
+        }]
+    }
+
+    /// A channel proof reads only the snapshot, so a stale null from a separate call is never used.
+    #[tokio::test]
+    async fn channel_classification_reads_one_snapshot_not_three_calls() {
+        let mut server = mockito::Server::new_async().await;
+        let sigs = channel_attempt();
+        let snapshot = mock_status_snapshot(
+            &mut server,
+            r#"{"slot":1010,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            1300,
+            400,
+        )
+        .await;
+        let separate = mock_unused_separate_reads(&mut server).await;
+        let rpc = make_rpc(&server.url());
+
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Landed(signature) => assert_eq!(signature, sigs[0].signature),
+            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
+                panic!("expected Landed, got an unresolved verdict: {reason}")
+            }
+        }
+        snapshot.assert_async().await;
+        for mock in separate {
+            mock.assert_async().await;
+        }
+    }
+
+    /// A core without the snapshot answers -32601, which must stay Uncertain with no fallback.
+    #[tokio::test]
+    async fn channel_snapshot_unavailable_is_uncertain_without_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let sigs = channel_attempt();
+        let snapshot = mock_rpc(
+            &mut server,
+            "getSignatureStatusSnapshot",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
+        )
+        .await;
+        let separate = mock_unused_separate_reads(&mut server).await;
+        let rpc = make_rpc(&server.url());
+
+        match classify_signatures(&FinalityRpc::channel(&rpc, None), &sigs).await {
+            SigFinality::Uncertain(_) => {}
+            SigFinality::Dead => panic!("an unanswered snapshot was turned into a Dead proof"),
+            SigFinality::Landed(_) | SigFinality::Live(_) => {
+                panic!("expected Uncertain for an unanswered snapshot")
+            }
+        }
+        snapshot.assert_async().await;
+        for mock in separate {
+            mock.assert_async().await;
+        }
+    }
+
+    /// Solana still reads separately: height first, so a null never comes from an older state.
     #[tokio::test]
     async fn classify_replica_catching_up_between_calls_is_not_dead() {
         let last_valid_block_height = 1150;
@@ -4081,8 +4213,8 @@ mod tests {
         let caught_up_height = 1300;
         let landed_sig = Signature::new_unique();
 
-        // The first request of any method sees the lagging replica; every later one sees
-        // it caught up, with the mint finalized.
+        // The first request of any method sees the lagging endpoint; every later one sees
+        // it caught up, with the transaction finalized.
         let requests_seen = Arc::new(AtomicUsize::new(0));
         let mut server = mockito::Server::new_async().await;
         let status_requests = requests_seen.clone();
@@ -4145,9 +4277,9 @@ mod tests {
             blockhash_slot: Some(blockhash_slot),
         }];
 
-        match classify_signatures(&FinalityRpc::channel(&client, None), &sigs).await {
+        match classify_signatures(&FinalityRpc::solana(&client, None), &sigs).await {
             SigFinality::Landed(signature) => assert_eq!(signature, landed_sig),
-            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Dead => panic!("a landed transaction was proven dead"),
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 panic!("expected Landed, got an unresolved verdict: {reason}")
             }

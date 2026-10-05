@@ -136,6 +136,13 @@ impl AccountsDB {
         super::get_first_available_block::get_first_available_block(self).await
     }
 
+    pub async fn get_signature_status_snapshot(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<super::get_signature_status_snapshot::StatusSnapshot> {
+        super::get_signature_status_snapshot::get_signature_status_snapshot(self, signatures).await
+    }
+
     pub async fn get_blocks(&self, start_slot: u64, end_slot: Option<u64>) -> Result<Vec<u64>> {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
     }
