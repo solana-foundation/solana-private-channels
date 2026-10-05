@@ -126,8 +126,7 @@ impl MintCache {
         self.existence_floor.contains_key(&mint.to_string())
     }
 
-    /// The slot this mint was proved to exist at, if any. Doubles as the freshness
-    /// anchor for reads that would otherwise have to establish one.
+    /// The slot this mint was proved to exist at, if any.
     pub fn existence_floor(&self, mint: &Pubkey) -> Option<u64> {
         self.existence_floor.get(&mint.to_string()).copied()
     }

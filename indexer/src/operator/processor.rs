@@ -2210,6 +2210,67 @@ mod tests {
         );
     }
 
+    /// A backend that cannot answer at the tip refuses the gate read. That has to stay
+    /// a transient error the row is requeued on, never a park, or a lagging backend
+    /// strands the row again.
+    #[tokio::test]
+    async fn a_backend_behind_the_tip_leaves_the_row_transient() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let txn = withdrawal_for(&mint, 5);
+        let txn_id = txn.id;
+        seed_processing_row(&storage, &txn);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1_000);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(allowed_mint_pda.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32016,
+                        "message": "Minimum context slot has not been reached"
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage.clone(), txn).await;
+
+        assert!(
+            matches!(outcome, Err(OperatorError::RpcError(_))),
+            "a refused read must surface as transient, got {outcome:?}"
+        );
+        assert!(update.is_none(), "a refused read must not park the row");
+        assert!(builder.is_none(), "nothing may be dispatched");
+        assert_eq!(
+            row_status(&storage, txn_id),
+            Some(TransactionStatus::Pending),
+            "the row must be requeued for another attempt"
+        );
+    }
+
     /// A `freeze_authority` holder can freeze the pooled escrow ATA, stranding every
     /// depositor for that mint. Parking makes that visible instead of dispatching a
     /// release the token program is certain to reject.
