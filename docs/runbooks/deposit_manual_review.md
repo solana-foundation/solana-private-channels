@@ -68,7 +68,7 @@ to the right Path below.
 
 | `error_message` contains | Cause |
 |---|---|
-| `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
+| `has no allowed status in mint_status_history` | The deposit's `mint` was not `allowed` in `mint_status_history` coming into the deposit's slot or by a change inside it. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint`, or `BlockMint` that left deposits open, authorizes it. Row data is fine; no on-chain mint attempted. See **Path F**. |
 | `withdraw config unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee and minimum the deposit must write to the channel are unknown (metric label `withdraw_config_unknown`). This happens when the mint's `AllowMint` was never indexed (the indexer started after it) but a later `BlockMint` that re-opened deposits was, since that writes an `allowed` status without a `mints` row; a missed `AllowMint` alone trips the allowlist gate (Path F) first. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee and minimum, and its history insert adds the `AllowMint`'s own row, which is harmless because the later `BlockMint` still decides the status. Then re-arm. |
 
 Pull the row:
@@ -302,8 +302,8 @@ Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
 ### Path F - mint not in `AllowMint` allowlist
 
 `error_message`: `has no allowed status in mint_status_history`. The deposit's
-mint has no `allowed` entry in `mint_status_history` at the deposit's slot (the
-`mints` row may exist); the operator refused to mint on the private channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
+mint was not `allowed` in `mint_status_history` coming into the deposit's slot or
+by a change inside it (the `mints` row may exist); the operator refused to mint on the private channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
 apply. Steps 1–2 diagnose *why* the allowlist row is missing; Steps 3a–3c
 are the recovery branches.
 
