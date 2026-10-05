@@ -14,7 +14,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C4 | Solana Private Channels MUST NOT allow a transaction with an expired blockhash to execute | MUST | Done | #22, #282 |
 | C5 | Solana Private Channels MUST require all transactions to be signed | MUST | Done | #22 |
 | C6 | Solana Private Channels MUST enforce the instructions allowlist | MUST | Done | #22 |
-| C7 | Solana Private Channels MUST require admin signatures for admin instructions and for SPL mint and freeze authority instructions | MUST | Done | #22 |
+| C7 | Solana Private Channels MUST require admin signatures for admin instructions and for mint and freeze authority instructions | MUST | Done | #22 |
 | C8 | Solana Private Channels MUST reject all transactions that mix admin and non-admin instructions | MUST | Done | #22 |
 | C9 | Solana Private Channels MUST reject all transactions with no instructions | MUST | Done | #22 |
 | C10 | Finalized state MUST be based on DB state | MUST | Done | #36 |

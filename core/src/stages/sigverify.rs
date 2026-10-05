@@ -76,11 +76,7 @@ fn needs_admin_signer(transaction: &SanitizedTransaction) -> bool {
     transaction
         .message()
         .program_instructions_iter()
-        .any(|(program_id, instruction)| {
-            instruction.data.first().is_some_and(|instruction_type| {
-                requires_admin_signer(program_id, *instruction_type)
-            })
-        })
+        .any(|(program_id, instruction)| requires_admin_signer(program_id, &instruction.data))
 }
 
 /// Classifies a transaction into one TransactionType enum
@@ -254,12 +250,16 @@ mod tests {
     use super::*;
     use crate::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY as SEQ_CAP;
     use crate::stage_metrics::NoopMetrics;
+    use private_channel_withdraw_program_client::instructions::{
+        SetWithdrawConfigBuilder, WithdrawFundsBuilder,
+    };
     use solana_sdk::{
         hash::Hash,
         instruction::{AccountMeta, Instruction},
         signature::{Keypair, Signature, Signer},
         transaction::{SanitizedTransaction, Transaction},
     };
+    use spl_token::instruction::AuthorityType;
     use std::collections::HashSet;
 
     /// Build a signed `SanitizedTransaction` from instructions + signers.
@@ -352,15 +352,18 @@ mod tests {
     }
 
     /// A mint names its own authorities, so a key dropped from `admin_keys` can still
-    /// hold them on chain. Minting, freezing and thawing need a configured admin signer.
+    /// hold them on chain. Minting, freezing, thawing, handing off a mint authority and
+    /// rewriting the withdraw config need a configured admin signer.
     #[tokio::test]
     async fn authority_instructions_require_configured_admin_signer() {
         let admin = Keypair::new();
         let retired_admin = Keypair::new();
         let mint = Pubkey::new_unique();
         let token_account = Pubkey::new_unique();
+        let withdraw_config = Pubkey::new_unique();
         let amount = 1_000;
         let decimals = 6;
+        let fee = 1_000_000;
 
         for (signer, signed_by_admin) in [(&admin, true), (&retired_admin, false)] {
             let authority = signer.pubkey();
@@ -412,6 +415,42 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                (
+                    "SetAuthority MintTokens",
+                    spl_token::instruction::set_authority(
+                        &spl_token::id(),
+                        &mint,
+                        None,
+                        AuthorityType::MintTokens,
+                        &authority,
+                        &[],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "SetAuthority FreezeAccount",
+                    spl_token::instruction::set_authority(
+                        &spl_token::id(),
+                        &mint,
+                        None,
+                        AuthorityType::FreezeAccount,
+                        &authority,
+                        &[],
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "SetWithdrawConfig",
+                    SetWithdrawConfigBuilder::new()
+                        .authority(authority)
+                        .mint(mint)
+                        .withdraw_config(withdraw_config)
+                        .fee(fee)
+                        .allow_mint_slot(u64::MAX)
+                        .treasury(authority)
+                        .min_withdraw_amount(0)
+                        .instruction(),
+                ),
             ];
 
             for (label, instruction) in instructions {
@@ -429,6 +468,71 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A mint can share a transaction with a withdrawal, leaving supply unchanged. The
+    /// mint goes second here, so a check that reads only the first instruction would pass it.
+    #[tokio::test]
+    async fn authority_instruction_after_another_requires_admin_signer() {
+        let admin = Keypair::new();
+        let retired_admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_account = Pubkey::new_unique();
+        let amount = 1_000;
+
+        let withdraw = WithdrawFundsBuilder::new()
+            .user(retired_admin.pubkey())
+            .mint(mint)
+            .token_account(token_account)
+            .withdraw_config(Pubkey::new_unique())
+            .treasury_token_account(Pubkey::new_unique())
+            .amount(amount)
+            .instruction();
+        let mint_to = spl_token::instruction::mint_to(
+            &spl_token::id(),
+            &mint,
+            &token_account,
+            &retired_admin.pubkey(),
+            &[],
+            amount,
+        )
+        .unwrap();
+
+        let tx = sanitize(&[withdraw, mint_to], &retired_admin, &[&retired_admin]);
+        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "MintTo after WithdrawFunds signed by a retired admin must be rejected, got {result}"
+        );
+    }
+
+    /// Token account authority changes stay open to their owners: only the mint-side
+    /// authority types need an admin signer.
+    #[tokio::test]
+    async fn token_account_authority_changes_stay_open_to_users() {
+        let admin = Keypair::new();
+        let user = Keypair::new();
+        let token_account = Pubkey::new_unique();
+        let new_authority = Pubkey::new_unique();
+
+        for authority_type in [AuthorityType::AccountOwner, AuthorityType::CloseAccount] {
+            let label = format!("{authority_type:?}");
+            let instruction = spl_token::instruction::set_authority(
+                &spl_token::id(),
+                &token_account,
+                Some(&new_authority),
+                authority_type,
+                &user.pubkey(),
+                &[],
+            )
+            .unwrap();
+            let tx = sanitize(&[instruction], &user, &[&user]);
+            let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+            assert!(
+                matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+                "SetAuthority {label} signed by its owner must pass, got {result}"
+            );
         }
     }
 

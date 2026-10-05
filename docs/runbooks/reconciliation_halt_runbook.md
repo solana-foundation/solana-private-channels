@@ -254,12 +254,16 @@ operator/admin key if over-issuance is suspected, and do **not** resume the
 pipelines.
 
 Rotating the channel admin means migrating every receipt mint's authority to the
-new key with SPL `SetAuthority` first. The old key stays the on-chain
-`mint_authority` until you do, so deposits fail with `OwnerMismatch`
-(see [`deposit_failed.md`](deposit_failed.md)). The old key can no longer mint,
-freeze or thaw once it is out of `PRIVATE_CHANNEL_ADMIN_KEYS`. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
-rotates on its own. Resync reads each receipt mint's own history as well as the
-new admin's, so deposits the old key minted before the rotation stay terminal.
+new key with SPL `SetAuthority` first. The node requires an admin signer on it,
+so run it while the old key is still in `PRIVATE_CHANNEL_ADMIN_KEYS`, or have
+the new admin co-sign as fee payer. The old key stays the on-chain
+`mint_authority` until you do, so deposits fail with `OwnerMismatch` (see
+[`deposit_failed.md`](deposit_failed.md)). Once it is out of
+`PRIVATE_CHANNEL_ADMIN_KEYS`, the old key can no longer mint, freeze, thaw,
+rewrite a withdraw config or change a mint's authorities alone. This is separate
+from the escrow `Instance.admin`, which `SetNewAdmin` rotates on its own. Resync
+reads each receipt mint's own history as well as the new admin's, so deposits
+the old key minted before the rotation stay terminal.
 
 The old key also stays each mint's withdraw-fee treasury, exempt from the fee
 and minimum, until a deposit of that mint rewrites it. Sweep its collected fees
