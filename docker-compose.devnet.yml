@@ -246,6 +246,8 @@ services:
       - GATEWAY_UPSTREAM_TIMEOUT_SECS=${GATEWAY_UPSTREAM_TIMEOUT_SECS:-30}
       # Max public reads in flight; more get a 503 so writes keep free connection slots.
       - GATEWAY_MAX_FORWARDED_READS=${GATEWAY_MAX_FORWARDED_READS:-768}
+      # The read node's pool size; sizes the gateway's cap on public block listings.
+      - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
       # Optional — omit or leave blank to disable RBAC enforcement.
       - JWT_SECRET=${JWT_SECRET:-}
       # A SELECT-only login: the two auth tables it checks roles and wallets

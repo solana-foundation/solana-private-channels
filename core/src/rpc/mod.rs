@@ -95,6 +95,9 @@ mod tests {
             admin_keys: vec![],
             max_blockhashes: TEST_MAX_BLOCKHASHES,
             simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
+            block_list_permits: tokio::sync::Semaphore::new(constants::block_list_slots(
+                crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,
+            )),
         }
     }
 
@@ -463,6 +466,96 @@ mod tests {
         let result =
             get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 500_001, None).await;
         assert!(result.is_err());
+    }
+
+    // ── block listing cap ─────────────────────────────────────────────────
+
+    /// Takes every block listing permit so the next large call finds none free.
+    fn hold_every_block_list_permit(deps: &ReadDeps) -> tokio::sync::SemaphorePermit<'_> {
+        let free = deps.block_list_permits.available_permits() as u32;
+        deps.block_list_permits.try_acquire_many(free).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_block_lists_are_refused_when_every_permit_is_held() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let _held = hold_every_block_list_permit(&deps);
+
+        let cases = [
+            (
+                "getBlocks span 10_001",
+                get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None).await,
+            ),
+            (
+                "getBlocks with no end",
+                get_blocks_impl::get_blocks_impl(&deps, 0, None, None).await,
+            ),
+            (
+                "getBlocksWithLimit 10_001",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 10_001, None)
+                    .await,
+            ),
+        ];
+        for (name, result) in cases {
+            let err = result.expect_err(name);
+            assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncapped_block_lists_are_not_refused() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let _held = hold_every_block_list_permit(&deps);
+
+        // Small spans reach the store, and invalid params are rejected before any permit.
+        let cases = [
+            (
+                "getBlocks span 10_000",
+                get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_000), None).await,
+                error::JSON_RPC_SERVER_ERROR,
+            ),
+            (
+                "getBlocksWithLimit 10_000",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 10_000, None)
+                    .await,
+                error::JSON_RPC_SERVER_ERROR,
+            ),
+            (
+                "getBlocks end before start",
+                get_blocks_impl::get_blocks_impl(&deps, 10, Some(5), None).await,
+                error::INVALID_PARAMS_CODE,
+            ),
+            (
+                "getBlocksWithLimit over max",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 500_001, None)
+                    .await,
+                error::INVALID_PARAMS_CODE,
+            ),
+        ];
+        for (name, result, code) in cases {
+            let err = result.expect_err(name);
+            assert_eq!(err.code(), code, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_large_block_lists_do_not_leak_permits() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let calls = deps.block_list_permits.available_permits() + 1;
+
+        for _ in 0..calls {
+            let err = get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None)
+                .await
+                .expect_err("the store is unreachable");
+            assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn block_list_slots_scale_with_pool() {
+        for (pool, slots) in [(1, 1), (7, 1), (8, 1), (32, 4), (256, 32)] {
+            assert_eq!(constants::block_list_slots(pool), slots, "pool {pool}");
+        }
     }
 
     // ── get_epoch_info ────────────────────────────────────────────────────

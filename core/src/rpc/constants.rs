@@ -18,6 +18,17 @@ pub const MAX_SIMULATION_ACCOUNTS_BYTES: usize = MAX_RESPONSE_SIZE / 2;
 /// per-transaction account data cap, so this bounds their total memory.
 pub const MAX_CONCURRENT_SIMULATIONS: usize = 8;
 
+/// Widest `getBlocks` span or `getBlocksWithLimit` limit served without a block listing
+/// permit. The indexer's lookahead search must fit under it, so a flood of large
+/// listings holding every permit can never stall the indexer.
+pub const MAX_UNCAPPED_BLOCK_SPAN: u64 = 10_000;
+
+/// Block listings above the uncapped span that may run at once: an eighth of the
+/// Postgres pool, so large scans from every caller together leave the rest to other reads.
+pub fn block_list_slots(pool_size: u32) -> usize {
+    (pool_size as usize / 8).max(1)
+}
+
 /// Encoded-byte budget for the account in a `getAccountInfo` reply.
 /// Sized off what the endpoint actually serves: the largest account is the
 /// 134 KB SPL Token precompile, encoding to ~175 KB. The reply holds nothing

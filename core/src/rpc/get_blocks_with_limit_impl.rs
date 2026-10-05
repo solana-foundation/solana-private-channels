@@ -19,6 +19,9 @@ pub async fn get_blocks_with_limit_impl(
         ));
     }
 
+    // Bound to a name so the permit is held until the scan finishes.
+    let _permit = read_deps.block_list_permit(limit)?;
+
     read_deps
         .accounts_db
         .get_blocks_with_limit(start_slot, limit)

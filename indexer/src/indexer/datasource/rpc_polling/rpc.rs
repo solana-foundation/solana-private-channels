@@ -17,6 +17,9 @@ pub(crate) const MAX_IDLE_GAP_SLOTS: u64 = 1_000;
 /// hole in the ledger rather than an idle gap. Tenfold the gap above, because the
 /// same poller also reads chains whose skipped runs no heartbeat bounds.
 pub(crate) const MAX_LOOKAHEAD_SLOTS: u64 = MAX_IDLE_GAP_SLOTS * 10;
+// Every lookahead search must stay under the node's block listing cap, which public callers can fill.
+const _: () =
+    assert!(MAX_LOOKAHEAD_SLOTS <= private_channel_core::rpc::constants::MAX_UNCAPPED_BLOCK_SPAN);
 
 /// Highest transaction version this poller can decode. A ceiling, not a request:
 /// below it one v1 tx fails the whole block with -32015, which wedges the slot

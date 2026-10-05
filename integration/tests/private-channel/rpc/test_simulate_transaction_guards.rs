@@ -20,7 +20,10 @@ use {
     jsonrpsee::server::RpcModule,
     private_channel_core::{
         accounts::AccountsDB,
-        rpc::{constants::MAX_CONCURRENT_SIMULATIONS, create_rpc_module, ReadDeps},
+        rpc::{
+            constants::{block_list_slots, MAX_CONCURRENT_SIMULATIONS},
+            create_rpc_module, ReadDeps,
+        },
     },
     serde_json::{json, Value},
     solana_sdk::{
@@ -60,6 +63,7 @@ async fn build_module(admin_keys: Vec<Pubkey>) -> (RpcModule<()>, ContainerAsync
         admin_keys,
         max_blockhashes: 150,
         simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
+        block_list_permits: tokio::sync::Semaphore::new(block_list_slots(32)),
     };
     let module = create_rpc_module(Some(read_deps), None).await;
     (module, pg)

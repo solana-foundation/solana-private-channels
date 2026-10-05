@@ -33,6 +33,9 @@ pub async fn get_blocks_impl(
         ));
     }
 
+    // Bound to a name so the permit is held until the scan finishes.
+    let _permit = read_deps.block_list_permit(range)?;
+
     read_deps
         .accounts_db
         .get_blocks(start_slot, Some(effective_end))

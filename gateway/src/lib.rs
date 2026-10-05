@@ -52,6 +52,12 @@ const AUTH_TIMEOUT: &str = "auth_timeout";
 /// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
 const READ_CAPACITY: &str = "read_capacity";
 
+/// Methods that scan the blocks table and so share the block listing slots.
+const BLOCK_LIST_METHODS: &[&str] = &["getBlocks", "getBlocksWithLimit"];
+
+/// Metric label for a public block listing shed because every block listing slot was taken.
+const BLOCK_LIST_CAPACITY: &str = "block_list_capacity";
+
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
 
@@ -145,6 +151,16 @@ pub struct Args {
     /// max_connections, so writes always find a free connection slot.
     #[arg(long, env = "GATEWAY_MAX_FORWARDED_READS", default_value = "768")]
     pub max_forwarded_reads: NonZeroUsize,
+
+    /// The read node's Postgres pool size, 1 to 256. Sizes the cap on public block
+    /// listings in flight, so it must match what the read node is given.
+    #[arg(
+        long,
+        env = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS",
+        default_value = "32",
+        value_parser = clap::value_parser!(u32).range(1..=256)
+    )]
+    pub read_node_pg_max_connections: u32,
 
     /// Seconds a client may take to send the full request header block before
     /// the connection is closed (slowloris protection). Must be non-zero; a
@@ -245,6 +261,9 @@ pub struct Limits {
     /// Max public requests in flight to the read node. Reads past it get a 503,
     /// so a stalled read node can't take the slots writes need.
     pub max_forwarded_reads: NonZeroUsize,
+    /// Max public `getBlocks` and `getBlocksWithLimit` calls in flight, of any span. More
+    /// get a 503, so block listings can never hold most of the read node's Postgres pool.
+    pub max_forwarded_block_lists: NonZeroUsize,
     /// Max time a client may take to send the full request header block.
     /// Slowloris header-trickle connections are closed after this.
     pub header_read_timeout: Duration,
@@ -274,6 +293,7 @@ impl Default for Limits {
             max_connections: NonZeroUsize::new(1024).unwrap(),
             max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
             max_forwarded_reads: NonZeroUsize::new(768).unwrap(),
+            max_forwarded_block_lists: Self::block_list_slots(32),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             auth_fetch_timeout: Duration::from_secs(3),
@@ -283,6 +303,14 @@ impl Default for Limits {
             rate_limit_per_second: NonZeroU32::new(50).unwrap(),
             rate_limit_burst: NonZeroU32::new(100).unwrap(),
         }
+    }
+}
+
+impl Limits {
+    /// Block listing slots for a read node pool of `pool_size`: a quarter of it, so
+    /// public listings of any span leave most connections to other reads.
+    pub fn block_list_slots(pool_size: u32) -> NonZeroUsize {
+        NonZeroUsize::new(pool_size as usize / 4).unwrap_or(NonZeroUsize::MIN)
     }
 }
 
@@ -309,6 +337,8 @@ pub struct Gateway {
     role_cache: Arc<Mutex<HashMap<Uuid, CachedRole>>>,
     /// Permits for public requests in flight to the read node, sized by `max_forwarded_reads`.
     read_slots: Arc<Semaphore>,
+    /// Permits for public block listings in flight, sized by `max_forwarded_block_lists`.
+    block_list_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone, Copy)]
@@ -756,6 +786,9 @@ impl Gateway {
             ready_cache: Arc::new(AsyncMutex::new(None)),
             role_cache: Arc::new(Mutex::new(HashMap::new())),
             read_slots: Arc::new(Semaphore::new(Limits::default().max_forwarded_reads.get())),
+            block_list_slots: Arc::new(Semaphore::new(
+                Limits::default().max_forwarded_block_lists.get(),
+            )),
         }
     }
 
@@ -763,6 +796,7 @@ impl Gateway {
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self.read_slots = Arc::new(Semaphore::new(limits.max_forwarded_reads.get()));
+        self.block_list_slots = Arc::new(Semaphore::new(limits.max_forwarded_block_lists.get()));
         self
     }
 
@@ -1501,6 +1535,32 @@ impl Gateway {
             None
         };
 
+        // Public block listings of any span share a global budget below the read node's pool;
+        // only this layer can tell them from the indexer's. Held until this handler returns, which
+        // covers the node's scan unless the client leaves or the deadline passes first.
+        let _block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
+        {
+            match Arc::clone(&self.block_list_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    warn!("Block listing capacity reached, shedding {}", method);
+                    metrics::GATEWAY_REJECTED_TOTAL
+                        .with_label_values(&[BLOCK_LIST_CAPACITY])
+                        .inc();
+                    Self::record_metrics(
+                        Some(BLOCK_LIST_CAPACITY),
+                        method_label,
+                        target_label,
+                        "503",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(self.closing_error_response(StatusCode::SERVICE_UNAVAILABLE, None));
+                }
+            }
+        } else {
+            None
+        };
+
         // --- RBAC enforcement ---
         // Skipped on the internal listener: the operator services carry no JWT,
         // and they need the raw errors their confirmation handling routes on.
@@ -1894,6 +1954,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         max_connections: args.max_connections,
         max_connections_per_ip: args.max_connections_per_ip,
         max_forwarded_reads: args.max_forwarded_reads,
+        max_forwarded_block_lists: Limits::block_list_slots(args.read_node_pg_max_connections),
         header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
         body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
         auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
@@ -3563,6 +3624,109 @@ mod tests {
 
         let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
         assert_status(&response, 200);
+    }
+
+    /// Serves `access` against `read_url` with every block listing slot already taken.
+    async fn start_gateway_with_block_lists_exhausted(
+        read_url: &str,
+        access: Access,
+    ) -> (SocketAddr, OwnedSemaphorePermit) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let gateway = Arc::new(Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            read_url.to_string(),
+            "*".to_string(),
+            None,
+            None,
+        ));
+        let slots = Arc::clone(&gateway.block_list_slots);
+        let free = slots.available_permits() as u32;
+        let all_block_lists = slots.try_acquire_many_owned(free).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, access).await;
+        });
+        (addr, all_block_lists)
+    }
+
+    #[tokio::test]
+    async fn public_block_list_over_capacity_gets_fast_503_and_close() {
+        for method in BLOCK_LIST_METHODS {
+            let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+            let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+                &format!("http://{read_node}"),
+                Access::Public,
+            )
+            .await;
+            let shed_before = metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&[BLOCK_LIST_CAPACITY])
+                .get();
+
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            conn.write_all(rpc_request(method).as_bytes())
+                .await
+                .unwrap();
+            let response = read_to_close(&mut conn).await;
+
+            assert_status(&response, 503);
+            assert!(
+                metrics::GATEWAY_REJECTED_TOTAL
+                    .with_label_values(&[BLOCK_LIST_CAPACITY])
+                    .get()
+                    > shed_before,
+                "{method} should count as a block listing shed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn answered_block_lists_release_their_slots() {
+        let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+        let addr =
+            start_gateway_with_urls("http://127.0.0.1:1", &format!("http://{read_node}")).await;
+
+        // One more call than there are slots: each must hand its slot back once answered.
+        for _ in 0..=Limits::default().max_forwarded_block_lists.get() {
+            let response = send_raw(addr, rpc_request("getBlocks").as_bytes()).await;
+            assert_status(&response, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn other_public_reads_pass_while_block_lists_are_full() {
+        let read_node = start_mock_http_backend(r#"{"result":7}"#).await;
+        let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+            &format!("http://{read_node}"),
+            Access::Public,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getSlot").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn internal_block_lists_are_not_capped() {
+        let read_node = start_mock_http_backend(r#"{"result":[]}"#).await;
+        let (addr, _all_block_lists) = start_gateway_with_block_lists_exhausted(
+            &format!("http://{read_node}"),
+            Access::Internal,
+        )
+        .await;
+
+        let response = send_raw(addr, rpc_request("getBlocks").as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[test]
+    fn gateway_block_list_slots_scale_with_pool() {
+        for (pool, slots) in [(1, 1), (7, 1), (8, 2), (32, 8), (256, 64)] {
+            assert_eq!(Limits::block_list_slots(pool).get(), slots, "pool {pool}");
+        }
     }
 
     #[test]
