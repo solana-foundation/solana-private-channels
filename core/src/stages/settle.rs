@@ -301,7 +301,7 @@ impl SettledInbox {
 
 /// Cap on buffered account bytes before the settler stops draining the executor, far
 /// below Postgres' 1 GB bytea limit and small enough to commit inside the health margin.
-/// A block that waits on an admission drains past it, up to the executor's in-flight budget.
+/// A block that waits on an admission can reach about 512 MiB, still under that limit.
 pub(crate) const MAX_BUFFERED_SETTLE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cap on address rows buffered for one block. It bounds every row kind a block
@@ -1211,6 +1211,9 @@ fn buffer_batch(
     true
 }
 
+/// How often a held block reports that it is still waiting on an admission.
+const ADMISSION_WAIT_REPORT: Duration = Duration::from_secs(1);
+
 /// Receive until the last message of admission `target` is buffered or the executor
 /// is gone. Ignores the buffer gate: a parked executor is freed only by receiving.
 /// Returns `false` on a length mismatch.
@@ -1226,11 +1229,24 @@ async fn collect_admitted(
     metrics: &SharedMetrics,
 ) -> bool {
     // No timeout: cutting the block early would let the admitted tx land late.
+    let started = Instant::now();
     while *received_through < target {
-        let Some(batch) = execution_results_rx.recv().await else {
-            // Every admitted result that will ever arrive is buffered.
-            return true;
-        };
+        let batch =
+            match tokio::time::timeout(ADMISSION_WAIT_REPORT, execution_results_rx.recv()).await {
+                Ok(Some(batch)) => batch,
+                // Every admitted result that will ever arrive is buffered.
+                Ok(None) => return true,
+                Err(_) => {
+                    // The held block is pending work, so a stall turns /health red.
+                    heartbeat.record_input();
+                    warn!(
+                        "Block held {:?} waiting on admission {target}, received through {}",
+                        started.elapsed(),
+                        received_through
+                    );
+                    continue;
+                }
+            };
         if !buffer_batch(
             batch,
             processing_results,
@@ -2559,6 +2575,33 @@ mod tests {
             lengths.push(window_of(&live).len());
         }
         assert_eq!(lengths, vec![2, 1, 0, 0, 0]);
+    }
+
+    /// A wait on an executor that is alive but never sends must show up on /health.
+    #[tokio::test]
+    async fn a_stalled_wait_turns_the_settler_unhealthy() {
+        let (_exec_tx, mut exec_rx) = mpsc::channel::<ExecutedBatch>(1);
+        let heartbeat = crate::health::StageHeartbeat::new();
+        assert!(heartbeat.is_healthy());
+        let waited = tokio::time::timeout(
+            ADMISSION_WAIT_REPORT + Duration::from_millis(500),
+            collect_admitted(
+                &mut exec_rx,
+                1,
+                &mut Vec::new(),
+                &mut 0,
+                &mut 0,
+                &mut 0,
+                &heartbeat,
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait has no timeout of its own");
+        assert!(
+            !heartbeat.is_healthy(),
+            "a stalled wait must not read healthy"
+        );
     }
 
     /// The wait must bypass the buffer gate. A full buffer shuts the receive

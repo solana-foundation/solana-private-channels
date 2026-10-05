@@ -429,12 +429,23 @@ fn result_weight(bytes: usize, rows: usize) -> usize {
 }
 
 /// A block that waits on an admission takes a full buffer, the message past its cap
-/// and the in-flight budget, plus the rest of one sub-batch in the slack at default sizes.
+/// and the in-flight budget, plus the rest of one sub-batch in the slack at the default
+/// batch size. A larger batch can overflow it; the writer's budget then takes the block alone.
 const _: () = assert!(
     crate::stages::MAX_BUFFERED_SETTLE_ROWS
         + MAX_SEND_CHUNK_ROWS
         + MAX_IN_FLIGHT_RESULT_BYTES / RESULT_BYTES_PER_ROW
         <= crate::stages::MAX_QUEUED_ADDRESS_ROWS
+);
+
+/// The same held block in bytes: the rest of its sub-batch is bounded by the preload
+/// budget, and the whole must stay under Postgres' 1 GB limit for one bound value.
+const _: () = assert!(
+    crate::stages::MAX_BUFFERED_SETTLE_BYTES
+        + MAX_SEND_CHUNK_BYTES
+        + MAX_IN_FLIGHT_RESULT_BYTES
+        + MAX_BATCH_PRELOAD_BYTES
+        < 1024 * 1024 * 1024
 );
 
 /// A chunk that could not fit the budget would wait for room that never comes.
