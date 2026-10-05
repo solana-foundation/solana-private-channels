@@ -31,12 +31,20 @@ fn find_event_authority_pda() -> (Pubkey, u8) {
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 5 {
+    if args.len() < 8 {
         eprintln!(
-            "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <mint-address>",
+            "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <mint-address> <withdraw-fee> <min-withdraw-amount> <min-deposit-amount>",
             args[0]
         );
-        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", args[0]);
+        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU 10000 1000000 1000000", args[0]);
+        eprintln!("\n<withdraw-fee> is in the mint's base units, charged on top of every PrivateChannel withdrawal.");
+        eprintln!("<min-withdraw-amount> is the smallest amount a PrivateChannel withdrawal may move, in base units.");
+        eprintln!("0 is allowed for either but removes its bound on release costs; use it only where every participant is known.");
+        eprintln!("<min-deposit-amount> is the smallest amount a deposit must land in the escrow, in base units, 0 for none.");
+        eprintln!(
+            "Run again with new values, to or from 0, to reprice; they apply from the next deposit."
+        );
+        eprintln!("Re-running also re-opens both gates and re-pins the mint profile, accepting any change since the last allow.");
         std::process::exit(1);
     }
 
@@ -44,11 +52,17 @@ fn main() -> Result<()> {
     let keypair_path = &args[2];
     let instance_id = Pubkey::from_str(&args[3])?;
     let mint = Pubkey::from_str(&args[4])?;
+    let withdraw_fee: u64 = args[5].parse()?;
+    let min_withdraw_amount: u64 = args[6].parse()?;
+    let min_deposit_amount: u64 = args[7].parse()?;
 
     println!("Connecting to: {}", rpc_url);
     println!("Using admin keypair: {}", keypair_path);
     println!("Instance: {}", instance_id);
     println!("Mint: {}", mint);
+    println!("Withdraw fee: {}", withdraw_fee);
+    println!("Minimum withdraw amount: {}", min_withdraw_amount);
+    println!("Minimum deposit amount: {}", min_deposit_amount);
 
     let client = RpcClient::new(rpc_url.to_string());
     let admin_keypair =
@@ -86,7 +100,12 @@ fn main() -> Result<()> {
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     }
-    .instruction(AllowMintInstructionArgs { bump });
+    .instruction(AllowMintInstructionArgs {
+        bump,
+        withdraw_fee,
+        min_withdraw_amount,
+        min_deposit_amount,
+    });
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(
@@ -102,6 +121,14 @@ fn main() -> Result<()> {
     println!("\n✅ Success!");
     println!("Transaction signature: {}", signature);
     println!("Mint {} allowed for instance {}", mint, instance_id);
+    println!(
+        "Withdraw fee {} and minimum {} reach PrivateChannel with the mint's next deposit",
+        withdraw_fee, min_withdraw_amount
+    );
+    println!(
+        "Deposits landing less than {} are rejected from now on",
+        min_deposit_amount
+    );
 
     Ok(())
 }

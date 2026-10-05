@@ -25,6 +25,7 @@ use trident_fuzz::fuzzing::*;
 
 use shared::{
     clamp_amount, setup_escrow, token_amount, AccountAddresses, ToClient, ToTrident,
+    FUZZ_MIN_DEPOSIT_AMOUNT, FUZZ_MIN_WITHDRAW_AMOUNT, FUZZ_WITHDRAW_FEE,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 
@@ -352,6 +353,9 @@ impl FuzzTest {
             .allowed_mint(allowed_mint.client())
             .instance_ata(instance_ata.client())
             .bump(allowed_mint_bump)
+            .withdraw_fee(FUZZ_WITHDRAW_FEE)
+            .min_withdraw_amount(FUZZ_MIN_WITHDRAW_AMOUNT)
+            .min_deposit_amount(FUZZ_MIN_DEPOSIT_AMOUNT)
             .instruction()
             .to_trident();
 

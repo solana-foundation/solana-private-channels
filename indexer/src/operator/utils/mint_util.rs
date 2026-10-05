@@ -9,17 +9,22 @@ use solana_rpc_client_api::request::RpcError;
 use solana_sdk::account::Account;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
+use spl_tlv_account_resolution::error::AccountResolutionError;
+use spl_tlv_account_resolution::solana_program_error::ProgramError;
+use spl_tlv_account_resolution::state::ExtraAccountMetaList;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, transfer_hook::TransferHook, BaseStateWithExtensions,
-    StateWithExtensions,
+    confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
+    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Account as Token2022AccountState;
 use spl_token_2022::state::AccountState;
 use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use spl_transfer_hook_interface::get_extra_account_metas_address;
+use spl_transfer_hook_interface::instruction::ExecuteInstruction;
 use spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute;
+use spl_type_length_value::state::TlvStateBorrowed;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -73,6 +78,19 @@ pub struct MintCache {
     /// Per-mint slot the mint provably existed at, recorded by the caller that
     /// proved it. Absent means unproven, which keeps a missing account retryable.
     existence_floor: HashMap<String, u64>,
+}
+
+/// Outcome of resolving a mint's transfer-hook accounts.
+#[derive(Debug)]
+pub enum HookExtras {
+    /// Accounts to append to the transfer; empty for a mint with no hook.
+    Resolved(Vec<AccountMeta>),
+    /// The validation account is absent, so no transfer of the mint resolves.
+    ValidationMissing,
+    /// The validation account's `Execute` list does not parse or cannot resolve.
+    ValidationInvalid(String),
+    /// The list resolves to `extras` accounts, more than a transfer can carry.
+    OverCap { extras: usize },
 }
 
 impl MintCache {
@@ -205,8 +223,8 @@ impl MintCache {
     /// transfer hook: the hook program, its validation account, and whatever the
     /// `ExtraAccountMetaList` resolves to. Empty for a mint with no hook.
     ///
-    /// `None` means the validation account is absent, so no transfer of this
-    /// mint can resolve; the caller parks instead of retrying.
+    /// Any variant other than `Resolved` means no transfer of this mint can
+    /// resolve; the caller parks instead of retrying.
     ///
     /// Resolved per withdrawal rather than cached, since an
     /// `ExtraAccountMetaList` can derive accounts from the amount and
@@ -218,9 +236,10 @@ impl MintCache {
         destination: &Pubkey,
         authority: &Pubkey,
         amount: u64,
-    ) -> Result<Option<Vec<AccountMeta>>, OperatorError> {
+        max_extras: usize,
+    ) -> Result<HookExtras, OperatorError> {
         let Some(hook_program) = self.transfer_hook_program(mint).await? else {
-            return Ok(Some(Vec::new()));
+            return Ok(HookExtras::Resolved(Vec::new()));
         };
 
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
@@ -235,8 +254,25 @@ impl MintCache {
             .get_account_with_context(&validation_pda, commitment)
             .await
             .map_err(|e| OperatorError::RpcError(format!("get_account({validation_pda}): {e}")))?;
-        if response.value.is_none() {
-            return Ok(None);
+        let Some(validation_account) = response.value else {
+            return Ok(HookExtras::ValidationMissing);
+        };
+        let validation_data = validation_account.data;
+
+        // The resolver reads every declared entry, so an oversized list is
+        // rejected before it runs. Extras are the entries plus the hook program
+        // and the validation account.
+        let extras_count = match TlvStateBorrowed::unpack(&validation_data).and_then(|tlv_state| {
+            ExtraAccountMetaList::unpack_with_tlv_state::<ExecuteInstruction>(&tlv_state)
+                .map(|list| list.len() + 2)
+        }) {
+            Ok(extras_count) => extras_count,
+            Err(e) => return Ok(HookExtras::ValidationInvalid(e.to_string())),
+        };
+        if extras_count > max_extras {
+            return Ok(HookExtras::OverCap {
+                extras: extras_count,
+            });
         }
 
         // The resolver requires source, mint, destination and authority in the
@@ -253,8 +289,11 @@ impl MintCache {
             ],
         );
 
+        // The resolver re-reads the validation account. Serving it these bytes
+        // makes it resolve exactly the list counted above, which is what makes
+        // the cap hold: a fresh read could return a longer list.
         let fetch_rpc = Arc::clone(rpc);
-        add_extra_account_metas_for_execute(
+        if let Err(error) = add_extra_account_metas_for_execute(
             &mut instruction,
             &hook_program,
             source,
@@ -264,14 +303,30 @@ impl MintCache {
             amount,
             move |address| {
                 let rpc = Arc::clone(&fetch_rpc);
+                let kept = (address == validation_pda).then(|| validation_data.clone());
                 async move {
+                    if kept.is_some() {
+                        return Ok(kept);
+                    }
                     let account = rpc.get_account_with_context(&address, commitment).await?;
                     Ok(account.value.map(|account| account.data))
                 }
             },
         )
         .await
-        .map_err(|e| OperatorError::RpcError(format!("hook resolution for mint {mint}: {e}")))?;
+        {
+            // A failed read comes back as AccountFetchFailed and stays transient.
+            // Any other ProgramError is the list itself, which fails every retry.
+            let fetch_failed = ProgramError::from(AccountResolutionError::AccountFetchFailed);
+            return match error.downcast_ref::<ProgramError>() {
+                Some(list_error) if *list_error != fetch_failed => {
+                    Ok(HookExtras::ValidationInvalid(list_error.to_string()))
+                }
+                _ => Err(OperatorError::RpcError(format!(
+                    "hook resolution for mint {mint}: {error}"
+                ))),
+            };
+        }
 
         // Signer bits are dropped: the escrow strips them before the CPI too, and
         // the operator must never hand its own signature to a mint's hook.
@@ -285,7 +340,7 @@ impl MintCache {
             })
             .collect();
 
-        Ok(Some(extras))
+        Ok(HookExtras::Resolved(extras))
     }
 
     /// Live fetch of a token account's raw balance (base units).
@@ -354,6 +409,50 @@ impl MintCache {
         Ok(state.base.state == AccountState::Frozen)
     }
 
+    /// Whether the token account refuses an ordinary transfer because its owner
+    /// turned off non-confidential credits (`DisableNonConfidentialCredits`).
+    ///
+    /// A release to such an account fails on-chain after the operator has paid
+    /// for it, so the withdrawal pre-flight parks it instead. Best-effort: the
+    /// owner can flip the flag after this read, and then the withdraw fee is
+    /// the bound. Only call this once the reviewed profile says the mint has
+    /// `ConfidentialTransferMint`, the only mint whose accounts can carry it.
+    pub async fn refuses_non_confidential_credits(
+        &self,
+        ata: &Pubkey,
+    ) -> Result<bool, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(
+                "refuses_non_confidential_credits requires an RPC client".to_string(),
+            )
+        })?;
+
+        let response = rpc
+            .get_account_with_context(ata, rpc.rpc_client.commitment())
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_account({ata}): {e}")))?;
+
+        // A missing account fails the release for its own reason; this check is
+        // only about one that exists but will not take the transfer.
+        let Some(account) = response.value else {
+            return Ok(false);
+        };
+
+        // The address is the user's choice, so anything that is not a Token-2022
+        // account parks here rather than halting the pipeline. It could not be
+        // credited either.
+        if account.owner != TOKEN_2022_PROGRAM_ID {
+            return Ok(true);
+        }
+        let Ok(state) = StateWithExtensions::<Token2022AccountState>::unpack(&account.data) else {
+            return Ok(true);
+        };
+
+        Ok(state
+            .get_extension::<ConfidentialTransferAccount>()
+            .is_ok_and(|extension| !bool::from(extension.allow_non_confidential_credits)))
+    }
+
     async fn fetch_mint_from_rpc(
         &self,
         mint: &Pubkey,
@@ -417,6 +516,7 @@ mod tests {
     use crate::error::OperatorError;
     use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::operator::RetryConfig;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::DbMintStatus;
     use crate::storage::common::storage::mock::MockStorage;
@@ -426,6 +526,11 @@ mod tests {
     use solana_client::rpc_request::RpcRequest;
     use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
+    use spl_tlv_account_resolution::account::ExtraAccountMeta;
+    use spl_tlv_account_resolution::seeds::Seed;
+    use spl_token_2022::extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    };
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
     use std::time::Duration;
 
@@ -479,12 +584,14 @@ mod tests {
             mint.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(1),
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                profile_slot: 0,
             },
         );
         // Two transient blips then success: the read backoff must ride them out.
@@ -684,6 +791,116 @@ mod tests {
         assert!(!frozen, "an account that does not exist cannot be frozen");
     }
 
+    /// A Token-2022 account carrying `ConfidentialTransferAccount`, as the
+    /// `getAccountInfo` response for the destination ATA.
+    fn confidential_account_response(allow_non_confidential_credits: bool) -> serde_json::Value {
+        let len = ExtensionType::try_calculate_account_len::<Token2022AccountState>(&[
+            ExtensionType::ConfidentialTransferAccount,
+        ])
+        .expect("a fixed-length extension has a calculable account length");
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022AccountState>::unpack_uninitialized(&mut data)
+                .expect("a zeroed buffer holds an uninitialized account");
+        state
+            .init_extension::<ConfidentialTransferAccount>(true)
+            .expect("the extension fits the calculated length")
+            .allow_non_confidential_credits = allow_non_confidential_credits.into();
+        state.base = Token2022AccountState {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        };
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+
+        serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(data), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
+    }
+
+    fn cache_answering(response: serde_json::Value) -> MintCache {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, response);
+        MintCache::with_rpc(
+            Arc::new(Storage::Mock(MockStorage::new())),
+            Arc::new(RpcClientWithRetry::new_mocked(mocks)),
+        )
+    }
+
+    /// `DisableNonConfidentialCredits` is what makes a release to this account
+    /// fail on-chain, so the flag alone decides.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_reads_the_extension_flag() {
+        for allow_non_confidential_credits in [true, false] {
+            let cache = cache_answering(confidential_account_response(
+                allow_non_confidential_credits,
+            ));
+
+            assert_eq!(
+                cache
+                    .refuses_non_confidential_credits(&Pubkey::new_unique())
+                    .await
+                    .unwrap(),
+                !allow_non_confidential_credits
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_accepts_an_account_without_the_extension() {
+        let cache = cache_answering(serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(create_mock_token_account_data(0, false)), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }));
+
+        assert!(!cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .unwrap());
+    }
+
+    /// A missing ATA fails the release for its own reason, which this check does
+    /// not claim to catch.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_ignores_a_missing_account() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+
+        assert!(!cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .expect("a missing ATA is not a transient failure"));
+    }
+
+    /// The address is user-chosen, so an account Token-2022 does not own parks
+    /// instead of surfacing as an error that would halt the pipeline.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_refuses_a_foreign_account() {
+        let cache = cache_answering(token_account_response(0, false));
+
+        assert!(cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .unwrap());
+    }
+
     /// The gate that decides whether a withdrawal pays for the ATA read at all.
     #[tokio::test]
     async fn resolve_hook_extras_is_empty_without_a_hook() {
@@ -709,12 +926,349 @@ mod tests {
         let destination = Pubkey::new_unique();
         let authority = Pubkey::new_unique();
 
-        let extras = cache
-            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000)
+        let resolved = cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
             .await
-            .unwrap()
-            .expect("a hook-less mint is resolvable");
-        assert!(extras.is_empty(), "no hook means no accounts to append");
+            .unwrap();
+        assert!(
+            matches!(&resolved, HookExtras::Resolved(extras) if extras.is_empty()),
+            "no hook means no accounts to append, got {resolved:?}"
+        );
+    }
+
+    /// A Token-2022 mint whose `TransferHook` points at `hook_program`.
+    fn hook_mint_data(hook_program: &Pubkey) -> Vec<u8> {
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&[
+            ExtensionType::TransferHook,
+        ])
+        .unwrap();
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data).unwrap();
+        let hook = state.init_extension::<TransferHook>(true).unwrap();
+        hook.program_id = Some(*hook_program).try_into().unwrap();
+        state.base.is_initialized = true;
+        state.pack_base();
+        state.init_account_type().unwrap();
+        data
+    }
+
+    /// Validation account bytes declaring `entries` for `Execute`.
+    fn validation_data(entries: &[ExtraAccountMeta]) -> Vec<u8> {
+        let mut data = vec![0u8; ExtraAccountMetaList::size_of(entries.len()).unwrap()];
+        ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, entries).unwrap();
+        data
+    }
+
+    /// Serves `address` to `getAccountInfo`, absent when `data` is `None`, and
+    /// expects exactly `reads` requests for it.
+    async fn mock_account(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        data: Option<&[u8]>,
+        reads: usize,
+    ) -> mockito::Mock {
+        let value = data.map(|bytes| {
+            serde_json::json!({
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            })
+        });
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {"context": {"slot": 1}, "value": value},
+            "id": 1,
+        });
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(address.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(reads)
+            .create_async()
+            .await
+    }
+
+    /// Every account is read once, the mint twice (hook lookup, then the
+    /// resolver), so a list at the cap costs a fixed number of reads.
+    #[tokio::test]
+    async fn resolve_hook_extras_at_cap_reads_validation_once() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        let extra_accounts: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+        let mut entries: Vec<ExtraAccountMeta> = extra_accounts
+            .iter()
+            .map(|address| ExtraAccountMeta::new_with_pubkey(address, false, false).unwrap())
+            .collect();
+        entries.push(ExtraAccountMeta::new_with_pubkey(&validation_pda, false, false).unwrap());
+
+        let mut server = mockito::Server::new_async().await;
+        let mint_reads =
+            mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 2).await;
+        let validation_reads = mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+        let mut single_reads = Vec::new();
+        for address in [source, destination, authority]
+            .iter()
+            .chain(&extra_accounts)
+        {
+            single_reads.push(mock_account(&mut server, address, None, 1).await);
+        }
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .await
+            .unwrap();
+
+        // Declared entries plus the hook program and the validation account,
+        // exactly the cap.
+        let HookExtras::Resolved(extras) = resolved else {
+            panic!("a list at the cap resolves, got {resolved:?}");
+        };
+        assert_eq!(extras.len(), entries.len() + 2);
+        validation_reads.assert_async().await;
+        mint_reads.assert_async().await;
+        for reads in single_reads {
+            reads.assert_async().await;
+        }
+    }
+
+    /// Only the mint and the validation account are mocked, so any read of a
+    /// declared entry fails the call: the cap must bail before resolving.
+    #[tokio::test]
+    async fn resolve_hook_extras_rejects_an_oversized_list_before_resolving() {
+        let max_extras = 15;
+        let declared = 14;
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+
+        let entries: Vec<ExtraAccountMeta> = (0..declared)
+            .map(|_| {
+                ExtraAccountMeta::new_with_pubkey(&Pubkey::new_unique(), false, false).unwrap()
+            })
+            .collect();
+
+        let mut server = mockito::Server::new_async().await;
+        let mint_reads =
+            mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 1).await;
+        let validation_reads = mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(
+                &mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                max_extras,
+            )
+            .await
+            .unwrap();
+
+        // Declared entries plus the hook program and the validation account.
+        let total = declared + 2;
+        assert!(
+            matches!(resolved, HookExtras::OverCap { extras } if extras == total),
+            "expected OverCap with {total} extras, got {resolved:?}"
+        );
+        mint_reads.assert_async().await;
+        validation_reads.assert_async().await;
+    }
+
+    /// Bytes that are not a list are the mint's problem, not the node's, so
+    /// they must park the row rather than read as transient.
+    #[tokio::test]
+    async fn resolve_hook_extras_rejects_an_unparseable_validation_account() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 1).await;
+        mock_account(&mut server, &validation_pda, Some(&[7; 64]), 1).await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(
+                &mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                15,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationInvalid(_)),
+            "expected ValidationInvalid, got {resolved:?}"
+        );
+    }
+
+    /// A list that parses but cannot resolve fails the same way on every retry,
+    /// so it must park the row rather than restart the processor.
+    #[tokio::test]
+    async fn resolve_hook_extras_rejects_a_list_that_cannot_resolve() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        // Execute data is 16 bytes, so a seed at offset 16 never resolves.
+        let entries = [ExtraAccountMeta::new_with_seeds(
+            &[Seed::InstructionData {
+                index: 16,
+                length: 8,
+            }],
+            false,
+            false,
+        )
+        .unwrap()];
+
+        let mut server = mockito::Server::new_async().await;
+        mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 2).await;
+        mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+        for address in [source, destination, authority] {
+            mock_account(&mut server, &address, None, 1).await;
+        }
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationInvalid(_)),
+            "expected ValidationInvalid, got {resolved:?}"
+        );
+    }
+
+    /// A read the node fails is not the list's fault, so it must stay transient
+    /// rather than park the row.
+    #[tokio::test]
+    async fn resolve_hook_extras_keeps_a_failed_read_transient() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let entries =
+            [ExtraAccountMeta::new_with_pubkey(&Pubkey::new_unique(), false, false).unwrap()];
+
+        // The source is not mocked, so the resolver's first read fails.
+        let mut server = mockito::Server::new_async().await;
+        mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 1).await;
+        mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let err = cache
+            .resolve_hook_extras(
+                &mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                15,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, OperatorError::RpcError(_)),
+            "a failed read must stay transient, got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,9 @@ pub struct AllowedMint {
     /// A freeze authority can be revoked but never re-added, so only gaining
     /// one implies a recreate. Deposit compares this in one direction.
     pub has_freeze_authority: bool,
+    /// Smallest amount a deposit must land in the escrow, 0 for none. Set by
+    /// AllowMint, so a re-allow reprices it.
+    pub min_deposit_amount: u64,
 }
 
 impl Discriminator for AllowedMint {
@@ -57,6 +60,7 @@ impl AccountSerialize for AllowedMint {
         data.extend_from_slice(self.token_program.as_ref());
         data.extend_from_slice(&self.extensions.to_le_bytes());
         data.push(self.has_freeze_authority as u8);
+        data.extend_from_slice(&self.min_deposit_amount.to_le_bytes());
         data
     }
 }
@@ -69,7 +73,8 @@ impl AllowedMint {
         1 + // decimals
         32 + // token_program
         8 + // extensions
-        1; // has_freeze_authority
+        1 + // has_freeze_authority
+        8; // min_deposit_amount
 
     pub fn new(
         bump: u8,
@@ -77,6 +82,7 @@ impl AllowedMint {
         token_program: Address,
         extensions: u64,
         has_freeze_authority: bool,
+        min_deposit_amount: u64,
     ) -> Self {
         Self {
             bump,
@@ -86,6 +92,7 @@ impl AllowedMint {
             token_program,
             extensions,
             has_freeze_authority,
+            min_deposit_amount,
         }
     }
 
@@ -136,6 +143,13 @@ impl AllowedMint {
             1 => true,
             _ => return Err(ProgramError::InvalidAccountData),
         };
+        offset += 1;
+
+        let min_deposit_amount = u64::from_le_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
 
         Ok(Self {
             bump,
@@ -145,6 +159,7 @@ impl AllowedMint {
             token_program,
             extensions,
             has_freeze_authority,
+            min_deposit_amount,
         })
     }
 
@@ -188,7 +203,8 @@ mod tests {
     #[test]
     fn test_allowed_mint_new() {
         let token_program = Address::new_from_array([7u8; 32]);
-        let allowed_mint = AllowedMint::new(99, 6, token_program, 0b1010, true);
+        let min_deposit_amount = 2_345_678;
+        let allowed_mint = AllowedMint::new(99, 6, token_program, 0b1010, true, min_deposit_amount);
 
         assert_eq!(allowed_mint.bump, 99);
         assert!(!allowed_mint.deposits_blocked);
@@ -197,6 +213,7 @@ mod tests {
         assert_eq!(allowed_mint.token_program, token_program);
         assert_eq!(allowed_mint.extensions, 0b1010);
         assert!(allowed_mint.has_freeze_authority);
+        assert_eq!(allowed_mint.min_deposit_amount, min_deposit_amount);
     }
 
     // Each case flips exactly one property off the allowed mint, so dropping any
@@ -205,7 +222,7 @@ mod tests {
     fn test_profile_changed_detects_drift() {
         let token_program = Address::new_from_array([7u8; 32]);
         let permanent_delegate = 1u64 << 12;
-        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false);
+        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false, 0);
 
         assert!(!allowed_mint.profile_changed(
             &MintProfile {
@@ -260,7 +277,7 @@ mod tests {
         let token_program = Address::new_from_array([7u8; 32]);
         let permanent_delegate = 1u64 << 12;
 
-        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false);
+        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false, 0);
         assert!(!allowed_mint.profile_changed(
             &MintProfile {
                 decimals: 6,
@@ -276,6 +293,7 @@ mod tests {
             token_program,
             permanent_delegate | ISSUER_ADDABLE_EXTENSIONS,
             false,
+            0,
         );
         assert!(!with_metadata.profile_changed(
             &MintProfile {
@@ -286,7 +304,7 @@ mod tests {
             &token_program
         ));
 
-        let freezable = AllowedMint::new(99, 6, token_program, 0, true);
+        let freezable = AllowedMint::new(99, 6, token_program, 0, true, 0);
         assert!(!freezable.profile_changed(
             &MintProfile {
                 decimals: 6,
@@ -308,6 +326,7 @@ mod tests {
             Address::new_from_array([7u8; 32]),
             0x0000_0000_0400_000A,
             true,
+            2_345_678,
         );
         allowed_mint.deposits_blocked = true;
 
@@ -357,7 +376,7 @@ mod tests {
     // what a pre-gates 2-byte account hits after the layout change.
     #[test]
     fn test_allowed_mint_try_from_bytes_too_short() {
-        let data = [AllowedMint::DISCRIMINATOR, 200]; // bump only, LEN=46
+        let data = [AllowedMint::DISCRIMINATOR, 200]; // bump only, LEN=54
         let result = AllowedMint::try_from_bytes(&data);
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
     }

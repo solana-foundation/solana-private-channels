@@ -22,7 +22,10 @@ use solana_commitment_config::CommitmentConfig;
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
-        types::{BenchState, DepositConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
+        types::{
+            BenchState, DepositConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
+            BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
+        },
     },
     anyhow::{Context, Result},
     private_channel_core::client::{
@@ -523,7 +526,12 @@ pub async fn run_setup_deposit_phase(
                         event_authority,
                         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
-                    .instruction(AllowMintInstructionArgs { bump: allow_bump });
+                    .instruction(AllowMintInstructionArgs {
+                        bump: allow_bump,
+                        withdraw_fee: BENCH_WITHDRAW_FEE,
+                        min_withdraw_amount: BENCH_MIN_WITHDRAW_AMOUNT,
+                        min_deposit_amount: BENCH_MIN_DEPOSIT_AMOUNT,
+                    });
                     let tx = Transaction::new_signed_with_payer(
                         &[allow_ix],
                         Some(&admin_keypair.pubkey()),

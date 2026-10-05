@@ -2,7 +2,8 @@ use crate::assertions::{assert_deposit_balances, assert_release_funds_balances};
 use crate::pda_utils::{find_allowed_mint_pda, find_event_authority_pda};
 use crate::utils::{
     assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID,
-    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT,
+    TEST_WITHDRAW_FEE,
 };
 use crate::{
     assertions::{
@@ -137,6 +138,9 @@ pub fn assert_get_or_allow_mint(
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     let transaction_metadata = context

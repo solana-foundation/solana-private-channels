@@ -38,8 +38,8 @@ async fn seed_mint_and_deposit(
     amount: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot, created_at)
-         VALUES ($1, 6, $2, 0, NOW())",
+        "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee, created_at)
+         VALUES ($1, 6, $2, 1, NOW())",
     )
     .bind(mint_address)
     .bind(spl_token::id().to_string())

@@ -77,6 +77,21 @@ pub const WITHDRAWALS_BLOCKED_FOR_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint as u32;
 pub const MINT_PROFILE_CHANGED_ERROR: u32 =
     PrivateChannelEscrowProgramError::MintProfileChanged as u32;
+pub const ZERO_AMOUNT_ERROR: u32 = PrivateChannelEscrowProgramError::ZeroAmount as u32;
+pub const BELOW_MINIMUM_DEPOSIT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::BelowMinimumDeposit as u32;
+
+/// Withdraw fee every test AllowMint sets. The escrow records it but does not
+/// act on it.
+pub const TEST_WITHDRAW_FEE: u64 = 1_000;
+
+/// Minimum withdrawal every test AllowMint sets. Recorded like the fee, never
+/// acted on by the escrow.
+pub const TEST_MIN_WITHDRAW_AMOUNT: u64 = 100;
+
+/// Minimum deposit every test AllowMint sets. 0 so existing deposit amounts
+/// are unaffected; the minimum tests set their own.
+pub const TEST_MIN_DEPOSIT_AMOUNT: u64 = 0;
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
 pub const NONCES_PER_GENERATION: u64 = 65_536;

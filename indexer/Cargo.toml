@@ -48,8 +48,10 @@ sqlx = { workspace = true, features = [
     "chrono",
     "bigdecimal",
 ] }
+spl-tlv-account-resolution = { workspace = true }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 spl-transfer-hook-interface = { workspace = true }
+spl-type-length-value = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = "0.7.16"
 tracing = { workspace = true }
@@ -62,6 +64,7 @@ const-crypto = { workspace = true }
 private-channel-core = { workspace = true }
 private-channel-escrow-program-client = { workspace = true }
 private-channel-metrics = { workspace = true }
+private-channel-withdraw-program-client = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
@@ -96,7 +99,6 @@ tokio = { workspace = true, features = ["test-util"] }
 spl-associated-token-account = { workspace = true }
 
 solana-system-interface = { workspace = true }
-private-channel-withdraw-program-client = { workspace = true }
 mockito = "1.7"
 serial_test = "3"
 solana-address = { workspace = true }

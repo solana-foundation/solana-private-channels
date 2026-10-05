@@ -527,8 +527,8 @@ async fn slot_of(client: &RpcClient, signature: &Signature) -> u64 {
 /// Register a mint, as an AllowMint indexed before the outage would have.
 async fn seed_allowed_mint(pool: &PgPool, mint_address: &str) {
     sqlx::query(
-        "INSERT INTO mints (mint_address, decimals, token_program, profile_slot, created_at)
-         VALUES ($1, 6, $2, 0, NOW())
+        "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee, created_at)
+         VALUES ($1, 6, $2, 1, NOW())
          ON CONFLICT (mint_address) DO NOTHING",
     )
     .bind(mint_address)

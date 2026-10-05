@@ -22,6 +22,9 @@ use {
     solana_transaction_status::UiTransactionEncoding,
     spl_associated_token_account::get_associated_token_address_with_program_id,
     std::time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    test_utils::mint_helper::{
+        TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+    },
     tokio::time::sleep,
 };
 
@@ -352,6 +355,9 @@ async fn allow_mint_in_escrow(solana_ctx: &SolanaContext, mint_keypair: &Keypair
         .instance_ata(instance_ata)
         .token_program(spl_token::ID)
         .bump(allowed_mint_bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     let blockhash = solana_ctx.get_latest_blockhash().await?;

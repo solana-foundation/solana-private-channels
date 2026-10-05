@@ -15,7 +15,7 @@ pub const PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID: &str =
 // Instruction discriminators
 const WITHDRAW_FUNDS: u8 = 0;
 
-/// Withdraw exposes only the user-initiated `WithdrawFunds`, so no inner (CPI) discriminator is excluded; mirrors the escrow predicate so both decoders share one per-program source of truth.
+/// Only the user-initiated `WithdrawFunds` is indexed. `SetWithdrawConfig` rides in the operator's deposit mint transactions and parses to `Ok(None)`, so no inner (CPI) discriminator needs excluding; mirrors the escrow predicate so both decoders share one per-program source of truth.
 pub fn withdraw_inner_discriminator_excluded(_discriminator: u8) -> bool {
     false
 }

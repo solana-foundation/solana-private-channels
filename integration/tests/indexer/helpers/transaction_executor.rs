@@ -5,8 +5,10 @@ use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_
 use solana_commitment_config::CommitmentConfig;
 
 use private_channel_escrow_program_client::instructions::DepositBuilder;
-use private_channel_withdraw_program_client::instructions::{
-    WithdrawFunds, WithdrawFundsInstructionArgs,
+use private_channel_withdraw_program_client::{
+    accounts::WithdrawConfig,
+    instructions::{WithdrawFunds, WithdrawFundsInstructionArgs},
+    PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, WITHDRAW_CONFIG_SEED,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
@@ -103,12 +105,28 @@ pub async fn execute_user_withdrawal_to(
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
 
+    // The fee is paid to the account the mint's config names, so read it the
+    // way any client has to.
+    let (withdraw_config, _) = Pubkey::find_program_address(
+        &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
+        &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    );
+    let withdraw_config_data = client
+        .get_account_data(&withdraw_config)
+        .await
+        .map_err(|e| format!("withdraw config {withdraw_config} not readable: {e}"))?;
+    let treasury_token_account = WithdrawConfig::from_bytes(&withdraw_config_data)
+        .map_err(|e| format!("withdraw config {withdraw_config} not decodable: {e}"))?
+        .treasury_token_account;
+
     let withdraw_ix = WithdrawFunds {
         user: user.pubkey(),
         mint,
         token_account: user_ata,
         token_program: TOKEN_PROGRAM_ID,
         associated_token_program: spl_associated_token_account::ID,
+        withdraw_config,
+        treasury_token_account,
     }
     .instruction(WithdrawFundsInstructionArgs {
         amount: total_deposited,

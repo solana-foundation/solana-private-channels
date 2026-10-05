@@ -72,6 +72,7 @@ use sqlx::{PgPool, Row};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
     indexer_helper::{start_private_channel_indexer, start_solana_indexer_rpc_polling},
+    mint_helper::TEST_WITHDRAW_FEE,
     mock_rpc::{MockRpcServer, Reply},
     operator_helper::{
         default_operator_config, start_private_channel_to_solana_operator_with_config,
@@ -761,7 +762,7 @@ async fn seed_withdrawal_side(db_url: &str) {
 /// A deposit, a mints row and the escrow checkpoint.
 async fn seed_escrow_side(db_url: &str) {
     seed_tx(db_url, "dep-seed", "deposit", "completed").await;
-    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program, profile_slot) VALUES ('seed_mint', 6, 'token', 0)").await;
+    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program, withdraw_fee) VALUES ('seed_mint', 6, 'token', 1)").await;
     seed_sql(
         db_url,
         "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('escrow', 111)",
@@ -3379,6 +3380,7 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
 
     // The release fails because the destination has no token account, so the burn is reminted.
     let destination = Keypair::new().pubkey();
+    let user_before_withdrawal = token_balance(&client, user.pubkey(), env.mint).await;
     let withdrawal =
         helpers::execute_user_withdrawal_to(&client, user, env.mint, WITHDRAW_AMOUNT, destination)
             .await?;
@@ -3406,6 +3408,14 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
     assert_eq!(
         row_of(&db_url, &withdrawal.signature).await.0,
         "failed_reminted"
+    );
+    // The remint restores the burned amount but not the fee, so a withdrawal
+    // that cannot settle costs the user one fee each time it is retried. Both
+    // paths remint the indexed amount, so this holds whichever one ran.
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before_withdrawal - TEST_WITHDRAW_FEE,
+        "a failed release must still cost the withdraw fee"
     );
     let (_, nonce, _) = row_of(&db_url, &withdrawal.signature).await;
     let nonce = nonce.expect("a withdrawal carries a nonce") as u64;
@@ -3536,10 +3546,12 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         custody_before - (WITHDRAW_AMOUNT + 1),
         "only the downtime release leaves custody"
     );
+    // Burn and release net out on this one validator, leaving only the fee,
+    // which moved to the admin rather than out of supply.
     assert_eq!(
         token_balance(&client, user.pubkey(), env.mint).await,
-        user_before,
-        "burned and released once"
+        user_before - TEST_WITHDRAW_FEE,
+        "burned and released once, paying one withdraw fee"
     );
 
     // Custody against the rebuilt ledger. The single-validator harness cannot model separate

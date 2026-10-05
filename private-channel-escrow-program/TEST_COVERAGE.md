@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**61 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **100 integration tests** (end-to-end behavior).
+**64 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **109 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -33,11 +33,14 @@
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
 
-### AllowMint (10 integration tests)
+### AllowMint (13 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
 - `test_allow_mint_twice_repins_instead_of_failing` — since BlockMint stopped closing the PDA, a second AllowMint re-pins the profile and re-opens both gates; expires the blockhash so the second transaction is not dropped as a replay
 - `test_allow_mint_invalid_pda` — wrong PDA rejected
+- `test_allow_mint_zero_fee_and_minimum_accepted` — a zero `withdraw_fee`, `min_withdraw_amount` and `min_deposit_amount` are allowed and create the AllowedMint PDA
+- `test_allow_mint_event_records_fee_and_minimums` — the emitted 98-byte `AllowMintEvent` carries all three values from the instruction data
+- `test_allow_mint_native_mint_rejected` — the spl-token native mint is rejected with InvalidMint, and with InvalidAccountOwner under a token program that does not own it
 - `test_allow_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_allow_mint_invalid_admin` — wrong admin rejected
 - `test_allow_mint_invalid_instance_account_owner` — wrong owner rejected
@@ -46,7 +49,7 @@
 - `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
 - `test_allow_mint_token_2022_transfer_hook_allowed` — hook mints are allowlistable, and the escrow ATA the CPI creates carries `TransferHookAccount`
 
-### BlockMint (11 integration tests)
+### BlockMint (12 integration tests)
 
 - `test_block_mint_success` — happy path; the PDA survives with both gates set
 - `test_block_mint_allowed_mint_not_found` — nonexistent mint fails
@@ -56,6 +59,7 @@
 - `test_block_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_block_mint_mismatched_mint` — PDA/mint mismatch rejected
 - `test_block_mint_prevents_deposit` — a deposit-blocked mint fails a subsequent deposit with DepositsBlockedForMint
+- `test_block_unblock_keeps_min_deposit_amount` — BlockMint rewrites the whole AllowedMint, so after block and unblock a deposit under the AllowMint minimum still fails with BelowMinimumDeposit
 - `test_allow_block_allow_cycle` — a mint can be re-allowed after being blocked; deposit succeeds once re-allowed
 - `test_block_mint_deposits_only_still_allows_release` — blocking deposits leaves already-escrowed funds withdrawable
 - `test_block_mint_withdrawals_prevents_release` — the withdrawal gate alone rejects a release with WithdrawalsBlockedForMint
@@ -88,7 +92,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (22 integration tests)
+### Deposit (27 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -101,6 +105,11 @@
 - `test_deposit_token_2022_transfer_hook_without_extras_fails` — omitting the extras fails the transfer rather than skipping the hook
 - `test_deposit_rejects_signer_bearing_hook_extra` — a hostile `ExtraAccountMetaList` names the fee payer as a signer extra; the stripped signer bit leaves the hook's drain CPI unsigned, so the deposit reverts and the attacker gets nothing
 - `test_deposit_token_2022_transfer_fee_success` — the escrow credits the measured balance delta, so the depositor is credited net of the fee
+- `test_deposit_rejects_zero_amount` — ZeroAmount; SPL Token accepts a zero transfer, so without the guard an empty ATA emits free DepositEvents
+- `test_deposit_rejects_zero_received_amount` — ZeroAmount; a 1-unit deposit on a 1% fee mint lands nothing, so the received amount is checked too
+- `test_deposit_below_minimum_rejected_at_minimum_lands` — BelowMinimumDeposit one unit under the AllowMint minimum; exactly the minimum lands
+- `test_deposit_minimum_repriced_by_reallow` — a re-allow with a lower minimum admits a deposit the first AllowMint rejected
+- `test_deposit_below_minimum_net_of_transfer_fee_rejected` — BelowMinimumDeposit; a request of exactly the minimum on a 1% fee mint lands 990 of 1_000, so the check is on the received amount
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData
@@ -159,8 +168,8 @@
 **Instruction data parsing** (processor modules):
 
 - `create_instance`: 4 tests (valid data, insufficient data, empty data, payload missing the bitmap bump)
-- `allow_mint`: 2 tests (valid bump, empty data)
-- `deposit`: 6 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
+- `allow_mint`: 3 tests (valid bump, fee and both minimums, payload missing the deposit minimum, empty data)
+- `deposit`: 7 tests (with/without recipient, insufficient length, empty accounts, zero amount rejected before the accounts are read and so before the CPI, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `rotate_bitmap`: 1 test (empty accounts)
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)

@@ -18,7 +18,7 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 
 Enumerates the producing slots in each batch with `getBlocks`, then fetches only those blocks in parallel with `getBlock`. Higher latency (~1-5 seconds) but no special infrastructure required.
 
-Slots and blocks are decoupled on a Solana Private Channels node: slots tick every `blocktime_ms` whether or not a block is produced, and an idle node produces one block per second. A batch window can therefore contain no block at all. When that happens the poller looks past the window with `getBlocksWithLimit` for the next producing slot and claims the range up to it, so `batch_size` caps how much work one batch does and never determines whether the indexer can advance. It is not coupled to the node's `blocktime_ms` or its idle block cadence. That search is bounded: a node heartbeats one block a second, so the widest idle gap is `1000 / blocktime_ms` slots and never more than 1 000, and the poller searches ten times that before treating the distance as a hole in the ledger rather than an idle stretch. The same bound is how far backfill looks below the chain tip for the last produced block, since the tip itself is usually a slot with no block and cannot anchor the range.
+Slots and blocks are decoupled on a Solana Private Channels node: slots tick every `blocktime_ms` whether or not a block is produced, and an idle node produces one block per second. A batch window can therefore contain no block at all. When that happens the poller looks past the window with `getBlocksWithLimit` for the next producing slot and claims the range up to it, so `batch_size` caps how much work one batch does and never determines whether the indexer can advance. It is not coupled to the node's `blocktime_ms` or its idle block cadence. That search is bounded: a node heartbeats one block a second, so the widest idle gap is `1000 / blocktime_ms` slots and never more than 1 000, and the poller searches ten times that before treating the distance as a hole in the ledger rather than an idle stretch. The same bound is how far backfill looks below the chain tip for the last produced block, since the tip itself is usually a slot with no block and cannot anchor the range. Both `indexer.rpc_polling.batch_size` and `indexer.backfill.batch_size` are capped at 100, and startup rejects a larger value wherever it would drive RPC batches (the live poller, backfill, and Yellowstone gap repair, which uses the backfill value even with backfill off): every RPC request has a fixed 60 s deadline sized for a 100-block batch, so a larger batch would time out on every retry.
 
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
@@ -41,6 +41,9 @@ Recovers missed slots on indexer restart or network issues:
      cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
+   - If the fill fails (retries exhausted, or a slot it cannot fetch or decode), the indexer
+     stops the live source and exits non-zero, so the supervisor restarts it and the gap is
+     refilled from the durable checkpoint
 4. For the Yellowstone datasource, persist a startup anchor before the live stream runs, so a
    durable checkpoint always exists: every connection, the first one included, replays from it up
    to the slot the stream opened at, and withholds live slots rather than advancing the checkpoint

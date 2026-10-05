@@ -952,6 +952,7 @@ pub(crate) mod tests {
             token_program: spl_token::id(),
             extensions: 0,
             has_freeze_authority: false,
+            min_deposit_amount: 0,
         };
         ui_account(
             PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,

@@ -30,7 +30,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Production defaults for the per-slot DB-write retry. Sized to ride out a
 /// routine Postgres restart or failover (about 15s of cumulative backoff)
@@ -685,6 +685,12 @@ fn convert_to_db_models(
                     data,
                     event,
                 } => {
+                    // The escrow rejects these, so one reaching here means the program regressed.
+                    if event.amount == 0 {
+                        warn!(%signature, "dropping deposit with zero received amount");
+                        return (None, None, None, None);
+                    }
+
                     let recipient = data
                         .recipient
                         .map(|r| r.to_string())
@@ -711,16 +717,22 @@ fn convert_to_db_models(
                     )
                 }
                 EscrowInstruction::AllowMint {
-                    accounts, event, ..
+                    accounts,
+                    data,
+                    event,
                 } => {
                     let mint_address = accounts.mint.to_string();
                     (
-                        Some(DbMint::new(
-                            mint_address.clone(),
-                            event.decimals as i16,
-                            accounts.token_program.to_string(),
-                            instruction_meta.slot as i64,
-                        )),
+                        Some(DbMint {
+                            min_withdraw_amount: TokenAmount(data.min_withdraw_amount),
+                            allow_mint_slot: instruction_meta.slot as i64,
+                            ..DbMint::new(
+                                mint_address.clone(),
+                                event.decimals as i16,
+                                accounts.token_program.to_string(),
+                                TokenAmount(data.withdraw_fee),
+                            )
+                        }),
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
@@ -836,16 +848,21 @@ mod tests {
         sig: Option<String>,
         recipient: Option<Pubkey>,
     ) -> InstructionWithMetadata {
-        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance())
+        // event.amount differs from data.amount (1000) to prove the operator
+        // is fed the event-reported received amount (e.g. net of a
+        // Token-2022 transfer fee), not the caller-requested amount.
+        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance(), 990)
     }
 
-    /// Like `make_deposit_instruction` but on a caller-chosen instance, so a
-    /// deposit can share a slot with an AllowMint on the same instance.
+    /// Like `make_deposit_instruction` but on a caller-chosen instance and
+    /// event amount, so a deposit can share a slot with an AllowMint on the
+    /// same instance.
     fn make_deposit_instruction_on_instance(
         slot: u64,
         sig: Option<String>,
         recipient: Option<Pubkey>,
         instance: Pubkey,
+        event_amount: u64,
     ) -> InstructionWithMetadata {
         let user = make_pubkey(1);
         let mint = make_pubkey(2);
@@ -869,10 +886,9 @@ mod tests {
                     amount: 1000,
                     recipient,
                 },
-                // event.amount differs from data.amount to prove the operator
-                // is fed the event-reported received amount (e.g. net of a
-                // Token-2022 transfer fee), not the caller-requested amount.
-                event: DepositEvent { amount: 990 },
+                event: DepositEvent {
+                    amount: event_amount,
+                },
             })),
             slot,
             program_type: ProgramType::Escrow,
@@ -881,6 +897,9 @@ mod tests {
             inner_index: None,
         }
     }
+
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
 
     fn make_allow_mint_instruction(
         slot: u64,
@@ -902,7 +921,11 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
                 event: AllowMintEvent { decimals },
             })),
             slot,
@@ -1082,6 +1105,19 @@ mod tests {
     }
 
     #[test]
+    fn convert_deposit_with_zero_received_amount_is_dropped() {
+        let ix = make_deposit_instruction_on_instance(
+            60,
+            Some("sig-zero".to_string()),
+            None,
+            deposit_instance(),
+            0,
+        );
+        let (_, _, txn, _) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        assert!(txn.is_none());
+    }
+
+    #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
         let ix = make_allow_mint_instruction(200, Some("sig3".to_string()), 6);
         let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
@@ -1096,6 +1132,15 @@ mod tests {
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
+        assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
+        assert_eq!(
+            mint.min_withdraw_amount,
+            TokenAmount(ALLOW_MINT_MIN_WITHDRAW_AMOUNT)
+        );
+        assert_eq!(
+            mint.allow_mint_slot, 200,
+            "the fee is stamped with its AllowMint's slot"
+        );
     }
 
     #[test]
@@ -1240,7 +1285,11 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
+                },
                 event: AllowMintEvent { decimals: 6 },
             })),
             slot: 200,
@@ -1407,7 +1456,7 @@ mod tests {
         let mints = mock.mints.lock().unwrap();
         let row = &mints[&make_pubkey(2).to_string()];
         assert_eq!(row.decimals, live_decimals as i16);
-        assert_eq!(row.profile_slot, live_slot as i64);
+        assert_eq!(row.allow_mint_slot, live_slot as i64);
     }
 
     #[tokio::test]
@@ -1448,7 +1497,7 @@ mod tests {
                 make_pubkey(2).to_string(),
                 6,
                 spl_token::id().to_string(),
-                0,
+                TokenAmount(ALLOW_MINT_WITHDRAW_FEE),
             ),
         );
         processor.buffer(make_block_mint_instruction(
@@ -1717,6 +1766,7 @@ mod tests {
             Some("sig-deposit-3".to_string()),
             None,
             allow_mint_instance(),
+            990,
         ));
         let result = processor
             .finalize_and_checkpoint(202, ProgramType::Escrow)
@@ -1923,6 +1973,7 @@ mod tests {
                 Some("deposit".to_string()),
                 None,
                 allow_mint_instance(),
+                990,
             ),
         ))
         .await

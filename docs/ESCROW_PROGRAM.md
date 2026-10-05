@@ -65,6 +65,9 @@ Discriminator: `1`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for allowed mint account |
+| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. `0` is allowed but leaves the operator paying every release; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The escrow records it in `AllowMintEvent`; the indexer reads it from the instruction data and the operator writes it to the channel's withdraw config on every deposit, so re-allowing with a new value (to or from `0`) reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
+| `min_withdraw_amount` | u64 | Smallest amount one channel withdrawal of this mint may move, `0` for none. Recorded, read and repriced the same way as `withdraw_fee` |
+| `min_deposit_amount` | u64 | Smallest amount one deposit of this mint must land in the escrow, net of any transfer fee, `0` for none. Unlike the two above it never reaches the channel: it is stored on `AllowedMint` and enforced by `Deposit`. The depositor keeps the tokens, so it does not pay for the recipient ATA and channel mint the operator funds; it limits how much of that one balance triggers at once, and only the withdraw fee bounds the total. A re-allow reprices it |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -167,6 +170,8 @@ Discriminator: `5`
 
 #### Deposit
 Deposits tokens from user ATA to instance escrow ATA (permissionless).
+
+Fails with `ZeroAmount` when `amount` is 0 or the escrow receives nothing, and with `BelowMinimumDeposit` when the received amount is under the mint's `min_deposit_amount`.
 
 Discriminator: `6`
 
@@ -369,6 +374,7 @@ profile recorded when it was allowed.
 | `token_program` | Pubkey | Token program at `AllowMint`; `Deposit` rejects a mismatch |
 | `extensions` | u64 | Bitmask of the mint's Token-2022 `ExtensionType` discriminants (bit N = type N), 0 for a legacy mint; `Deposit` rejects a mismatch outside the metadata and group bits |
 | `has_freeze_authority` | bool | Whether the mint had a freeze authority at `AllowMint`; `Deposit` rejects *gaining* one |
+| `min_deposit_amount` | u64 | Smallest amount a deposit must land, set by `AllowMint`; `Deposit` rejects less, `0` for none |
 
 A mint carrying `MintCloseAuthority` can be closed and recreated at the same address
 with any of these changed. Closing requires zero supply, so that window is while the
@@ -415,6 +421,8 @@ The program defines the following custom errors:
 | 15 | `DepositsBlockedForMint` | Deposits are blocked for this mint |
 | 16 | `WithdrawalsBlockedForMint` | Withdrawals are blocked for this mint |
 | 17 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
+| 18 | `ZeroAmount` | Deposit requested or received zero tokens |
+| 19 | `BelowMinimumDeposit` | Deposit received less than the mint's minimum deposit |
 
 ## Other Constants
 

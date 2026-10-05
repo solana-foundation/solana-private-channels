@@ -9,8 +9,8 @@ use std::str::FromStr;
 
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateSlot,
-    SubscribeUpdateTransactionInfo,
+    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdatePing,
+    SubscribeUpdateSlot, SubscribeUpdateTransactionInfo,
 };
 use yellowstone_grpc_proto::solana::storage::confirmed_block::{
     CompiledInstruction as ProtoCompiledInstruction, InnerInstruction as ProtoInnerInstruction,
@@ -71,6 +71,15 @@ pub fn slot_update(slot: u64) -> SubscribeUpdate {
             slot,
             ..Default::default()
         })),
+        created_at: None,
+    }
+}
+
+/// A server keepalive ping. It carries no chain data, so it must never count as progress.
+pub fn ping_update() -> SubscribeUpdate {
+    SubscribeUpdate {
+        filters: vec![],
+        update_oneof: Some(UpdateOneof::Ping(SubscribeUpdatePing {})),
         created_at: None,
     }
 }

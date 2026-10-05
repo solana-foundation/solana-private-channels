@@ -410,17 +410,19 @@ impl MockStorage {
         self.check_should_fail("upsert_mints_batch")?;
         let mut store = self.mints.lock().unwrap();
         for mint in mints {
-            // Must mirror the Postgres `ON CONFLICT DO UPDATE`: refresh the profile
+            // Must mirror the Postgres `ON CONFLICT DO UPDATE`: refresh the row
             // only from a same-or-newer slot. A blanket `insert` here would silently
             // disagree with prod and let tests lock in the wrong behavior. Neither
             // gate is touched on conflict — `sync_mint_status` is the sole writer
             // of both mirrors.
             match store.get_mut(&mint.mint_address) {
                 Some(existing) => {
-                    if existing.profile_slot <= mint.profile_slot {
+                    if existing.allow_mint_slot <= mint.allow_mint_slot {
                         existing.decimals = mint.decimals;
                         existing.token_program = mint.token_program.clone();
-                        existing.profile_slot = mint.profile_slot;
+                        existing.withdraw_fee = mint.withdraw_fee;
+                        existing.min_withdraw_amount = mint.min_withdraw_amount;
+                        existing.allow_mint_slot = mint.allow_mint_slot;
                     }
                 }
                 None => {

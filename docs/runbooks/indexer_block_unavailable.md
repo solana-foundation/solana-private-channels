@@ -42,7 +42,11 @@ does not have it. The usual causes:
 - The indexer's current slot stops advancing for one `program_type` while the
   chain tip keeps rising, so the lag panel climbs.
 - Deposits or withdrawals at and after the wedged slot never appear in the DB.
-- The process stays healthy and keeps retrying; it does not crash-loop.
+- Live polling and reconnect gap-fill stay healthy and keep retrying; they do
+  not crash-loop. A startup backfill that hits the slot instead exits and is
+  restarted in a loop, logging `Startup backfill failed` and `Backfill slot <N>
+  is unavailable`. Each run exits within seconds, so the alert may not fire;
+  recognize it by the restart loop and those log lines.
 
 ### Detection
 
@@ -147,5 +151,8 @@ skipped, and there should not be.
 - Do not point the indexer at a non-archival peer hoping it differs. A
   load-balanced peer can answer identically, which turns the restart into a
   no-op and burns time.
-- Do not restart the indexer repeatedly without changing the endpoint. It
-  already retries with backoff on its own.
+- Do not restart the indexer repeatedly without changing the endpoint. Live
+  polling and reconnect gap-fill already retry with backoff on their own. A
+  startup backfill instead exits the process and the supervisor restarts it, so
+  a restart loop with the `Backfill slot <N> is unavailable` line means the
+  endpoint must change. Nothing is indexed while it loops.

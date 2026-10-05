@@ -261,6 +261,17 @@ mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
 rotates on its own. Resync reads each receipt mint's own history as well as the
 new admin's, so deposits the old key minted before the rotation stay terminal.
 
+The old key also stays each mint's withdraw-fee treasury, exempt from the fee
+and minimum, until a deposit of that mint rewrites it. Sweep its collected fees
+before rotating: once the treasury switches they are an ordinary balance, and
+anything below the minimum plus the fee is stuck. The sweep and `SetAuthority` can
+run under the halt, but the deposit that rewrites the treasury cannot mint until the
+flag is cleared. After [Recover](#recover-only-after-backing-is-confirmed), make a
+small deposit per allowed mint, and check that each mint's
+[`WithdrawConfig.treasury`](../WITHDRAW_PROGRAM.md#withdrawconfig) names the new
+key before treating the rotation as complete. If the old key was compromised,
+block withdrawals per mint until then.
+
 ## Recover (only after backing is confirmed)
 
 Once you have verified that custody genuinely backs the minted supply (e.g. the

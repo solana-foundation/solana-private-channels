@@ -75,6 +75,15 @@
                   "kind": "numberTypeNode"
                 }
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minDepositAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -236,6 +245,33 @@
               "type": {
                 "endian": "le",
                 "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawFee",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minWithdrawAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minDepositAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
                 "kind": "numberTypeNode"
               }
             }
@@ -662,6 +698,18 @@
         "kind": "errorNode",
         "message": "Mint no longer matches the profile recorded at AllowMint",
         "name": "mintProfileChanged"
+      },
+      {
+        "code": 18,
+        "kind": "errorNode",
+        "message": "Deposit requested or received zero tokens",
+        "name": "zeroAmount"
+      },
+      {
+        "code": 19,
+        "kind": "errorNode",
+        "message": "Deposit received less than the mint's minimum deposit",
+        "name": "belowMinimumDeposit"
       }
     ],
     "instructions": [
@@ -907,6 +955,33 @@
             "type": {
               "endian": "le",
               "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "withdrawFee",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "minWithdrawAmount",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "minDepositAmount",
+            "type": {
+              "endian": "le",
+              "format": "u64",
               "kind": "numberTypeNode"
             }
           }

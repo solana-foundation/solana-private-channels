@@ -503,3 +503,83 @@ pub mod rpc_mocks {
             .await
     }
 }
+
+#[cfg(test)]
+pub mod stall_server {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// How a stalled connection hangs.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Stall {
+        /// Never answers.
+        BeforeHeaders,
+        /// Sends headers and part of the body, then goes silent.
+        AfterHeaders,
+    }
+
+    /// Local server whose first `stall_first` connections hang and the rest pipe to `upstream`; returns its URL and accept count.
+    pub async fn stall_server(
+        stall: Stall,
+        stall_first: usize,
+        upstream: Option<String>,
+    ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, upstream, move |index| index < stall_first).await
+    }
+
+    /// Like `stall_server`, but the first `forward_first` connections pipe to `upstream` and the rest hang.
+    pub async fn stall_server_after(
+        stall: Stall,
+        forward_first: usize,
+        upstream: String,
+    ) -> (String, Arc<AtomicUsize>) {
+        serve(stall, Some(upstream), move |index| index >= forward_first).await
+    }
+
+    async fn serve(
+        stall: Stall,
+        upstream: Option<String>,
+        stalls: impl Fn(usize) -> bool + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                // Decided at accept time so a forwarded connection is never read here first.
+                let stalled = stalls(counter.fetch_add(1, Ordering::SeqCst));
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if stalled {
+                        hang(socket, stall).await;
+                    } else if let Some(upstream) = upstream {
+                        forward(socket, &upstream).await;
+                    }
+                });
+            }
+        });
+        (url, accepted)
+    }
+
+    async fn hang(mut socket: TcpStream, stall: Stall) {
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        if let Stall::AfterHeaders = stall {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(br#"{"jsonrpc":"2.0","#).await;
+        }
+        // Keep the socket open: a closed one fails fast instead of timing out.
+        std::future::pending::<()>().await;
+    }
+
+    async fn forward(mut socket: TcpStream, upstream: &str) {
+        if let Ok(mut target) = TcpStream::connect(upstream).await {
+            let _ = tokio::io::copy_bidirectional(&mut socket, &mut target).await;
+        }
+    }
+}
