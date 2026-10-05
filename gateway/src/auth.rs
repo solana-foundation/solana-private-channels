@@ -323,9 +323,8 @@ pub async fn check_account_data_ownership(
 /// Whether `pubkey` is still the associated token account its own `owner` field
 /// derives to.
 ///
-/// A user's token accounts are all ATAs: the ingress allowlist limits System to
-/// `Transfer`, so `CreateAccount` is unreachable and only the ATA program can
-/// make them. An ATA's address is derived from the wallet that owned it at
+/// A user's token accounts are all ATAs: the ingress allowlist refuses System,
+/// so `CreateAccount` is unreachable and only the ATA program can make them. An ATA's address is derived from the wallet that owned it at
 /// creation, and nothing rewrites the address afterwards. So an owner the
 /// address no longer derives to is proof the owner field was moved, whatever
 /// moved it, including a CPI this gateway never sees.

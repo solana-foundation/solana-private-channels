@@ -68,7 +68,7 @@ pub async fn send_transaction_impl(
         return Err(custom_error(INVALID_PARAMS_CODE, NATIVE_MINT_UNSUPPORTED));
     }
 
-    // Admission is per instruction, not per program: System is limited to Transfer.
+    // Admission is per instruction; the System program is refused outright.
     let is_allowed_transaction = sanitized_tx
         .message()
         .program_instructions_iter()
@@ -93,7 +93,7 @@ pub async fn send_transaction_impl(
         );
         return Err(custom_error(
             INVALID_PARAMS_CODE,
-            "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted; System is limited to Transfer",
+            "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted",
         ));
     }
 
@@ -496,10 +496,10 @@ mod tests {
         );
     }
 
-    // B3: System Transfer stays admitted, including alongside another allowed
-    // program. Guards against an over-broad rewrite of the `.all(..)` filter.
+    // B3: System is refused even beside an allowed program, which guards the
+    // `.all(..)` filter against an over-broad rewrite.
     #[tokio::test]
-    async fn system_transfer_with_memo_accepted() {
+    async fn system_transfer_with_memo_rejected() {
         let payer = Keypair::new();
         let transfer_ix =
             system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000);
@@ -516,12 +516,18 @@ mod tests {
         );
         let (deps, rx) = make_write_deps();
 
-        let result = send_transaction_impl(&deps, encode_tx(&tx), None).await;
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("System Transfer + Memo must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
         assert!(
-            result.is_ok(),
-            "System Transfer + Memo must pass: {result:?}"
+            err.to_string().contains("Only SPL token"),
+            "expected allowlist error, got: {err}"
         );
-        assert_eq!(rx.len(), 1, "the accepted tx must reach the ingress queue");
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
     }
 
     // A closed ingress channel refuses as retryable whether it was closed by
