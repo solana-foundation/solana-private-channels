@@ -430,8 +430,7 @@ async fn failed_startup_releases_the_sender_lock() {
 }
 
 /// A lock lost mid pre-flight means a replacement may already own the pending_remint
-/// rows. The pre-flight swallows its own errors, so the operator must still refuse to
-/// start rather than spawn a sender that no longer holds the lock.
+/// rows. The bitmap read that fails afterwards must be reported as the lost lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
     let _metrics_guard = WITHDRAW_LOCK_LOST_METRIC.lock().await;
