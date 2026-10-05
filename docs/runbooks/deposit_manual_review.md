@@ -204,7 +204,7 @@ admin pubkey.
   since the node requires a configured admin signer,
 
   ```bash
-  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair>
+  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --url <private-channel-rpc>
   ```
 
   to point the mint at the current operator admin. Then re-arm to
