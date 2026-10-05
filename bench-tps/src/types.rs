@@ -28,6 +28,10 @@ pub const BENCH_WITHDRAW_FEE: u64 = 1;
 /// writes to the channel. At 1 so the bench's 1-raw-unit withdrawals pass.
 pub const BENCH_MIN_WITHDRAW_AMOUNT: u64 = 1;
 
+/// Minimum deposit every bench AllowMint sets. 0 so any bench deposit amount
+/// lands.
+pub const BENCH_MIN_DEPOSIT_AMOUNT: u64 = 0;
+
 /// Maximum time to wait for a batch of on-chain confirmations before giving up.
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
