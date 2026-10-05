@@ -4745,6 +4745,8 @@ mod tests {
             release_refused_on_chain: false,
         };
 
+        // Seeded so a wrong park would land and send, letting the check below fail.
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 

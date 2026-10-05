@@ -11,14 +11,17 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Alerts waiting for the webhook; past this an alert is dropped.
 const ALERT_QUEUE_CAPACITY: usize = 1024;
 
-/// How long a stopped writer keeps posting what is still queued.
-const ALERT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a stopped writer keeps posting, the post in flight included. Kept
+/// under shutdown's writer stage so the undelivered ids are logged before it
+/// stops waiting.
+const ALERT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// DbTransactionWriter that receives transaction status updates from sender
 /// and writes them to the database
@@ -63,11 +66,13 @@ impl DbTransactionWriter {
 
         // Delivery runs beside the writes in this task, so a slow endpoint never
         // delays a status write and an abort stops both.
+        let writer_stopped = CancellationToken::new();
         let deliveries = Self::deliver_alerts(
             self.webhook_client.clone(),
             self.webhook_url.clone(),
             self.alert_rx.take(),
             self.program_type,
+            writer_stopped.clone(),
         );
         let writes = async move {
             while let Some(update) = self.update_rx.recv().await {
@@ -81,7 +86,9 @@ impl DbTransactionWriter {
                     "Writer stopped with alerts still queued; draining them"
                 );
             }
-            // Dropping the writer here closes the alert queue, which starts the bounded drain.
+            // Starts the bounded drain. Dropping the writer here then closes the
+            // alert queue, so the drain ends once it is empty.
+            writer_stopped.cancel();
         };
         tokio::join!(writes, deliveries);
 
@@ -184,42 +191,61 @@ impl DbTransactionWriter {
     }
 
     /// Post queued alerts one at a time until the queue closes and drains. Once
-    /// the writer has stopped, what is left shares one `ALERT_DRAIN_TIMEOUT`.
+    /// the writer stops, the post in flight and everything still queued share
+    /// one `ALERT_DRAIN_TIMEOUT`.
     async fn deliver_alerts(
         client: WebhookClient,
         webhook_url: Option<String>,
         alerts: Option<mpsc::Receiver<TransactionStatusUpdate>>,
         program_type: ProgramType,
+        writer_stopped: CancellationToken,
     ) {
         let (Some(webhook_url), Some(mut alerts)) = (webhook_url, alerts) else {
             return;
         };
-        let mut drain_deadline = None;
-        while let Some(update) = alerts.recv().await {
-            let post = Self::send_webhook_alert(&client, &webhook_url, &update);
-            if !alerts.is_closed() {
-                post.await;
-                continue;
+        let drain_expired = async {
+            writer_stopped.cancelled().await;
+            sleep(ALERT_DRAIN_TIMEOUT).await;
+        };
+        tokio::pin!(drain_expired);
+        // Biased so an expired drain is reported rather than racing another post.
+        let cut_off = loop {
+            let update = tokio::select! {
+                biased;
+                _ = &mut drain_expired => break None,
+                update = alerts.recv() => match update {
+                    Some(update) => update,
+                    None => return,
+                },
+            };
+            tokio::select! {
+                biased;
+                _ = &mut drain_expired => break Some(update.transaction_id),
+                _ = Self::send_webhook_alert(
+                    &client,
+                    &webhook_url,
+                    &update,
+                    program_type.as_label(),
+                ) => {}
             }
-            let deadline = *drain_deadline.get_or_insert(Instant::now() + ALERT_DRAIN_TIMEOUT);
-            if timeout_at(deadline, post).await.is_err() {
-                // The cut-off post is undelivered too. The ids are the on-call's
-                // list of rows to review, since nothing replays these alerts.
-                let mut undelivered = vec![update.transaction_id];
-                while let Ok(remaining) = alerts.try_recv() {
-                    undelivered.push(remaining.transaction_id);
-                }
-                error!(
-                    undelivered = undelivered.len(),
-                    transaction_ids = ?undelivered,
-                    "Alert drain timed out; these transactions were not paged"
-                );
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[program_type.as_label(), "alert_drain_dropped"])
-                    .inc_by(undelivered.len() as f64);
-                return;
-            }
+        };
+        // The cut-off post is undelivered too. The ids are the on-call's list of
+        // rows to review, since nothing replays these alerts.
+        let mut undelivered: Vec<i64> = cut_off.into_iter().collect();
+        while let Ok(remaining) = alerts.try_recv() {
+            undelivered.push(remaining.transaction_id);
         }
+        if undelivered.is_empty() {
+            return;
+        }
+        error!(
+            undelivered = undelivered.len(),
+            transaction_ids = ?undelivered,
+            "Alert drain timed out; these transactions were not paged"
+        );
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[program_type.as_label(), "alert_drain_dropped"])
+            .inc_by(undelivered.len() as f64);
     }
 
     /// Send webhook alert for failed transaction
@@ -227,6 +253,7 @@ impl DbTransactionWriter {
         client: &WebhookClient,
         webhook_url: &str,
         update: &TransactionStatusUpdate,
+        pt: &str,
     ) {
         let processed_at = update
             .processed_at
@@ -270,10 +297,16 @@ impl DbTransactionWriter {
                 "Webhook alert sent successfully for transaction {}",
                 update.transaction_id
             ),
-            Err(error) => warn!(
-                "Failed to send webhook alert for transaction {}: {}",
-                update.transaction_id, error
-            ),
+            // Single attempt, so this alert is lost; counted for the `alerts-dropped` rule.
+            Err(error) => {
+                warn!(
+                    "Failed to send webhook alert for transaction {}: {}",
+                    update.transaction_id, error
+                );
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "alert_post_failed"])
+                    .inc();
+            }
         }
     }
 }
@@ -282,6 +315,7 @@ impl DbTransactionWriter {
 mod tests {
     use super::*;
     use crate::config::ProgramType;
+    use crate::shutdown_utils::SHUTDOWN_STORAGE_WRITER_DRAIN_TIMEOUT_SECS;
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use chrono::Utc;
@@ -322,8 +356,13 @@ mod tests {
         let update = create_test_update(TransactionStatus::Failed);
 
         // Send webhook alert
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
 
         // Verify webhook was called
         mock.assert();
@@ -349,8 +388,13 @@ mod tests {
         let update = create_test_update(TransactionStatus::Failed);
 
         // Send webhook alert (should handle error gracefully)
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
 
         // Verify webhook was called despite error
         mock.assert();
@@ -379,8 +423,13 @@ mod tests {
 
         let update = create_test_update(TransactionStatus::Failed);
 
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
 
         mock.assert();
     }
@@ -404,7 +453,13 @@ mod tests {
         let update = create_test_update(TransactionStatus::Failed);
 
         // Send webhook alert (should handle error gracefully without panicking)
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, invalid_url, &update).await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            invalid_url,
+            &update,
+            "escrow",
+        )
+        .await;
 
         // Test passes if no panic occurs
     }
@@ -484,8 +539,13 @@ mod tests {
             alert_only: false,
         };
 
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
         mock.assert();
     }
 
@@ -519,8 +579,13 @@ mod tests {
             alert_only: false,
         };
 
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
         mock.assert();
     }
 
@@ -555,8 +620,13 @@ mod tests {
             alert_only: false,
         };
 
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
         mock.assert();
     }
 
@@ -591,8 +661,13 @@ mod tests {
             alert_only: false,
         };
 
-        DbTransactionWriter::send_webhook_alert(&writer.webhook_client, &server.url(), &update)
-            .await;
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &update,
+            "escrow",
+        )
+        .await;
         mock.assert();
     }
 
@@ -785,7 +860,8 @@ mod tests {
 
     /// A stopped writer gives queued alerts one bounded drain, so a hanging
     /// endpoint cannot hold a refused boot for 10s per alert, and counts what
-    /// the drain drops.
+    /// the drain drops. It ends inside shutdown's writer stage, or shutdown
+    /// stops waiting before the undelivered ids are logged.
     #[tokio::test(start_paused = true)]
     async fn a_stopped_writer_bounds_the_drain_of_queued_alerts() {
         // Bound but never accepted, so every post hangs until its 10s timeout.
@@ -814,19 +890,60 @@ mod tests {
         let started = tokio::time::Instant::now();
         writer.start().await.unwrap();
 
-        // At most one post in flight plus the drain, not one timeout per alert.
         assert!(
-            started.elapsed() <= Duration::from_secs(20),
+            started.elapsed() < Duration::from_secs(SHUTDOWN_STORAGE_WRITER_DRAIN_TIMEOUT_SECS),
             "drain took {:?}",
             started.elapsed()
         );
-        // The first post's own timeout lands on the deadline's tick, so it may
-        // count as attempted rather than dropped.
-        let dropped_count = dropped.get() - before;
+        // The deadline cuts the first post off before its own timeout, so every
+        // alert counts as dropped.
+        assert_eq!(dropped.get() - before, queued as f64);
+    }
+
+    /// A post already hanging when the writer stops is bounded by the same
+    /// drain, so it cannot push what is queued behind it past shutdown's
+    /// writer stage.
+    #[tokio::test(start_paused = true)]
+    async fn a_post_in_flight_when_the_writer_stops_shares_the_drain() {
+        // Bound but never accepted, so every post hangs until its 10s timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let webhook_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let (tx, rx) = mpsc::channel(2);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(webhook_url), ProgramType::Escrow);
+        // Only this test drops on drain under this label, so no parallel test moves it.
+        let dropped = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["escrow", "alert_drain_dropped"]);
+        let before = dropped.get();
+        let handle = tokio::spawn(writer.start());
+
+        let in_flight_id = 1;
+        let queued_id = 2;
+        tx.send(TransactionStatusUpdate {
+            transaction_id: in_flight_id,
+            ..create_test_update(TransactionStatus::ManualReview)
+        })
+        .await
+        .unwrap();
+        // Long enough for its post to start, well short of its 10s timeout.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(TransactionStatusUpdate {
+            transaction_id: queued_id,
+            ..create_test_update(TransactionStatus::ManualReview)
+        })
+        .await
+        .unwrap();
+        let stopped = tokio::time::Instant::now();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
         assert!(
-            dropped_count >= (queued - 1) as f64 && dropped_count <= queued as f64,
-            "dropped {dropped_count} of {queued}"
+            stopped.elapsed() < Duration::from_secs(SHUTDOWN_STORAGE_WRITER_DRAIN_TIMEOUT_SECS),
+            "drain took {:?}",
+            stopped.elapsed()
         );
+        assert_eq!(dropped.get() - before, 2.0);
     }
 
     /// With the queue full, the next alert is dropped and counted, never waited on.
@@ -855,6 +972,37 @@ mod tests {
         }
 
         assert_eq!(dropped.get() - before, 1.0);
+    }
+
+    /// A post the endpoint fails is a page nobody receives, so it is counted for
+    /// the `alerts-dropped` rule rather than only logged.
+    #[tokio::test]
+    async fn a_failed_alert_post_is_counted() {
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/")
+            .with_status(500)
+            .create_async()
+            .await;
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer =
+            DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Withdraw);
+        // Only this test uses the label, so no parallel test moves the series.
+        let label = "test_alert_post_failed";
+        let failed =
+            metrics::OPERATOR_TRANSACTION_ERRORS.with_label_values(&[label, "alert_post_failed"]);
+        let before = failed.get();
+
+        DbTransactionWriter::send_webhook_alert(
+            &writer.webhook_client,
+            &server.url(),
+            &create_test_update(TransactionStatus::ManualReview),
+            label,
+        )
+        .await;
+
+        assert_eq!(failed.get() - before, 1.0);
     }
 
     /// A webhook that accepts the connection but never answers must not hold

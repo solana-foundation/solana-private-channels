@@ -71,12 +71,21 @@ configured paging mechanism today. It fires on `Failed`,
 no retries). Alerts are queued off the status-write path (up to 1024) and
 posted one at a time; when the queue is full an alert is dropped and counted
 as `error_reason="alert_queue_full"`, which pages through the Grafana
-`alerts-dropped` rule, and its ERROR log line still fires. A shutdown drain
-gets 10s; what it cannot post is counted as `alert_drain_dropped` and its ids
-are logged at ERROR. An `error_message` ending in `(status write unverified;
-check the row)` means the operator could not confirm its status write: a row
-still `processing` is redone by recovery, which pages again; otherwise handle it
-as the payload's status. All dispatch below is keyed on the webhook payload.
+`alerts-dropped` rule, and its ERROR log line still fires. On shutdown the
+remaining alerts, the post in flight included, get 5s; what is not posted is
+logged at ERROR as `Alert drain timed out` with its `transaction_ids`. The
+process exits right after, so its `alert_drain_dropped` count may never be
+scraped: after a restart, that log line is the record of who was not paged. A
+post the endpoint fails or does not answer within 10s is lost too; it is counted
+as `alert_post_failed`, pages through the same rule, and its id is in the WARN
+line. An `error_message` ending in `(status write unverified; check the row)`
+means the operator could not confirm its status write: a row still `processing`
+is redone by recovery, which pages again; otherwise handle it as the payload's
+status. A row can also be paged twice with different reasons: a late outcome
+from an earlier attempt still pages when the row is already in that status.
+Neither reason is stored on the row, so check both against the row's current
+state before following a path below. All dispatch below is keyed on the webhook
+payload.
 
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|

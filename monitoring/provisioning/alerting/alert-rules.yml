@@ -1014,7 +1014,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) dropped transaction alert webhooks ({{ $labels.error_reason }}): either its alert queue was full or a shutdown drain ran out of time, most likely because the webhook endpoint is slow or hanging. The dropped transactions are recorded in the database and each logged its ERROR line, but nobody was paged for them. A shutdown drop logs their ids as transaction_ids. Check the webhook endpoint, then list recent outcomes with: SELECT id, transaction_type, status, updated_at FROM transactions WHERE status IN ('manual_review', 'failed', 'failed_reminted') ORDER BY updated_at DESC."
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) dropped transaction alert webhooks ({{ $labels.error_reason }}): its alert queue was full, a shutdown drain ran out of time, or a post failed (the endpoint errored or did not answer within 10s), most likely because the webhook endpoint is down, slow or hanging. The dropped transactions are recorded in the database and each logged its ERROR line, but nobody was paged for them. A shutdown drop logs their ids as transaction_ids; a failed post logs its id in a 'Failed to send webhook alert for transaction' WARN line. Check the webhook endpoint, then list recent outcomes with: SELECT id, transaction_type, status, updated_at FROM transactions WHERE status IN ('manual_review', 'failed', 'failed_reminted') ORDER BY updated_at DESC."
         labels:
           severity: critical
         data:
@@ -1024,7 +1024,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: increase(private_channel_operator_transaction_errors_total{error_reason=~"alert_queue_full|alert_drain_dropped"}[5m])
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason=~"alert_queue_full|alert_drain_dropped|alert_post_failed"}[5m])
               instant: true
               refId: A
           - refId: C
