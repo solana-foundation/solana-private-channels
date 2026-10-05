@@ -566,28 +566,21 @@ async fn read_withdrawal_allowed_mint(
         .instance_pda;
     let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
 
-    // A floor already proves this account existed, so it doubles as the freshness
-    // anchor and spares the extra round-trip on every withdrawal after the first.
-    let recorded_floor = processor_state.mint_cache.existence_floor(&mint);
-
     let rpc = processor_state
         .mint_cache
         .rpc_client()
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
     let commitment = rpc.rpc_client.commitment();
 
-    // A null only proves "never allowlisted" if the node has caught up. Anchor on the
-    // tip it reports and require the read to answer at or past it, so a lagging backend
-    // errors instead of denying an allowlist entry it simply has not seen yet.
-    let min_slot = match recorded_floor {
-        Some(floor) => floor,
-        None => {
-            rpc.get_latest_blockhash_with_context(commitment)
-                .await
-                .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
-                .0
-        }
-    };
+    // Anchor on the tip and require the read to answer at or past it, so a lagging
+    // backend errors instead of answering with a gate or allowlist state an admin has
+    // since changed. The existence floor is no substitute: it can predate a block and
+    // reopen, and the pause read inherits the slot recorded below.
+    let min_slot = rpc
+        .get_latest_blockhash_with_context(commitment)
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
+        .0;
 
     let response = rpc
         .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(min_slot))
@@ -1304,8 +1297,8 @@ mod tests {
     use solana_sdk::program_option::COption;
     use solana_sdk::program_pack::Pack;
     use spl_token_2022::extension::{
-        confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensionsMut,
-        StateWithExtensionsMut,
+        confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
+        BaseStateWithExtensionsMut, StateWithExtensionsMut,
     };
     use spl_token_2022::state::{
         Account as Token2022AccountState, AccountState, Mint as Token2022MintState,
@@ -1454,9 +1447,8 @@ mod tests {
         }
     }
 
-    /// Treat `mint` as already proved to exist on the target chain, so the
-    /// allowlist read needs no freshness anchor and mint reads can report a
-    /// missing account as permanent.
+    /// Treat `mint` as already proved to exist on the target chain, so mint reads
+    /// can report a missing account as permanent.
     ///
     /// This no longer skips any gate: the withdrawal gate and the mint profile
     /// are read from the `AllowedMint` account on every withdrawal, so a test
@@ -1557,6 +1549,7 @@ mod tests {
         let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, mint);
 
         let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1);
         mock_account_read(
             &mut server,
             &allowed_mint_pda,
@@ -1645,6 +1638,68 @@ mod tests {
             .create()
     }
 
+    /// Answer `getLatestBlockhash` at `slot`, the tip the allowlist read binds to.
+    fn mock_tip(server: &mut mockito::ServerGuard, slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": slot},
+                        "value": {
+                            "blockhash": Hash::new_unique().to_string(),
+                            "lastValidBlockHeight": 1_000u64
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Answer `getAccountInfo` for `address` only when the read is bound to
+    /// `min_context_slot`, standing in for a backend whose state is as of that slot.
+    fn mock_account_read_at_slot(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        owner: &Pubkey,
+        data: Vec<u8>,
+        min_context_slot: u64,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(address.to_string()),
+                mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{min_context_slot}\b"#)),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": min_context_slot},
+                        "value": {
+                            "owner": owner.to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&data), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
     /// A withdrawal processor whose target chain answers every account read with
     /// `response`, which for these tests is the allowlist account the gate reads.
     fn processor_state_answering(
@@ -1717,6 +1772,32 @@ mod tests {
             mint: Pubkey::new_unique(),
             owner: Pubkey::new_unique(),
             state: AccountState::Initialized,
+            ..Default::default()
+        };
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+        data
+    }
+
+    /// Bytes of a Token-2022 mint carrying `PausableConfig` with `paused` as given.
+    fn pausable_mint_bytes(paused: bool) -> Vec<u8> {
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&[
+            ExtensionType::Pausable,
+        ])
+        .expect("a fixed-length extension has a calculable mint length");
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data)
+                .expect("a zeroed buffer holds an uninitialized mint");
+        state
+            .init_extension::<PausableConfig>(true)
+            .expect("the extension fits the calculated length")
+            .paused = paused.into();
+        state.base = Token2022MintState {
+            decimals: 6,
+            is_initialized: true,
             ..Default::default()
         };
         state.pack_base();
@@ -1919,6 +2000,139 @@ mod tests {
         );
     }
 
+    /// An admin blocked and then reopened the gate while the operator kept running.
+    /// The floor recorded before the block is still satisfied by a backend that has
+    /// not seen the reopen, and that backend answers with the gate blocked. Binding
+    /// the read to the current tip instead keeps the row from parking on stale state.
+    #[tokio::test]
+    async fn a_reopened_gate_is_read_at_the_tip_not_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let floor_slot = 100;
+        let tip_slot = 1_000;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // A backend from before the reopen still has the gate blocked.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            tip_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+        // Recorded when this process last served the mint, before the block.
+        ps.mint_cache.record_existence_floor(&mint, floor_slot);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a reopened gate must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The pause read is bound to the slot the gate read just answered at. A backend
+    /// from before an unpause still satisfies the old floor and answers with the
+    /// mint paused, so that slot has to come from the tip too.
+    #[tokio::test]
+    async fn an_unpaused_mint_is_read_at_the_tip_not_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let allowed_mint = allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PAUSABLE);
+        let floor_slot = 100;
+        let tip_slot = 1_000;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // The gate is open on every backend, so only the pause read can park the row.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint.clone(),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint,
+            tip_slot,
+        );
+        // A backend from before the unpause still has the mint paused.
+        mock_account_read_at_slot(
+            &mut server,
+            &mint,
+            &spl_token_2022::id(),
+            pausable_mint_bytes(true),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &mint,
+            &spl_token_2022::id(),
+            pausable_mint_bytes(false),
+            tip_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+        // Recorded when this process last served the mint, before the pause.
+        ps.mint_cache.record_existence_floor(&mint, floor_slot);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "an unpaused mint must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
     /// A `freeze_authority` holder can freeze the pooled escrow ATA, stranding every
     /// depositor for that mint. Parking makes that visible instead of dispatching a
     /// release the token program is certain to reject.
@@ -1944,6 +2158,7 @@ mod tests {
         ata_data[108] = 2;
 
         let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1);
         // Pinned with a freeze authority, which is the only reason the pre-flight
         // reads the escrow ATA at all.
         let _allowlist_mock = mock_account_read(
@@ -2013,6 +2228,7 @@ mod tests {
 
         // Recreated as SPL: the same AllowedMint account now pins the SPL program.
         server.reset();
+        mock_tip(&mut server, 1);
         mock_account_read(
             &mut server,
             &find_allowed_mint_pda(&instance_pda, &mint),
