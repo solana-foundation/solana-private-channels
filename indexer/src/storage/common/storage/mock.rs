@@ -1135,8 +1135,12 @@ impl MockStorage {
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
             if txn.id == transaction_id && txn.status == TransactionStatus::Processing {
+                // The capped write still matches the row, so the trigger bumps it.
                 if txn.recovery_requeue_attempts >= max_attempts {
-                    return Ok(RequeueOutcome::AtCap);
+                    txn.updated_at = Utc::now();
+                    return Ok(RequeueOutcome::AtCap {
+                        lease: txn.updated_at,
+                    });
                 }
                 txn.status = TransactionStatus::Pending;
                 txn.recovery_requeue_attempts += 1;

@@ -1,4 +1,5 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
+use chrono::{DateTime, Utc};
 
 /// Outcome of a pre-broadcast requeue attempt. The cap is enforced inside the
 /// single write so the caller never needs a separate counter read.
@@ -8,7 +9,9 @@ pub enum RequeueOutcome {
     /// new durable counter after the increment.
     Requeued { attempts: i32 },
     /// Row was Processing but at/over the cap: left Processing, not requeued.
-    AtCap,
+    /// The write still matched the row and bumped `updated_at`; `lease` is the
+    /// new value, which a later fenced write on this incarnation must present.
+    AtCap { lease: DateTime<Utc> },
     /// No Processing row for this id (already claimed or advanced by another owner).
     NotProcessing,
 }

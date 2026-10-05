@@ -73,7 +73,10 @@ posted one at a time; when the queue is full an alert is dropped and counted
 as `error_reason="alert_queue_full"`, which pages through the Grafana
 `alerts-dropped` rule, and its ERROR log line still fires. A shutdown drain
 gets 10s; what it cannot post is counted as `alert_drain_dropped` and its ids
-are logged at ERROR. All dispatch below is keyed on the webhook payload.
+are logged at ERROR. An `error_message` ending in `(status write unverified;
+check the row)` means the operator could not confirm its status write: a row
+still `processing` is redone by recovery, which pages again; otherwise handle it
+as the payload's status. All dispatch below is keyed on the webhook payload.
 
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|
@@ -219,8 +222,8 @@ RUST_LOG=trace cargo test -p private-channel-indexer --test runbook_drills -- \
 - Before merging a runbook edit.
 - After changes to: `processor.rs`, `sender/transaction.rs` (and in
   particular `send_fatal_error` — drill_12; or the
-  `JitOutcome::ManualReview` caller-arm dispatch which emits the
-  `ManualReview` status update inline — drill_14), `sender/mint.rs`
+  `JitOutcome::ManualReview` caller arm, which parks the row through
+  `send_fenced_outcome` — drill_14), `sender/mint.rs`
   (the `JitOutcome::ManualReview` reason strings live here — drill_14
   specifically), `sender/remint.rs`, `db_transaction_writer.rs`
   (including its webhook-payload serializer — drill_13 anchors on the

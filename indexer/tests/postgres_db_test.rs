@@ -2460,13 +2460,20 @@ async fn try_requeue_prebroadcast_requeues_under_cap_then_caps(
     assert_eq!(status_of(&pool, id).await, "pending");
     assert_eq!(requeue_attempts_of(&pool, id).await, 1);
 
-    // At the cap (max 1, attempts 1): leave Processing, counter unchanged.
+    // At the cap (max 1, attempts 1): leave Processing, counter unchanged, but
+    // the write still bumps `updated_at` and hands back the new lease.
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let locked = updated_at_of(&pool, id).await;
+    let RequeueOutcome::AtCap { lease } = storage.try_requeue_prebroadcast(id, 1).await? else {
+        panic!("at the cap the write must report AtCap");
+    };
+    assert_ne!(lease, locked, "the capped write must bump updated_at");
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 1).await?,
-        RequeueOutcome::AtCap
+        lease,
+        updated_at_of(&pool, id).await,
+        "the lease must be the row's current updated_at"
     );
     assert_eq!(
         status_of(&pool, id).await,

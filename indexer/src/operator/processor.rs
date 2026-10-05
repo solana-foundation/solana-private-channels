@@ -314,7 +314,7 @@ async fn requeue_single_prebroadcast(
                 "Requeued withdrawal to Pending after a pre-broadcast transient error"
             );
         }
-        Ok(RequeueOutcome::AtCap) => {
+        Ok(RequeueOutcome::AtCap { .. }) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
                 .inc();

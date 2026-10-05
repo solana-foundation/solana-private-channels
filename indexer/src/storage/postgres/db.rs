@@ -2027,8 +2027,9 @@ impl PostgresDb {
         // One atomic write enforces the cap: the CASE requeues (and increments) only
         // while under max_attempts, otherwise leaves the row Processing. RETURNING the
         // post-update count plus whether the row is now Pending distinguishes the
-        // three outcomes without a separate counter read that could fail.
-        let row: Option<(i32, bool)> = sqlx::query_as(
+        // three outcomes without a separate counter read that could fail. The
+        // trigger bumps `updated_at` even at the cap, so it is returned as the lease.
+        let row: Option<(i32, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
             r#"
             UPDATE transactions
             SET status = CASE WHEN recovery_requeue_attempts < $2
@@ -2038,7 +2039,7 @@ impl PostgresDb {
                               ELSE recovery_requeue_attempts END
             WHERE id = $1
               AND status = 'processing'
-            RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued
+            RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued, updated_at
             "#,
         )
         .bind(transaction_id)
@@ -2048,8 +2049,8 @@ impl PostgresDb {
 
         Ok(match row {
             None => RequeueOutcome::NotProcessing,
-            Some((attempts, true)) => RequeueOutcome::Requeued { attempts },
-            Some((_, false)) => RequeueOutcome::AtCap,
+            Some((attempts, true, _)) => RequeueOutcome::Requeued { attempts },
+            Some((_, false, lease)) => RequeueOutcome::AtCap { lease },
         })
     }
 

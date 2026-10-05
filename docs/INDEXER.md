@@ -252,7 +252,7 @@ Runs alongside the three-stage pipeline to detect and resolve discrepancies betw
 
 #### DB Transaction Writer
 
-Handles batched database writes for transaction status updates from the operator pipeline.
+Writes operator status updates one at a time and posts their alert webhooks from a separate bounded queue, so a slow endpoint never delays a write. Terminal outcomes for a `processing` row are written by their producer as a CAS on that incarnation's `updated_at` and reach the writer as alert-only updates, so a late outcome cannot terminalize a row recovery has requeued.
 
 **Location**: [`indexer/src/operator/db_transaction_writer.rs`](../indexer/src/operator/db_transaction_writer.rs)
 
