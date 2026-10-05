@@ -65,10 +65,9 @@ use {
 // TODO: Make this a config parameter
 const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
 
-/// Upper bound on resident cache entries. Once exceeded, the oldest clean
-/// entries are evicted down to a low watermark. Must stay well above the max
-/// distinct account keys a single batch can reference so a batch never evicts
-/// its own working set. Large accounts break any byte estimate, hence the byte cap.
+/// Upper bound on resident cache entries. Once exceeded, the oldest clean entries
+/// are evicted down to a low watermark. The preload's own keys are spared, so the
+/// cap can be exceeded by one working set. Large accounts need the byte cap too.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 1_000_000;
 
 /// Upper bound on resident account-data bytes. Without it a stream of large
@@ -251,9 +250,7 @@ impl BOB {
             .as_secs();
 
         // Split the keys into cache hits and misses, skipping precompiles (always
-        // in memory, no DB lookup). Each hit is stamped with the current time so
-        // that when eviction runs below, this batch's accounts look freshest and
-        // are never the ones evicted. Misses are fetched from the DB further down.
+        // in memory, no DB lookup). Misses are fetched from the DB further down.
         let mut already_cached = 0usize;
         let mut miss_keys: Vec<Pubkey> = Vec::new();
 
@@ -263,9 +260,8 @@ impl BOB {
             }
             if let Some(entry) = self.accounts.get_mut(pubkey) {
                 already_cached += 1;
-                // Reading a clean (in-sync) entry does not desync it, so refresh
-                // its recency; this keeps hot read-only accounts from aging or
-                // capping out.
+                // Refresh a clean hit's recency. This keeps it out of the age sweep
+                // below, which would otherwise drop it before the fetch with no reload.
                 if entry.synced_since.is_some() {
                     entry.synced_since = Some(now);
                 }
@@ -274,9 +270,8 @@ impl BOB {
             }
         }
 
-        // Drain the settled inbox to keep dirty/clean tracking current, enforce
-        // the hard cap, and run the periodic age sweep. Misses are not resident
-        // yet, so they are never eviction candidates here.
+        // Drain the settled inbox to keep dirty/clean tracking current and run the
+        // periodic age sweep. Misses are not resident yet, so they are never swept here.
         self.garbage_collect();
 
         let mut fetched = 0usize;
@@ -309,8 +304,9 @@ impl BOB {
             }
         }
 
-        // Runs after the misses land so the cache is back within its cap before the
-        // batch executes. This preload's keys are spared, so none reaches the SVM as absent.
+        // Both caps run after the misses land and spare this preload's keys, so no
+        // hit or miss reaches the SVM as absent and no evicted key needs a refetch.
+        self.cap_evict(pubkeys);
         self.evict_to_byte_cap(pubkeys);
 
         Ok((fetched, already_cached))
@@ -476,12 +472,6 @@ impl BOB {
             }
         }
 
-        // Phase 1b: apply the hard entry cap. The len() check is cheap and skips
-        // out when under the cap, so the extra work only happens when the cache
-        // has actually grown too large. This runs before the current batch adds
-        // its missed accounts, so those accounts are never evicted here.
-        self.cap_evict();
-
         // Phase 2: only run the O(N) eviction sweep periodically. The same scan
         // recomputes the dirty/byte totals from scratch, correcting any drift in
         // the incremental accounting at least once per sweep.
@@ -511,14 +501,13 @@ impl BOB {
     }
 
     /// Evict the oldest clean entries when the cache exceeds `max_cache_entries`,
-    /// down to a 90% low watermark. Dirty (ahead-of-DB) entries are never
-    /// evicted, so the cap can only be enforced against clean state. The low
-    /// watermark amortizes the sort so it does not run every batch under
-    /// sustained pressure.
-    fn cap_evict(&mut self) {
+    /// down to a 90% low watermark that amortizes the work under sustained pressure.
+    /// Dirty entries and `protected` keys are never candidates.
+    fn cap_evict(&mut self, protected: &[Pubkey]) {
         if self.accounts.len() <= self.max_cache_entries {
             return;
         }
+        let protected: HashSet<&Pubkey> = protected.iter().collect();
 
         // Keep at least one entry of headroom even for a tiny cap so we trim
         // toward a 90% watermark instead of collapsing the whole clean set.
@@ -528,11 +517,15 @@ impl BOB {
             return;
         }
 
-        // Oldest synced_since first; dirty entries are not candidates.
+        // Oldest synced_since first; dirty and protected entries are not candidates.
         let mut clean: Vec<(Pubkey, u64)> = self
             .accounts
             .iter()
-            .filter_map(|(pubkey, meta)| meta.synced_since.map(|t| (*pubkey, t)))
+            .filter_map(|(pubkey, meta)| {
+                meta.synced_since
+                    .filter(|_| !protected.contains(pubkey))
+                    .map(|t| (*pubkey, t))
+            })
             .collect();
 
         let remove_count = to_remove.min(clean.len());
@@ -2019,7 +2012,7 @@ mod tests {
             );
         }
 
-        bob.garbage_collect();
+        bob.cap_evict(&[]);
 
         assert_eq!(
             bob.accounts.len(),
@@ -2057,7 +2050,7 @@ mod tests {
             );
         }
 
-        bob.garbage_collect();
+        bob.cap_evict(&[]);
 
         assert_eq!(
             bob.accounts.len(),
@@ -2067,7 +2060,7 @@ mod tests {
     }
 
     /// A clean account referenced by the current batch must survive the cap even
-    /// if it was cold, because preload restamps hits before eviction runs.
+    /// if it was cold, because the cap spares the keys the preload was asked for.
     #[tokio::test]
     async fn cap_keeps_account_referenced_this_batch() {
         let (mut bob, _inbox) = create_test_bob();
@@ -2106,6 +2099,96 @@ mod tests {
         assert!(
             bob.accounts.contains_key(&referenced),
             "an account referenced this batch must not be cap-evicted"
+        );
+        assert_eq!(
+            bob.accounts.len(),
+            1,
+            "the preload still enforces the cap on unreferenced entries"
+        );
+    }
+
+    /// When dirty entries alone fill the cap, the only clean entry is this
+    /// batch's hit. It must stay resident, or the SVM sees a real account as absent.
+    #[tokio::test]
+    async fn preload_keeps_hit_resident_under_dirty_pressure() {
+        let (mut bob, _inbox) = create_test_bob();
+        bob.max_cache_entries = 2;
+
+        let mut dirty = Vec::new();
+        for _ in 0..3 {
+            let pk = Pubkey::new_unique();
+            bob.insert_account_for_test(pk, make_account(0, &[], &Pubkey::default()));
+            dirty.push(pk);
+        }
+        let hit = insert_clean(&mut bob, 1);
+
+        let counts = bob.preload_accounts(&[hit], usize::MAX).await.unwrap();
+
+        assert_eq!(counts, (0, 1), "the hit is served from memory");
+        assert!(
+            bob.get_account_shared_data(&hit).is_some(),
+            "a preloaded hit must reach the SVM"
+        );
+        assert!(
+            bob.account_lamports(&hit).is_some(),
+            "a preloaded hit must not look newly created"
+        );
+        for pk in &dirty {
+            assert!(
+                bob.accounts.contains_key(pk),
+                "dirty entries are never evicted"
+            );
+        }
+    }
+
+    /// A hit last synced over an hour ago must survive the age sweep that runs
+    /// during its own preload, because the restamp makes it fresh first.
+    #[tokio::test]
+    async fn preload_age_sweep_spares_stale_hit() {
+        let (mut bob, _inbox) = create_test_bob();
+        let hit = Pubkey::new_unique();
+        bob.accounts.insert(
+            hit,
+            AccountWithMeta {
+                account: make_account(1, &[1], &Pubkey::default()),
+                synced_since: Some(now_secs() - OLDEST_SYNCED_ACCOUNT_AGE - 1),
+                deleted: false,
+                generation: None,
+            },
+        );
+        bob.batches_since_eviction = GC_EVICTION_INTERVAL - 1;
+
+        bob.preload_accounts(&[hit], usize::MAX).await.unwrap();
+
+        assert!(
+            bob.get_account_shared_data(&hit).is_some(),
+            "a stale hit must not be age-swept by its own preload"
+        );
+    }
+
+    /// A miss fetched under dirty pressure must survive the entry cap that runs
+    /// after the fetch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_keeps_fetched_miss_under_dirty_pressure() {
+        let (mut bob, _inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
+        bob.max_cache_entries = 2;
+        for _ in 0..3 {
+            bob.insert_account_for_test(
+                Pubkey::new_unique(),
+                make_account(0, &[], &Pubkey::default()),
+            );
+        }
+        let miss = Pubkey::new_unique();
+        let stored = make_account(1_000, &[4, 5, 6], &Pubkey::default());
+        bob.accounts_db.set_account(miss, stored.clone()).await;
+
+        let counts = bob.preload_accounts(&[miss], usize::MAX).await.unwrap();
+
+        assert_eq!(counts, (1, 0), "the account must be a cache miss");
+        assert_eq!(
+            bob.get_account_shared_data(&miss),
+            Some(stored),
+            "a fetched miss must reach the SVM"
         );
     }
 
