@@ -3,6 +3,7 @@ pub mod constants;
 mod decode;
 pub mod error;
 mod get_account_info_impl;
+mod get_address_index_slot_impl;
 mod get_block_height_impl;
 mod get_block_impl;
 mod get_block_time_impl;
