@@ -2391,6 +2391,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_flags_deposit_before_mint_allowed() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 1, "mint_a", 5);
         storage
             .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
@@ -2403,6 +2404,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_passes_deposit_at_or_after_allow() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 1, "mint_a", 10);
         seed_deposit(&mock, 2, "mint_a", 15);
         storage
@@ -2416,6 +2418,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_query_flags_deposit_during_blocked_window() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         seed_deposit(&mock, 7, "mint_a", 25);
         storage
             .insert_mint_statuses_batch(&[
@@ -2426,6 +2429,24 @@ mod tests {
             .unwrap();
         let ids = storage.get_orphan_deposit_ids().await.unwrap();
         assert_eq!(ids, vec![7]);
+    }
+
+    /// A deposit above the escrow checkpoint may sit past history a repair still owes, so it
+    /// is judged only once the checkpoint covers it.
+    #[tokio::test]
+    async fn orphan_query_waits_for_escrow_checkpoint() {
+        let (storage, mock) = make_mock_storage();
+        seed_deposit(&mock, 1, "mint_a", 106);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert!(ids.is_empty(), "no checkpoint judges no deposit");
+
+        mock.set_checkpoint("escrow", 100);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert!(ids.is_empty(), "an uncovered deposit is not an orphan yet");
+
+        mock.set_checkpoint("escrow", 106);
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert_eq!(ids, vec![1], "a covered deposit with no allow is an orphan");
     }
 
     #[tokio::test]

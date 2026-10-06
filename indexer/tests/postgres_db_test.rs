@@ -1636,6 +1636,7 @@ async fn get_mint_status_at_slot_returns_blocked_with_no_allow_in_or_before_the_
 async fn orphan_query_passes_deposit_in_the_block_slot_pg() -> Result<(), Box<dyn std::error::Error>>
 {
     let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let block_slot = 20;
     storage
         .insert_mint_statuses_batch(&[
@@ -1661,6 +1662,7 @@ async fn orphan_query_passes_deposit_in_the_block_slot_pg() -> Result<(), Box<dy
 async fn orphan_query_passes_deposit_in_the_first_allow_slot_pg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let allow_slot = 20;
     storage
         .insert_mint_statuses_batch(&[mk_status("mint_new", "allowed", allow_slot, "sig-a")])
@@ -1682,6 +1684,7 @@ async fn orphan_query_passes_deposit_in_the_first_allow_slot_pg(
 async fn orphan_query_flags_deposit_with_only_blocks_in_its_slot_pg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let block_slot = 20;
     storage
         .insert_mint_statuses_batch(&[
@@ -1698,6 +1701,44 @@ async fn orphan_query_flags_deposit_with_only_blocks_in_its_slot_pg(
 
     let ids = storage.get_orphan_deposit_ids().await?;
     assert_eq!(ids, vec![deposit_id]);
+    Ok(())
+}
+
+/// A repair still owes the AllowMint at 103 while a live deposit at 106 is written. The
+/// orphan check waits for the checkpoint, so it does not flag the deposit early.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_waits_for_escrow_checkpoint_pg() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let deposit = DbTransaction {
+        slot: 106,
+        mint: "mint_gap".to_string(),
+        ..make_db_transaction("deposit_past_gap", TransactionType::Deposit)
+    };
+    let deposit_id = storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "no checkpoint judges no deposit: {ids:?}");
+
+    storage.update_committed_checkpoint("escrow", 100).await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(
+        ids.is_empty(),
+        "an uncovered deposit is not an orphan yet: {ids:?}"
+    );
+
+    storage.update_committed_checkpoint("escrow", 106).await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert_eq!(
+        ids,
+        vec![deposit_id],
+        "with the repair done and still no allow, it is an orphan"
+    );
+
+    storage
+        .insert_mint_statuses_batch(&[mk_status("mint_gap", "allowed", 103, "sig-gap")])
+        .await?;
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "the repaired allow clears it: {ids:?}");
     Ok(())
 }
 
@@ -1803,6 +1844,7 @@ async fn allow_then_block_in_one_transaction_ends_blocked_pg(
 async fn orphan_query_orders_an_earlier_slot_by_block_position_pg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let slot = 20;
     let first_block = DbMintStatus {
         transaction_index: 3,

@@ -3314,8 +3314,8 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// `transactions.id` for every `deposit` row whose mint was not allowed
-    /// coming into the deposit's slot or by a change inside it.
+    /// `transactions.id` for every `deposit` row the escrow checkpoint covers whose mint
+    /// was not allowed coming into the deposit's slot or by a change inside it.
     pub async fn get_orphan_deposit_ids_internal(&self) -> Result<Vec<i64>, sqlx::Error> {
         let rows: Vec<(i64,)> = sqlx::query_as(
             r#"
@@ -3331,6 +3331,8 @@ impl PostgresDb {
                 LIMIT 1
             ) coming_in ON true
             WHERE t.transaction_type = 'deposit'
+              -- Judged only once the escrow checkpoint covers the slot, so a gap repair cannot fake an orphan.
+              AND t.slot <= (SELECT last_committed_slot FROM indexer_state WHERE program_type = $1)
               -- Same rule as the gate: allowed coming into the slot, or any allow inside it.
               AND coming_in.status IS DISTINCT FROM 'allowed'
               AND NOT EXISTS (
@@ -3343,6 +3345,7 @@ impl PostgresDb {
             ORDER BY t.id ASC
             "#,
         )
+        .bind(program_key(ProgramType::Escrow))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())

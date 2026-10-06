@@ -1,7 +1,7 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
-/// `transactions.id` for every `deposit` row whose mint was not allowed coming
-/// into the deposit's slot or by a change inside it (per `mint_status_history`). A non-empty
+/// `transactions.id` for every `deposit` row the escrow checkpoint covers whose mint was not
+/// allowed coming into the deposit's slot or by a change inside it (per `mint_status_history`). A non-empty
 /// result means the indexer recorded a deposit for a mint that was either
 /// never allowlisted or was blocked at the time of the deposit — a
 /// trust-boundary leak. Reconciliation queries this to alert on any such

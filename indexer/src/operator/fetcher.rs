@@ -2,7 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::metrics;
-use crate::storage::common::models::DbTransaction;
+use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
 use private_channel_metrics::{HealthState, MetricLabel};
@@ -26,6 +26,12 @@ pub async fn run_fetcher(
     info!("Starting fetcher");
 
     let transaction_type = program_type.owned_transaction_type();
+    // Start the stall clock at boot, so a backlog that never moves after a restart still shows on /health.
+    if let Some(h) = &health {
+        h.record_progress();
+    }
+    // Set while deposits wait for the escrow checkpoint, so the reason is logged once per wait.
+    let mut holding = false;
 
     loop {
         // Check for cancellation
@@ -35,22 +41,28 @@ pub async fn run_fetcher(
         }
 
         // Measured before the halt gate so /health can still report a stalled backlog.
-        match storage.count_pending_transactions(transaction_type).await {
+        let backlog = match storage.count_pending_transactions(transaction_type).await {
             Ok(count) => {
                 metrics::OPERATOR_BACKLOG_DEPTH
                     .with_label_values(&[program_type.as_label()])
                     .set(count as f64);
                 if let Some(h) = &health {
                     h.set_pending(count as u64);
+                    // An empty backlog is caught up, so idle time never counts against the next row.
+                    if count == 0 {
+                        h.record_progress();
+                    }
                 }
+                Some(count)
             }
             Err(e) => {
                 warn!(
                     "Failed to count pending transactions for backlog metric: {}",
                     e
                 );
+                None
             }
-        }
+        };
 
         // Durable cross-process freeze: a reconciliation halt stops BOTH operators'
         // fetchers here, the single point that moves rows pending -> processing.
@@ -89,7 +101,18 @@ pub async fn run_fetcher(
             .await
         {
             Ok(transactions) => {
+                let held = transactions.is_empty()
+                    && backlog.is_some_and(|count| count > 0)
+                    && transaction_type == TransactionType::Deposit;
+                if held && !holding {
+                    warn!(
+                        backlog,
+                        "Pending deposits are held until the escrow indexer checkpoint covers their slot"
+                    );
+                }
+                holding = held;
                 if !transactions.is_empty() {
+                    holding = false;
                     info!("Fetched {} pending transactions", transactions.len());
                     metrics::OPERATOR_TRANSACTIONS_FETCHED
                         .with_label_values(&[program_type.as_label()])
@@ -332,18 +355,14 @@ mod tests {
     /// claims nothing. It still measures the backlog so /health can report the stall.
     #[tokio::test]
     async fn fetcher_halt_read_error_skips_fetch() {
-        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        use private_channel_metrics::HealthOutcome;
         let mock = covered_mock();
         mock.pending_transactions
             .lock()
             .unwrap()
             .push(make_test_transaction("sig_err"));
         mock.set_should_fail("is_reconciliation_halted", true);
-        let health = HealthState::new(HealthConfig::operator());
-        // An old progress stamp lets a measured backlog surface as Stalled.
-        health
-            .last_progress_at()
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let health = fast_stall_health();
         let read_errors = metrics::OPERATOR_TRANSACTION_ERRORS
             .with_label_values(&[ProgramType::Escrow.as_label(), "halt_read_error"]);
         let errors_before = read_errors.get();
@@ -365,8 +384,8 @@ mod tests {
             .await
         });
 
-        // Several polls while the read keeps failing.
-        let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        // Polls past the stall window while the read keeps failing.
+        let got = tokio::time::timeout(Duration::from_millis(2_500), rx.recv()).await;
         assert!(
             got.is_err(),
             "halt read error must not forward transactions"
@@ -398,21 +417,26 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
     }
 
+    /// Operator health with a one second stall window, so the tests can watch it expire.
+    fn fast_stall_health() -> Arc<private_channel_metrics::HealthState> {
+        private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig {
+            stale_threshold_secs: 1,
+            ..private_channel_metrics::HealthConfig::operator()
+        })
+    }
+
     /// A live deposit written while a gap repair still trails its slot is held Pending,
     /// not handed to the mint gate, and goes through once the checkpoint covers it.
-    /// The backlog still counts it, so /health reports deposits paused by a long repair.
+    /// The stall clock starts at boot, so a fresh operator holding it still turns /health red.
     #[tokio::test]
     async fn fetcher_holds_deposit_until_checkpoint_covers_it() {
-        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        use private_channel_metrics::HealthOutcome;
         let mock = MockStorage::new();
         let mut txn = make_test_transaction("sig_live");
         txn.slot = 106;
         mock.pending_transactions.lock().unwrap().push(txn);
         mock.set_checkpoint("escrow", 100);
-        let health = HealthState::new(HealthConfig::operator());
-        health
-            .last_progress_at()
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let health = fast_stall_health();
 
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let (tx, mut rx) = mpsc::channel(10);
@@ -431,7 +455,7 @@ mod tests {
             .await
         });
 
-        let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        let got = tokio::time::timeout(Duration::from_millis(2_500), rx.recv()).await;
         assert!(got.is_err(), "an uncovered deposit must not be forwarded");
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,
@@ -450,6 +474,56 @@ mod tests {
             .expect("timeout waiting for transaction")
             .expect("channel closed");
         assert_eq!(received.signature, "sig_live");
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// An idle stretch is not a stall: a deposit that arrives after it starts a fresh window.
+    #[tokio::test]
+    async fn fetcher_idle_time_does_not_count_against_a_new_deposit() {
+        use private_channel_metrics::HealthOutcome;
+        let mock = covered_mock();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(make_test_transaction("sig_first"));
+        let health = fast_stall_health();
+
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (tx, mut rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let health_clone = Some(health.clone());
+        let handle = tokio::spawn(async move {
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                health_clone,
+            )
+            .await
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+        assert_eq!(first.signature, "sig_first");
+
+        // Idle well past the stall window, then a deposit arrives that must wait for the checkpoint.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let mut txn = make_test_transaction("sig_after_idle");
+        txn.slot = 106;
+        mock.pending_transactions.lock().unwrap().push(txn);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            health.check(),
+            HealthOutcome::Healthy,
+            "a deposit held for a moment after idle is not a stall"
+        );
 
         token.cancel();
         assert!(handle.await.unwrap().is_ok());

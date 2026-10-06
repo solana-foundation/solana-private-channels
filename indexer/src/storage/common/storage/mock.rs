@@ -746,6 +746,15 @@ impl MockStorage {
 
     pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
         self.check_should_fail("get_orphan_deposit_ids")?;
+        // Same checkpoint bound as Postgres: an uncovered deposit is not judged yet.
+        let escrow_checkpoint = self
+            .committed_checkpoints
+            .lock()
+            .unwrap()
+            .get(&crate::indexer::checkpoint::program_key(
+                crate::config::ProgramType::Escrow,
+            ))
+            .copied();
         // Mirror Postgres, which scans the whole `transactions` table regardless
         // of status: union every transaction store the mock holds, deduped by id.
         let deposits: Vec<DbTransaction> = {
@@ -758,6 +767,7 @@ impl MockStorage {
                 .chain(singles.iter())
                 .chain(batches.iter().flatten())
                 .filter(|t| t.transaction_type == TransactionType::Deposit)
+                .filter(|t| escrow_checkpoint.is_some_and(|cp| t.slot <= cp as i64))
                 .filter(|t| seen_ids.insert(t.id))
                 .cloned()
                 .collect()

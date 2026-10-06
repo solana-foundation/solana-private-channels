@@ -4948,6 +4948,8 @@ mod tests {
     ) -> i64 {
         use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
         use chrono::Utc;
+        // The orphan query only judges deposits the escrow checkpoint covers.
+        seed_checkpoint(mock, 1);
         let mut txs = mock.pending_transactions.lock().unwrap();
         let id = txs.len() as i64 + 1;
         txs.push(DbTransaction {
