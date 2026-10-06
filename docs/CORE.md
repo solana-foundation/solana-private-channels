@@ -143,9 +143,12 @@ commit is already readable, because a block's statuses and its height commit in
 one Postgres transaction. From the retire until dedup takes in the new block's
 hash, which is after that block commits, `isBlockhashValid` answers the retryable
 "catching up" error for the retired hash rather than `false`. So `false` means
-the original can no longer land, not that it did not: a client must still check
-`getSignatureStatuses` before it re-signs, or the original and its replacement
-can both execute. A transaction dropped by either
+the original can no longer land, not that it did not, and it comes from the write
+node while `getSignatureStatuses` is served by a read replica that can lag. A
+client may re-sign only after `getBlockHeight` is above the old
+`lastValidBlockHeight` and a `getSignatureStatuses` read made after that height
+read, on the same endpoint, is still `null`; otherwise the original and its
+replacement can both execute. A transaction dropped by either
 check is never settled, so it stays absent from `getSignatureStatuses` exactly as
 one dropped on arrival does.
 
