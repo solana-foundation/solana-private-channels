@@ -147,7 +147,7 @@ const RECONNECT_GAP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// HTTP/2 keepalive interval: send a PING to the peer this often so a dead transport
 /// surfaces as a stream error instead of hanging. Paired with keep_alive_while_idle so
-/// pings fire even when no blocks stream (escrow blocks are sparse on quiet clusters).
+/// pings fire between updates. Blocks always stream; only their transaction lists are sparse.
 const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Tear the connection down if a keepalive PING goes unanswered this long.

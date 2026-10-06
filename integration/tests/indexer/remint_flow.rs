@@ -164,6 +164,8 @@ fn make_pending_remint(
         finality_check_attempts,
         release_refused_on_chain: false,
         coverage_slot: None,
+        coverage_checkpoint: None,
+        coverage_waits: 0,
     }
 }
 
@@ -190,6 +192,8 @@ fn make_pending_remint_with_lvbh(
         finality_check_attempts,
         release_refused_on_chain: false,
         coverage_slot: None,
+        coverage_checkpoint: None,
+        coverage_waits: 0,
     }
 }
 

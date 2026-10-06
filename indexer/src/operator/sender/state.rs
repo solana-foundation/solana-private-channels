@@ -850,6 +850,8 @@ impl SenderState {
                 // into a manual one. Anything else is held to the ordinary gate.
                 release_refused_on_chain: tx.release_refused_on_chain,
                 coverage_slot: None,
+                coverage_checkpoint: None,
+                coverage_waits: 0,
             });
         }
 
