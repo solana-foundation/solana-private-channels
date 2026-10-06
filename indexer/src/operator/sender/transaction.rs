@@ -378,6 +378,7 @@ pub(super) async fn route_builder_error(
             send_fatal_error(
                 &state.storage,
                 storage_tx,
+                state.program_type.as_label(),
                 ctx,
                 incarnation_lease(state, ctx),
                 &e.to_string(),
@@ -863,6 +864,7 @@ pub(super) fn handle_confirmation_result<'a>(
                         let outcome = send_fenced_outcome(
                             &state.storage,
                             storage_tx,
+                            pt,
                             ctx,
                             txn_id,
                             ctx.deposit_claim_lease,
@@ -1356,6 +1358,7 @@ pub(super) async fn send_manual_review(
     send_fenced_outcome(
         &state.storage,
         storage_tx,
+        state.program_type.as_label(),
         ctx,
         transaction_id,
         incarnation_lease(state, ctx),
@@ -1618,6 +1621,7 @@ async fn defer_remint_after_failure(
         send_fatal_error(
             &state.storage,
             storage_tx,
+            state.program_type.as_label(),
             ctx,
             incarnation_lease(state, ctx),
             error_msg,
@@ -2005,6 +2009,7 @@ pub(super) async fn fire_and_store_task(
                     send_fatal_error(
                         &storage,
                         &storage_tx,
+                        pt,
                         &ctx,
                         ctx.deposit_claim_lease,
                         &e.to_string(),
@@ -2098,6 +2103,7 @@ pub(super) async fn fire_and_store_task(
                 send_fatal_error(
                     &storage,
                     &storage_tx,
+                    pt,
                     &ctx,
                     ctx.deposit_claim_lease,
                     &e.to_string(),
@@ -2496,6 +2502,7 @@ pub(super) async fn run_poll_task(
 pub(super) async fn send_fatal_error(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt: &str,
     ctx: &TransactionContext,
     lease: Option<DateTime<Utc>>,
     error_msg: &str,
@@ -2506,6 +2513,7 @@ pub(super) async fn send_fatal_error(
     send_fenced_outcome(
         storage,
         storage_tx,
+        pt,
         ctx,
         transaction_id,
         lease,
@@ -2529,9 +2537,11 @@ fn incarnation_lease(state: &SenderState, ctx: &TransactionContext) -> Option<Da
 /// The write is a CAS on the incarnation's `updated_at`, so an outcome that
 /// routes late cannot terminalize a later incarnation, and the update sent
 /// afterwards only alerts. Without a lease the writer's own write is the outcome.
+#[allow(clippy::too_many_arguments)]
 async fn send_fenced_outcome(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt: &str,
     ctx: &TransactionContext,
     transaction_id: i64,
     lease: Option<DateTime<Utc>>,
@@ -2541,14 +2551,21 @@ async fn send_fenced_outcome(
     let outcome = match lease {
         None => FencedWrite::Applied,
         Some(lease) if status == TransactionStatus::Failed => {
-            fenced_terminal_write(storage, "failure", transaction_id, status, reason, || {
-                storage.try_fail_processing(transaction_id, lease)
-            })
+            fenced_terminal_write(
+                storage,
+                pt,
+                "failure",
+                transaction_id,
+                status,
+                reason,
+                || storage.try_fail_processing(transaction_id, lease),
+            )
             .await
         }
         Some(lease) => {
             fenced_terminal_write(
                 storage,
+                pt,
                 "manual review",
                 transaction_id,
                 status,
@@ -4310,6 +4327,7 @@ mod tests {
         send_fatal_error(
             &Storage::Mock(MockStorage::new()),
             &tx,
+            "escrow",
             &ctx,
             ctx.deposit_claim_lease,
             "test error",
@@ -4341,6 +4359,7 @@ mod tests {
         send_fatal_error(
             &Storage::Mock(MockStorage::new()),
             &tx,
+            "escrow",
             &ctx,
             ctx.deposit_claim_lease,
             "test error",
@@ -4385,6 +4404,7 @@ mod tests {
         send_fatal_error(
             &storage,
             &storage_tx,
+            "escrow",
             &ctx,
             ctx.deposit_claim_lease,
             "program error",
@@ -4421,6 +4441,7 @@ mod tests {
         send_fatal_error(
             &storage,
             &storage_tx,
+            "escrow",
             &ctx,
             ctx.deposit_claim_lease,
             "program error",
@@ -4455,6 +4476,7 @@ mod tests {
         send_fatal_error(
             &storage,
             &storage_tx,
+            "escrow",
             &ctx,
             ctx.deposit_claim_lease,
             "program error",

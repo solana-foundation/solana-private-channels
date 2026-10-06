@@ -1,4 +1,5 @@
 use crate::error::StorageError;
+use crate::metrics;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::Storage;
 use std::future::Future;
@@ -72,8 +73,11 @@ impl FencedWrite {
 /// incarnation. A write or re-read that still fails after its retries is
 /// unverified. If that write never committed, the row is still Processing and
 /// recovery redoes it, paging again.
+///
+/// The writer never sees these writes, so they are counted here as it counts its own.
 pub(crate) async fn fenced_terminal_write<F, Fut>(
     storage: &Storage,
+    pt: &str,
     op_name: &str,
     transaction_id: i64,
     status: TransactionStatus,
@@ -85,7 +89,7 @@ where
     Fut: Future<Output = Result<bool, StorageError>>,
 {
     let verified = match with_storage_backoff(op_name, transaction_id, write).await {
-        Ok(true) => return FencedWrite::Applied,
+        Ok(true) => Ok(true),
         Ok(false) => with_storage_backoff(&format!("{op_name} re-read"), transaction_id, || {
             storage.get_transaction_status(transaction_id)
         })
@@ -94,7 +98,12 @@ where
         Err(e) => Err(e),
     };
     match verified {
-        Ok(true) => FencedWrite::Applied,
+        Ok(true) => {
+            metrics::OPERATOR_DB_UPDATES
+                .with_label_values(&[pt, &format!("{status:?}")])
+                .inc();
+            FencedWrite::Applied
+        }
         Ok(false) => {
             warn!(
                 transaction_id,
@@ -108,7 +117,68 @@ where
                 transaction_id,
                 reason, "{op_name} could not be verified; alerting without writing: {e}"
             );
+            metrics::OPERATOR_DB_UPDATE_ERRORS
+                .with_label_values(&[pt])
+                .inc();
             FencedWrite::Unverified
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::common::storage::mock::MockStorage;
+
+    /// A fenced write never reaches the writer, so it counts its own update or
+    /// the DB Updates panel misses every Failed and ManualReview.
+    #[tokio::test]
+    async fn an_applied_fenced_write_counts_as_a_db_update() {
+        // Only this test uses the label, so no parallel test moves the series.
+        let label = "test_fenced_write_applied";
+        let updates = metrics::OPERATOR_DB_UPDATES.with_label_values(&[label, "ManualReview"]);
+        let before = updates.get();
+
+        let outcome = fenced_terminal_write(
+            &Storage::Mock(MockStorage::new()),
+            label,
+            "quarantine",
+            1,
+            TransactionStatus::ManualReview,
+            "withdrawals blocked",
+            || async { Ok(true) },
+        )
+        .await;
+
+        assert_eq!(outcome, FencedWrite::Applied);
+        assert_eq!(updates.get() - before, 1.0);
+    }
+
+    /// A fenced write that still fails after its retries counts as an update
+    /// error, as a failed write in the writer does.
+    #[tokio::test]
+    async fn an_unverified_fenced_write_counts_as_a_db_update_error() {
+        // Only this test uses the label, so no parallel test moves the series.
+        let label = "test_fenced_write_unverified";
+        let errors = metrics::OPERATOR_DB_UPDATE_ERRORS.with_label_values(&[label]);
+        let before = errors.get();
+
+        let outcome = fenced_terminal_write(
+            &Storage::Mock(MockStorage::new()),
+            label,
+            "failure",
+            1,
+            TransactionStatus::Failed,
+            "program error",
+            || async {
+                Err(StorageError::DatabaseError {
+                    message: "connection reset".to_string(),
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, FencedWrite::Unverified);
+        assert_eq!(errors.get() - before, 1.0);
     }
 }

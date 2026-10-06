@@ -166,11 +166,13 @@ impl BailReason {
 async fn quarantine_single(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
     transaction: &DbTransaction,
     error_message: String,
 ) -> bool {
     let outcome = fenced_terminal_write(
         storage,
+        pt_label,
         "quarantine",
         transaction.id,
         TransactionStatus::ManualReview,
@@ -214,7 +216,7 @@ async fn park_row(
     transaction: &DbTransaction,
     bail: BailReason,
 ) {
-    if quarantine_single(storage, storage_tx, transaction, bail.message).await {
+    if quarantine_single(storage, storage_tx, pt_label, transaction, bail.message).await {
         metrics::OPERATOR_TRANSACTION_QUARANTINED
             .with_label_values(&[pt_label, bail.label])
             .inc();
@@ -238,6 +240,7 @@ async fn park_row(
 async fn halt_withdrawal_pipeline(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
     fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
     poison: Option<&DbTransaction>,
 ) {
@@ -250,6 +253,7 @@ async fn halt_withdrawal_pipeline(
         quarantine_single(
             storage,
             storage_tx,
+            pt_label,
             &buffered,
             "withdrawal pipeline halted after poison-pill".to_string(),
         )
@@ -367,7 +371,7 @@ async fn requeue_or_quarantine_head(
             attempts = transaction.recovery_requeue_attempts,
             "Withdrawal failed after max pre-broadcast requeues; quarantining"
         );
-        quarantine_single(storage, storage_tx, transaction, reason).await;
+        quarantine_single(storage, storage_tx, pt_label, transaction, reason).await;
     } else {
         requeue_single_prebroadcast(storage, pt_label, transaction).await;
     }
@@ -1018,7 +1022,14 @@ pub async fn process_release_funds(
                         "Quarantining withdrawal and halting pipeline: {}",
                         err
                     );
-                    if quarantine_single(&storage, &storage_tx, &transaction, err.to_string()).await
+                    if quarantine_single(
+                        &storage,
+                        &storage_tx,
+                        pt_label,
+                        &transaction,
+                        err.to_string(),
+                    )
+                    .await
                     {
                         metrics::OPERATOR_TRANSACTION_QUARANTINED
                             .with_label_values(&[pt_label, reason])
@@ -1027,6 +1038,7 @@ pub async fn process_release_funds(
                     halt_withdrawal_pipeline(
                         &storage,
                         &storage_tx,
+                        pt_label,
                         &mut fetcher_rx,
                         Some(&transaction),
                     )
@@ -1296,7 +1308,14 @@ pub async fn process_deposit_funds(
                         "Quarantining deposit to ManualReview: {}",
                         err
                     );
-                    if quarantine_single(&storage, &storage_tx, &transaction, err.to_string()).await
+                    if quarantine_single(
+                        &storage,
+                        &storage_tx,
+                        pt_label,
+                        &transaction,
+                        err.to_string(),
+                    )
+                    .await
                     {
                         metrics::OPERATOR_TRANSACTION_QUARANTINED
                             .with_label_values(&[pt_label, reason])
@@ -3683,7 +3702,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         seed_processing_row(&storage, &txn);
 
-        quarantine_single(&storage, &storage_tx, &txn, "bad row".into()).await;
+        quarantine_single(&storage, &storage_tx, "withdraw", &txn, "bad row".into()).await;
 
         let update = storage_rx.recv().await.expect("update was sent");
         assert_eq!(update.transaction_id, 77);
@@ -3721,7 +3740,7 @@ mod tests {
         seed_processing_row(&storage, &txn);
 
         // Must not panic.  send_guaranteed will log and return Err; we swallow it.
-        quarantine_single(&storage, &storage_tx, &txn, "closed".into()).await;
+        quarantine_single(&storage, &storage_tx, "withdraw", &txn, "closed".into()).await;
     }
 
     /// A park that reaches the row after recovery requeued it and the fetcher
@@ -3764,6 +3783,7 @@ mod tests {
         quarantine_single(
             &storage,
             &storage_tx,
+            "withdraw",
             &stale,
             "withdrawals blocked".to_string(),
         )
@@ -3799,6 +3819,7 @@ mod tests {
         let counted = quarantine_single(
             &storage,
             &storage_tx,
+            "withdraw",
             &txn,
             "withdrawals blocked".to_string(),
         )
@@ -3849,9 +3870,10 @@ mod tests {
     }
 
     /// A park whose first write landed rides out a blip on the re-read that
-    /// confirms it, and still pages.
+    /// confirms it, so it counts as applied and pages without the unverified flag.
     #[tokio::test]
     async fn a_park_whose_reread_blips_still_alerts() {
+        let reason = "withdrawals blocked";
         let txn = make_db_transaction(
             1,
             &Pubkey::new_unique().to_string(),
@@ -3868,16 +3890,14 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let (storage_tx, mut storage_rx) = mpsc::channel(1);
 
-        quarantine_single(
-            &storage,
-            &storage_tx,
-            &txn,
-            "withdrawals blocked".to_string(),
-        )
-        .await;
+        let counted =
+            quarantine_single(&storage, &storage_tx, "withdraw", &txn, reason.to_string()).await;
 
+        // An unverified park pages too, so only these tell the retry apart.
+        assert!(counted, "the retried re-read must confirm the park");
         let update = storage_rx.try_recv().expect("the park must still page");
         assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(update.error_message.as_deref(), Some(reason));
     }
 
     /// A retried park whose first write landed but whose reply was lost finds the
@@ -3902,6 +3922,7 @@ mod tests {
         quarantine_single(
             &storage,
             &storage_tx,
+            "withdraw",
             &txn,
             "withdrawals blocked".to_string(),
         )
@@ -3935,7 +3956,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         // No in-flight rows were buffered — no channel-side quarantines.
         assert!(storage_rx.try_recv().is_err());
@@ -3963,7 +3984,7 @@ mod tests {
         drop(fetcher_tx);
         let storage = Storage::Mock(mock);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         let mut ids = Vec::new();
         while let Ok(update) = storage_rx.try_recv() {
@@ -3992,7 +4013,7 @@ mod tests {
         let storage = Storage::Mock(mock);
 
         // Must not panic; must complete.
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         let update = storage_rx.recv().await.expect("buffered row quarantined");
         assert_eq!(update.transaction_id, txn_id);
@@ -4033,7 +4054,14 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+        halt_withdrawal_pipeline(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &mut fetcher_rx,
+            Some(&poison),
+        )
+        .await;
 
         let rows = match &storage {
             Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
@@ -4058,7 +4086,14 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+        halt_withdrawal_pipeline(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &mut fetcher_rx,
+            Some(&poison),
+        )
+        .await;
 
         let rows = match &storage {
             Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
