@@ -73,6 +73,9 @@ async fn seed_mint_status_allowed(
             mint_address: mint_address.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint_address}"),
             created_at: Utc::now(),
         }])

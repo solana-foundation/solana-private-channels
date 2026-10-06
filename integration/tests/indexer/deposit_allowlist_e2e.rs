@@ -98,6 +98,9 @@ async fn insert_mint_row_at_slot(
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-seed-{mint}-{effective_slot}"),
                 created_at: chrono::Utc::now(),
             },
@@ -122,6 +125,9 @@ async fn insert_block_row_at_slot(
                 mint_address: mint.to_string(),
                 status: "blocked".to_string(),
                 effective_slot,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-block-{mint}-{effective_slot}"),
                 created_at: chrono::Utc::now(),
             },
@@ -503,7 +509,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
 // ── Deposit-after-block gate against real Postgres ───────────────────────────
 
 /// End-to-end proof through real Postgres that a `"blocked"` row gates deposits:
-/// allowed at slot N then blocked at M (> N) → gate accepts N <= slot < M, refuses slot >= M.
+/// allowed at slot N then blocked at M (> N) → gate accepts N <= slot <= M, refuses slot > M.
 #[tokio::test(flavor = "multi_thread")]
 async fn deposit_gate_rejects_after_block_against_real_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -513,8 +519,9 @@ async fn deposit_gate_rejects_after_block_against_real_postgres(
     let mint_str = mint.to_string();
 
     // AllowMint effective at slot 10, BlockMint effective at slot 20.
+    let block_slot = 20;
     insert_mint_row_at_slot(&storage, &mint_str, 10).await?;
-    insert_block_row_at_slot(&storage, &mint_str, 20).await?;
+    insert_block_row_at_slot(&storage, &mint_str, block_slot).await?;
 
     let cache = MintCache::new(storage.clone());
 
@@ -523,6 +530,14 @@ async fn deposit_gate_rejects_after_block_against_real_postgres(
         .assert_mint_allowed_at_slot(&mint, 15, 1)
         .await
         .expect("deposit in the allowed window must pass the gate");
+
+    // Deposit at slot 20, the block's own slot, may have run before the block,
+    // so it passes.
+    let cache = MintCache::new(storage.clone());
+    cache
+        .assert_mint_allowed_at_slot(&mint, block_slot, 3)
+        .await
+        .expect("deposit in the block's own slot must pass the gate");
 
     // Deposit at slot 25 — after the block took effect — must be refused.
     // A fresh cache rules out any in-memory shortcut: every call hits the DB.

@@ -151,6 +151,12 @@ if anything fails. It is guarded these ways.
    program but the rebuild replays only from the genesis slot, so a genesis above the
    program's earliest row refuses before anything is deleted. The marker keeps the lowest
    slot its wipe deleted, so a rerun after an interrupted resync is held to the same bound.
+8. **The channel history must be complete.** The channel writes its address index after
+   each block commits, so its history can briefly miss a mint that is already final.
+   Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
+   the index covers the block that was newest at its first read, and refuses before anything is deleted
+   if it never does or the method is unavailable. Deploy core and the gateway before
+   the indexer.
 
 The delete runs in one transaction on the lock session and is capped at 300s. Measured at
 roughly 30k deposit rows a second with one journal each (6s for 200k rows, 30s for 1M), so
@@ -187,6 +193,24 @@ Each indexed instruction is keyed on the triple **`(signature, instruction_index
 **This works at any CPI depth, not just one level.** The validator flattens *every* CPI depth under a top-level instruction into a single inner-instruction list (`meta.innerInstructions[i].instructions`), each entry carrying a `stackHeight`. So a deposit invoked two or more hops deep (`A → B → escrow.Deposit`) is still one entry in that flat list with a unique `inner_index` — `inner_index` is a flat position, **not** a nesting level. Deposit-event scoping likewise keys on `stackHeight` (it walks the contiguous run of deeper entries after the deposit), so it resolves the correct `DepositEvent` regardless of nesting depth.
 
 **Locations**: identity column [`indexer/src/storage/common/models.rs`](../indexer/src/storage/common/models.rs); position capture [`InstructionLocation`/`InnerLocation`](../indexer/src/indexer/datasource/common/types.rs); event scoping `parse_deposit` in [`escrow.rs`](../indexer/src/indexer/datasource/common/parser/escrow.rs).
+
+### Mint status history
+
+Each AllowMint and BlockMint writes one `mint_status_history` row, keyed on its source
+instruction and ordered by block position (slot, transaction, instruction, inner
+instruction). A BlockMint that leaves deposits open writes `allowed`. Status is read three ways:
+
+- **Deposit in a slot with changes**: allowed if the status coming into the slot is
+  `allowed` or any change inside it is. Order inside the slot is ignored: the program
+  refuses blocked deposits and only successful transactions are indexed, so a deposit
+  row proves the gate was open when it ran.
+- **Deposit in a later slot**: the last change by block position decides.
+- **`mints` mirror** (`status`, `withdrawals_blocked`): the last change by block position.
+
+The operator gate and the reconciliation orphan query use the same rule.
+
+**Locations**: `get_mint_status_at_slot_internal`, `get_orphan_deposit_ids_internal` and
+`sync_mint_status_internal` in [`db.rs`](../indexer/src/storage/postgres/db.rs).
 
 
 ## Operator Components

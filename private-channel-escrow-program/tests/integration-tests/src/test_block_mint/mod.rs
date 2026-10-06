@@ -6,12 +6,15 @@ use crate::{
     },
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        DEPOSITS_BLOCKED_FOR_MINT_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
-        INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
+        BELOW_MINIMUM_DEPOSIT_ERROR, DEPOSITS_BLOCKED_FOR_MINT_ERROR, INVALID_ACCOUNT_DATA_ERROR,
+        INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+        WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
-use private_channel_escrow_program_client::instructions::{BlockMintBuilder, DepositBuilder};
+use private_channel_escrow_program_client::instructions::{
+    AllowMintBuilder, BlockMintBuilder, DepositBuilder,
+};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -424,6 +427,112 @@ fn test_block_mint_prevents_deposit() {
 
     // The PDA still exists and deserializes; the deposit gate is what rejects.
     assert_program_error(result, DEPOSITS_BLOCKED_FOR_MINT_ERROR);
+}
+
+// BlockMint rewrites the whole AllowedMint, so unblocking must not drop the
+// minimum the AllowMint set.
+#[test]
+fn test_block_unblock_keeps_min_deposit_amount() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let min_deposit_amount = 1_000;
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let allow_mint_instruction = AllowMintBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(min_deposit_amount)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(allow_mint_instruction, &[&admin])
+        .expect("AllowMint should succeed");
+
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        true,  // block_deposits
+        false, // block_withdrawals
+        false, // with_profiling
+    )
+    .expect("BlockMint should succeed");
+
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        false, // block_deposits
+        false, // block_withdrawals
+        false, // with_profiling
+    )
+    .expect("Unblocking should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        min_deposit_amount,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(min_deposit_amount - 1)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, BELOW_MINIMUM_DEPOSIT_ERROR);
 }
 
 #[test]

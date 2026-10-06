@@ -10,6 +10,7 @@ import { mockTransactionSigner, TEST_ADDRESSES, EXPECTED_PROGRAM_ADDRESS } from 
 
 const WITHDRAW_FEE = 1_000n;
 const MIN_WITHDRAW_AMOUNT = 100n;
+const MIN_DEPOSIT_AMOUNT = 2_345_678n;
 
 describe('allowMint', () => {
     describe('Automatic allowedMint PDA derivation', () => {
@@ -29,6 +30,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -60,6 +62,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -81,6 +84,7 @@ describe('allowMint', () => {
             const instruction1 = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -90,6 +94,7 @@ describe('allowMint', () => {
             const instruction2 = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -121,6 +126,7 @@ describe('allowMint', () => {
             const instruction1 = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance: instance1,
@@ -130,6 +136,7 @@ describe('allowMint', () => {
             const instruction2 = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance: instance2,
@@ -161,6 +168,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -192,6 +200,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -218,6 +227,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -248,6 +258,7 @@ describe('allowMint', () => {
                 const instruction = await getAllowMintInstructionAsync({
                     withdrawFee: WITHDRAW_FEE,
                     minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                    minDepositAmount: MIN_DEPOSIT_AMOUNT,
                     payer,
                     admin,
                     instance,
@@ -271,6 +282,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -286,6 +298,7 @@ describe('allowMint', () => {
             expect(decodedData.bump).toBe(testBump);
             expect(decodedData.withdrawFee).toBe(WITHDRAW_FEE);
             expect(decodedData.minWithdrawAmount).toBe(MIN_WITHDRAW_AMOUNT);
+            expect(decodedData.minDepositAmount).toBe(MIN_DEPOSIT_AMOUNT);
 
             // Verify data types
             expect(typeof decodedData.discriminator).toBe('number');
@@ -296,6 +309,7 @@ describe('allowMint', () => {
                 bump: testBump,
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
             });
             expect(reEncodedData).toEqual(instruction.data);
         });
@@ -312,6 +326,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -377,6 +392,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,
@@ -439,6 +455,7 @@ describe('allowMint', () => {
             const instruction = await getAllowMintInstructionAsync({
                 withdrawFee: WITHDRAW_FEE,
                 minWithdrawAmount: MIN_WITHDRAW_AMOUNT,
+                minDepositAmount: MIN_DEPOSIT_AMOUNT,
                 payer,
                 admin,
                 instance,

@@ -23,7 +23,6 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{signature::Signature, signer::Signer},
-    solana_system_interface::instruction as system_instruction,
 };
 
 pub async fn run_sig_statuses_search_depth_test(ctx: &PrivateChannelContext) {
@@ -42,9 +41,12 @@ pub async fn run_sig_statuses_search_depth_test(ctx: &PrivateChannelContext) {
 
 async fn submit_trivial_tx(ctx: &PrivateChannelContext) -> Signature {
     let from = solana_sdk::signature::Keypair::new();
-    let to = solana_sdk::signature::Keypair::new().pubkey();
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let ix = system_instruction::transfer(&from.pubkey(), &to, 1_000);
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"search-depth".to_vec(),
+    };
     let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
         &[ix],
         Some(&from.pubkey()),

@@ -189,6 +189,9 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
             mint_address: env.mint.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{}", env.mint),
             created_at: Utc::now(),
         }])

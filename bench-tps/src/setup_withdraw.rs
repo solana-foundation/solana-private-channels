@@ -28,8 +28,8 @@ use {
         rpc::{poll_confirmations, send_parallel},
         setup_deposit::{find_instance_pda, find_withdrawal_bitmap_pda},
         types::{
-            BenchState, WithdrawConfig, BENCH_MIN_WITHDRAW_AMOUNT, BENCH_WITHDRAW_FEE,
-            MINT_DECIMALS, SETUP_BATCH_SIZE,
+            BenchState, WithdrawConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
+            BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
         },
     },
     anyhow::{Context, Result},
@@ -417,6 +417,7 @@ pub async fn run_setup_withdraw_phase(
                         bump: allow_bump,
                         withdraw_fee: BENCH_WITHDRAW_FEE,
                         min_withdraw_amount: BENCH_MIN_WITHDRAW_AMOUNT,
+                        min_deposit_amount: BENCH_MIN_DEPOSIT_AMOUNT,
                     });
                     let tx = Transaction::new_signed_with_payer(
                         &[allow_ix],
