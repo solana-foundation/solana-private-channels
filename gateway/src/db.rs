@@ -1,4 +1,4 @@
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -13,7 +13,19 @@ pub struct OwnerChange {
     pub new_owner: String,
 }
 
-/// The `limit` most recent recorded owner handoffs for `address`, oldest first.
+/// An address's handoffs and the slots they are known to cover, read together.
+pub struct OwnerChain {
+    /// `None` if the watermark or the tip is missing.
+    pub coverage: Option<OwnerChangeCoverage>,
+    /// The newest recorded handoffs, oldest first.
+    pub changes: Vec<OwnerChange>,
+}
+
+/// The coverage and the `limit` most recent recorded handoffs for `address`.
+///
+/// One statement, so one snapshot: the node commits the tip with its block's
+/// handoffs, so the chain read here holds every handoff at or below the tip
+/// read beside it. Splitting the statement would lose that.
 ///
 /// This is the gateway's one read outside the `private_channel_auth` schema.
 /// The auth service keeps its objects in their own schema to stay clear of the
@@ -27,39 +39,72 @@ pub struct OwnerChange {
 /// deleted, so reading from the oldest end would let churn that has long since
 /// scrolled past decide what the current owner may read. The caller decides what
 /// a chain that fills the limit means.
-///
-/// Takes a connection so it can be read in one snapshot with
-/// `owner_change_coverage`.
-pub async fn owner_changes(
-    connection: &mut PgConnection,
+pub async fn owner_chain(
+    pool: &PgPool,
     address: &[u8],
     limit: i64,
-) -> Result<Vec<OwnerChange>, sqlx::Error> {
-    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+) -> Result<OwnerChain, sqlx::Error> {
+    type OwnerChainRow = (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    // Joined on true so an address with no handoffs still returns the coverage.
+    let rows: Vec<OwnerChainRow> = sqlx::query_as(
         r#"
-        SELECT slot, prev_owner, new_owner
-        FROM public.token_account_owner_change
-        WHERE address = $1
-        ORDER BY slot DESC, tx_index DESC
-        LIMIT $2
+        WITH coverage AS (
+            SELECT
+                (SELECT value FROM public.metadata WHERE key = $3) AS indexed_from,
+                (SELECT value FROM public.metadata WHERE key = $4) AS tip
+        ),
+        chain AS (
+            SELECT slot, tx_index, prev_owner, new_owner
+            FROM public.token_account_owner_change
+            WHERE address = $1
+            ORDER BY slot DESC, tx_index DESC
+            LIMIT $2
+        )
+        SELECT coverage.indexed_from, coverage.tip, chain.slot, chain.prev_owner, chain.new_owner
+        FROM coverage LEFT JOIN chain ON true
+        ORDER BY chain.slot DESC, chain.tx_index DESC
         "#,
     )
     .bind(address)
     .bind(limit)
-    .fetch_all(&mut *connection)
+    .bind(OWNER_CHANGE_INDEXED_FROM_KEY)
+    .bind(LATEST_SLOT_KEY)
+    .fetch_all(pool)
     .await?;
 
+    // Every row carries the same coverage. The node writes the watermark
+    // big-endian and the tip as a little-endian counter.
+    let coverage = rows.first().and_then(|(indexed_from, tip, ..)| {
+        let indexed_from = <[u8; 8]>::try_from(indexed_from.as_deref()?).ok()?;
+        let tip = <[u8; 8]>::try_from(tip.as_deref()?).ok()?;
+        Some(OwnerChangeCoverage {
+            indexed_from: i64::from_be_bytes(indexed_from),
+            tip: i64::try_from(u64::from_le_bytes(tip)).ok()?,
+        })
+    });
+
     // Taken newest first to bound the read, handed back oldest first because
-    // that is the order the timeline chains in.
-    Ok(rows
+    // that is the order the timeline chains in. The row with no slot is the
+    // coverage alone.
+    let changes = rows
         .into_iter()
         .rev()
-        .map(|(slot, prev_owner, new_owner)| OwnerChange {
-            slot,
-            prev_owner: bs58::encode(prev_owner).into_string(),
-            new_owner: bs58::encode(new_owner).into_string(),
+        .filter_map(|(_, _, slot, prev_owner, new_owner)| {
+            Some(OwnerChange {
+                slot: slot?,
+                prev_owner: bs58::encode(prev_owner?).into_string(),
+                new_owner: bs58::encode(new_owner?).into_string(),
+            })
         })
-        .collect())
+        .collect();
+
+    Ok(OwnerChain { coverage, changes })
 }
 
 /// Returns the role currently stored for `user_id`, or `None` if the user no
@@ -90,38 +135,6 @@ pub struct OwnerChangeCoverage {
     pub indexed_from: i64,
     /// Newest slot the ledger has committed.
     pub tip: i64,
-}
-
-/// The watermark and the tip, or `None` if either is missing.
-///
-/// Read in the same snapshot as `owner_changes`: the node commits the tip with
-/// its block's handoffs, so that chain holds every handoff at or below it. The
-/// watermark is stored big-endian and the tip as a little-endian counter.
-pub async fn owner_change_coverage(
-    connection: &mut PgConnection,
-) -> Result<Option<OwnerChangeCoverage>, sqlx::Error> {
-    let rows: Vec<(String, Vec<u8>)> =
-        sqlx::query_as("SELECT key, value FROM public.metadata WHERE key = ANY($1)")
-            .bind([OWNER_CHANGE_INDEXED_FROM_KEY, LATEST_SLOT_KEY])
-            .fetch_all(&mut *connection)
-            .await?;
-
-    let mut indexed_from = None;
-    let mut tip = None;
-    for (key, value) in rows {
-        let Ok(bytes) = <[u8; 8]>::try_from(value.as_slice()) else {
-            continue;
-        };
-        match key.as_str() {
-            OWNER_CHANGE_INDEXED_FROM_KEY => indexed_from = Some(i64::from_be_bytes(bytes)),
-            LATEST_SLOT_KEY => tip = i64::try_from(u64::from_le_bytes(bytes)).ok(),
-            _ => {}
-        }
-    }
-
-    Ok(indexed_from
-        .zip(tip)
-        .map(|(indexed_from, tip)| OwnerChangeCoverage { indexed_from, tip }))
 }
 
 /// Which of `pubkeys` are verified wallets of `user_id`, in one round trip.

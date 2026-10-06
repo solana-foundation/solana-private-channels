@@ -3,13 +3,14 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    asks_for_whole_account, auth_unavailable_body, authority_is_in_account_data,
-    check_account_data_ownership, check_request_auth, db_error_body, decode_account_data,
-    forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
-    resolve_owned_slot_ranges, role_check_error_body, token_account_amount, verify_bearer,
-    whole_account_only_body, AuthDecision, Role,
+    auth_unavailable_body, authority_is_in_account_data, check_account_data_ownership,
+    check_request_auth, db_error_body, decode_account_data, forbidden_body, is_gated,
+    is_owner_only, redacts_transaction_errors_for, requested_data_slice, resolve_owned_slot_ranges,
+    role_check_error_body, token_account_amount, verify_bearer, AuthDecision, DataSlice, Role,
 };
 use crate::db::get_user_role;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use clap::Parser;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -341,6 +342,8 @@ enum AccountFetch {
     Found {
         data: Vec<u8>,
         program_owner: String,
+        /// The slot the node answered at.
+        context_slot: u64,
     },
     NotFound,
     Unavailable,
@@ -377,11 +380,23 @@ impl CallPolicy {
 /// bytes can change hands between them. The response is held to the bytes the
 /// caller is authorized on.
 enum ResponseCheck {
-    /// Run the ownership check again on the account the response carries.
-    AccountBytes { user_id: Uuid, pubkey: String },
-    /// Serve the balance held in the bytes that passed the check, or `None`
-    /// when those bytes were not a token account and so held no balance.
-    AuthorizedBalance(Option<u64>),
+    /// Run the ownership check again on the whole account the response
+    /// carries, unless it is the account already authorized, then cut the
+    /// caller's `data_slice` from it.
+    AccountBytes {
+        user_id: Uuid,
+        pubkey: String,
+        data_slice: Option<DataSlice>,
+        authorized_program_owner: String,
+        authorized_data: Vec<u8>,
+    },
+    /// Serve the balance held in the bytes that passed the check, at the slot
+    /// they were read at. `amount` is `None` when those bytes were not a token
+    /// account and so held no balance.
+    AuthorizedBalance {
+        amount: Option<u64>,
+        context_slot: u64,
+    },
 }
 
 /// Add the caller's slot scope to an outgoing `getSignaturesForAddress`.
@@ -402,6 +417,25 @@ fn apply_slot_ranges(request: &mut Value, ranges: &[(i64, i64)]) {
         params[1] = serde_json::json!({});
     }
     params[1]["privateChannelSlotRanges"] = serde_json::json!(ranges);
+}
+
+/// Ask the node for the whole account in base64, keeping the rest of the
+/// caller's config, so the bytes checked are the bytes the reply is cut from.
+/// The config was already accepted by `requested_data_slice`.
+fn ask_for_whole_base64(request: &mut Value) {
+    let Some(params) = request.get_mut("params").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    if params.len() < 2 {
+        params.resize(2, Value::Null);
+    }
+    if !params[1].is_object() {
+        params[1] = serde_json::json!({});
+    }
+    params[1]["encoding"] = serde_json::json!("base64");
+    if let Some(config) = params[1].as_object_mut() {
+        config.remove("dataSlice");
+    }
 }
 
 /// `amount` base units as a decimal string with trailing zeros trimmed, the way
@@ -967,9 +1001,21 @@ impl Gateway {
             return AccountFetch::Unavailable;
         };
 
+        // The slot these bytes were read at, so a reply built from them can say so.
+        let Some(context_slot) = json
+            .get("result")
+            .and_then(|result| result.get("context"))
+            .and_then(|context| context.get("slot"))
+            .and_then(Value::as_u64)
+        else {
+            warn!("Ownership account fetch returned an account with no context slot");
+            return AccountFetch::Unavailable;
+        };
+
         AccountFetch::Found {
             data,
             program_owner: program_owner.to_owned(),
+            context_slot,
         }
     }
 
@@ -1161,6 +1207,7 @@ impl Gateway {
                     AccountFetch::Found {
                         data,
                         program_owner,
+                        ..
                     } => {
                         check_account_data_ownership(
                             data,
@@ -1190,12 +1237,14 @@ impl Gateway {
                                 AccountFetch::Found {
                                     data,
                                     program_owner,
+                                    context_slot,
                                 },
                                 true,
                             ) => match resolve_owned_slot_ranges(
                                 data,
                                 program_owner,
                                 &pubkey,
+                                *context_slot,
                                 user_id,
                                 auth_db,
                             )
@@ -1216,31 +1265,41 @@ impl Gateway {
                         // The forwarded read may see the account after it changed
                         // hands, so it is held to the bytes this check was made on.
                         let response_check = match &fetched {
-                            AccountFetch::Found { program_owner, .. }
-                                if method == "getAccountInfo"
-                                    && authority_is_in_account_data(program_owner) =>
+                            AccountFetch::Found {
+                                data,
+                                program_owner,
+                                ..
+                            } if method == "getAccountInfo"
+                                && authority_is_in_account_data(program_owner) =>
                             {
-                                if !asks_for_whole_account(params) {
-                                    return Err(self.reject_with_metrics(
-                                        method_label,
-                                        StatusCode::BAD_REQUEST,
-                                        whole_account_only_body(),
-                                        start,
-                                    ));
-                                }
+                                let data_slice = match requested_data_slice(params) {
+                                    Ok(data_slice) => data_slice,
+                                    Err(body) => {
+                                        return Err(self.reject_with_metrics(
+                                            method_label,
+                                            StatusCode::BAD_REQUEST,
+                                            body,
+                                            start,
+                                        ))
+                                    }
+                                };
                                 Some(ResponseCheck::AccountBytes {
                                     user_id,
                                     pubkey: pubkey.clone(),
+                                    data_slice,
+                                    authorized_program_owner: program_owner.clone(),
+                                    authorized_data: data.clone(),
                                 })
                             }
                             AccountFetch::Found {
                                 data,
                                 program_owner,
+                                context_slot,
                             } if method == "getTokenAccountBalance" => {
-                                Some(ResponseCheck::AuthorizedBalance(token_account_amount(
-                                    data,
-                                    program_owner,
-                                )))
+                                Some(ResponseCheck::AuthorizedBalance {
+                                    amount: token_account_amount(data, program_owner),
+                                    context_slot: *context_slot,
+                                })
                             }
                             _ => None,
                         };
@@ -1292,12 +1351,15 @@ impl Gateway {
         };
 
         match check {
-            ResponseCheck::AuthorizedBalance(authorized) => {
+            ResponseCheck::AuthorizedBalance {
+                amount: authorized,
+                context_slot,
+            } => {
                 // An error carries no balance.
-                let Some(value) = json
-                    .get_mut("result")
-                    .and_then(|result| result.get_mut("value"))
-                else {
+                let Some(result) = json.get_mut("result") else {
+                    return Ok(body);
+                };
+                let Some(value) = result.get_mut("value") else {
                     return Ok(body);
                 };
                 // Decimals belong to the mint, which the account's address fixes
@@ -1312,9 +1374,20 @@ impl Gateway {
                 value["amount"] = Value::from(amount.to_string());
                 value["uiAmount"] = Value::from(amount as f64 / 10_f64.powi(i32::from(decimals)));
                 value["uiAmountString"] = Value::from(ui_amount_string(amount, decimals));
+                // The slot the amount was read at, not the one the node answered at.
+                let Some(context) = result.get_mut("context").and_then(Value::as_object_mut) else {
+                    return Err((StatusCode::BAD_GATEWAY, None));
+                };
+                context.insert("slot".to_string(), Value::from(*context_slot));
                 Ok(Bytes::from(json.to_string()))
             }
-            ResponseCheck::AccountBytes { user_id, pubkey } => {
+            ResponseCheck::AccountBytes {
+                user_id,
+                pubkey,
+                data_slice,
+                authorized_program_owner,
+                authorized_data,
+            } => {
                 // An error carries no account, and a null value is one closed
                 // since the check. Neither shows anyone's state.
                 let Some(account) = json
@@ -1342,27 +1415,51 @@ impl Gateway {
                 };
                 let data = match served {
                     Some(data) => data,
+                    // It was asked for in base64, so any other shape is the
+                    // node misbehaving.
                     None if authority_is_in_account_data(program_owner) => {
-                        return Err((StatusCode::BAD_REQUEST, Some(whole_account_only_body())))
+                        return Err((StatusCode::BAD_GATEWAY, None))
                     }
                     // A wallet's reader is decided by its address, not its bytes.
                     None => Vec::new(),
                 };
 
-                match check_account_data_ownership(
-                    &data,
-                    program_owner,
-                    pubkey,
-                    method,
-                    *user_id,
-                    auth_db,
-                )
-                .await
-                {
-                    AuthDecision::Proceed => Ok(body),
-                    AuthDecision::Reject(status, rejection) => Err((status, Some(rejection))),
-                    AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
+                // Identical to what was authorized, so that check's verdict holds
+                // and its wallet lookup is reused. A wallet unlinked between the
+                // two reads is still served, as it was before replies were
+                // checked at all; the gap is milliseconds. Compared whole, before
+                // any slice, so a cut of a changed account cannot match.
+                let unchanged =
+                    program_owner == authorized_program_owner.as_str() && data == *authorized_data;
+                if !unchanged {
+                    match check_account_data_ownership(
+                        &data,
+                        program_owner,
+                        pubkey,
+                        method,
+                        *user_id,
+                        auth_db,
+                    )
+                    .await
+                    {
+                        AuthDecision::Proceed => {}
+                        AuthDecision::Reject(status, rejection) => {
+                            return Err((status, Some(rejection)))
+                        }
+                        AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
+                    }
                 }
+
+                // Cut from the bytes that passed, the way the node cuts: an
+                // offset past the end gives nothing, and a long slice stops there.
+                let Some(DataSlice { offset, length }) = data_slice else {
+                    return Ok(body);
+                };
+                let start = (*offset).min(data.len());
+                let end = start.saturating_add(*length).min(data.len());
+                json["result"]["value"]["data"] =
+                    serde_json::json!([BASE64.encode(&data[start..end]), "base64"]);
+                Ok(Bytes::from(json.to_string()))
             }
         }
     }
@@ -1719,6 +1816,14 @@ impl Gateway {
                 Bytes::from(scoped.to_string())
             }
             None => body_bytes,
+        };
+        let body_bytes = match &call_policy.response_check {
+            Some(ResponseCheck::AccountBytes { .. }) => {
+                let mut whole = json.clone();
+                ask_for_whole_base64(&mut whole);
+                Bytes::from(whole.to_string())
+            }
+            _ => body_bytes,
         };
 
         let forwarded_req = match Request::builder()
@@ -2885,6 +2990,64 @@ mod tests {
                 "{amount} at {decimals} decimals"
             );
         }
+    }
+
+    /// A served account identical to the one already checked keeps that check's
+    /// verdict, wallet lookup included. The auth database here is unreachable,
+    /// so a second lookup would turn the reply into a 500.
+    #[tokio::test]
+    async fn an_unchanged_account_skips_the_second_wallet_lookup() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let unreachable = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgres://postgres:password@127.0.0.1:1/unused")
+            .unwrap();
+        let gateway = Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "*".to_string(),
+            Some(TEST_JWT_SECRET.to_string()),
+            Some(unreachable),
+        );
+
+        let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let account_space = 165;
+        let mut account = vec![0u8; account_space];
+        account[32..64].copy_from_slice(&[7u8; 32]);
+        let body = Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": 1},
+                    "value": {
+                        "lamports": 2_039_280,
+                        "owner": token_program,
+                        "data": [BASE64.encode(&account), "base64"],
+                        "executable": false,
+                        "rentEpoch": 0,
+                        "space": account_space
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let check = ResponseCheck::AccountBytes {
+            user_id: Uuid::nil(),
+            pubkey: bs58::encode([8u8; 32]).into_string(),
+            data_slice: None,
+            authorized_program_owner: token_program.to_string(),
+            authorized_data: account,
+        };
+
+        assert_eq!(
+            gateway
+                .check_response(&check, "getAccountInfo", body.clone())
+                .await,
+            Ok(body)
+        );
     }
 
     /// Both legs of the balance probe (InsufficientFunds above the source

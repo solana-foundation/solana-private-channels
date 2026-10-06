@@ -18,7 +18,7 @@ use std::str::FromStr;
 use tracing::warn;
 
 use crate::db::{
-    is_wallet_owned_by_user, owned_wallets, owner_change_coverage, owner_changes, OwnerChange,
+    is_wallet_owned_by_user, owned_wallets, owner_chain, OwnerChain, OwnerChange,
     OwnerChangeCoverage,
 };
 
@@ -351,17 +351,51 @@ pub fn token_account_amount(data: &[u8], program_owner: &str) -> Option<u64> {
     Some(u64::from_le_bytes(amount))
 }
 
-/// Whether a `getAccountInfo` asks for the account whole and in a form whose
-/// bytes the gateway can check: no `dataSlice`, and base64. `jsonParsed`
-/// qualifies because the node passes no mint decimals, so it serves token and
-/// swap accounts as base64 either way.
-pub fn asks_for_whole_account(params: &Value) -> bool {
-    let Some(config) = params.get(1).filter(|config| !config.is_null()) else {
-        return true;
+/// A `dataSlice`, read the way the node's `UiDataSliceConfig` reads one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataSlice {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// The slice a `getAccountInfo` for a token or swap account asks for, or the
+/// body to refuse it with.
+///
+/// The gateway forwards these as whole base64 and cuts the reply itself, so the
+/// node never sees the caller's config and cannot refuse a malformed one. This
+/// refuses what the node would. Base58 and binary are refused too: the node
+/// refuses them for any account this large, and a cut small enough to encode
+/// is not worth re-encoding here.
+pub fn requested_data_slice(params: &Value) -> Result<Option<DataSlice>, Bytes> {
+    let config = match params.get(1) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(config)) => config,
+        Some(_) => return Err(malformed_account_config_body()),
     };
-    let encoding = config.get("encoding").and_then(Value::as_str);
-    config.get("dataSlice").is_none_or(Value::is_null)
-        && matches!(encoding, None | Some("base64") | Some("jsonParsed"))
+
+    match config.get("encoding") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(encoding)) => match encoding.as_str() {
+            "base64" | "base64+zstd" | "jsonParsed" => {}
+            "base58" | "binary" => return Err(base58_account_body()),
+            _ => return Err(malformed_account_config_body()),
+        },
+        Some(_) => return Err(malformed_account_config_body()),
+    }
+
+    let slice = match config.get("dataSlice") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(slice) => slice,
+    };
+    let offset = slice.get("offset").and_then(Value::as_u64);
+    let length = slice.get("length").and_then(Value::as_u64);
+    match (
+        offset.and_then(|offset| usize::try_from(offset).ok()),
+        length.and_then(|length| usize::try_from(length).ok()),
+    ) {
+        (Some(offset), Some(length)) => Ok(Some(DataSlice { offset, length })),
+        _ => Err(malformed_account_config_body()),
+    }
 }
 
 /// Whether `pubkey` is still the associated token account its own `owner` field
@@ -411,10 +445,18 @@ const MAX_OWNER_CHANGES: i64 = 64;
 /// in the same snapshot as its chain. The chain holds every handoff up to that
 /// tip, so a handoff after it, which the node may already show when it serves
 /// the page, is outside every window.
+///
+/// They also end no later than `fetched_slot`, the slot ownership was checked
+/// at. The node reads `data` at or after it, so a handoff that left no row and
+/// landed by then shows in those bytes. The cost is freshness: a read node
+/// behind the tip holds back the newest signatures until it catches up. On the
+/// node's Redis path a cache miss reads the replica behind it, which can be
+/// older than the slot, so there the cap narrows that gap without closing it.
 pub async fn resolve_owned_slot_ranges(
     data: &[u8],
     program_owner: &str,
     pubkey: &str,
+    fetched_slot: u64,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> Result<Option<Vec<(i64, i64)>>, sqlx::Error> {
@@ -432,23 +474,27 @@ pub async fn resolve_owned_slot_ranges(
         return Ok(Some(Vec::new()));
     };
 
-    // One snapshot for the coverage and the chain, so the chain holds every
-    // handoff up to the tip whichever server answers the history query.
-    let mut snapshot = auth_db.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *snapshot)
-        .await?;
-
-    let Some(coverage) = owner_change_coverage(&mut snapshot).await? else {
-        warn!("Ledger records no owner-change watermark or tip; serving no history for {pubkey}");
+    let Ok(checked_at) = i64::try_from(fetched_slot) else {
+        warn!("Ownership of {pubkey} was checked at slot {fetched_slot}, past any ledger slot; serving no history");
         record_scope_outcome("no_coverage");
         return Ok(Some(Vec::new()));
     };
 
-    // One past the cap, so a full page is how an over-long chain announces itself.
-    let changes = owner_changes(&mut snapshot, &address, MAX_OWNER_CHANGES + 1).await?;
-    // The wallet lookup below needs no snapshot.
-    snapshot.commit().await?;
+    // The coverage and the chain in one snapshot, so the chain holds every
+    // handoff up to the tip whichever server answers the history query. One
+    // past the cap, so a full page is how an over-long chain announces itself.
+    let OwnerChain { coverage, changes } =
+        owner_chain(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
+    let Some(coverage) = coverage else {
+        warn!("Ledger records no owner-change watermark or tip; serving no history for {pubkey}");
+        record_scope_outcome("no_coverage");
+        return Ok(Some(Vec::new()));
+    };
+    let coverage = OwnerChangeCoverage {
+        tip: coverage.tip.min(checked_at),
+        ..coverage
+    };
+
     if changes.is_empty() {
         // No row is only evidence of no handoff while the address still derives
         // from its owner. An owner it does not derive to was moved without one
@@ -460,12 +506,16 @@ pub async fn resolve_owned_slot_ranges(
             return Ok(Some(Vec::new()));
         }
         // Never handed on, so every slot the chain vouches for is theirs.
-        record_scope_outcome(if coverage.indexed_from == 0 {
-            "never_handed_on"
+        let ranges = clip_to_coverage(vec![(0, i64::MAX)], coverage);
+        if ranges.is_empty() {
+            warn!("No slot of {pubkey} is vouched for yet: the watermark is past the cap");
+            record_scope_outcome("no_window");
+        } else if coverage.indexed_from == 0 {
+            record_scope_outcome("never_handed_on");
         } else {
-            "watermarked"
-        });
-        return Ok(Some(clip_to_coverage(vec![(0, i64::MAX)], coverage)));
+            record_scope_outcome("watermarked");
+        }
+        return Ok(Some(ranges));
     }
     // Past the cap what we hold is a suffix of the timeline. Every window inside
     // it is still accounted for by the handoffs on either side of it, so the cap
@@ -766,12 +816,21 @@ pub fn auth_unavailable_body() -> Bytes {
     )
 }
 
-/// 400 body for a token or swap account asked for, or served, in a shape whose
-/// bytes the gateway cannot check.
-pub fn whole_account_only_body() -> Bytes {
+/// 400 body for a token or swap account asked for as base58 or binary.
+fn base58_account_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
-            "error": { "code": -32602, "message": "Invalid params: token and swap accounts are served whole, as base64" }
+            "error": { "code": -32602, "message": "Invalid params: token and swap accounts cannot be served as base58 or binary" }
+        })
+        .to_string(),
+    )
+}
+
+/// 400 body for a `getAccountInfo` config the node would refuse.
+fn malformed_account_config_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32602, "message": "Invalid params: malformed getAccountInfo config" }
         })
         .to_string(),
     )
