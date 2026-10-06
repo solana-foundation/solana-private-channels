@@ -794,6 +794,9 @@ fn execute_parallel(
     merge_svm_outputs(chunk_outputs)
 }
 
+/// CreateDvp makes 4 accounts, the most any flow here needs from the float.
+const MAX_FLOAT_FUNDED_CREATIONS: u64 = 4;
+
 /// The lamports the gasless callback makes up for an unknown fee payer are the
 /// only money here that nobody deposited. Treat them as a loan the transaction
 /// has to pay back, less one lamport for each account it creates.
@@ -802,6 +805,9 @@ fn execute_parallel(
 /// blocked, every other balance is made of money that was already here and does
 /// not need checking. A loan that is not paid back fails the transaction rather
 /// than editing accounts, because editing accounts is what corrupts bystanders.
+///
+/// A new System account is never kept, whatever paid for it: lamports have no
+/// value here, and burning them is what stops float becoming a permanent wallet.
 ///
 /// Regular path only: admin execution never makes up fee payers.
 fn enforce_lamport_conservation(
@@ -813,6 +819,7 @@ fn enforce_lamport_conservation(
 ) {
     // Reused across transactions so the whole batch allocates at most once.
     let mut fabricated: Vec<usize> = Vec::new();
+    let mut burned: Vec<usize> = Vec::new();
 
     for (result, tx) in output
         .processing_results
@@ -828,6 +835,7 @@ fn enforce_lamport_conservation(
         }
 
         fabricated.clear();
+        burned.clear();
         // How much of the made-up money is gone, how many new accounts exist to
         // explain it, and whether any older account ended up richer.
         let mut shortfall = 0u64;
@@ -850,7 +858,12 @@ fn enforce_lamport_conservation(
                 shortfall += DEFAULT_FEE_PAYER_LAMPORTS.saturating_sub(acct.lamports());
             } else if acct.lamports() > 0 {
                 // BOB never saw it, but it has money, so this tx just made it.
-                created += 1;
+                if acct.owner() == &solana_sdk_ids::system_program::ID && acct.data().is_empty() {
+                    // A wallet this tx would bring into being. Burn it, whatever paid for it.
+                    burned.push(index);
+                } else {
+                    created += 1;
+                }
             }
         }
 
@@ -861,13 +874,17 @@ fn enforce_lamport_conservation(
         // Counting new accounts does not prove the made-up money paid for them,
         // so a new account paid for with real money could excuse a made-up
         // lamport that went elsewhere. Hence no older account may grow while any
-        // made-up money is missing.
-        if shortfall > created || (shortfall > 0 && credited) {
-            // Nothing legitimate trips this, so every hit is worth an alert.
+        // made-up money is missing. Burned wallets are not creations, and the
+        // float may pay for at most MAX_FLOAT_FUNDED_CREATIONS accounts.
+        if shortfall > created
+            || (shortfall > 0 && (credited || created > MAX_FLOAT_FUNDED_CREATIONS))
+        {
+            // Only a leak or more creations than the cap trips this, so every hit is worth a look.
             warn!(
                 sig = %tx.signature(),
                 shortfall,
                 created,
+                burned = burned.len(),
                 credited,
                 "execution: failing tx that does not account for its fabricated fee-payer lamports"
             );
@@ -884,8 +901,9 @@ fn enforce_lamport_conservation(
         // Always wipe, which burns any real money sent to the payer. Keeping it
         // would turn an address we made up into a real one, paying the sender
         // back would rewrite an innocent account, and failing the tx would break
-        // CancelDvp, which sends the closed escrows' leftover money here.
-        for index in &fabricated {
+        // CancelDvp, which sends the closed escrows' leftover money here. New
+        // wallets are burned for the same reason, so float never becomes one.
+        for index in fabricated.iter().chain(&burned) {
             executed.loaded_transaction.accounts[*index].1 = AccountSharedData::default();
         }
     }
@@ -1503,13 +1521,21 @@ mod tests {
 
     // ── Lamport-cap test helpers ──
 
+    /// A tx over `ixs`, paid for and signed by `payer` alone.
+    fn payer_tx(
+        payer: &Keypair,
+        ixs: &[solana_sdk::instruction::Instruction],
+    ) -> SanitizedTransaction {
+        let msg = Message::new(ixs, Some(&payer.pubkey()));
+        let tx = Transaction::new(&[payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to build payer tx")
+    }
+
     /// Transfer `amount` from `from` to `to`, paid for (and signed) by `from`.
     fn transfer(from: &Keypair, to: &Pubkey, amount: u64) -> SanitizedTransaction {
         let ix = solana_system_interface::instruction::transfer(&from.pubkey(), to, amount);
-        let msg = Message::new(&[ix], Some(&from.pubkey()));
-        let tx = Transaction::new(&[from], msg, Hash::default());
-        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
-            .expect("failed to build transfer tx")
+        payer_tx(from, &[ix])
     }
 
     /// Transfer from `from` to `to`, but signed/fee-paid by a separate `payer`.
@@ -2191,6 +2217,87 @@ mod tests {
         assert!(out.rejected(), "status was {:?}", out.status);
     }
 
+    /// A new System account is burned and never counts as a creation, so float
+    /// cannot pay for it and real lamports sent to it are burned.
+    #[tokio::test]
+    async fn new_system_accounts_are_burned_and_do_not_count() {
+        // (a) float leaked into a new wallet: shortfall 1, created 0.
+        let payer = Pubkey::new_unique();
+        let fresh = Pubkey::new_unique();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(FLOAT - 1)),
+                (fresh, dataless_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.rejected(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[1],
+            dataless_account(1),
+            "a rejected tx must not rewrite the new wallet"
+        );
+
+        // (b) float intact, an existing account pays a new wallet.
+        let funder = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(funder, dataless_account(5000))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (funder, dataless_account(4999)),
+                (fresh, dataless_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[1],
+            dataless_account(4999),
+            "the funder's debit stands"
+        );
+        assert_eq!(
+            out.accounts[2],
+            AccountSharedData::default(),
+            "the new wallet must be burned"
+        );
+    }
+
+    /// While float is missing a tx may create at most four accounts, the
+    /// count CreateDvp needs.
+    #[tokio::test]
+    async fn float_funds_at_most_four_creations() {
+        let payer = Pubkey::new_unique();
+        for (count, accepted) in [(4u64, true), (5, false)] {
+            let mut accounts = vec![(payer, dataless_account(FLOAT - count))];
+            accounts.extend((0..count).map(|_| (Pubkey::new_unique(), data_account(1))));
+            let out = run_conservation(&[], accounts, &[payer]);
+            if accepted {
+                assert!(out.status.is_ok(), "{count}: status was {:?}", out.status);
+                for account in &out.accounts[1..] {
+                    assert_eq!(*account, data_account(1), "{count}: creation persists");
+                }
+            } else {
+                assert!(out.rejected(), "{count}: status was {:?}", out.status);
+                assert_eq!(out.accounts[0], dataless_account(FLOAT - count));
+                for account in &out.accounts[1..] {
+                    assert_eq!(*account, data_account(1), "{count}: nothing rewritten");
+                }
+            }
+        }
+
+        // The cap counts creations, not missing float: 1 short, 5 created, 4 of
+        // them paid by an existing account, is still rejected.
+        let existing = Pubkey::new_unique();
+        let mut accounts = vec![
+            (payer, dataless_account(FLOAT - 1)),
+            (existing, dataless_account(1)),
+        ];
+        accounts.extend((0..5).map(|_| (Pubkey::new_unique(), data_account(1))));
+        let out = run_conservation(&[(existing, dataless_account(5))], accounts, &[payer]);
+        assert!(out.rejected(), "status was {:?}", out.status);
+    }
+
     /// A pre-existing account credited by another pre-existing account keeps
     /// the credit. This is the property whose absence drains a wSOL escrow.
     #[tokio::test]
@@ -2510,9 +2617,9 @@ mod tests {
         Err(solana_transaction_error::TransactionError::UnbalancedTransaction)
     }
 
-    /// Direct exploit: a fabricated payer transfers its whole float to R. The
-    /// loan is unrepaid beyond the single lamport R's creation allows, so the
-    /// transaction is rejected and nothing persists.
+    /// Direct exploit: a fabricated payer transfers its whole float to R. R is a
+    /// new wallet, so it is burned and earns no allowance; the loan is unrepaid,
+    /// so the transaction is rejected and nothing persists.
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2535,8 +2642,8 @@ mod tests {
         );
     }
 
-    /// Partial spend (5 of the float lands on R): still short by more than the
-    /// one lamport R's creation allows, so it is rejected too.
+    /// Partial spend (5 of the float lands on R): R is burned and earns no
+    /// allowance, so the tx is short and rejected too.
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2586,8 +2693,8 @@ mod tests {
         );
     }
 
-    /// Synthetic fee payer is dropped: any synthetic-payer transaction erases
-    /// the payer, so it is never persisted in BOB.
+    /// Synthetic fee payer is dropped: after a successful tx the payer is wiped,
+    /// so it is never persisted.
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2596,19 +2703,151 @@ mod tests {
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
-        let r = Pubkey::new_unique();
-        let _ = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 1)]).await;
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &a.pubkey(), 0)]).await;
+        assert_eq!(regular_status(&result, 0), Ok(()), "the tx must succeed");
         assert!(
             bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic fee payer must not be persisted"
         );
     }
 
+    /// The issue's shape: a made-up payer sends 1 lamport to each of `n` fresh
+    /// wallets. Each wallet is burned, so the float is unrepaid.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fabricated_payer_cannot_fund_new_system_accounts() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        for n in [1, FLOAT] {
+            let p = Keypair::new();
+            let recipients: Vec<Pubkey> = (0..n).map(|_| Pubkey::new_unique()).collect();
+            let ixs: Vec<_> = recipients
+                .iter()
+                .map(|r| solana_system_interface::instruction::transfer(&p.pubkey(), r, 1))
+                .collect();
+            let result = run_batch(&mut deps, &metrics, vec![payer_tx(&p, &ixs)]).await;
+
+            assert_eq!(regular_status(&result, 0), unbalanced(), "n = {n}");
+            for r in &recipients {
+                assert!(
+                    bob_balance(&deps.bob, r).is_none(),
+                    "n = {n}: {r} persisted"
+                );
+            }
+        }
+    }
+
+    /// ATA create then CloseAccount to a fresh wallet moves a float lamport
+    /// without any System instruction. The wallet is burned, so it is rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fabricated_payer_cannot_launder_the_float_through_an_ata() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let (admin_tx, mint) = create_admin_initialize_mint_tx();
+        let p = Keypair::new();
+        let r = Pubkey::new_unique();
+        let ata = spl_associated_token_account::get_associated_token_address(&p.pubkey(), &mint);
+        let ixs = [
+            spl_associated_token_account::instruction::create_associated_token_account(
+                &p.pubkey(),
+                &p.pubkey(),
+                &mint,
+                &spl_token::id(),
+            ),
+            spl_token::instruction::close_account(&spl_token::id(), &ata, &r, &p.pubkey(), &[])
+                .unwrap(),
+        ];
+        let result = run_batch(&mut deps, &metrics, vec![admin_tx, payer_tx(&p, &ixs)]).await;
+
+        assert_eq!(regular_status(&result, 0), unbalanced());
+        assert!(bob_balance(&deps.bob, &r).is_none(), "r must not persist");
+        assert!(
+            bob_balance(&deps.bob, &ata).is_none(),
+            "the ATA must not persist"
+        );
+    }
+
+    /// Five float-funded ATAs exceed the cap of four, so the tx is rejected and
+    /// none persists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fabricated_payer_cannot_create_five_atas() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let (admin_tx, mint) = create_admin_initialize_mint_tx();
+        let p = Keypair::new();
+        let wallets: Vec<Pubkey> = (0..5).map(|_| Pubkey::new_unique()).collect();
+        let ixs: Vec<_> = wallets
+            .iter()
+            .map(|w| {
+                spl_associated_token_account::instruction::create_associated_token_account(
+                    &p.pubkey(),
+                    w,
+                    &mint,
+                    &spl_token::id(),
+                )
+            })
+            .collect();
+        let result = run_batch(&mut deps, &metrics, vec![admin_tx, payer_tx(&p, &ixs)]).await;
+
+        // The admin tx runs on the admin path, so the attack is regular index 0.
+        assert_eq!(regular_status(&result, 0), unbalanced());
+        for w in &wallets {
+            let ata = spl_associated_token_account::get_associated_token_address(w, &mint);
+            assert!(bob_balance(&deps.bob, &ata).is_none(), "{ata} persisted");
+        }
+    }
+
+    /// Two-tx route: a persisted ATA is closed to a fresh wallet by a payer
+    /// that spends no float. The close is honoured and the lamport is burned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_persisted_ata_burns_its_lamport() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let (admin_tx, mint) = create_admin_initialize_mint_tx();
+        let p = Keypair::new();
+        let w = Keypair::new();
+        let ata = spl_associated_token_account::get_associated_token_address(&w.pubkey(), &mint);
+        let setup = run_batch(
+            &mut deps,
+            &metrics,
+            vec![admin_tx, ata_create_tx(&p, &w.pubkey(), &mint)],
+        )
+        .await;
+        assert_eq!(regular_status(&setup, 0), Ok(()));
+        assert_eq!(bob_balance(&deps.bob, &ata), Some(1), "the ATA persists");
+
+        let q = Keypair::new();
+        let d = Pubkey::new_unique();
+        let ix =
+            spl_token::instruction::close_account(&spl_token::id(), &ata, &d, &w.pubkey(), &[])
+                .unwrap();
+        let msg = Message::new(&[ix], Some(&q.pubkey()));
+        let raw = Transaction::new(&[&q, &w], msg, Hash::default());
+        let close = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build close tx");
+        let result = run_batch(&mut deps, &metrics, vec![close]).await;
+
+        assert_eq!(regular_status(&result, 0), Ok(()), "the close is honoured");
+        assert!(bob_balance(&deps.bob, &ata).is_none(), "the ATA is closed");
+        assert!(bob_balance(&deps.bob, &d).is_none(), "d must be burned");
+    }
+
     // ── Legitimate flows still work ──
 
     /// Legit gasless sponsorship: a fresh `A` pays for a real `B`'s transfer
-    /// without sending or receiving value. The transfer lands on both sides and
-    /// the fabricated sponsor is erased.
+    /// without sending or receiving value. The transfer lands, and a recipient
+    /// the channel has never seen is burned.
     #[tokio::test(flavor = "multi_thread")]
     async fn gasless_sponsor_succeeds_and_is_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2633,14 +2872,13 @@ mod tests {
             "sponsor must not be persisted"
         );
         assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000));
-        assert_eq!(bob_balance(&deps.bob, &r), Some(1000));
+        assert!(bob_balance(&deps.bob, &r).is_none(), "r must be burned");
     }
 
-    /// A transfer between accounts made of pre-existing lamports persists on
-    /// both sides. This is the clearest semantic change from the old cap, which
-    /// zeroed both.
+    /// A transfer of pre-existing lamports keeps the sender's debit, while a
+    /// recipient the channel has never seen is burned rather than created.
     #[tokio::test(flavor = "multi_thread")]
-    async fn real_transfer_persists_both_sides() {
+    async fn real_transfer_debits_sender_and_burns_new_recipient() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
@@ -2653,7 +2891,7 @@ mod tests {
 
         assert_eq!(regular_status(&result, 0), Ok(()));
         assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000));
-        assert_eq!(bob_balance(&deps.bob, &r), Some(1000));
+        assert!(bob_balance(&deps.bob, &r).is_none(), "r must be burned");
     }
 
     /// A gasless user creating an ATA: the payer's float covers the ATA's
@@ -2699,10 +2937,7 @@ mod tests {
             mint,
             &spl_token::id(),
         );
-        let msg = Message::new(&[ix], Some(&payer.pubkey()));
-        let raw = Transaction::new(&[payer], msg, Hash::default());
-        SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
-            .expect("failed to build ATA-create tx")
+        payer_tx(payer, &[ix])
     }
 
     /// The native mint cannot be created, so a gasless native ATA cannot be
@@ -2887,10 +3122,12 @@ mod tests {
         let mut txs = Vec::with_capacity(n);
         let mut payers = Vec::with_capacity(n);
         let mut recipients = Vec::with_capacity(n);
-        for _ in 0..n {
+        for i in 0..n {
             let a = Keypair::new();
             let r = Pubkey::new_unique();
-            txs.push(transfer(&a, &r, 10)); // 1-step spend, unrepaid loan
+            // Odd txs send 1 lamport, which only the burn of new wallets rejects.
+            let amount = if i % 2 == 0 { 10 } else { 1 };
+            txs.push(transfer(&a, &r, amount));
             payers.push(a);
             recipients.push(r);
         }
