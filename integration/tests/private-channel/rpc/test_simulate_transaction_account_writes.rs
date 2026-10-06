@@ -20,7 +20,6 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{hash::Hash, signature::Keypair, signer::Signer, transaction::Transaction},
-    solana_system_interface::instruction as system_instruction,
 };
 
 pub async fn run_simulate_transaction_account_writes_test(ctx: &PrivateChannelContext) {
@@ -32,19 +31,19 @@ pub async fn run_simulate_transaction_account_writes_test(ctx: &PrivateChannelCo
     println!("✓ accounts + replaceRecentBlockhash branches passed");
 }
 
-// Build a simple transfer tx the server will accept. Does NOT sign as the
+// Build a simple memo tx the server will accept. Does NOT sign as the
 // payer; we rely on sigVerify=false to avoid needing a funded keypair.
-fn build_unsigned_transfer(blockhash: Hash) -> Transaction {
+fn build_unsigned_memo(blockhash: Hash) -> Transaction {
     let payer = Keypair::new();
-    let recipient = Keypair::new().pubkey();
-    let ix = system_instruction::transfer(&payer.pubkey(), &recipient, 100);
+    let ix =
+        solana_sdk::instruction::Instruction::new_with_bytes(spl_memo::id(), b"simulate", vec![]);
     Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], blockhash)
 }
 
 // ── Case A ──────────────────────────────────────────────────────────────────
 async fn case_a_accounts_returned(ctx: &PrivateChannelContext) {
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let tx = build_unsigned_transfer(blockhash);
+    let tx = build_unsigned_memo(blockhash);
     let addr = Keypair::new().pubkey().to_string(); // just a placeholder address
     let resp = ctx
         .read_client
@@ -82,7 +81,7 @@ async fn case_b_replace_recent_blockhash(ctx: &PrivateChannelContext) {
     // Use an obviously-stale blockhash (all-zero); server must replace it
     // because replaceRecentBlockhash=true was requested.
     let stale = Hash::new_from_array([0u8; 32]);
-    let tx = build_unsigned_transfer(stale);
+    let tx = build_unsigned_memo(stale);
     let resp = ctx
         .read_client
         .send::<serde_json::Value>(

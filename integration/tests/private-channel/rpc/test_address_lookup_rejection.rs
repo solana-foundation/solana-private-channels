@@ -39,16 +39,15 @@ pub async fn run_address_lookup_rejection_test(ctx: &PrivateChannelContext) {
     println!("✓ sendTransaction + simulateTransaction reject declared lookups and admit plain v0");
 }
 
-/// Base64-encodes a v0 System transfer carrying `num_lookups` declared lookups.
+/// Base64-encodes a v0 memo carrying `num_lookups` declared lookups.
 /// The lookup case also indexes a lookup-supplied key, so without the guard the
 /// node would admit a transaction whose account index it never resolved.
 async fn encoded_v0_tx(ctx: &PrivateChannelContext, num_lookups: usize) -> String {
     let payer = Keypair::new();
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let tx = setup::v0_system_transfer(
+    let tx = setup::v0_memo_transaction(
         &payer,
         &Pubkey::new_unique(),
-        1_000,
         blockhash,
         num_lookups,
         num_lookups > 0,
@@ -121,7 +120,7 @@ async fn case_simulate_with_lookup_rejected(ctx: &PrivateChannelContext) {
 async fn case_simulate_without_lookup_accepted(ctx: &PrivateChannelContext) {
     let encoded = encoded_v0_tx(ctx, 0).await;
 
-    // The transfer itself may fail for lack of funds; only admission matters.
+    // The memo itself may fail, since `to` does not sign; only admission matters.
     let result = ctx
         .read_client
         .send::<serde_json::Value>(

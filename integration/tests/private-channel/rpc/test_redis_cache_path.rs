@@ -327,6 +327,28 @@ async fn read_path_serves_through_a_redis_cache() -> Result<()> {
         .get_signatures_for_address(&Keypair::new().pubkey())
         .await
         .expect("getSignaturesForAddress through the cache");
+    // Retried briefly: the first block's watermark can trail the block itself.
+    let mut progress = Err(None);
+    for _ in 0..50 {
+        progress = client
+            .send::<serde_json::Value>(
+                solana_client::rpc_request::RpcRequest::Custom {
+                    method: "getAddressIndexSlot",
+                },
+                serde_json::json!([]),
+            )
+            .await
+            .map_err(Some);
+        if progress.is_ok() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let progress = progress.expect("getAddressIndexSlot through the cache");
+    assert!(
+        progress["watermark"].is_u64() && progress["latestBlock"].is_u64(),
+        "index progress names both slots, got: {progress}"
+    );
 
     // One knob drives both paths, so the settler must have mirrored to the same
     // instance the read path attached to.
