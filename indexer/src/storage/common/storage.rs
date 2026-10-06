@@ -929,6 +929,7 @@ mod tests {
     #[tokio::test]
     async fn get_and_lock_marks_processing_and_leaves_pending() {
         let (storage, mock) = make_mock_storage();
+        mock.set_checkpoint("escrow", 100);
         {
             let mut pending = mock.pending_transactions.lock().unwrap();
             for i in 0..3 {
@@ -970,6 +971,53 @@ mod tests {
             1,
             "only the remaining Pending deposit re-locks"
         );
+    }
+
+    /// Mirrors the Postgres gate: deposits wait for the escrow checkpoint, withdrawals never do.
+    #[tokio::test]
+    async fn get_and_lock_deposits_waits_for_escrow_checkpoint() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            let mut dep = make_db_transaction();
+            dep.signature = "dep_106".to_string();
+            dep.slot = 106;
+            pending.push(dep);
+            let mut w = make_db_transaction();
+            w.transaction_type = TransactionType::Withdrawal;
+            w.signature = "wd_far".to_string();
+            w.slot = 1_000_000;
+            pending.push(w);
+        }
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(locked.is_empty(), "no checkpoint claims no deposit");
+
+        mock.set_checkpoint("escrow", 105);
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(
+            locked.is_empty(),
+            "a deposit above the checkpoint stays Pending"
+        );
+
+        mock.set_checkpoint("escrow", 106);
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 1, "a covered deposit is claimed");
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 1, "withdrawals ignore the escrow checkpoint");
     }
 
     /// The resolved dequeue has no nonce frontier and orders by `created_at`.

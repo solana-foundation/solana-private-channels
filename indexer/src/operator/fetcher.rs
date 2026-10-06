@@ -192,6 +192,13 @@ mod tests {
         }
     }
 
+    /// Mock whose escrow checkpoint covers `make_test_transaction`'s slot, so its deposits are claimable.
+    fn covered_mock() -> MockStorage {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 100);
+        mock
+    }
+
     #[tokio::test]
     async fn cancellation_before_first_poll_exits_ok() {
         let mock = MockStorage::new();
@@ -207,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_transactions_sent_to_channel() {
-        let mock = MockStorage::new();
+        let mock = covered_mock();
         let txn = make_test_transaction("sig1");
         mock.pending_transactions.lock().unwrap().push(txn);
 
@@ -243,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn fetcher_skips_fetch_when_halted() {
         use private_channel_metrics::{HealthConfig, HealthState};
-        let mock = MockStorage::new();
+        let mock = covered_mock();
         // A pending deposit is present, but the halt flag must stop it being fetched.
         mock.pending_transactions
             .lock()
@@ -326,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn fetcher_halt_read_error_skips_fetch() {
         use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
-        let mock = MockStorage::new();
+        let mock = covered_mock();
         mock.pending_transactions
             .lock()
             .unwrap()
@@ -391,9 +398,66 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
     }
 
+    /// A live deposit written while a gap repair still trails its slot is held Pending,
+    /// not handed to the mint gate, and goes through once the checkpoint covers it.
+    /// The backlog still counts it, so /health reports deposits paused by a long repair.
+    #[tokio::test]
+    async fn fetcher_holds_deposit_until_checkpoint_covers_it() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        let mock = MockStorage::new();
+        let mut txn = make_test_transaction("sig_live");
+        txn.slot = 106;
+        mock.pending_transactions.lock().unwrap().push(txn);
+        mock.set_checkpoint("escrow", 100);
+        let health = HealthState::new(HealthConfig::operator());
+        health
+            .last_progress_at()
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (tx, mut rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let health_clone = Some(health.clone());
+        let handle = tokio::spawn(async move {
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                health_clone,
+            )
+            .await
+        });
+
+        let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(got.is_err(), "an uncovered deposit must not be forwarded");
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Pending,
+            "the held deposit stays Pending"
+        );
+        assert!(
+            matches!(health.check(), HealthOutcome::Stalled { pending: 1, .. }),
+            "the held deposit still counts as backlog: {:?}",
+            health.check()
+        );
+
+        mock.set_checkpoint("escrow", 106);
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+        assert_eq!(received.signature, "sig_live");
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn channel_closed_returns_error() {
-        let mock = MockStorage::new();
+        let mock = covered_mock();
         let txn = make_test_transaction("sig2");
         mock.pending_transactions.lock().unwrap().push(txn);
 

@@ -303,6 +303,15 @@ impl MockStorage {
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
+        // Same deposit gate as Postgres: only slots the escrow checkpoint covers.
+        let escrow_checkpoint = self
+            .committed_checkpoints
+            .lock()
+            .unwrap()
+            .get(&crate::indexer::checkpoint::program_key(
+                crate::config::ProgramType::Escrow,
+            ))
+            .copied();
         let mut pending = self.pending_transactions.lock().unwrap();
 
         // Mirror the Postgres dequeue: Pending rows of this type in created_at
@@ -313,6 +322,8 @@ impl MockStorage {
             .filter(|&i| {
                 pending[i].transaction_type == transaction_type
                     && pending[i].status == TransactionStatus::Pending
+                    && (transaction_type == TransactionType::Withdrawal
+                        || escrow_checkpoint.is_some_and(|cp| pending[i].slot <= cp as i64))
             })
             .collect();
         order.sort_by_key(|&i| pending[i].created_at);

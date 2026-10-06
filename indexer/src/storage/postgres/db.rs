@@ -1777,18 +1777,28 @@ impl PostgresDb {
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        // Claim a deposit only once the escrow checkpoint covers its slot, so the mint gate
+        // never reads history a gap repair still owes. No checkpoint reads NULL and claims none.
+        let checkpoint_filter = match transaction_type {
+            TransactionType::Deposit => format!(
+                "AND {} <= (SELECT last_committed_slot FROM indexer_state WHERE program_type = $4)",
+                transaction_cols::SLOT
+            ),
+            TransactionType::Withdrawal => String::new(),
+        };
+
         // Use a transaction to ensure atomicity
         let mut tx = self.pool.begin().await?;
 
         // Lock rows with FOR UPDATE SKIP LOCKED
-        let mut transactions = sqlx::query_as::<_, DbTransaction>(&format!(
+        let sql = format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}
             FROM transactions
-            WHERE {} = $1 AND {} = $2
+            WHERE {} = $1 AND {} = $2 {checkpoint_filter}
             ORDER BY {} ASC
             LIMIT $3
             FOR UPDATE SKIP LOCKED
@@ -1823,12 +1833,15 @@ impl PostgresDb {
             transaction_cols::TRANSACTION_TYPE,
             // Ordering (FIFO)
             transaction_cols::CREATED_AT,
-        ))
-        .bind(TransactionStatus::Pending)
-        .bind(transaction_type)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
+        );
+        let mut query = sqlx::query_as::<_, DbTransaction>(&sql)
+            .bind(TransactionStatus::Pending)
+            .bind(transaction_type)
+            .bind(limit);
+        if transaction_type == TransactionType::Deposit {
+            query = query.bind(program_key(ProgramType::Escrow));
+        }
+        let mut transactions = query.fetch_all(&mut *tx).await?;
 
         // Update status to Processing, returning the trigger-bumped `updated_at`
         // so the fetched row carries its true post-lock token; the sender CASes
