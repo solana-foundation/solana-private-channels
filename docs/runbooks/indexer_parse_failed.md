@@ -74,13 +74,14 @@ SELECT program_type, last_committed_slot, updated_at FROM indexer_state;
 ```
 
 ```sh
-curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","maxSupportedTransactionVersion":0,"commitment":"finalized"}]}' | jq '.result.transactions[].meta | {inner: (.innerInstructions | length), heights: [.innerInstructions[]?.instructions[]?.stackHeight]}'
+curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","maxSupportedTransactionVersion":0,"commitment":"finalized"}]}' | jq --arg sig '<SIG>' --arg e 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU '.result.transactions[] | select(.transaction.signatures[0] == $sig) | (.transaction.message.accountKeys + (.meta.loadedAddresses.writable // []) + (.meta.loadedAddresses.readonly // [])) as $k | {inner_sets: (.meta.innerInstructions | length), escrow_inner: ([.meta.innerInstructions[]?.instructions[]? | select($k[.programIdIndex] == $e)] | length)}'
 ```
 
-Zero inner instructions is cause 1. `null` stack heights alone are not, so read
-`<reason>`: `no escrow entry after it` or `not a DepositEvent` on a CPI deposit means
-the inner list lost the event (cause 1); a borsh or account-count error against a
-recently upgraded program means the parser needs updating (cause 2).
+Every escrow instruction emits its event as an escrow self-CPI, so `escrow_inner: 0` on
+the named transaction is cause 1. Otherwise read `<reason>`: `no escrow entry after it` or
+`not a DepositEvent` on a CPI deposit means the inner list lost that deposit's event
+(cause 1); a borsh or account-count error against a recently upgraded program means the
+parser needs updating (cause 2). `null` stack heights alone are not a cause.
 
 ### Recovery
 
@@ -112,18 +113,25 @@ one; there is no operator command that marks a slot skipped, and there should no
 
 ### Before deploying
 
-Screen every endpoint the deploy uses, not just the primary: failing closed makes a thin
-one a halt rather than a dropped row, and a fallback that strips inner instructions
-recovers nothing. Each is asked for its own finalized tip, so a lagging node still answers. An unset
-`COMMON_FALLBACK_RPC_URL` is skipped rather than probed, since only that one is optional.
+Screen every endpoint the escrow indexer (`indexer-solana`) uses, not just the primary:
+failing closed makes a thin one a halt rather than a dropped row, and a fallback that strips
+inner instructions recovers nothing. The withdraw indexer reads no inner instructions, so
+its endpoints need no screen. An unset `COMMON_FALLBACK_RPC_URL` is skipped rather than
+probed, since only that one is optional.
+
+Set `SLOT` to a finalized slot holding a successful escrow transaction, for example
+`SELECT max(slot) FROM transactions WHERE transaction_type = 'deposit';`. The probe checks
+only the successful escrow transactions in it, the same ones the decoder reads.
 
 ```sh
-for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; slot=$(curl -s "$url" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' | jq -r .result); [ -n "$slot" ] && [ "$slot" != null ] || { echo "no finalized tip, endpoint unreachable or not serving"; continue; }; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$slot,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq '[.result.transactions[].meta.innerInstructions] | {txs: length, missing: map(select(. == null)) | length}'; done
+for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$SLOT,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq --arg e 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU '[.result.transactions[] | select(.meta.err == null) | (.transaction.message.accountKeys + (.meta.loadedAddresses.writable // []) + (.meta.loadedAddresses.readonly // [])) as $k | select($k | index($e)) | .meta.innerInstructions as $i | if $i == null then "null" elif ([$i[].instructions[] | select($k[.programIdIndex] == $e)] | length) == 0 then "no_event" else "ok" end] | {escrow_txs: length, null_inner: map(select(. == "null")) | length, no_escrow_inner: map(select(. == "no_event")) | length}'; done
 ```
 
-Any `missing` is cause 1 on that endpoint. `txs: 0` is inconclusive on a quiet chain, so
-re-run it against a slot known to carry a deposit. Screens cause 1 only. A skipped fallback
-means the deploy has no failover, so a thin primary halts ingestion instead of recovering.
+Any `null_inner` or `no_escrow_inner` is cause 1 on that endpoint: the decoder rejects a
+null list on an escrow transaction, and every escrow instruction emits its event as an
+inner escrow entry. `escrow_txs: 0` is inconclusive, so pick a slot that holds one. Screens
+cause 1 only. A skipped fallback means the deploy has no failover, so a thin primary halts
+ingestion instead of recovering.
 
 ## Corrupt or incomplete provider data
 
