@@ -8,7 +8,9 @@ use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS
 use crate::operator::utils::instruction_util::{
     mint_extra_error_checks_policy, TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
 };
-use crate::operator::utils::storage_util::with_storage_backoff;
+use crate::operator::utils::storage_util::{
+    fenced_terminal_write, with_storage_backoff, FencedWrite,
+};
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
     MAX_POLL_ATTEMPTS_CONFIRMATION,
@@ -18,7 +20,7 @@ use crate::operator::{
 };
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::{RequeueOutcome, Storage};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
 use solana_commitment_config::CommitmentConfig;
@@ -373,7 +375,15 @@ pub(super) async fn route_builder_error(
                 .with_label_values(&[state.program_type.as_label(), "build_error"])
                 .inc();
             error!("Failed to build transaction: {}", e);
-            send_fatal_error(storage_tx, ctx, &e.to_string()).await;
+            send_fatal_error(
+                &state.storage,
+                storage_tx,
+                state.program_type.as_label(),
+                ctx,
+                incarnation_lease(state, ctx),
+                &e.to_string(),
+            )
+            .await;
         }
     }
 }
@@ -849,36 +859,45 @@ pub(super) fn handle_confirmation_result<'a>(
                             .with_label_values(&[pt, "mint_jit_manual_review"])
                             .inc();
                         error!("JIT verdict: ManualReview — {}", reason);
-                        send_guaranteed(
+                        // Parked under the claim lease, so a verdict that routes late
+                        // cannot park a later incarnation of the deposit.
+                        let outcome = send_fenced_outcome(
+                            &state.storage,
                             storage_tx,
-                            TransactionStatusUpdate {
-                                transaction_id: txn_id,
-                                trace_id: ctx.trace_id.clone(),
-                                status: TransactionStatus::ManualReview,
-                                counterpart_signature: None,
-                                processed_at: Some(Utc::now()),
-                                error_message: Some(reason),
-                                remint_signature: None,
-                                remint_attempted: false,
-                            },
-                            "transaction status update",
+                            pt,
+                            ctx,
+                            txn_id,
+                            ctx.deposit_claim_lease,
+                            TransactionStatus::ManualReview,
+                            &reason,
                         )
-                        .await
-                        .ok();
-                        // Release the cached MintToBuilder so it doesn't
-                        // linger past the terminal transition. For deposits
-                        // ctx.withdrawal_nonce is None, so the remint /
-                        // pending_signatures cleanup is a no-op; Mirrors
-                        // the cleanup pattern in handle_permanent_failure.
-                        cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                        state.mint_builders.remove(&txn_id);
+                        .await;
+                        // A verdict that did not apply, or may not have, leaves the
+                        // cache alone: it is keyed by transaction id, so the builder
+                        // may be the later incarnation's.
+                        if outcome == FencedWrite::Applied {
+                            // Release the cached MintToBuilder so it doesn't
+                            // linger past the terminal transition. For deposits
+                            // ctx.withdrawal_nonce is None, so the remint /
+                            // pending_signatures cleanup is a no-op; Mirrors
+                            // the cleanup pattern in handle_permanent_failure.
+                            cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                            state.mint_builders.remove(&txn_id);
+                        }
                     }
                     // Only deposits reach this block: the guard above proves a
                     // cached mint builder, and those are cached for the deposit
                     // mint alone. So there is no nonce-keyed state to unwind
                     // and no withdrawal remint to compensate here.
                     JitOutcome::Transient(reason) => {
-                        requeue_deposit_after_jit(state, txn_id, &signature, &reason).await;
+                        requeue_deposit_after_jit(
+                            state,
+                            txn_id,
+                            ctx.deposit_claim_lease,
+                            &signature,
+                            &reason,
+                        )
+                        .await;
                     }
                 }
             }
@@ -993,6 +1012,7 @@ pub(super) async fn handle_success(
                 error_message: None,
                 remint_signature: None,
                 remint_attempted: false,
+                alert_only: false,
             },
             "transaction status update",
         )
@@ -1319,6 +1339,9 @@ async fn remint_after_onchain_refusal(
 /// The broadcast signatures are deliberately kept: this escalation happens
 /// because the outcome is unknown, and they are the only thing that can still
 /// classify it.
+///
+/// Parked under the incarnation's lease, so an escalation that routes late
+/// cannot park a later incarnation of the row.
 pub(super) async fn send_manual_review(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -1332,22 +1355,17 @@ pub(super) async fn send_manual_review(
         return;
     };
 
-    send_guaranteed(
+    send_fenced_outcome(
+        &state.storage,
         storage_tx,
-        TransactionStatusUpdate {
-            transaction_id,
-            trace_id: ctx.trace_id.clone(),
-            status: TransactionStatus::ManualReview,
-            counterpart_signature: None,
-            processed_at: Some(Utc::now()),
-            error_message: Some(reason.to_string()),
-            remint_signature: None,
-            remint_attempted: false,
-        },
-        "transaction status update",
+        state.program_type.as_label(),
+        ctx,
+        transaction_id,
+        incarnation_lease(state, ctx),
+        TransactionStatus::ManualReview,
+        reason,
     )
-    .await
-    .ok();
+    .await;
 }
 
 /// Leave a persisted transaction Processing after an uncertain terminal outcome.
@@ -1388,9 +1406,21 @@ pub(super) async fn requeue_or_fail_prebroadcast(
     // holding the rotation barrier. The next attempt puts it back.
     state.in_flight_withdrawals.remove(&nonce);
 
+    // Submission arms the lease for every release, so without one this sender
+    // cannot prove it owns the row and leaves it to recovery.
+    let Some(lease) = state.release_leases.get(&nonce).copied() else {
+        state.remint_cache.remove(&nonce);
+        warn!(
+            transaction_id,
+            nonce,
+            "No release lease for the pre-broadcast requeue, row left Processing for recovery"
+        );
+        return;
+    };
+
     match state
         .storage
-        .try_requeue_prebroadcast(transaction_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(transaction_id, lease, MAX_RECOVERY_REQUEUE_ATTEMPTS)
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -1404,7 +1434,10 @@ pub(super) async fn requeue_or_fail_prebroadcast(
                 nonce, attempts, "Requeued withdrawal to Pending after pre-broadcast failure"
             );
         }
-        Ok(RequeueOutcome::AtCap) => {
+        Ok(RequeueOutcome::AtCap { lease }) => {
+            // The capped write bumped the row, so the escalation below must
+            // present its lease to write this incarnation.
+            state.release_leases.insert(nonce, lease);
             // Keep remint_cache: handle_permanent_failure consumes it to route a
             // no-signature withdrawal to ManualReview rather than a bare Failed.
             metrics::OPERATOR_TRANSACTION_ERRORS
@@ -1416,7 +1449,7 @@ pub(super) async fn requeue_or_fail_prebroadcast(
             state.remint_cache.remove(&nonce);
             warn!(
                 transaction_id,
-                nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+                nonce, "Pre-broadcast requeue skipped: row has moved past this incarnation"
             );
         }
         Err(e) => {
@@ -1436,12 +1469,13 @@ pub(super) async fn requeue_or_fail_prebroadcast(
 /// still journaled; the helper only adds an `InitializeMint`, which moves no
 /// balance and is idempotent, so re-arming sends nothing value-bearing.
 ///
-/// No status is written on any branch: the cap, a raced row and a failed write
-/// all leave the row to the recovery sweep, which classifies the deposit
-/// on-chain before escalating to a human.
+/// No status is written on any branch: the cap, a raced row, a missing claim
+/// lease and a failed write all leave the row to the recovery sweep, which
+/// classifies the deposit on-chain before escalating to a human.
 pub(super) async fn requeue_deposit_after_jit(
     state: &mut SenderState,
     txn_id: i64,
+    claim_lease: Option<DateTime<Utc>>,
     signature: &Signature,
     reason: &str,
 ) {
@@ -1454,9 +1488,19 @@ pub(super) async fn requeue_deposit_after_jit(
     // its own builder, so the cached one would only go stale here.
     state.mint_builders.remove(&txn_id);
 
+    let Some(claim_lease) = claim_lease else {
+        leave_processing_for_recovery(
+            pt,
+            Some(txn_id),
+            signature,
+            &format!("JIT requeue has no claim lease to present ({reason})"),
+        );
+        return;
+    };
+
     match state
         .storage
-        .try_requeue_prebroadcast(txn_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(txn_id, claim_lease, MAX_RECOVERY_REQUEUE_ATTEMPTS)
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -1471,7 +1515,7 @@ pub(super) async fn requeue_deposit_after_jit(
         // The capped write still matches the row, so its `updated_at` trigger
         // fires and the staleness clock restarts. That delays the recovery sweep
         // by one window, the cost of keeping the cap inside a single statement.
-        Ok(RequeueOutcome::AtCap) => {
+        Ok(RequeueOutcome::AtCap { .. }) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[pt, "prebroadcast_requeue_cap"])
                 .inc();
@@ -1574,7 +1618,15 @@ async fn defer_remint_after_failure(
 
     let Some(info) = remint_info else {
         // Not a withdrawal, so use the normal fatal error path
-        send_fatal_error(storage_tx, ctx, error_msg).await;
+        send_fatal_error(
+            &state.storage,
+            storage_tx,
+            state.program_type.as_label(),
+            ctx,
+            incarnation_lease(state, ctx),
+            error_msg,
+        )
+        .await;
         return;
     };
 
@@ -1619,25 +1671,13 @@ async fn defer_remint_after_failure(
             "No signatures to verify for nonce {:?}, cannot safely remint, sending to ManualReview",
             ctx.withdrawal_nonce,
         );
-        send_guaranteed(
+        send_manual_review(
+            state,
+            ctx,
             storage_tx,
-            TransactionStatusUpdate {
-                transaction_id,
-                trace_id: ctx.trace_id.clone(),
-                status: TransactionStatus::ManualReview,
-                counterpart_signature: None,
-                processed_at: Some(Utc::now()),
-                error_message: Some(format!(
-                    "{} | no signatures to verify, remint unsafe",
-                    error_msg
-                )),
-                remint_signature: None,
-                remint_attempted: false,
-            },
-            "transaction status update",
+            &format!("{error_msg} | no signatures to verify, remint unsafe"),
         )
-        .await
-        .ok();
+        .await;
         return;
     }
 
@@ -1966,7 +2006,15 @@ pub(super) async fn fire_and_store_task(
                 }
                 SendDurability::Terminal => {
                     error!("Failed to build/sign transaction (fire-and-forget): {}", e);
-                    send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                    send_fatal_error(
+                        &storage,
+                        &storage_tx,
+                        pt,
+                        &ctx,
+                        ctx.deposit_claim_lease,
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             }
             return;
@@ -2052,7 +2100,15 @@ pub(super) async fn fire_and_store_task(
                     "send error after write-ahead persist",
                 );
             } else {
-                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                send_fatal_error(
+                    &storage,
+                    &storage_tx,
+                    pt,
+                    &ctx,
+                    ctx.deposit_claim_lease,
+                    &e.to_string(),
+                )
+                .await;
             }
         }
     }
@@ -2399,6 +2455,7 @@ pub(super) async fn run_poll_task(
                                     error_message: None,
                                     remint_signature: None,
                                     remint_attempted: false,
+                                    alert_only: false,
                                 })
                                 .await
                                 .is_err()
@@ -2440,30 +2497,106 @@ pub(super) async fn run_poll_task(
     }
 }
 
-/// Helper for fatal errors (Failed status, no signature)
+/// Helper for fatal errors (Failed status, no signature), failed under `lease`
+/// so a failure that routes late cannot fail a later incarnation of the row.
 pub(super) async fn send_fatal_error(
+    storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt: &str,
     ctx: &TransactionContext,
+    lease: Option<DateTime<Utc>>,
     error_msg: &str,
 ) {
-    if let Some(transaction_id) = ctx.transaction_id {
-        send_guaranteed(
-            storage_tx,
-            TransactionStatusUpdate {
+    let Some(transaction_id) = ctx.transaction_id else {
+        return;
+    };
+    send_fenced_outcome(
+        storage,
+        storage_tx,
+        pt,
+        ctx,
+        transaction_id,
+        lease,
+        TransactionStatus::Failed,
+        error_msg,
+    )
+    .await;
+}
+
+/// The lease the row's current incarnation was claimed under: the deposit's
+/// claim, or the release lease this sender holds for the nonce.
+fn incarnation_lease(state: &SenderState, ctx: &TransactionContext) -> Option<DateTime<Utc>> {
+    ctx.deposit_claim_lease.or_else(|| {
+        ctx.withdrawal_nonce
+            .and_then(|nonce| state.release_leases.get(&nonce).copied())
+    })
+}
+
+/// Write `status` (`Failed` or `ManualReview`) under `lease`, then alert on it.
+///
+/// The write is a CAS on the incarnation's `updated_at`, so an outcome that
+/// routes late cannot terminalize a later incarnation, and the update sent
+/// afterwards only alerts. Without a lease the writer's own write is the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn send_fenced_outcome(
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt: &str,
+    ctx: &TransactionContext,
+    transaction_id: i64,
+    lease: Option<DateTime<Utc>>,
+    status: TransactionStatus,
+    reason: &str,
+) -> FencedWrite {
+    let outcome = match lease {
+        None => FencedWrite::Applied,
+        Some(lease) if status == TransactionStatus::Failed => {
+            fenced_terminal_write(
+                storage,
+                pt,
+                "failure",
                 transaction_id,
-                trace_id: ctx.trace_id.clone(),
-                status: TransactionStatus::Failed,
-                counterpart_signature: None,
-                processed_at: Some(Utc::now()),
-                error_message: Some(error_msg.to_string()),
-                remint_signature: None,
-                remint_attempted: false,
-            },
-            "transaction status update",
-        )
-        .await
-        .ok();
+                status,
+                reason,
+                || storage.try_fail_processing(transaction_id, lease),
+            )
+            .await
+        }
+        Some(lease) => {
+            fenced_terminal_write(
+                storage,
+                pt,
+                "manual review",
+                transaction_id,
+                status,
+                reason,
+                || storage.try_quarantine_processing(transaction_id, lease, None, None),
+            )
+            .await
+        }
+    };
+    if outcome == FencedWrite::Stale {
+        return outcome;
     }
+    send_guaranteed(
+        storage_tx,
+        TransactionStatusUpdate {
+            transaction_id,
+            trace_id: ctx.trace_id.clone(),
+            status,
+            counterpart_signature: None,
+            processed_at: Some(Utc::now()),
+            error_message: Some(outcome.alert_message(reason)),
+            remint_signature: None,
+            remint_attempted: false,
+            // Without a lease nothing wrote the row yet.
+            alert_only: lease.is_some(),
+        },
+        "transaction status update",
+    )
+    .await
+    .ok();
+    outcome
 }
 
 #[cfg(test)]
@@ -2473,14 +2606,14 @@ mod tests {
     use crate::operator::sender::test_support::{
         ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
         mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
-        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
-        sender_state as make_sender_state_with_server, sender_state_with_storage,
+        push_processing_row, push_withdrawal_with_nonce, requeue_attempts, row_status,
+        row_updated_at, sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::SignerUtil;
-    use crate::storage::common::models::{DbObservedRelease, HaltInfo};
+    use crate::storage::common::models::{DbObservedRelease, HaltInfo, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use solana_commitment_config::CommitmentConfig;
@@ -3105,6 +3238,46 @@ mod tests {
         );
     }
 
+    /// An escalation routed for an earlier incarnation of a withdrawal must not
+    /// park the one recovery requeued and the fetcher locked again.
+    #[tokio::test]
+    async fn a_late_manual_review_cannot_park_the_next_incarnation() {
+        let txn_id = 21;
+        let nonce = 9;
+        let mock = MockStorage::new();
+        push_processing_row(&mock, txn_id);
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap();
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, stale_lease);
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        send_manual_review(
+            &mut state,
+            &withdrawal_ctx(txn_id, nonce),
+            &storage_tx,
+            "nonce consumed on-chain but none of our broadcast signatures landed",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "an escalation for the old incarnation must not reach the writer"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+    }
+
     // ── read failures must not mark a row Failed ─────────────────────
 
     /// Nothing was broadcast when the build itself could not read chain or
@@ -3193,28 +3366,29 @@ mod tests {
     /// that an ordinary retry would settle.
     #[tokio::test]
     async fn build_failure_requeues_the_withdrawal_instead_of_escalating() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
-        state.in_flight_withdrawals.insert(7);
-        state.remint_cache.insert(7, make_remint_info(10));
+        let txn_id = 10;
+        let nonce = 7;
+        let mock = mock_with_processing_row(txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, lease);
+        state.in_flight_withdrawals.insert(nonce);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         send_and_confirm(
             &mut state,
             dummy_instruction(),
             None,
-            &withdrawal_ctx(10, 7),
+            &withdrawal_ctx(txn_id, nonce),
             RetryPolicy::Idempotent,
             &ExtraErrorCheckPolicy::None,
             &storage_tx,
         )
         .await;
 
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
         assert_eq!(
-            row_status(mock, 10),
+            row_status(&mock, txn_id),
             Some(TransactionStatus::Pending),
             "a withdrawal that never broadcast must go back on the queue"
         );
@@ -3223,27 +3397,33 @@ mod tests {
             "no terminal status may be written for a row that never left"
         );
         assert!(
-            !state.in_flight_withdrawals.contains(&7),
+            !state.in_flight_withdrawals.contains(&nonce),
             "an unsent nonce must not hold the rotation barrier"
         );
     }
 
     /// The cap lives in the same write that requeues, so a row that has spent
     /// its budget escalates rather than cycling between Pending and Processing.
+    /// The capped write still bumps `updated_at`, so the escalation has to
+    /// present the lease that write returned or it would park nothing.
     #[tokio::test]
     async fn build_failure_at_the_requeue_cap_escalates_to_manual_review() {
-        let mock = mock_with_processing_row(11);
+        let txn_id = 11;
+        let nonce = 8;
+        let mock = mock_with_processing_row(txn_id);
         mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
             MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let mut state = sender_state_with_storage("http://localhost:8899", mock);
-        state.remint_cache.insert(8, make_remint_info(11));
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, lease);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         send_and_confirm(
             &mut state,
             dummy_instruction(),
             None,
-            &withdrawal_ctx(11, 8),
+            &withdrawal_ctx(txn_id, nonce),
             RetryPolicy::Idempotent,
             &ExtraErrorCheckPolicy::None,
             &storage_tx,
@@ -3254,13 +3434,66 @@ mod tests {
             .try_recv()
             .expect("a row out of requeues must be escalated");
         assert_eq!(update.status, TransactionStatus::ManualReview);
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
+        assert!(update.alert_only, "the fenced write already parked the row");
         assert_eq!(
-            row_status(mock, 11),
-            Some(TransactionStatus::Processing),
-            "the capped write must leave the row where it was"
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::ManualReview),
+            "the escalation must park the row, not requeue it"
+        );
+    }
+
+    /// An attempt that reaches the cap after recovery requeued its row and the
+    /// fetcher claimed it again holds a dead lease. Its requeue must match
+    /// nothing: a bump would fail the new claim, and adopting the bumped lease
+    /// would let the old attempt park work it no longer owns.
+    #[tokio::test]
+    async fn a_stale_attempt_at_the_requeue_cap_leaves_the_next_incarnation_alone() {
+        let txn_id = 14;
+        let nonce = 10;
+        let mock = mock_with_processing_row(txn_id);
+        mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
+            MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        // Recovery spends the last attempt, then the fetcher claims the row again.
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap();
+        let current_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, stale_lease);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the stale attempt must not park the claimed row"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+        assert_eq!(
+            row_updated_at(&mock, txn_id),
+            Some(current_lease),
+            "the stale attempt must not bump the row, or the new claim fails"
         );
     }
 
@@ -3307,14 +3540,18 @@ mod tests {
     /// waiting for the recovery sweep to notice it.
     #[tokio::test]
     async fn read_failure_requeues_the_withdrawal_for_a_bounded_retry() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(13));
-        state.in_flight_withdrawals.insert(9);
+        let txn_id = 13;
+        let nonce = 9;
+        let mock = mock_with_processing_row(txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, lease);
+        state.in_flight_withdrawals.insert(nonce);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         route_builder_error(
             &mut state,
-            &withdrawal_ctx(13, 9),
+            &withdrawal_ctx(txn_id, nonce),
             &storage_tx,
             crate::error::StorageError::DatabaseError {
                 message: "transient".to_string(),
@@ -3323,11 +3560,8 @@ mod tests {
         )
         .await;
 
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
         assert_eq!(
-            row_status(mock, 13),
+            row_status(&mock, txn_id),
             Some(TransactionStatus::Pending),
             "an unreadable chain or database must not freeze the row"
         );
@@ -3335,7 +3569,7 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "a read failure is not a terminal outcome"
         );
-        assert!(!state.in_flight_withdrawals.contains(&9));
+        assert!(!state.in_flight_withdrawals.contains(&nonce));
     }
 
     // ── handle_success ──────────────────────────────────────────────
@@ -4090,13 +4324,23 @@ mod tests {
             deposit_claim_lease: None,
         };
 
-        send_fatal_error(&tx, &ctx, "test error").await;
+        send_fatal_error(
+            &Storage::Mock(MockStorage::new()),
+            &tx,
+            "escrow",
+            &ctx,
+            ctx.deposit_claim_lease,
+            "test error",
+        )
+        .await;
 
         let update = rx.recv().await.unwrap();
         assert_eq!(update.transaction_id, 42);
         assert_eq!(update.status, TransactionStatus::Failed);
         assert!(update.counterpart_signature.is_none());
         assert_eq!(update.error_message.as_deref(), Some("test error"));
+        // No lease means no fenced write, so the writer's write is the only one.
+        assert!(!update.alert_only);
     }
 
     /// Without a transaction id there is nothing to mark as failed, so `send_fatal_error`
@@ -4112,10 +4356,188 @@ mod tests {
             deposit_claim_lease: None,
         };
 
-        send_fatal_error(&tx, &ctx, "test error").await;
+        send_fatal_error(
+            &Storage::Mock(MockStorage::new()),
+            &tx,
+            "escrow",
+            &ctx,
+            ctx.deposit_claim_lease,
+            "test error",
+        )
+        .await;
 
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    /// A failure routed for an earlier incarnation of a deposit must not fail the
+    /// one recovery requeued and the fetcher locked again.
+    #[tokio::test]
+    async fn a_late_deposit_failure_cannot_fail_the_next_incarnation() {
+        let txn_id = 31;
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 1)
+            .await
+            .unwrap();
+        assert_ne!(
+            row_updated_at(&mock, txn_id),
+            Some(stale_lease),
+            "the re-lock is a new incarnation"
+        );
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(stale_lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        send_fatal_error(
+            &storage,
+            &storage_tx,
+            "escrow",
+            &ctx,
+            ctx.deposit_claim_lease,
+            "program error",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a failure for the old incarnation must not reach the writer"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+    }
+
+    /// A failure for the deposit's own incarnation is recorded and still pages.
+    #[tokio::test]
+    async fn a_deposit_failure_for_its_own_incarnation_is_recorded() {
+        let txn_id = 32;
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        send_fatal_error(
+            &storage,
+            &storage_tx,
+            "escrow",
+            &ctx,
+            ctx.deposit_claim_lease,
+            "program error",
+        )
+        .await;
+
+        let update = storage_rx.try_recv().expect("the failure must page");
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert!(update.alert_only, "the fenced write already failed the row");
+        assert_eq!(row_status(&mock, txn_id), Some(TransactionStatus::Failed));
+    }
+
+    /// A deposit failure whose write cannot be verified may have committed, and
+    /// nothing retries a committed write, so it still pages without writing.
+    #[tokio::test]
+    async fn an_unverified_deposit_failure_still_pages_without_writing() {
+        let txn_id = 33;
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        mock.set_should_fail("try_fail_processing", true);
+        let storage = Storage::Mock(mock.clone());
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        send_fatal_error(
+            &storage,
+            &storage_tx,
+            "escrow",
+            &ctx,
+            ctx.deposit_claim_lease,
+            "program error",
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an unverified failure must still page");
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert!(update.alert_only, "the writer must not write it");
+        assert!(update
+            .error_message
+            .is_some_and(|message| message.contains("unverified")));
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+    }
+
+    /// A failure routed for an earlier incarnation of a withdrawal must not fail
+    /// the one recovery requeued and the fetcher locked again.
+    #[tokio::test]
+    async fn a_late_release_failure_cannot_fail_the_next_incarnation() {
+        let txn_id = 34;
+        let nonce = 12;
+        let mock = MockStorage::new();
+        push_processing_row(&mock, txn_id);
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap();
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.release_leases.insert(nonce, stale_lease);
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(txn_id, nonce),
+            &storage_tx,
+            ProgramError::InvalidBuilder {
+                reason: "No signers provided".to_string(),
+            }
+            .into(),
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a failure for the old incarnation must not reach the writer"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
     }
 
     /// A successful mint (no withdrawal nonce) must emit `Completed` with the on-chain
@@ -4529,6 +4951,175 @@ mod tests {
         .await;
 
         send.assert();
+    }
+
+    /// A JIT ManualReview routed for an earlier incarnation of a deposit must not
+    /// park the one recovery requeued and the fetcher locked again.
+    #[tokio::test]
+    async fn a_late_jit_manual_review_cannot_park_the_next_incarnation() {
+        ensure_test_signer();
+        let txn_id = 24;
+        let mut server = mockito::Server::new_async().await;
+        // A foreign authority makes the JIT verdict ManualReview.
+        let _account = mock_initialized_mint(&mut server, Pubkey::new_unique());
+
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let storage = Storage::Mock(mock.clone());
+        assert!(storage
+            .try_requeue_processing(txn_id, stale_lease)
+            .await
+            .unwrap());
+        storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 1)
+            .await
+            .unwrap();
+
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        let mut builder = MintToBuilder::new();
+        builder.mint(Pubkey::new_unique());
+        state.mint_builders.insert(txn_id, builder);
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(stale_lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a verdict for the old incarnation must not reach the writer"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+        // Keyed by transaction id, so this is the later incarnation's builder.
+        assert!(
+            state.mint_builders.contains_key(&txn_id),
+            "a stale verdict must not evict the later incarnation's builder"
+        );
+    }
+
+    /// A JIT ManualReview for the deposit's own incarnation parks the row and pages.
+    #[tokio::test]
+    async fn a_jit_manual_review_for_its_own_incarnation_parks_the_row() {
+        ensure_test_signer();
+        let txn_id = 25;
+        let mut server = mockito::Server::new_async().await;
+        // A foreign authority makes the JIT verdict ManualReview.
+        let _account = mock_initialized_mint(&mut server, Pubkey::new_unique());
+
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        let mut builder = MintToBuilder::new();
+        builder.mint(Pubkey::new_unique());
+        state.mint_builders.insert(txn_id, builder);
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let update = storage_rx.try_recv().expect("the verdict must page");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update.alert_only, "the fenced write already parked the row");
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::ManualReview)
+        );
+    }
+
+    /// A JIT ManualReview whose write cannot be verified still pages without
+    /// writing. It keeps the cached builder, which may be a later incarnation's.
+    #[tokio::test]
+    async fn an_unverified_jit_manual_review_still_pages_and_keeps_the_builder() {
+        ensure_test_signer();
+        let txn_id = 26;
+        let mut server = mockito::Server::new_async().await;
+        // A foreign authority makes the JIT verdict ManualReview.
+        let _account = mock_initialized_mint(&mut server, Pubkey::new_unique());
+
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        mock.set_should_fail("try_quarantine_processing", true);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        let mut builder = MintToBuilder::new();
+        builder.mint(Pubkey::new_unique());
+        state.mint_builders.insert(txn_id, builder);
+
+        let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: Some(lease),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an unverified verdict must still page");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update.alert_only, "the writer must not write it");
+        assert!(update
+            .error_message
+            .is_some_and(|message| message.contains("unverified")));
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing)
+        );
+        assert!(
+            state.mint_builders.contains_key(&txn_id),
+            "an unverified verdict must not evict the cached builder"
+        );
     }
 
     /// The confirmed arm must release the finalized entry's in-flight slot before the

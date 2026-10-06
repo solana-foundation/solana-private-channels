@@ -1129,14 +1129,22 @@ impl MockStorage {
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, StorageError> {
         self.check_should_fail("try_requeue_prebroadcast")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
-            if txn.id == transaction_id && txn.status == TransactionStatus::Processing {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                // The capped write still matches the row, so the trigger bumps it.
                 if txn.recovery_requeue_attempts >= max_attempts {
-                    return Ok(RequeueOutcome::AtCap);
+                    txn.updated_at = Utc::now();
+                    return Ok(RequeueOutcome::AtCap {
+                        lease: txn.updated_at,
+                    });
                 }
                 txn.status = TransactionStatus::Pending;
                 txn.recovery_requeue_attempts += 1;
@@ -1224,6 +1232,28 @@ impl MockStorage {
             {
                 txn.status = TransactionStatus::Pending;
                 txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn try_fail_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_fail_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Failed;
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
                 return Ok(true);
             }
         }

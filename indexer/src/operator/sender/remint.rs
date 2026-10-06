@@ -354,6 +354,7 @@ pub async fn execute_deferred_remint(
                     error_message: Some(entry.original_error.clone()),
                     remint_signature: Some(signature.to_string()),
                     remint_attempted: true,
+                    alert_only: false,
                 },
                 "transaction status update",
             )
@@ -389,6 +390,7 @@ pub async fn execute_deferred_remint(
                         error_message: Some(combined),
                         remint_signature: None,
                         remint_attempted: true,
+                        alert_only: false,
                     },
                     "transaction status update",
                 )
@@ -1135,6 +1137,7 @@ async fn send_manual_review(
             error_message: Some(format!("{} | {}", entry.original_error, reason)),
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         },
         "transaction status update",
     )
@@ -1175,6 +1178,7 @@ async fn send_completed(
             error_message: None,
             remint_signature: None,
             remint_attempted: false,
+            alert_only: false,
         },
         "transaction status update",
     )
@@ -1215,6 +1219,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    alert_only: false,
                 },
                 "transaction status update",
             )
@@ -1252,6 +1257,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    alert_only: false,
                 },
                 "transaction status update",
             )

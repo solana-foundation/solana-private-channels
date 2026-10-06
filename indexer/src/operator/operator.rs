@@ -843,6 +843,7 @@ mod tests {
                 error_message: Some("boot reconcile".to_string()),
                 remint_signature: None,
                 remint_attempted: false,
+                alert_only: false,
             })
             .expect("queue the update");
         let handle = tokio::spawn(async move {
