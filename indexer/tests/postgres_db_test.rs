@@ -599,12 +599,15 @@ async fn lock_pending_sets_processing() -> Result<(), Box<dyn std::error::Error>
 async fn lock_pending_second_call_empty() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
+    cover_fixture_deposits(&storage).await?;
     let txn = make_db_transaction("lock2", TransactionType::Deposit);
     storage.insert_db_transaction(&txn).await?;
 
-    let _ = storage
+    let first = storage
         .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
         .await?;
+    assert_eq!(first.len(), 1, "the first call claims the deposit");
+    assert_eq!(first[0].signature, "lock2");
     let second = storage
         .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
         .await?;
