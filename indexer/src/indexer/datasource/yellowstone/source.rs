@@ -2178,6 +2178,80 @@ mod tests {
         );
     }
 
+    /// A feed that sends no `stack_height` still decodes two CPI escrow deposits,
+    /// each reading its own event, instead of tearing the stream down.
+    #[tokio::test]
+    async fn handle_transaction_decodes_cpi_escrow_deposits_without_stack_heights() {
+        use crate::operator::utils::account_util::find_instance_pda;
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes_full, deposit_ix_bytes};
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        let instance_seed = Pubkey::new_from_array([50u8; 32]);
+        // Escrow at key 0, foreign router at key 1 (also the user), instance PDA at 2, mint at 3.
+        let mut account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys[0] = escrow.to_bytes().to_vec();
+        account_keys[2] = find_instance_pda(&instance_seed).to_bytes().to_vec();
+        let user = Pubkey::try_from(account_keys[1].as_slice()).unwrap();
+        let mint = Pubkey::try_from(account_keys[3].as_slice()).unwrap();
+
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        }];
+        let deposit = || proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: (0u8..12).collect(),
+            data: deposit_ix_bytes(1000, None),
+            stack_height: None,
+        };
+        let event = |amount: u64| proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: vec![],
+            data: deposit_event_bytes_full(instance_seed, user, amount, user, mint),
+            stack_height: None,
+        };
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![deposit(), event(300), deposit(), event(480)],
+        }];
+
+        let tx_update =
+            escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(m)) = rx.recv().await {
+            metas.push(m);
+        }
+
+        assert_eq!(metas.len(), 2, "both CPI deposits are indexed");
+        assert_eq!(metas[0].inner_index, Some(0));
+        assert_eq!(
+            escrow_deposit_amount(&metas[0]),
+            300,
+            "deposit A reads its own event"
+        );
+        assert_eq!(metas[1].inner_index, Some(2));
+        assert_eq!(
+            escrow_deposit_amount(&metas[1]),
+            480,
+            "deposit B reads its own event"
+        );
+    }
+
     /// A top-level escrow deposit whose program id is ALT-loaded is still parsed.
     /// Escrow is the readonly loaded key behind one writable loaded key, so it
     /// only resolves if loaded keys are appended writable-then-readonly after the
@@ -3514,7 +3588,7 @@ async fn parse_and_send(
         // different responses. `parse_failed` means the checkpoint is stuck and nothing is
         // being indexed. Here the gap-fill usually decodes the slot from an endpoint with
         // fuller metadata, so no data is lost and the checkpoint keeps moving; what is wrong
-        // is that a systematic cause (a feed that cannot express CPI stack heights) makes
+        // is that a systematic cause (a feed with incomplete inner instructions) makes
         // this recur per block, so the stream tears down continuously and contributes
         // nothing while RPC quietly does its job. That is worth knowing about, but it is not
         // an emergency, and paging `parse_failed` for it would cry wolf on a healthy slot.
