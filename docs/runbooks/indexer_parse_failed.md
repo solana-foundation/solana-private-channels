@@ -19,12 +19,13 @@ divergent fork`). Yellowstone reaches the fallback through the gap-fill, not the
 An unrecognized discriminator is ignored on purpose, so a program gaining a new
 instruction never causes this. Two causes only:
 
-1. **Thin metadata** (common, fixed by a different endpoint). No `innerInstructions`,
-   or inner instructions with no `stackHeight`. An escrow `Deposit` reads its amount
-   from a `DepositEvent` self-CPI and scopes it by stack height, so either omission
-   makes every CPI deposit undecodable while the block still looks well-formed. Only
-   escrow reads inner instructions, so a channel node returning a null list cannot
-   trip the withdraw indexer.
+1. **Thin metadata** (fixed by a different endpoint). No `innerInstructions`, or an
+   inner list missing the escrow's `DepositEvent` self-CPI. An escrow `Deposit` reads
+   its amount from that event, so either omission makes the deposit undecodable while
+   the block still looks well-formed. A missing `stackHeight` alone is not a cause: a
+   CPI deposit without one reads its event by call order. Only escrow reads inner
+   instructions, so a channel node returning a null list cannot trip the withdraw
+   indexer.
 2. **Layout drift** (a code problem). A program's instruction changed on chain and
    the parser was not updated.
 
@@ -38,8 +39,8 @@ instruction never causes this. Two causes only:
 `parse_failed_stream` loses no data. What it costs is the feed: failing a block is how the
 stream withholds a slot, so a systematic cause tears the connection down once per affected
 block, the geyser feed contributes nothing, and the backfill RPC carries the whole load. Fix
-it by repointing the geyser provider at one that emits `stackHeight` on inner instructions,
-or by switching to the RPC-polling datasource and dropping the feed. Everything below is
+it by repointing the geyser provider at one that emits complete inner instructions, or by
+switching to the RPC-polling datasource and dropping the feed. Everything below is
 about `parse_failed`.
 
 ### Detection
@@ -76,9 +77,10 @@ SELECT program_type, last_committed_slot, updated_at FROM indexer_state;
 curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","maxSupportedTransactionVersion":0,"commitment":"finalized"}]}' | jq '.result.transactions[].meta | {inner: (.innerInstructions | length), heights: [.innerInstructions[]?.instructions[]?.stackHeight]}'
 ```
 
-Zero inner instructions or `null` stack heights is cause 1. Real stack heights point
-at cause 2, so read `<reason>`: a borsh or account-count error against a recently
-upgraded program means the parser needs updating.
+Zero inner instructions is cause 1. `null` stack heights alone are not, so read
+`<reason>`: `no escrow entry after it` or `not a DepositEvent` on a CPI deposit means
+the inner list lost the event (cause 1); a borsh or account-count error against a
+recently upgraded program means the parser needs updating (cause 2).
 
 ### Recovery
 
@@ -88,7 +90,7 @@ upgraded program means the parser needs updating.
    configured. Both are read once at startup, so restart the process.
 2. On Yellowstone the slot is replayed by the reconnect gap-fill over RPC, so the
    endpoint to fix is the backfill RPC URL. The gRPC provider must also emit
-   `stackHeight` for live escrow deposits to decode.
+   complete inner instructions for live escrow deposits to decode.
 3. Watch the counter go quiet and the checkpoint resume. The indexer re-reads from
    its stored checkpoint, so nothing is replayed by hand and nothing is skipped.
 
@@ -111,15 +113,15 @@ one; there is no operator command that marks a slot skipped, and there should no
 ### Before deploying
 
 Screen every endpoint the deploy uses, not just the primary: failing closed makes a thin
-one a halt rather than a dropped row, and a fallback that strips stack heights recovers
-nothing. Each is asked for its own finalized tip, so a lagging node still answers. An unset
+one a halt rather than a dropped row, and a fallback that strips inner instructions
+recovers nothing. Each is asked for its own finalized tip, so a lagging node still answers. An unset
 `COMMON_FALLBACK_RPC_URL` is skipped rather than probed, since only that one is optional.
 
 ```sh
-for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; slot=$(curl -s "$url" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' | jq -r .result); [ -n "$slot" ] && [ "$slot" != null ] || { echo "no finalized tip, endpoint unreachable or not serving"; continue; }; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$slot,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq '[.result.transactions[].meta.innerInstructions[]?.instructions[]?.stackHeight] | {heights: length, nulls: map(select(. == null)) | length}'; done
+for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; slot=$(curl -s "$url" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' | jq -r .result); [ -n "$slot" ] && [ "$slot" != null ] || { echo "no finalized tip, endpoint unreachable or not serving"; continue; }; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$slot,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq '[.result.transactions[].meta.innerInstructions] | {txs: length, missing: map(select(. == null)) | length}'; done
 ```
 
-Any `nulls` is cause 1 on that endpoint. `heights: 0` is inconclusive on a quiet chain, so
+Any `missing` is cause 1 on that endpoint. `txs: 0` is inconclusive on a quiet chain, so
 re-run it against a slot known to carry a deposit. Screens cause 1 only. A skipped fallback
 means the deploy has no failover, so a thin primary halts ingestion instead of recovering.
 
