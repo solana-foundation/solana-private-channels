@@ -649,7 +649,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} keeps receiving geyser blocks whose parent is not the last block it forwarded, so the provider is dropping finalized blocks. Each hole is re-read over RPC by the gap-fill, but if drops outpace fills the checkpoint stops moving. Switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} keeps receiving geyser blocks whose parent is not the last block it forwarded, or finalized slots whose blocks never arrive, so the provider is dropping finalized blocks. Each hole is re-read over RPC by the gap-fill, but if drops outpace fills the checkpoint stops moving. Switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: warning
         data:
