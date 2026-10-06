@@ -112,29 +112,48 @@ arrives whole before it can be counted, so that bound covers what a fetch return
 not that brief reply.
 
 **Resident account memory**: the preload budget bounds one fetch, but the cache
-keeps what it loads, so BOB is also capped by bytes (1 GiB) as well as by entry
-count. After each preload lands, clean entries are evicted largest first until the
-cache is back under 90% of that cap. The accounts the preload was asked for are
-never evicted, and neither are unsettled writes, so resident account data stays
-within the cap plus one preload. Rows are decoded as they stream in, so a preload
-briefly costs about 1.07 times the bytes it fetches. Results leaving the executor
+keeps what it loads, so BOB is capped by entry count (1,000,000) and by bytes
+(1 GiB). Both caps run after each preload lands: the entry cap evicts the oldest
+clean entries first and the byte cap the largest, each until the cache is back
+under 90% of its cap. The accounts the preload was asked for are never evicted,
+and neither are unsettled writes, so every account the batch reads reaches the
+SVM. Resident entries and account data each stay within the cap plus one preload
+plus the writes the settler has not yet acknowledged, since only clean entries
+can be evicted. Rows are decoded as they stream in, so a preload briefly costs about
+1.07 times the bytes it fetches. Results leaving the executor
 keep writable account data and every account's lamports but drop readonly data,
 which nothing downstream reads; otherwise a result would keep an evicted account
 alive until the settler had finished with it.
 
-**Blockhash expiry**: the live window keeps advancing while a batch waits on
-that account load, so validity is checked twice. The check on arrival only
-avoids loading accounts for a transaction that is already dead; the check after
-the load is the one that decides whether a transaction may run, and the run from
-it to both VM dispatches is synchronous, so what remains between the verdict and
-the dispatch is microseconds rather than a whole account load. Neither VM would
-catch a stale transaction later, since Core supplies successful transaction
-prechecks and a default processing blockhash. Without the second check a
-transaction could expire while its accounts loaded and still execute beside the
-replacement a client signs once `isBlockhashValid` reports the original hash
-dead, debiting the sender twice. A transaction dropped this way is never
-settled, so it stays absent from `getSignatureStatuses` exactly as one dropped
-on arrival does.
+**Blockhash expiry**: a transaction commits in a block whose height is at most
+`lastValidBlockHeight + 1` of its blockhash, or it never commits. The live window
+keeps advancing while a batch waits on its account load, so validity is checked
+twice. The check on arrival only avoids loading accounts for a transaction that
+is already dead. The check after the load decides whether a transaction may run.
+Under the same read lock it counts the batch as an *admission* if anything in it
+is still live, and the last results message of that batch carries the admission's
+number. Neither VM would catch a stale transaction later, since Core supplies
+successful transaction prechecks and a default processing blockhash.
+
+Before it cuts each block, the settler retires the hash that block expires under
+the window's write lock, and counts the block as announced in the same step. If
+it retired anything, it keeps receiving results, past its buffer caps if need be,
+until the last message of every admission made before the retire has arrived,
+and puts them all in this block. An admission either came first and lands in this
+block, or came after and found the hash gone. So once `getBlockHeight` is above a
+hash's `lastValidBlockHeight`, every transaction built on it that will ever
+commit is already readable, because a block's statuses and its height commit in
+one Postgres transaction. From the retire until dedup takes in the new block's
+hash, which is after that block commits, `isBlockhashValid` answers the retryable
+"catching up" error for the retired hash rather than `false`. So `false` means
+the original can no longer land, not that it did not, and it comes from the write
+node while `getSignatureStatuses` is served by a read replica that can lag. A
+client may re-sign only after `getBlockHeight` is above the old
+`lastValidBlockHeight` and a `getSignatureStatuses` read made after that height
+read, on the same endpoint, is still `null`; otherwise the original and its
+replacement can both execute. A transaction dropped by either
+check is never settled, so it stays absent from `getSignatureStatuses` exactly as
+one dropped on arrival does.
 
 
 **Execution Modes**:
@@ -199,11 +218,11 @@ Batches execution results every 100ms (configurable) and commits to PostgreSQL, 
 
 The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache. It is also bounded: a cache that has not answered within the budget is abandoned for that block, and one that keeps failing is left alone for a cooldown, then probed with a PING off the block path and rebuilt before it is mirrored to again.
 
-The settler also caps what it buffers between ticks: the settled account bytes, and the address-index rows the block will write, one per account key per transaction. Once a tick's buffer reaches either budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
+The settler also caps what it buffers between ticks: the settled account bytes, and the address-index rows the block will write, one per account key per transaction. Once a tick's buffer reaches either budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. A block that waits on an admission (see blockhash expiry above) drains the queue past the budget, so the queue itself is bounded too: the executor's in-flight budget weighs each message by its bytes or its address rows, whichever is more, and a full buffer plus that whole budget still fits the address-index writer. The rest of the admitted sub-batch also lands in that block; its rows fit at the default batch size, and in bytes the block can reach about 512 MiB, which a compile-time check keeps under Postgres' 1 GB limit for one bound value. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
 
-Both queues either side of the settler are bounded by the account bytes and index rows their messages carry, not only by how many messages are queued. The executor holds a byte budget for the results it has sent but the settler has not yet received, sized at two of its own chunks, and the settler holds a row budget for the address-index rows it has handed to the background writer but the writer has not yet folded into a flush. In each case the budget travels inside the message and comes back when the message is consumed or dropped, so no consumer has to account for it.
+Both queues either side of the settler are bounded by the account bytes and index rows their messages carry, not only by how many messages are queued. The executor holds a budget for the results it has sent but the settler has not yet received, sized at two of its own chunks and counting a message's address rows as well as its bytes, and the settler holds a row budget for the address-index rows it has handed to the background writer but the writer has not yet folded into a flush. In each case the budget travels inside the message and comes back when the message is consumed or dropped, so no consumer has to account for it.
 
-Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop. That acknowledgement is merged into a per-account inbox rather than sent on a queue, so it never blocks settlement: BOB drains it only while the executor runs and the executor runs only while the settler drains, so a blocking send would deadlock the three stages. Each account keeps only its newest settlement, which is all BOB can act on, so the inbox never holds more entries than BOB has dirty accounts. A settlement carries the generation of the executor write it made durable, not a mark for the whole block, so when the executor splits one batch across two messages and they land in different blocks, each account is still acknowledged for exactly the write that committed. It shares the account buffers BOB is already pinning rather than copying them, so its size costs metadata, not account data. The settled blockhash goes to dedup on a queue as deep as the blockhash window; dedup drains it even while its own forward to the sequencer is parked, so the settler only ever waits on it briefly.
+Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop. That acknowledgement is merged into a per-account inbox rather than sent on a queue, so it never blocks settlement: BOB drains it only while the executor runs and the executor runs only while the settler drains, so a blocking send would deadlock the three stages. Each account keeps only its newest settlement, which is all BOB can act on, so the inbox never holds more entries than BOB has dirty accounts. A settlement carries the generation of the executor write it made durable, not a mark for the whole block, so when the executor splits one batch across two messages and they land in different blocks, each account is still acknowledged for exactly the write that committed. It shares the account buffers BOB is already pinning rather than copying them, so its size costs metadata, not account data. The settler retires the hash each block expires from the dedup window itself, before it cuts the block, so the window keeps moving during a shutdown drain after dedup has stopped. The settled blockhash goes to dedup on a queue as deep as the blockhash window; dedup drains it even while its own forward to the sequencer is parked, so the settler only ever waits on it briefly.
 
 **Location**: [`core/src/stages/settle.rs`](../core/src/stages/settle.rs)
 

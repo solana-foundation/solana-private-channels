@@ -8,7 +8,7 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::{retained_bytes_of, ExecutedBatch, SettledInbox, WeightBudget},
+        stages::{retained_bytes_of, BlockhashProgress, ExecutedBatch, SettledInbox, WeightBudget},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
@@ -38,7 +38,7 @@ use {
     solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
     std::{
         collections::{HashMap, HashSet, LinkedList},
-        sync::{Arc, RwLock},
+        sync::{atomic::Ordering, Arc, RwLock},
         time::{Duration, Instant},
     },
     tokio::sync::mpsc,
@@ -66,6 +66,9 @@ pub struct ExecutionArgs {
     /// Shared live-blockhash window (same Arc advanced by dedup). Read twice
     /// per batch, the second time after the account load decides what executes.
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// The node's shared counters. The executor bumps `admissions` under the
+    /// window's read guard, and the settler waits on them before cutting a block.
+    pub blockhash_progress: Arc<BlockhashProgress>,
 }
 
 pub struct ExecutionDeps {
@@ -77,6 +80,9 @@ pub struct ExecutionDeps {
     pub max_svm_workers: usize,
     /// Shared live-blockhash window
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// Private by default, so a caller like simulation never bumps the node's
+    /// counter. The worker swaps in the shared one.
+    pub blockhash_progress: Arc<BlockhashProgress>,
     /// The environments the program cache entries were compiled against.
     ///
     /// The cache matches an entry to an environment by pointer, so framing a
@@ -108,6 +114,9 @@ pub struct ExecutionResult {
     /// order. Nothing has been done to them, so the caller reruns them as their
     /// own batch once these results are off its hands.
     pub deferred: Vec<SanitizedTransaction>,
+    /// This batch's admission number, `None` when nothing in it was live at the
+    /// final check. The last message sent for the batch carries it.
+    pub admission: Option<u64>,
 }
 
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
@@ -120,6 +129,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         max_svm_workers,
         heartbeat,
         live_blockhashes,
+        blockhash_progress,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -137,6 +147,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
             live_blockhashes,
         )
         .await;
+        execution_deps.blockhash_progress = blockhash_progress;
 
         // Stage-private: nothing outside the executor takes from this budget.
         let results_budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
@@ -208,6 +219,7 @@ pub async fn get_execution_deps(
         admin_vm,
         max_svm_workers,
         live_blockhashes,
+        blockhash_progress: Arc::default(),
         program_runtime_environments: batch_processor.environments,
         max_tx_loaded_accounts_bytes: MAX_TX_LOADED_ACCOUNTS_BYTES,
         preload_budget_bytes: MAX_BATCH_PRELOAD_BYTES,
@@ -401,10 +413,40 @@ const _: () = assert!(
         <= crate::stages::MAX_QUEUED_ADDRESS_ROWS
 );
 
-/// Cap on retained account bytes sent to the settler but not yet received.
+/// Cap on the weight of results sent to the settler but not yet received.
 /// Two whole chunks, so the executor can hand one over while the settler still
 /// holds the previous one and ordinary traffic never waits on the budget.
 pub(crate) const MAX_IN_FLIGHT_RESULT_BYTES: usize = 2 * MAX_SEND_CHUNK_BYTES;
+
+/// What one address row weighs in the in-flight budget. A chunk at both caps
+/// then weighs at most one byte-capped chunk.
+pub(crate) const RESULT_BYTES_PER_ROW: usize = MAX_SEND_CHUNK_BYTES / MAX_SEND_CHUNK_ROWS;
+
+/// A message weighs its bytes or its rows, whichever is more. Rows count because
+/// a block that waits on an admission takes the whole queue, gate or no gate.
+fn result_weight(bytes: usize, rows: usize) -> usize {
+    bytes.max(rows.saturating_mul(RESULT_BYTES_PER_ROW))
+}
+
+/// A block that waits on an admission takes a full buffer, the message past its cap
+/// and the in-flight budget, plus the rest of one sub-batch in the slack at the default
+/// batch size. A larger batch can overflow it; the writer's budget then takes the block alone.
+const _: () = assert!(
+    crate::stages::MAX_BUFFERED_SETTLE_ROWS
+        + MAX_SEND_CHUNK_ROWS
+        + MAX_IN_FLIGHT_RESULT_BYTES / RESULT_BYTES_PER_ROW
+        <= crate::stages::MAX_QUEUED_ADDRESS_ROWS
+);
+
+/// The same held block in bytes: the rest of its sub-batch is bounded by the preload
+/// budget, and the whole must stay under Postgres' 1 GB limit for one bound value.
+const _: () = assert!(
+    crate::stages::MAX_BUFFERED_SETTLE_BYTES
+        + MAX_SEND_CHUNK_BYTES
+        + MAX_IN_FLIGHT_RESULT_BYTES
+        + MAX_BATCH_PRELOAD_BYTES
+        < 1024 * 1024 * 1024
+);
 
 /// A chunk that could not fit the budget would wait for room that never comes.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= MAX_IN_FLIGHT_RESULT_BYTES);
@@ -471,6 +513,12 @@ pub(crate) async fn process_batch(
                 admin_results,
                 execution_result.admin_transactions,
                 execution_result.admin_generation,
+                // The tag rides the last send, which is the regular one if any.
+                if execution_result.regular_transactions.is_empty() {
+                    execution_result.admission
+                } else {
+                    None
+                },
                 MAX_SEND_CHUNK_BYTES,
                 MAX_SEND_CHUNK_ROWS,
                 results_budget,
@@ -500,6 +548,7 @@ pub(crate) async fn process_batch(
                 regular_results,
                 execution_result.regular_transactions,
                 execution_result.regular_generation,
+                execution_result.admission,
                 MAX_SEND_CHUNK_BYTES,
                 MAX_SEND_CHUNK_ROWS,
                 results_budget,
@@ -537,12 +586,20 @@ pub(crate) async fn process_batch(
     }
 }
 
-/// One chunk of a batch: where it starts and ends, and the account bytes it
-/// retains. Carrying the byte sum out means the send path can take its share of
-/// the in-flight budget without walking every account a second time.
+/// One chunk of a batch: where it starts and ends, and the account bytes and
+/// address rows it retains. Carrying the sums out means the send path can take
+/// its share of the in-flight budget without walking every account a second time.
 struct ChunkRange {
     range: std::ops::Range<usize>,
     bytes: usize,
+    rows: usize,
+}
+
+impl ChunkRange {
+    /// The chunk's share of the in-flight budget.
+    fn weight(&self) -> usize {
+        result_weight(self.bytes, self.rows)
+    }
 }
 
 /// Where to split a batch, as end-exclusive index ranges over its transactions.
@@ -570,6 +627,7 @@ fn chunk_ranges(
             ranges.push(ChunkRange {
                 range: start..index,
                 bytes: buffered,
+                rows: buffered_rows,
             });
             start = index;
             buffered = 0;
@@ -582,6 +640,7 @@ fn chunk_ranges(
         ranges.push(ChunkRange {
             range: start..results.len(),
             bytes: buffered,
+            rows: buffered_rows,
         });
     }
     ranges
@@ -618,12 +677,14 @@ fn record_unsent(
 /// Send results to the settler in byte-bounded and row-bounded messages. A batch
 /// under both caps goes untouched. Every chunk carries the batch's generation: the
 /// settler acknowledges each account at the write it committed, never a whole block.
+/// Only the last message carries `admission`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_results_chunked(
     results_tx: &mpsc::Sender<ExecutedBatch>,
     output: LoadAndExecuteSanitizedTransactionsOutput,
     transactions: Vec<SanitizedTransaction>,
     generation: u64,
+    admission: Option<u64>,
     cap: usize,
     row_cap: usize,
     budget: &WeightBudget,
@@ -633,7 +694,7 @@ pub(crate) async fn send_results_chunked(
     if ranges.len() <= 1 {
         // Empty only when the batch is empty or its lengths disagree, and the
         // settler rejects the latter on arrival, so nothing is left unweighed.
-        let weight = ranges.first().map_or(0, |chunk| chunk.bytes);
+        let weight = ranges.first().map_or(0, ChunkRange::weight);
         let Some(permit) = budget.acquire(weight, results_tx).await else {
             record_unsent(&transactions, &[], metrics);
             return SendOutcome::ChannelClosed;
@@ -644,6 +705,7 @@ pub(crate) async fn send_results_chunked(
                 output,
                 transactions,
                 generation,
+                admission,
                 permit,
             },
         )
@@ -670,7 +732,8 @@ pub(crate) async fn send_results_chunked(
     let mut head = Some((error_metrics, execute_timings, balance_collector));
 
     let mut sent = 0usize;
-    for chunk_range in ranges.iter() {
+    let last = ranges.len() - 1;
+    for (index, chunk_range) in ranges.iter().enumerate() {
         let take = chunk_range.range.end - chunk_range.range.start;
         let (error_metrics, execute_timings, balance_collector) =
             head.take().unwrap_or_else(|| {
@@ -687,7 +750,7 @@ pub(crate) async fn send_results_chunked(
             balance_collector,
         };
         let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
-        let Some(permit) = budget.acquire(chunk_range.bytes, results_tx).await else {
+        let Some(permit) = budget.acquire(chunk_range.weight(), results_tx).await else {
             if sent > 0 {
                 metrics.executor_results_sent(sent);
             }
@@ -700,6 +763,8 @@ pub(crate) async fn send_results_chunked(
                 output: chunk,
                 transactions: chunk_transactions,
                 generation,
+                // One FIFO queue, so the last chunk arriving proves the rest did.
+                admission: if index == last { admission } else { None },
                 permit,
             },
         )
@@ -936,6 +1001,36 @@ fn shed_readonly_account_data(
     }
 }
 
+/// Copy the live window under its read lock, so the per-tx check is a hash lookup.
+fn snapshot_window(live_blockhashes: &RwLock<LinkedList<Hash>>) -> HashSet<Hash> {
+    live_blockhashes
+        .read()
+        .expect("blockhash lock poisoned")
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// The final check. Copies the window and, if any tx is still live in that copy,
+/// counts this batch as an admission, both under one read guard. The settler
+/// retires under the write guard, so it either sees this admission or we miss the hash.
+fn snapshot_and_admit(
+    live_blockhashes: &RwLock<LinkedList<Hash>>,
+    transactions: &[SanitizedTransaction],
+    oversized: &[SanitizedTransaction],
+    progress: &BlockhashProgress,
+) -> (HashSet<Hash>, Option<u64>) {
+    let guard = live_blockhashes.read().expect("blockhash lock poisoned");
+    let live: HashSet<Hash> = guard.iter().copied().collect();
+    let admits = transactions
+        .iter()
+        .chain(oversized)
+        .any(|tx| live.contains(tx.message().recent_blockhash()));
+    let admission = admits.then(|| progress.admissions.fetch_add(1, Ordering::Release) + 1);
+    drop(guard);
+    (live, admission)
+}
+
 /// Keep only the transactions whose recent blockhash is still in the live
 /// window, in input order. Order matters because each partition's transactions
 /// are later zipped positionally against the SVM results the settler reads.
@@ -944,18 +1039,10 @@ fn shed_readonly_account_data(
 /// log line says whether it aged out before the account load or during it.
 fn retain_live(
     mut transactions: Vec<SanitizedTransaction>,
-    live_blockhashes: &RwLock<LinkedList<Hash>>,
+    live: &HashSet<Hash>,
     metrics: &SharedMetrics,
     when: &'static str,
 ) -> Vec<SanitizedTransaction> {
-    // Snapshot under the lock once, so the per-tx check is a hash lookup.
-    let live: HashSet<Hash> = live_blockhashes
-        .read()
-        .expect("blockhash lock poisoned")
-        .iter()
-        .copied()
-        .collect();
-
     // Retained in place, so the usual no-drop batch reallocates nothing.
     let mut dropped = 0usize;
     transactions.retain(|tx| {
@@ -1000,7 +1087,7 @@ pub async fn execute_batch(
     // Cheap first pass, so the account load never pays for an already-dead tx.
     let all_transactions = retain_live(
         all_transactions,
-        &execution_deps.live_blockhashes,
+        &snapshot_window(&execution_deps.live_blockhashes),
         metrics,
         "pipeline wait",
     );
@@ -1113,33 +1200,24 @@ pub async fn execute_batch(
     );
     metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
 
-    // The window keeps advancing while the load above is pending, so a tx that
-    // was live when the batch arrived can be expired by now. Nothing downstream
-    // catches it: both VMs get all-Ok prechecks and a default processing
-    // blockhash. Without this a client told the hash is dead can re-sign, and
-    // the stale tx and its replacement both execute.
-    //
-    // Dedup can still evict on its own task just after this reads, so the
-    // verdict is not atomic with the dispatch. What keeps that harmless is the
-    // synchronous run from here to both VMs: the gap is microseconds rather
-    // than a whole account load. An await added in between restores the bug.
-    let all_transactions = retain_live(
-        all_transactions,
+    // The window moves during the load, and neither VM rechecks the blockhash.
+    // The window can still move right after this check. That is safe because the
+    // settler waits for a counted admission before cutting the block that expires it.
+    let (live, admission) = snapshot_and_admit(
         &execution_deps.live_blockhashes,
-        metrics,
-        "account preload",
+        &all_transactions,
+        &oversized_transactions,
+        &execution_deps.blockhash_progress,
     );
+    // No Err or await after this point but the sends: the settler waits for this
+    // admission, so returning without sending it would stall block production.
+    let all_transactions = retain_live(all_transactions, &live, metrics, "account preload");
     // An oversized tx is never loaded, but one that expired meanwhile still gets
     // no result, the same outcome it would have had if its accounts were loaded.
     let oversized_transactions = if oversized_transactions.is_empty() {
         oversized_transactions
     } else {
-        retain_live(
-            oversized_transactions,
-            &execution_deps.live_blockhashes,
-            metrics,
-            "account preload",
-        )
+        retain_live(oversized_transactions, &live, metrics, "account preload")
     };
     if !oversized_transactions.is_empty() {
         for tx in &oversized_transactions {
@@ -1409,6 +1487,7 @@ pub async fn execute_batch(
         admin_generation,
         regular_generation,
         deferred,
+        admission,
     })
 }
 
@@ -1767,10 +1846,11 @@ mod tests {
         let cap = 1000usize;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
         let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        // Generation and admission tag of each message, in send order.
         let generations = |rx: &mut mpsc::Receiver<ExecutedBatch>| {
             let mut gens = Vec::new();
             while let Ok(batch) = rx.try_recv() {
-                gens.push(batch.generation);
+                gens.push((batch.generation, batch.admission));
             }
             gens
         };
@@ -1783,6 +1863,7 @@ mod tests {
             output_of(results),
             txs,
             42,
+            Some(7),
             cap,
             MAX_SEND_CHUNK_ROWS,
             &budget,
@@ -1792,8 +1873,8 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Sent));
         assert_eq!(
             generations(&mut rx),
-            vec![42, 42, 42],
-            "every byte-split chunk must carry the batch's generation"
+            vec![(42, None), (42, None), (42, Some(7))],
+            "every byte-split chunk carries the generation, only the last the admission"
         );
 
         // Weightless transfers of three keys each, so a row cap of three splits per transaction.
@@ -1804,6 +1885,7 @@ mod tests {
             output_of(results),
             txs,
             43,
+            Some(8),
             cap,
             3,
             &budget,
@@ -1813,8 +1895,8 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Sent));
         assert_eq!(
             generations(&mut rx),
-            vec![43, 43, 43],
-            "every row-split chunk must carry the batch's generation"
+            vec![(43, None), (43, None), (43, Some(8))],
+            "every row-split chunk carries the generation, only the last the admission"
         );
 
         // Under both caps the batch goes as one message, still stamped.
@@ -1825,6 +1907,7 @@ mod tests {
             output_of(results),
             txs,
             7,
+            Some(9),
             cap,
             MAX_SEND_CHUNK_ROWS,
             &budget,
@@ -1834,8 +1917,8 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Sent));
         assert_eq!(
             generations(&mut rx),
-            vec![7],
-            "an unsplit batch stays one message"
+            vec![(7, Some(9))],
+            "an unsplit batch stays one message and carries the admission"
         );
     }
 
@@ -1872,6 +1955,7 @@ mod tests {
             output_of(results),
             txs,
             1,
+            None,
             MAX_SEND_CHUNK_BYTES,
             MAX_SEND_CHUNK_ROWS,
             &WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES),
@@ -1917,6 +2001,7 @@ mod tests {
                 output_of(results),
                 txs,
                 9,
+                None,
                 1000,
                 MAX_SEND_CHUNK_ROWS,
                 &budget,
@@ -1941,9 +2026,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_chunk_parks_on_bytes_and_the_receive_returns_them() {
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
-        let (results, txs) = sized_batch(&[600, 600]);
+        let (results, txs) = sized_batch(&[6000, 6000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let budget = Arc::new(WeightBudget::new(1000));
+        let budget = Arc::new(WeightBudget::new(10_000));
 
         let sender = tokio::spawn({
             let budget = Arc::clone(&budget);
@@ -1953,7 +2038,8 @@ mod tests {
                     output_of(results),
                     txs,
                     3,
-                    1000,
+                    None,
+                    10_000,
                     MAX_SEND_CHUNK_ROWS,
                     &budget,
                     &metrics,
@@ -1979,7 +2065,7 @@ mod tests {
         assert!(matches!(sender.await.unwrap(), SendOutcome::Sent));
         assert_eq!(
             budget.available(),
-            1000,
+            10_000,
             "every permit comes back with its message"
         );
     }
@@ -1989,16 +2075,17 @@ mod tests {
     #[tokio::test]
     async fn an_unsplit_batch_takes_its_retained_bytes() {
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
-        let (results, txs) = sized_batch(&[300, 400]);
+        let (results, txs) = sized_batch(&[30_000, 40_000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let budget = WeightBudget::new(1000);
+        let budget = WeightBudget::new(100_000);
 
         let outcome = send_results_chunked(
             &chan_tx,
             output_of(results),
             txs,
             1,
-            1000,
+            None,
+            100_000,
             MAX_SEND_CHUNK_ROWS,
             &budget,
             &metrics,
@@ -2007,12 +2094,54 @@ mod tests {
         assert!(matches!(outcome, SendOutcome::Sent));
         assert_eq!(
             budget.available(),
-            300,
-            "the queued message holds all 700 of its retained bytes"
+            30_000,
+            "the queued message holds all 70000 of its retained bytes"
         );
 
         drop(rx.recv().await.expect("the one message"));
-        assert_eq!(budget.available(), 1000);
+        assert_eq!(budget.available(), 100_000);
+    }
+
+    /// Results that hold no account data still cost the settler address rows,
+    /// so the in-flight budget weighs rows too, or a flood of them is free.
+    #[tokio::test]
+    async fn a_dataless_many_key_batch_weighs_its_rows() {
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let extra: Vec<Pubkey> = (0..30).map(|_| Pubkey::new_unique()).collect();
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &extra);
+        let accounts = tx
+            .message()
+            .account_keys()
+            .iter()
+            .map(|key| (*key, AccountSharedData::new(1, 0, &Pubkey::default())))
+            .collect();
+        let results = vec![executed_with(accounts)];
+        let txs = vec![tx];
+        assert_eq!(retained_account_bytes(&results, &txs), 0, "no data held");
+        let rows = crate::stages::retained_rows(&txs);
+
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            1,
+            None,
+            MAX_SEND_CHUNK_BYTES,
+            MAX_SEND_CHUNK_ROWS,
+            &budget,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+        assert_eq!(
+            budget.available(),
+            MAX_IN_FLIGHT_RESULT_BYTES - rows * RESULT_BYTES_PER_ROW,
+            "a dataless message weighs its rows"
+        );
+        drop(rx.recv().await.expect("the one message"));
+        assert_eq!(budget.available(), MAX_IN_FLIGHT_RESULT_BYTES);
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
@@ -3479,6 +3608,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
             live_blockhashes: default_live_blockhashes(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -3804,6 +3934,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
             live_blockhashes: default_live_blockhashes(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -3925,6 +4056,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
+        let progress = Arc::new(BlockhashProgress::default());
 
         let _handle = start_execution_worker(ExecutionArgs {
             batch_rx,
@@ -3935,6 +4067,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
             live_blockhashes: default_live_blockhashes(),
+            blockhash_progress: Arc::clone(&progress),
         })
         .await;
 
@@ -3950,15 +4083,26 @@ mod tests {
 
         // First result is available.
         let first = tokio::time::timeout(Duration::from_secs(5), execution_results_rx.recv()).await;
-        assert!(first.is_ok(), "first result must arrive");
+        let first = first
+            .expect("first result must arrive")
+            .expect("open channel");
+        // The worker must count on the node's shared counter, not a private one.
+        assert_eq!(first.admission, Some(1), "the result carries its admission");
 
         // Draining the first unblocks the executor's parked send; the second arrives.
         let second =
             tokio::time::timeout(Duration::from_secs(5), execution_results_rx.recv()).await;
         assert!(
-            matches!(second, Ok(Some(_))),
+            matches!(
+                second,
+                Ok(Some(ExecutedBatch {
+                    admission: Some(2),
+                    ..
+                }))
+            ),
             "second result must arrive once the channel drains (no deadlock, no poison)"
         );
+        assert_eq!(progress.admissions.load(Ordering::SeqCst), 2);
 
         shutdown.cancel();
     }
@@ -3984,6 +4128,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
             live_blockhashes: default_live_blockhashes(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -4526,7 +4671,8 @@ mod tests {
     /// preload pulls more than the budget.
     #[tokio::test(flavor = "multi_thread")]
     async fn process_batch_forwards_each_sub_batch_before_running_the_next() {
-        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let (mut accounts_db, pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
         let readonly = seed_sized_accounts(&mut accounts_db, 3, 1_500).await;
         let mut deps = deps_with_budget(accounts_db, 3_000).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
@@ -4555,21 +4701,58 @@ mod tests {
         assert!(matches!(outcome, BatchOutcome::Continue { executed: 3 }));
         drop(results_tx);
 
-        let mut messages = 0;
+        let mut tags = Vec::new();
         let mut seen = HashSet::new();
         while let Some(executed) = results_rx.recv().await {
-            messages += 1;
+            tags.push(executed.admission);
             for tx in &executed.transactions {
                 assert!(seen.insert(*tx.signature()), "a tx must be settled once");
             }
         }
         assert_eq!(
-            messages, 2,
-            "the batch must reach the settler in two pieces"
+            tags,
+            vec![Some(1), Some(2)],
+            "the batch must reach the settler in two pieces, each its own admission"
         );
         assert_eq!(
             seen, expected,
             "every tx must reach the settler exactly once"
+        );
+
+        // Admin and regular in one admission: only the later send is tagged.
+        let mut deps = get_execution_deps(
+            crate::accounts::AccountsDB::new(&url, true).await.unwrap(),
+            SettledInbox::new(),
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let batch = ConflictFreeBatch {
+            transactions: [
+                create_admin_initialize_mint_tx().0,
+                create_test_transaction(),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, tx)| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index,
+            })
+            .collect(),
+        };
+        let (results_tx, mut results_rx) = mpsc::channel::<ExecutedBatch>(8);
+        let outcome =
+            process_batch(batch, &mut deps, &results_tx, &budget, &metrics, &heartbeat).await;
+        assert!(matches!(outcome, BatchOutcome::Continue { executed: 2 }));
+        drop(results_tx);
+        let mut tags = Vec::new();
+        while let Some(executed) = results_rx.recv().await {
+            tags.push(executed.admission);
+        }
+        assert_eq!(
+            tags,
+            vec![None, Some(1)],
+            "admin first, the tag on the last send"
         );
     }
 
@@ -4734,6 +4917,102 @@ mod tests {
         );
     }
 
+    /// The bump sits under the same guard as the snapshot, so whenever the
+    /// snapshot still held the hash, the racing retire must count the admission.
+    #[test]
+    fn snapshot_and_admit_is_atomic_with_retirement() {
+        let expiring = Hash::new_unique();
+        let tx = sanitize_transfer(&Keypair::new(), expiring);
+        for round in 0..2_000 {
+            let live = Arc::new(RwLock::new(LinkedList::from([
+                expiring,
+                Hash::new_unique(),
+            ])));
+            let progress = Arc::new(BlockhashProgress::default());
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let retire = std::thread::spawn({
+                let (live, progress, start) =
+                    (Arc::clone(&live), Arc::clone(&progress), Arc::clone(&start));
+                move || {
+                    start.wait();
+                    crate::stages::retire_expiring_blockhashes(&live, 2, &progress)
+                }
+            });
+            start.wait();
+            let (snapshot, admission) =
+                snapshot_and_admit(&live, std::slice::from_ref(&tx), &[], &progress);
+            let (popped, admissions) = retire.join().unwrap();
+
+            assert_eq!(
+                popped, 1,
+                "round {round}: the retire pops the expiring hash"
+            );
+            if snapshot.contains(&expiring) {
+                assert_eq!(admission, Some(1), "round {round}: a live tx is admitted");
+                assert_eq!(admissions, 1, "round {round}: the retire saw the admission");
+            } else {
+                assert_eq!(admission, None, "round {round}: nothing live, no admission");
+            }
+        }
+    }
+
+    /// Only a batch that will send results counts as an admission, or the settler
+    /// would wait for a message that never comes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_final_check_counts_an_admission_only_when_something_runs() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 1, 2_000).await;
+        let mut deps = get_execution_deps(
+            accounts_db.clone(),
+            SettledInbox::new(),
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let mut capped_deps = deps_with_tx_cap(accounts_db, 1_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let cases: Vec<(&str, bool, Vec<SanitizedTransaction>, Option<u64>)> = vec![
+            (
+                "all live",
+                false,
+                vec![create_test_transaction(), create_test_transaction()],
+                Some(1),
+            ),
+            (
+                "all expired",
+                false,
+                vec![sanitize_transfer(&Keypair::new(), Hash::new_unique())],
+                None,
+            ),
+            (
+                "admin only",
+                false,
+                vec![create_admin_initialize_mint_tx().0],
+                Some(1),
+            ),
+            (
+                "oversized only",
+                true,
+                vec![transfer_with_unused_readonly(&Keypair::new(), &big)],
+                Some(1),
+            ),
+        ];
+        for (name, capped, txs, expected) in cases {
+            let deps = if capped { &mut capped_deps } else { &mut deps };
+            deps.blockhash_progress
+                .admissions
+                .store(0, Ordering::SeqCst);
+            let result = run_batch(deps, &noop, txs).await;
+            assert_eq!(result.admission, expected, "{name}");
+            assert_eq!(
+                deps.blockhash_progress.admissions.load(Ordering::SeqCst),
+                expected.unwrap_or(0),
+                "{name}: the counter moves only with an admission"
+            );
+        }
+    }
+
     /// The filter keeps input order, which is what keeps each partition's
     /// transactions aligned with the SVM results the settler later zips
     /// against them, and drops every transaction whose blockhash is not in
@@ -4741,7 +5020,7 @@ mod tests {
     #[test]
     fn retain_live_keeps_live_transactions_in_order() {
         let (a, b, c) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
-        let live = RwLock::new(LinkedList::from([a, b]));
+        let live = HashSet::from([a, b]);
         let payer = Keypair::new();
 
         let txs = vec![
