@@ -25,6 +25,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
 | C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
 | C17 | A transaction that lists the spl-token native mint MUST be rejected at ingress, and the admin VM MUST NOT create it, so fabricated lamports never become wSOL. Revisit if a second ingress path or a lamport-valued exit is added | MUST | Done | - |
+| C18 | `sendTransaction` MUST refuse every top-level System instruction. A regular transaction MUST NOT create a System-owned account; lamports that would create one are burned. A transaction that leaves any synthesized float unrepaid MUST NOT create more than 4 accounts. Storage per anonymous caller is otherwise bounded only by the gateway rate limit | MUST | Done | - |
 
 ## On-chain Programs
 

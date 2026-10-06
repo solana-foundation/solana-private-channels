@@ -31,7 +31,6 @@ use {
         signature::{Keypair, Signer},
         transaction::Transaction,
     },
-    solana_system_interface::instruction as system_instruction,
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
 };
@@ -81,13 +80,10 @@ async fn call(module: &RpcModule<()>, method: &str, params: Value) -> Value {
 }
 
 fn valid_tx() -> Transaction {
-    let payer = Keypair::new();
-    let recipient = Keypair::new().pubkey();
-    let ix = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000);
-    Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], Hash::default())
+    tx_with_account_keys(3)
 }
 
-/// A transfer padded with unused read-only keys so it carries exactly `total_keys` keys.
+/// A memo padded with unused keys so it carries exactly `total_keys` keys.
 /// Needed to ask for many addresses without tripping the count cap first.
 fn tx_with_account_keys(total_keys: usize) -> Transaction {
     assert!(
@@ -96,30 +92,25 @@ fn tx_with_account_keys(total_keys: usize) -> Transaction {
     );
     let payer = Keypair::new();
     let recipient = Pubkey::new_unique();
-    let mut account_keys = vec![
-        payer.pubkey(),
-        recipient,
-        solana_sdk_ids::system_program::ID,
-    ];
+    let mut account_keys = vec![payer.pubkey(), recipient, spl_memo::id()];
     while account_keys.len() < total_keys {
         account_keys.push(Pubkey::new_unique());
     }
 
-    // Key 0 signs and key 1 receives; the program and padding keys stay read-only.
+    // Key 0 signs and key 1 is writable; the program and padding keys stay read-only.
     let header = MessageHeader {
         num_required_signatures: 1,
         num_readonly_signed_accounts: 0,
         num_readonly_unsigned_accounts: (total_keys - 2) as u8,
     };
-    let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 100);
     let message = Message {
         header,
         account_keys,
         recent_blockhash: Hash::default(),
         instructions: vec![CompiledInstruction {
             program_id_index: 2,
-            accounts: vec![0, 1],
-            data: transfer.data,
+            accounts: vec![],
+            data: b"simulate".to_vec(),
         }],
     };
 
@@ -139,7 +130,7 @@ fn tx_with_account_keys(total_keys: usize) -> Transaction {
 async fn simulate_rejects_more_addresses_than_tx_accounts() {
     let (module, _pg) = build_module(vec![]).await;
 
-    // valid_tx() carries three keys: payer, recipient, system program.
+    // valid_tx() carries three keys: payer, recipient, memo program.
     let addresses: Vec<String> = (0..4).map(|_| Pubkey::new_unique().to_string()).collect();
     let encoded = STANDARD.encode(bincode::serialize(&valid_tx()).unwrap());
 
@@ -349,7 +340,7 @@ async fn simulate_handles_malformed_address_as_null() {
 
     // The malformed-address branch only fires if the tx reaches the
     // Executed arm with `accounts` config. A fresh-keypair
-    // system transfer from our own-built module will exercise execution and
+    // memo from our own-built module will exercise execution and
     // carry the malformed address through to the mapping step.
     let tx = valid_tx();
     let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
