@@ -151,6 +151,12 @@ if anything fails. It is guarded these ways.
    program but the rebuild replays only from the genesis slot, so a genesis above the
    program's earliest row refuses before anything is deleted. The marker keeps the lowest
    slot its wipe deleted, so a rerun after an interrupted resync is held to the same bound.
+8. **The channel history must be complete.** The channel writes its address index after
+   each block commits, so its history can briefly miss a mint that is already final.
+   Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
+   the index covers the block that was newest at its first read, and refuses before anything is deleted
+   if it never does or the method is unavailable. Deploy core and the gateway before
+   the indexer.
 
 The delete runs in one transaction on the lock session and is capped at 300s. Measured at
 roughly 30k deposit rows a second with one journal each (6s for 200k rows, 30s for 1M), so

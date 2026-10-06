@@ -23,7 +23,6 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
-    solana_system_interface::instruction as system_instruction,
 };
 
 pub async fn run_simulate_transaction_preflight_test(ctx: &PrivateChannelContext) {
@@ -39,12 +38,12 @@ pub async fn run_simulate_transaction_preflight_test(ctx: &PrivateChannelContext
 
 // ── Case A ──────────────────────────────────────────────────────────────────
 async fn case_a_valid_simulation(ctx: &PrivateChannelContext) {
-    // Build a real system-transfer tx; simulate should succeed with no err
+    // Build a real memo tx; simulate should succeed with no err
     // and report compute-unit usage.
     let payer = Keypair::new();
-    let recipient = Keypair::new().pubkey();
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let ix = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000);
+    let ix =
+        solana_sdk::instruction::Instruction::new_with_bytes(spl_memo::id(), b"simulate", vec![]);
     let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], blockhash);
 
     let resp = ctx

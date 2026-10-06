@@ -6,7 +6,6 @@ use {
         signature::{Keypair, Signature},
         signer::Signer,
     },
-    solana_system_interface::instruction as system_instruction,
 };
 
 pub async fn run_get_signature_statuses_test(ctx: &PrivateChannelContext) {
@@ -24,13 +23,16 @@ async fn test_signature_statuses_with_malformed_and_unknown_signatures(
     println!("\n  Test 1: unknown signatures return null, malformed ones fail the call");
 
     let from_keypair = Keypair::new();
-    let to_pubkey = Keypair::new().pubkey();
 
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let transfer_ix = system_instruction::transfer(&from_keypair.pubkey(), &to_pubkey, 1_000);
+    let memo_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"signature-statuses".to_vec(),
+    };
 
     let transaction = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[transfer_ix],
+        &[memo_ix],
         Some(&from_keypair.pubkey()),
         &[&from_keypair],
         blockhash,

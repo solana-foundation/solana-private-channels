@@ -1,7 +1,6 @@
 use {
     super::test_context::PrivateChannelContext,
     solana_sdk::{signature::Keypair, signer::Signer},
-    solana_system_interface::instruction as system_instruction,
 };
 
 pub async fn run_transaction_count_test(ctx: &PrivateChannelContext) {
@@ -11,15 +10,18 @@ pub async fn run_transaction_count_test(ctx: &PrivateChannelContext) {
     let initial_count = ctx.get_transaction_count().await.unwrap();
     println!("Initial transaction count: {}", initial_count);
 
-    // Create a simple transfer transaction to increment the count
+    // Create a simple memo transaction to increment the count
     let from_keypair = Keypair::new();
-    let to_pubkey = Keypair::new().pubkey();
 
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let transfer_ix = system_instruction::transfer(&from_keypair.pubkey(), &to_pubkey, 1_000);
+    let memo_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"transaction-count".to_vec(),
+    };
 
     let transaction = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[transfer_ix],
+        &[memo_ix],
         Some(&from_keypair.pubkey()),
         &[&from_keypair],
         blockhash,
