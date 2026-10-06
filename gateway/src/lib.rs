@@ -58,6 +58,19 @@ const BLOCK_LIST_METHODS: &[&str] = &["getBlocks", "getBlocksWithLimit"];
 /// Metric label for a public block listing shed because every block listing slot was taken.
 const BLOCK_LIST_CAPACITY: &str = "block_list_capacity";
 
+/// The read node's default and maximum Postgres pool size, which the gateway must mirror.
+const DEFAULT_READ_POOL_SIZE: u32 = 32;
+const MAX_READ_POOL_SIZE: u32 = 256;
+
+/// Reads the pool size as the read node does, so one setting never starts one and stops the
+/// other: unset, empty, unparseable or zero means the default, and larger values are clamped.
+fn resolve_read_pool_size(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_READ_POOL_SIZE))
+        .unwrap_or(DEFAULT_READ_POOL_SIZE)
+}
+
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
 
@@ -152,15 +165,10 @@ pub struct Args {
     #[arg(long, env = "GATEWAY_MAX_FORWARDED_READS", default_value = "768")]
     pub max_forwarded_reads: NonZeroUsize,
 
-    /// The read node's Postgres pool size, 1 to 256. Sizes the cap on public block
-    /// listings in flight, so it must match what the read node is given.
-    #[arg(
-        long,
-        env = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS",
-        default_value = "32",
-        value_parser = clap::value_parser!(u32).range(1..=256)
-    )]
-    pub read_node_pg_max_connections: u32,
+    /// The read node's Postgres pool size. Sizes the cap on public block listings in flight,
+    /// so it is read exactly as the read node reads it: see `resolve_read_pool_size`.
+    #[arg(long, env = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS")]
+    pub read_node_pg_max_connections: Option<String>,
 
     /// Seconds a client may take to send the full request header block before
     /// the connection is closed (slowloris protection). Must be non-zero; a
@@ -293,7 +301,7 @@ impl Default for Limits {
             max_connections: NonZeroUsize::new(1024).unwrap(),
             max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
             max_forwarded_reads: NonZeroUsize::new(768).unwrap(),
-            max_forwarded_block_lists: Self::block_list_slots(32),
+            max_forwarded_block_lists: Self::block_list_slots(DEFAULT_READ_POOL_SIZE),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             auth_fetch_timeout: Duration::from_secs(3),
@@ -492,6 +500,8 @@ struct DeadlineBody {
     sleep: Pin<Box<tokio::time::Sleep>>,
     /// Held until the body ends, so a streaming read keeps its read slot.
     _read_permit: Option<OwnedSemaphorePermit>,
+    /// Held until the body ends, so a slow reader cannot free its listing slot early.
+    _block_list_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl DeadlineBody {
@@ -504,7 +514,13 @@ impl DeadlineBody {
             inner,
             sleep: Box::pin(tokio::time::sleep_until(deadline)),
             _read_permit: read_permit,
+            _block_list_permit: None,
         }
+    }
+
+    fn with_block_list_permit(mut self, permit: Option<OwnedSemaphorePermit>) -> Self {
+        self._block_list_permit = permit;
+        self
     }
 }
 
@@ -1536,9 +1552,9 @@ impl Gateway {
         };
 
         // Public block listings of any span share a global budget below the read node's pool;
-        // only this layer can tell them from the indexer's. Held until this handler returns, which
-        // covers the node's scan unless the client leaves or the deadline passes first.
-        let _block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
+        // only this layer can tell them from the indexer's. Held until the exchange ends, streamed
+        // body included, so slow readers cannot pin more read slots than the listing budget.
+        let block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
         {
             match Arc::clone(&self.block_list_slots).try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -1679,7 +1695,8 @@ impl Gateway {
                         body.map_err(BoxError::from).boxed_unsync(),
                         deadline,
                         read_permit,
-                    );
+                    )
+                    .with_block_list_permit(block_list_permit);
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -1954,7 +1971,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         max_connections: args.max_connections,
         max_connections_per_ip: args.max_connections_per_ip,
         max_forwarded_reads: args.max_forwarded_reads,
-        max_forwarded_block_lists: Limits::block_list_slots(args.read_node_pg_max_connections),
+        max_forwarded_block_lists: Limits::block_list_slots(resolve_read_pool_size(
+            args.read_node_pg_max_connections.as_deref(),
+        )),
         header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
         body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
         auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
@@ -3720,6 +3739,67 @@ mod tests {
 
         let response = send_raw(addr, rpc_request("getBlocks").as_bytes()).await;
         assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn streamed_block_list_keeps_its_slot_until_the_body_ends() {
+        let read_node = start_stalled_body_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{read_node}"),
+            Limits {
+                max_forwarded_block_lists: NonZeroUsize::new(1).unwrap(),
+                upstream_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // The first listing has its headers back and is mid-body.
+        let mut streaming = TcpStream::connect(addr).await.unwrap();
+        streaming
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = streaming.read(&mut buf).await.unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+
+        // A slow reader must not free the listing slot while its body is still streaming.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut second).await, 503);
+
+        // Once the body ends, the slot is free again.
+        read_to_close(&mut streaming).await;
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        third
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
+            .await
+            .expect("a listing should be forwarded once the slot is free")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    #[test]
+    fn read_pool_size_is_resolved_like_the_read_node() {
+        for (raw, pool) in [
+            (None, 32),
+            (Some(""), 32),
+            (Some("abc"), 32),
+            (Some("0"), 32),
+            (Some("64"), 64),
+            (Some("256"), 256),
+            (Some("300"), 256),
+        ] {
+            assert_eq!(resolve_read_pool_size(raw), pool, "raw {raw:?}");
+        }
     }
 
     #[test]
