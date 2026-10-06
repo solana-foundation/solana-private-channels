@@ -58,6 +58,12 @@ impl WeightBudget {
         }
     }
 
+    /// A permit that holds no budget and never waits, for a message that carries
+    /// no weight but must still fit the queued message shape.
+    pub(crate) fn empty_permit(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.semaphore).try_acquire_many_owned(0).ok()
+    }
+
     /// Only the tests read the budget back; production just parks on it.
     #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
@@ -113,7 +119,7 @@ mod sponsor_replay_test;
 
 #[cfg(test)]
 mod weight_budget_tests {
-    use {super::WeightBudget, std::time::Duration, tokio::sync::mpsc};
+    use {super::WeightBudget, std::sync::Arc, std::time::Duration, tokio::sync::mpsc};
 
     /// The two hazards the budget exists for, plus the shapes that must never
     /// wait: a zero weight, a weight that fits, and one larger than the budget.
@@ -222,5 +228,16 @@ mod weight_budget_tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn empty_permit_is_free_on_a_spent_budget() {
+        let budget = WeightBudget::new(1);
+        let held = Arc::clone(&budget.semaphore)
+            .try_acquire_owned()
+            .expect("the only permit");
+        assert!(budget.empty_permit().is_some(), "a zero permit never waits");
+        assert_eq!(budget.available(), 0, "a zero permit takes no budget");
+        drop(held);
     }
 }

@@ -27,6 +27,8 @@ tracing.workspace = true
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+# MockRpcServer::start_with_upstream forwards unscripted methods.
+reqwest = { workspace = true, features = ["json"] }
 
 # `test-mock-yellowstone` pulls in tonic + yellowstone-grpc-proto only when
 # integration tests need a scripted gRPC stub (see `mock_yellowstone.rs`).
@@ -55,7 +57,6 @@ test-mock-yellowstone = [
 test-mock-storage = ["private-channel-indexer/test-mock-storage"]
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json"] }
 yellowstone-grpc-client = { workspace = true }
 futures = { workspace = true }
 rustls = { workspace = true }
