@@ -29,31 +29,27 @@ pub fn is_allowed_instruction(program_id: &Pubkey, _instruction_type: u8) -> boo
     program_id == &spl_token::id()
 }
 
-/// bincode encodes a SystemInstruction variant tag as a 4-byte little-endian u32.
-const SYSTEM_TRANSFER_DISCRIMINANT: u32 = 2;
-
-/// Reads the leading variant tag; data shorter than 4 bytes yields None.
-fn system_discriminant(data: &[u8]) -> Option<u32> {
-    data.get(..4)?.try_into().ok().map(u32::from_le_bytes)
-}
-
-/// Admission policy for a single top-level instruction.
-///
-/// System is restricted to Transfer because it is all any flow here needs, and
-/// because CreateAccount, Allocate, and their seeded forms let a caller allocate
-/// permanent state that the gasless model never charges for. We match the raw
-/// variant tag rather than deserialize, so no decoder runs on attacker bytes at
-/// ingress, and bincode reads that same tag first anyway.
-pub fn is_allowed_program_instruction(program_id: &Pubkey, data: &[u8]) -> bool {
-    if *program_id == solana_sdk_ids::system_program::ID {
-        return system_discriminant(data) == Some(SYSTEM_TRANSFER_DISCRIMINANT);
-    }
+/// Admission policy for a single top-level instruction. System is refused: SOL
+/// has no use here, and a Transfer to a new address creates a permanent account
+/// the gasless model never charges for. System still runs as a CPI target.
+pub fn is_allowed_program_instruction(program_id: &Pubkey, _data: &[u8]) -> bool {
     *program_id == spl_token::id()
         || *program_id == spl_associated_token_account::id()
         || *program_id == spl_memo::id()
         || *program_id
             == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
         || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
+}
+
+/// Rejection reason for a transaction with a top-level instruction outside the allowlist.
+pub const PROGRAM_NOT_ALLOWED: &str =
+    "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted";
+
+/// Whether every top-level instruction of `tx` passes the admission policy.
+pub fn all_instructions_allowed(tx: &SanitizedTransaction) -> bool {
+    tx.message()
+        .program_instructions_iter()
+        .all(|(program_id, ix)| is_allowed_program_instruction(program_id, &ix.data))
 }
 
 /// Rejection reason for a transaction that lists the spl-token native mint.
@@ -187,21 +183,26 @@ mod tests {
         bincode::serialize(ix).unwrap()
     }
 
-    /// A1: Transfer is the only System variant any flow here needs.
+    /// A1: System is refused, Transfer included, whatever the data.
     #[test]
-    fn system_transfer_is_admitted() {
+    fn system_transfer_is_rejected() {
         let data = encode(&SystemInstruction::Transfer { lamports: 1 });
-        assert!(is_allowed_program_instruction(&system_id(), &data));
+        for data in [&data[..], &[][..], &[2][..], &[2, 0, 0][..]] {
+            assert!(
+                !is_allowed_program_instruction(&system_id(), data),
+                "System data {data:?} must be rejected"
+            );
+        }
     }
 
-    // A2: serialize the real enum rather than hand-written tag bytes so an
-    // upstream variant reorder fails this test instead of silently reopening
-    // the allocation surface.
+    // A2: serialize the real enum so every variant, present and future, is
+    // pinned as refused.
     #[test]
-    fn every_non_transfer_system_variant_is_rejected() {
+    fn every_system_variant_is_rejected() {
         let owner = Pubkey::new_unique();
         let base = Pubkey::new_unique();
-        let cases: [(&str, SystemInstruction); 12] = [
+        let cases: [(&str, SystemInstruction); 13] = [
+            ("Transfer", SystemInstruction::Transfer { lamports: 1 }),
             (
                 "CreateAccount",
                 SystemInstruction::CreateAccount {
@@ -281,36 +282,6 @@ mod tests {
                 "System::{name} must be rejected at ingress"
             );
         }
-    }
-
-    /// A3: data shorter than the 4-byte tag fails closed.
-    #[test]
-    fn system_data_shorter_than_tag_is_rejected() {
-        for data in [&[][..], &[2][..], &[2, 0, 0][..]] {
-            assert!(
-                !is_allowed_program_instruction(&system_id(), data),
-                "truncated System data {data:?} must be rejected"
-            );
-        }
-    }
-
-    // A4: admission reads only the tag; the SVM stays the authoritative decoder
-    // and fails a malformed tag-2 body with InvalidInstructionData, allocating
-    // nothing.
-    #[test]
-    fn system_transfer_tag_admits_regardless_of_body() {
-        assert!(is_allowed_program_instruction(&system_id(), &[2, 0, 0, 0]));
-
-        let mut with_junk = vec![2, 0, 0, 0];
-        with_junk.extend_from_slice(&1u64.to_le_bytes());
-        with_junk.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        assert!(is_allowed_program_instruction(&system_id(), &with_junk));
-    }
-
-    /// A5: the tag is little-endian; a big-endian 2 is a different variant.
-    #[test]
-    fn system_big_endian_two_is_rejected() {
-        assert!(!is_allowed_program_instruction(&system_id(), &[0, 0, 0, 2]));
     }
 
     /// A6: non-System allowlisted programs are admitted for any instruction data.
