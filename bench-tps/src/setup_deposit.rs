@@ -23,8 +23,8 @@ use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
         types::{
-            BenchState, DepositConfig, BENCH_MIN_WITHDRAW_AMOUNT, BENCH_WITHDRAW_FEE,
-            MINT_DECIMALS, SETUP_BATCH_SIZE,
+            BenchState, DepositConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
+            BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
         },
     },
     anyhow::{Context, Result},
@@ -530,6 +530,7 @@ pub async fn run_setup_deposit_phase(
                         bump: allow_bump,
                         withdraw_fee: BENCH_WITHDRAW_FEE,
                         min_withdraw_amount: BENCH_MIN_WITHDRAW_AMOUNT,
+                        min_deposit_amount: BENCH_MIN_DEPOSIT_AMOUNT,
                     });
                     let tx = Transaction::new_signed_with_payer(
                         &[allow_ix],

@@ -196,22 +196,24 @@ impl DataSource for RpcPollingSource {
                     info!("RPC polling source received cancellation signal, stopping...");
                     break;
                 }
-                // Get slots to process
-                let (slots, chain_tip) =
-                    match poller.get_slots_to_process(current_slot, batch_size).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            {
-                                error!("Failed to get slots to process: {}", e);
-                                metrics::INDEXER_RPC_ERRORS
-                                    .with_label_values(&[program_type.as_label(), "get_slots"])
-                                    .inc();
-                            }
-                            tokio::time::sleep(Duration::from_millis(error_retry_interval_ms))
-                                .await;
-                            continue;
+                // RPC reads race the token so shutdown abandons a stalled one; dropping a read is safe.
+                let slots_result = tokio::select! {
+                    _ = cancellation_token.cancelled() => break,
+                    result = poller.get_slots_to_process(current_slot, batch_size) => result,
+                };
+                let (slots, chain_tip) = match slots_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        {
+                            error!("Failed to get slots to process: {}", e);
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "get_slots"])
+                                .inc();
                         }
-                    };
+                        tokio::time::sleep(Duration::from_millis(error_retry_interval_ms)).await;
+                        continue;
+                    }
+                };
                 metrics::INDEXER_CHAIN_TIP_SLOT
                     .with_label_values(&[program_type.as_label()])
                     .set(chain_tip as f64);
@@ -226,7 +228,10 @@ impl DataSource for RpcPollingSource {
                 }
 
                 // Fetch blocks in batch
-                let blocks = poller.get_blocks_batch(slots.clone(), last_block).await;
+                let blocks = tokio::select! {
+                    _ = cancellation_token.cancelled() => break,
+                    blocks = poller.get_blocks_batch(slots.clone(), last_block) => blocks,
+                };
 
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
@@ -237,28 +242,31 @@ impl DataSource for RpcPollingSource {
                             // one fallback re-fetch; if that is unconfigured, unavailable or
                             // also rejected, fail closed like an unavailable block: no
                             // SlotComplete, no advance, re-fetch on the next poll.
-                            let instructions_with_meta = match decode_fetched_block(
-                                &poller,
-                                &block,
-                                slot,
-                                program_type,
-                                escrow_instance_id.as_ref(),
-                            )
-                            .await
-                            {
+                            // Leaving the slot loop skips SlotComplete; the outer check then stops.
+                            let decoded = tokio::select! {
+                                _ = cancellation_token.cancelled() => break,
+                                decoded = decode_fetched_block(
+                                    &poller,
+                                    &block,
+                                    slot,
+                                    program_type,
+                                    escrow_instance_id.as_ref(),
+                                ) => decoded,
+                            };
+                            let instructions_with_meta = match decoded {
                                 Ok(instructions) => instructions,
                                 Err(rejection) => {
                                     let recovered = match &fallback_poller {
-                                        Some(fallback) => {
-                                            refetch_slot_via_fallback(
+                                        Some(fallback) => tokio::select! {
+                                            _ = cancellation_token.cancelled() => break,
+                                            recovered = refetch_slot_via_fallback(
                                                 fallback,
                                                 slot,
                                                 &block.blockhash,
                                                 program_type,
                                                 escrow_instance_id.as_ref(),
-                                            )
-                                            .await
-                                        }
+                                            ) => recovered,
+                                        },
                                         None => None,
                                     };
                                     match recovered {
@@ -1142,8 +1150,18 @@ mod tests {
         program_type: ProgramType,
         done: impl Fn(&[ProcessorMessage]) -> bool,
     ) -> Vec<ProcessorMessage> {
+        poll_slot_100_at(primary.url(), fallback, program_type, done).await
+    }
+
+    /// `poll_slot_100` against any primary URL, such as a stall server in front of mockito.
+    async fn poll_slot_100_at(
+        primary_url: String,
+        fallback: Option<&Server>,
+        program_type: ProgramType,
+        done: impl Fn(&[ProcessorMessage]) -> bool,
+    ) -> Vec<ProcessorMessage> {
         let mut source = RpcPollingSource::new(
-            primary.url(),
+            primary_url,
             Some(100),
             10,
             10,
@@ -1543,5 +1561,176 @@ mod tests {
                 "slot {slot} must be completed once the poller reaches past the window"
             );
         }
+    }
+
+    fn stall_test_source(
+        url: String,
+        from_slot: Option<u64>,
+        program_type: ProgramType,
+        fallback: Option<String>,
+    ) -> RpcPollingSource {
+        RpcPollingSource::new(
+            url,
+            from_slot,
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_commitment_config::CommitmentLevel::Finalized,
+            program_type,
+            None,
+            fallback,
+        )
+    }
+
+    /// A poll whose response stalls times out and the retry completes the same slot, without a restart.
+    #[tokio::test]
+    async fn a_stalled_poll_recovers_without_a_restart() {
+        use crate::test_utils::rpc_mocks::mock_get_block_at;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 105);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _b100 = mock_get_block_at(&mut primary, 100, 99);
+        // The first getSlot stalls; the retry opens a new connection that reaches mockito.
+        let (url, _) = stall_server(Stall::AfterHeaders, 1, Some(primary.host_with_port())).await;
+
+        // Longer than the helper's own 10s wait, which ends in an unbounded join.
+        let messages = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            poll_slot_100_at(url, None, ProgramType::Withdraw, |m| completed(m, 100)),
+        )
+        .await
+        .expect("the source stayed stuck on the stalled request");
+
+        assert!(
+            completed(&messages, 100),
+            "slot 100 must complete after the retry"
+        );
+    }
+
+    /// With no start slot, a stalled getSlot makes `start` fail instead of hanging.
+    #[tokio::test]
+    async fn start_fails_instead_of_hanging_when_get_slot_stalls() {
+        use crate::indexer::datasource::rpc_polling::rpc::RPC_REQUEST_TIMEOUT;
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let (url, _) = stall_server(Stall::AfterHeaders, usize::MAX, None).await;
+        let mut source = stall_test_source(url, None, ProgramType::Withdraw, None);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = tokio::time::timeout(
+            3 * RPC_REQUEST_TIMEOUT,
+            source.start(tx, CancellationToken::new()),
+        )
+        .await
+        .expect("start hung on the stalled getSlot");
+
+        match result {
+            Err(DataSourceError::Rpc(DataSourceRpcError::HttpRequest(e))) if e.is_timeout() => {}
+            other => panic!("expected a getSlot timeout, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A mock whose reply closes the connection, so each request opens a new one the stall server counts.
+    fn closing_mock(
+        server: &mut Server,
+        request: serde_json::Value,
+        result: serde_json::Value,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(request))
+            .with_header("connection", "close")
+            .with_body(json!({ "jsonrpc": "2.0", "result": result, "id": 1 }).to_string())
+            .create()
+    }
+
+    /// Starts `source`, cancels once `accepted` reaches `pending_at`, and requires a stop well inside the deadline.
+    async fn assert_cancel_interrupts_pending_read(
+        mut source: RpcPollingSource,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pending_at: usize,
+    ) {
+        use crate::indexer::datasource::rpc_polling::rpc::RPC_REQUEST_TIMEOUT;
+        use std::sync::atomic::Ordering;
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        // Cancel only once the stalled request is pending, or the test would pass without one.
+        tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, async {
+            while accepted.load(Ordering::SeqCst) < pending_at {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled request was never sent");
+        cancel.cancel();
+
+        // Only abandoning the request stops this fast; waiting for its deadline would not.
+        tokio::time::timeout(RPC_REQUEST_TIMEOUT / 4, handle)
+            .await
+            .expect("cancel did not interrupt the pending request")
+            .unwrap();
+    }
+
+    /// Cancelling during a stalled tip read stops the source at once.
+    #[tokio::test]
+    async fn cancel_during_a_stalled_request_stops_the_source() {
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let (url, accepted) = stall_server(Stall::AfterHeaders, usize::MAX, None).await;
+        let source = stall_test_source(url, Some(100), ProgramType::Withdraw, None);
+        assert_cancel_interrupts_pending_read(source, accepted, 1).await;
+    }
+
+    /// Cancelling during a stalled block batch read stops the source at once.
+    #[tokio::test]
+    async fn cancel_during_a_stalled_block_batch_stops_the_source() {
+        use crate::test_utils::stall_server::{stall_server_after, Stall};
+        let mut primary = Server::new_async().await;
+        let _slot = closing_mock(&mut primary, json!({ "method": "getSlot" }), json!(105));
+        let _enum = closing_mock(&mut primary, json!({ "method": "getBlocks" }), json!([100]));
+        // getSlot and the window's getBlocks pass; the batch's own getBlocks stalls.
+        let (url, accepted) =
+            stall_server_after(Stall::AfterHeaders, 2, primary.host_with_port()).await;
+        let source = stall_test_source(url, Some(100), ProgramType::Withdraw, None);
+        assert_cancel_interrupts_pending_read(source, accepted, 3).await;
+    }
+
+    /// Cancelling during a stalled empty-block confirmation stops the source at once.
+    #[tokio::test]
+    async fn cancel_during_a_stalled_empty_block_confirm_stops_the_source() {
+        use crate::test_utils::stall_server::{stall_server_after, Stall};
+        let mut primary = Server::new_async().await;
+        let _slot = closing_mock(&mut primary, json!({ "method": "getSlot" }), json!(105));
+        let _enum = closing_mock(&mut primary, json!({ "method": "getBlocks" }), json!([100]));
+        let _full = closing_mock(
+            &mut primary,
+            json!({ "method": "getBlock", "params": [100, { "transactionDetails": "full" }] }),
+            json!({ "blockhash": "TestBlockHash100", "parentSlot": 99, "transactions": [] }),
+        );
+        // Everything up to the full block passes; the signatures-view confirm stalls.
+        let (url, accepted) =
+            stall_server_after(Stall::AfterHeaders, 4, primary.host_with_port()).await;
+        let source = stall_test_source(url, Some(100), ProgramType::Escrow, None);
+        assert_cancel_interrupts_pending_read(source, accepted, 5).await;
+    }
+
+    /// Cancelling during a stalled fallback refetch stops the source at once.
+    #[tokio::test]
+    async fn cancel_during_a_stalled_fallback_refetch_stops_the_source() {
+        use crate::test_utils::stall_server::{stall_server, Stall};
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 105);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _block = mock_get_block_missing_meta(&mut primary, 100, 1);
+        let (fallback, accepted) = stall_server(Stall::AfterHeaders, usize::MAX, None).await;
+        let source = stall_test_source(
+            primary.url(),
+            Some(100),
+            ProgramType::Withdraw,
+            Some(fallback),
+        );
+        assert_cancel_interrupts_pending_read(source, accepted, 1).await;
     }
 }

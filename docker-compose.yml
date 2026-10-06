@@ -249,6 +249,10 @@ services:
       - GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT:-8904}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
+      # Max seconds for one forwarded request, including the client's download.
+      - GATEWAY_UPSTREAM_TIMEOUT_SECS=${GATEWAY_UPSTREAM_TIMEOUT_SECS:-30}
+      # Max public reads in flight; more get a 503 so writes keep free connection slots.
+      - GATEWAY_MAX_FORWARDED_READS=${GATEWAY_MAX_FORWARDED_READS:-768}
       - METRICS_PORT=9101
       # Optional — omit or leave blank to disable RBAC enforcement.
       - JWT_SECRET=${JWT_SECRET:-}

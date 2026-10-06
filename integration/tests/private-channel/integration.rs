@@ -396,6 +396,7 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_transaction_count_test(private_channel_ctx).await;
     run_get_transaction_test(private_channel_ctx).await;
     run_first_available_block_test(private_channel_ctx).await;
+    run_address_index_slot_test(private_channel_ctx).await;
     run_get_block_height_test(private_channel_ctx).await;
     run_get_blocks_test(private_channel_ctx).await;
     run_get_blocks_with_limit_test(private_channel_ctx).await;

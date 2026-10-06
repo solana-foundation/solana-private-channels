@@ -19,7 +19,9 @@ use spl_associated_token_account::{
     instruction::create_associated_token_account_idempotent,
 };
 use spl_token::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
-use test_utils::mint_helper::{TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE};
+use test_utils::mint_helper::{
+    TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+};
 
 use super::helpers::{
     generate_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions, setup_wallets,
@@ -203,6 +205,7 @@ impl TestEnvironment {
             .bump(bump)
             .withdraw_fee(TEST_WITHDRAW_FEE)
             .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+            .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
             .instruction();
 
         send_and_confirm_instructions(client, &[allow_ix], &admin, &[&admin], "Allow Mint").await?;
@@ -355,6 +358,7 @@ pub async fn allow_mint_for_program(
         .bump(bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();
 
     send_and_confirm_instructions(client, &[allow_ix], admin, &[admin], "Allow Mint").await?;

@@ -306,7 +306,8 @@ async fn perform_indexer_shutdown_stages(
     .await;
 
     match processor_result {
-        Ok(Ok(_)) => info!("Transaction processor drained successfully"),
+        Ok(Ok(Ok(()))) => info!("Transaction processor drained successfully"),
+        Ok(Ok(Err(e))) => error!("Transaction processor failed during drain: {}", e),
         Ok(Err(e)) => warn!("Transaction processor error: {:?}", e),
         Err(_) => {
             warn!(

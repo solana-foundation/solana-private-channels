@@ -1,10 +1,10 @@
 use super::test_context::PrivateChannelContext;
 use solana_sdk::{
     hash::Hash,
+    instruction::Instruction,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
-use solana_system_interface::instruction as system_instruction;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -34,19 +34,13 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     println!("First blockhash: {:?}", first_blockhash);
 
     // Send a few transactions to advance the blockchain
-    let test_keypair = Keypair::new();
     for i in 0..3 {
         let blockhash = ctx.get_blockhash().await.unwrap();
-        let transfer_ix = system_instruction::transfer(
-            &ctx.operator_key.pubkey(),
-            &test_keypair.pubkey(),
-            1000 * (i + 1),
-        );
-
+        let payer = Keypair::new();
         let tx = Transaction::new_signed_with_payer(
-            &[transfer_ix],
-            Some(&ctx.operator_key.pubkey()),
-            &[&ctx.operator_key],
+            &[memo_ix(&format!("blockhash-window-{i}"))],
+            Some(&payer.pubkey()),
+            &[&payer],
             blockhash,
         );
 
@@ -132,15 +126,11 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     // metric for "dropped: unknown blockhash" fires.
     println!("\n--- Test 6: Tx with unknown blockhash is dropped ---");
     let fake_for_send = Hash::new_unique();
-    let dropped_keypair = Keypair::new();
+    let dropped_payer = Keypair::new();
     let drop_tx = Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &ctx.operator_key.pubkey(),
-            &dropped_keypair.pubkey(),
-            1,
-        )],
-        Some(&ctx.operator_key.pubkey()),
-        &[&ctx.operator_key],
+        &[memo_ix("unknown-blockhash")],
+        Some(&dropped_payer.pubkey()),
+        &[&dropped_payer],
         fake_for_send,
     );
     let send_outcome = ctx
@@ -177,4 +167,13 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     }
 
     println!("\n=== Blockhash Validation Test Complete ===\n");
+}
+
+/// An allowlisted memo, so each tx is admitted and differs by `tag`.
+fn memo_ix(tag: &str) -> Instruction {
+    Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: tag.as_bytes().to_vec(),
+    }
 }

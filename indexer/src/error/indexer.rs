@@ -19,6 +19,9 @@ pub enum IndexerError {
     #[error("Transaction processor task panicked")]
     ProcessorPanicked,
 
+    #[error("Startup backfill task panicked")]
+    BackfillPanicked,
+
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
 

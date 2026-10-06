@@ -11,10 +11,8 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentLevel;
 use solana_sdk::{
-    hash::Hash, pubkey::Pubkey, signature::Keypair, signature::Signature, signer::Signer,
-    transaction::Transaction,
+    hash::Hash, signature::Keypair, signature::Signature, signer::Signer, transaction::Transaction,
 };
-use solana_system_interface::instruction as system_instruction;
 use solana_transaction_status::UiTransactionEncoding;
 use std::{net::TcpListener, sync::Arc, time::Duration};
 use testcontainers::runners::AsyncRunner;
@@ -125,12 +123,16 @@ async fn start_node_on(pg_url: &str, max_blockhashes: usize) -> Result<TestNode>
     panic!("node never produced a block at {url}");
 }
 
-/// A distinct System transfer bearing `blockhash`. Execution is gasless, so a
-/// fresh payer still settles, which makes each probe observable by signature.
+/// A distinct memo bearing `blockhash`. Execution is gasless, so a fresh payer
+/// still settles, which makes each probe observable by signature.
 fn client_transaction(blockhash: Hash) -> Transaction {
     let payer = Keypair::new();
-    let transfer = system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1);
-    Transaction::new_signed_with_payer(&[transfer], Some(&payer.pubkey()), &[&payer], blockhash)
+    let memo = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"sparse-chain".to_vec(),
+    };
+    Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[&payer], blockhash)
 }
 
 /// Submit without preflight. Preflight would reject a stale blockhash in the

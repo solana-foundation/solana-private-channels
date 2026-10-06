@@ -30,7 +30,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Production defaults for the per-slot DB-write retry. Sized to ride out a
 /// routine Postgres restart or failover (about 15s of cumulative backoff)
@@ -306,6 +306,9 @@ impl TransactionProcessor {
                         status: change.status.as_str().to_string(),
                         withdrawals_blocked: change.withdrawals_blocked,
                         effective_slot: slot as i64,
+                        transaction_index: instruction_meta.transaction_index as i32,
+                        instruction_index: instruction_meta.instruction_index as i32,
+                        inner_index: instruction_meta.inner_index.map(|inner| inner as i32),
                         signature: sig,
                         created_at: chrono::Utc::now(),
                     });
@@ -685,6 +688,12 @@ fn convert_to_db_models(
                     data,
                     event,
                 } => {
+                    // The escrow rejects these, so one reaching here means the program regressed.
+                    if event.amount == 0 {
+                        warn!(%signature, "dropping deposit with zero received amount");
+                        return (None, None, None, None);
+                    }
+
                     let recipient = data
                         .recipient
                         .map(|r| r.to_string())
@@ -842,16 +851,21 @@ mod tests {
         sig: Option<String>,
         recipient: Option<Pubkey>,
     ) -> InstructionWithMetadata {
-        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance())
+        // event.amount differs from data.amount (1000) to prove the operator
+        // is fed the event-reported received amount (e.g. net of a
+        // Token-2022 transfer fee), not the caller-requested amount.
+        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance(), 990)
     }
 
-    /// Like `make_deposit_instruction` but on a caller-chosen instance, so a
-    /// deposit can share a slot with an AllowMint on the same instance.
+    /// Like `make_deposit_instruction` but on a caller-chosen instance and
+    /// event amount, so a deposit can share a slot with an AllowMint on the
+    /// same instance.
     fn make_deposit_instruction_on_instance(
         slot: u64,
         sig: Option<String>,
         recipient: Option<Pubkey>,
         instance: Pubkey,
+        event_amount: u64,
     ) -> InstructionWithMetadata {
         let user = make_pubkey(1);
         let mint = make_pubkey(2);
@@ -875,14 +889,14 @@ mod tests {
                     amount: 1000,
                     recipient,
                 },
-                // event.amount differs from data.amount to prove the operator
-                // is fed the event-reported received amount (e.g. net of a
-                // Token-2022 transfer fee), not the caller-requested amount.
-                event: DepositEvent { amount: 990 },
+                event: DepositEvent {
+                    amount: event_amount,
+                },
             })),
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -921,6 +935,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -953,6 +968,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -978,6 +994,7 @@ mod tests {
             slot,
             program_type: ProgramType::Withdraw,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -999,6 +1016,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -1058,6 +1076,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -1092,6 +1111,19 @@ mod tests {
         let txn = txn.unwrap();
         // recipient should default to accounts.user
         assert_eq!(txn.recipient, make_pubkey(1).to_string());
+    }
+
+    #[test]
+    fn convert_deposit_with_zero_received_amount_is_dropped() {
+        let ix = make_deposit_instruction_on_instance(
+            60,
+            Some("sig-zero".to_string()),
+            None,
+            deposit_instance(),
+            0,
+        );
+        let (_, _, txn, _) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        assert!(txn.is_none());
     }
 
     #[test]
@@ -1232,6 +1264,7 @@ mod tests {
             slot: 100,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         };
@@ -1272,6 +1305,7 @@ mod tests {
             slot: 200,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         };
@@ -1510,6 +1544,30 @@ mod tests {
         assert_eq!(cp.slot, 250);
     }
 
+    /// A history row keeps the block position of the instruction it came from.
+    #[tokio::test]
+    async fn finalize_writes_block_position_on_mint_status_history() {
+        let (mut processor, _checkpoint_rx, mock) = make_processor_with_mock(allow_mint_instance());
+        let slot = 250;
+        let (transaction_index, instruction_index, inner_index) = (4, 2, 1);
+        processor.buffer(InstructionWithMetadata {
+            transaction_index,
+            instruction_index,
+            inner_index: Some(inner_index),
+            ..make_block_mint_instruction(slot, Some("sig-block".to_string()), true, false)
+        });
+        processor
+            .finalize_and_checkpoint(slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let rows = mock.mint_status_history.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transaction_index, transaction_index as i32);
+        assert_eq!(rows[0].instruction_index, instruction_index as i32);
+        assert_eq!(rows[0].inner_index, Some(inner_index as i32));
+    }
+
     // ========================================================================
     // observed release recording
     // ========================================================================
@@ -1743,6 +1801,7 @@ mod tests {
             Some("sig-deposit-3".to_string()),
             None,
             allow_mint_instance(),
+            990,
         ));
         let result = processor
             .finalize_and_checkpoint(202, ProgramType::Escrow)
@@ -1949,6 +2008,7 @@ mod tests {
                 Some("deposit".to_string()),
                 None,
                 allow_mint_instance(),
+                990,
             ),
         ))
         .await
