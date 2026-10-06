@@ -204,17 +204,30 @@ pub mod escrow_fixtures {
         data
     }
 
-    /// DepositEvent self-CPI bytes (145B): tag(8) + disc(1) + instance_seed(32)
-    /// + user(32) + amount(8 LE) + recipient(32) + mint(32).
+    /// DepositEvent self-CPI bytes (145B) with zero-filled identity fields; use
+    /// `deposit_event_bytes_full` to set them.
     pub fn deposit_event_bytes(amount: u64) -> Vec<u8> {
+        let zero = Pubkey::default();
+        deposit_event_bytes_full(zero, zero, amount, zero, zero)
+    }
+
+    /// DepositEvent self-CPI bytes: tag(8) + disc(1) + instance_seed(32) + user(32)
+    /// + amount(8 LE) + recipient(32) + mint(32).
+    pub fn deposit_event_bytes_full(
+        instance_seed: Pubkey,
+        user: Pubkey,
+        amount: u64,
+        recipient: Pubkey,
+        mint: Pubkey,
+    ) -> Vec<u8> {
         let mut data = Vec::with_capacity(145);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(DEPOSIT_EVENT_DISCRIMINATOR);
-        data.extend_from_slice(&[0u8; 32]); // instance_seed
-        data.extend_from_slice(&[0u8; 32]); // user
+        data.extend_from_slice(instance_seed.as_ref());
+        data.extend_from_slice(user.as_ref());
         data.extend_from_slice(&amount.to_le_bytes());
-        data.extend_from_slice(&[0u8; 32]); // recipient
-        data.extend_from_slice(&[0u8; 32]); // mint
+        data.extend_from_slice(recipient.as_ref());
+        data.extend_from_slice(mint.as_ref());
         data
     }
 }
