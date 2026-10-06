@@ -8,7 +8,6 @@ use {
         signature::{Keypair, Signature},
         signer::Signer,
     },
-    solana_system_interface::instruction as system_instruction,
     std::time::Duration,
 };
 
@@ -39,17 +38,21 @@ async fn test_snapshot_matches_the_separate_reads(ctx: &PrivateChannelContext) {
 
     let from_keypair = Keypair::new();
     let blockhash = ctx.get_blockhash().await.unwrap();
+    let memo_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"signature-status-snapshot".to_vec(),
+    };
     let transaction = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &from_keypair.pubkey(),
-            &Keypair::new().pubkey(),
-            1_000,
-        )],
+        &[memo_ix],
         Some(&from_keypair.pubkey()),
         &[&from_keypair],
         blockhash,
     );
-    let landed = ctx.send_transaction(&transaction).await.unwrap();
+    let landed = ctx
+        .send_transaction(&transaction)
+        .await
+        .expect("the memo is admitted at ingress");
     ctx.check_transaction_exists(landed).await;
     let unknown = Signature::new_unique();
 
