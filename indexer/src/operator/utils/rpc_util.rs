@@ -263,6 +263,33 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the channel's address index progress as `(watermark, latest_block)`
+    /// with retry. Every block at or below the watermark is fully indexed.
+    pub async fn get_address_index_slot(&self) -> Result<(u64, u64), Box<client_error::Error>> {
+        let reply = self
+            .with_retry(
+                "get_address_index_slot",
+                RetryPolicy::Idempotent,
+                || async {
+                    self.rpc_client
+                        .send::<serde_json::Value>(
+                            RpcRequest::Custom {
+                                method: "getAddressIndexSlot",
+                            },
+                            serde_json::json!([]),
+                        )
+                        .await
+                },
+            )
+            .await?;
+        match (reply["watermark"].as_u64(), reply["latestBlock"].as_u64()) {
+            (Some(watermark), Some(latest_block)) => Ok((watermark, latest_block)),
+            _ => Err(Box::new(client_error::Error::from(ErrorKind::Custom(
+                format!("getAddressIndexSlot reply lacks watermark or latestBlock: {reply}"),
+            )))),
+        }
+    }
+
     /// Get the cluster genesis hash with retry. Used once at withdraw startup to
     /// prove the fallback endpoint is on the same cluster as the primary.
     pub async fn get_genesis_hash(&self) -> Result<Hash, Box<client_error::Error>> {
