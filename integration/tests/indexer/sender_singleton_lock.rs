@@ -433,6 +433,17 @@ async fn failed_startup_releases_the_sender_lock() {
 /// rows. The bitmap read that fails afterwards must be reported as the lost lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
+    lock_lost_during_the_boot_preflight(false).await;
+}
+
+/// Same lost lock, but the bitmap check that follows passes. The pre-flight returns Ok,
+/// so only the check after it stops the fetcher and sender from spawning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_lost_before_a_passing_bitmap_check_refuses_to_start() {
+    lock_lost_during_the_boot_preflight(true).await;
+}
+
+async fn lock_lost_during_the_boot_preflight(bitmap_check_passes: bool) {
     let _metrics_guard = WITHDRAW_LOCK_LOST_METRIC.lock().await;
     let (url, _container) = start_postgres().await;
     let db = PostgresDb::new(&PostgresConfig {
@@ -495,6 +506,34 @@ async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
             })
             .create_async()
             .await
+    };
+    // An absent bitmap at the anchor is an empty generation 0, a clean diff for this row.
+    let _bitmap_reads = if bitmap_check_passes {
+        vec![
+            rpc.mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+                ))
+                .with_status(200)
+                .with_body(format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":300}},"value":{{"blockhash":"{}","lastValidBlockHeight":450}}}},"id":1}}"#,
+                    solana_sdk::hash::Hash::new_unique()
+                ))
+                .create_async()
+                .await,
+            rpc.mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getAccountInfo""#.into(),
+                ))
+                .with_status(200)
+                .with_body(
+                    r#"{"jsonrpc":"2.0","result":{"context":{"slot":300},"value":null},"id":1}"#,
+                )
+                .create_async()
+                .await,
+        ]
+    } else {
+        Vec::new()
     };
     let killer = {
         let url = url.clone();
