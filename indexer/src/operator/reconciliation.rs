@@ -26,6 +26,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -33,6 +34,9 @@ const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
 const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
 const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Masked-breach alerts waiting for the webhook; past this one is dropped, its log line already written.
+const MASKED_ALERT_QUEUE_CAPACITY: usize = 64;
 
 /// Consecutive beyond-envelope, insolvency-direction ticks required before the
 /// pipelines are frozen. Each tick is a fresh finalized read, so a one-off
@@ -130,6 +134,10 @@ pub async fn run_reconciliation(
         WebhookRetryConfig::new(WEBHOOK_MAX_ATTEMPTS, WEBHOOK_BASE_DELAY, WEBHOOK_MAX_DELAY),
     )
     .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
+    let masked_alerts = MaskedAlerts::spawn(
+        config.reconciliation_webhook_url.clone(),
+        webhook_client.clone(),
+    );
 
     // Orphan-mint dedup state
     let mut previously_alerted_orphans: Option<HashSet<i64>> = None;
@@ -164,6 +172,7 @@ pub async fn run_reconciliation(
             &channel_rpc,
             escrow_instance_id,
             &webhook_client,
+            &masked_alerts,
             &health,
             &mut previously_alerted_orphans,
             &mut breach_counters,
@@ -318,6 +327,7 @@ async fn perform_reconciliation_check(
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
     webhook_client: &WebhookClient,
+    masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut BreachCounters,
@@ -333,6 +343,7 @@ async fn perform_reconciliation_check(
         channel_rpc,
         escrow_instance_id,
         webhook_client,
+        masked_alerts,
         health,
         previously_alerted_orphans,
         breach_counters,
@@ -435,6 +446,7 @@ async fn check_invariants(
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
     webhook_client: &WebhookClient,
+    masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut BreachCounters,
@@ -511,7 +523,7 @@ async fn check_invariants(
         fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
 
-    evaluate_and_maybe_halt(
+    let masked = evaluate_and_maybe_halt(
         storage,
         config,
         health,
@@ -528,6 +540,9 @@ async fn check_invariants(
         halted,
     )
     .await;
+    for masked_breach in masked {
+        masked_alerts.send(masked_breach);
+    }
 
     Ok(match supply_missing.or(ledger_missing) {
         Some(reason) => TickInputs::Missing(reason),
@@ -803,7 +818,9 @@ async fn evaluate_and_maybe_halt(
     liabilities: Option<&HashMap<Pubkey, u64>>,
     breach_counters: &mut BreachCounters,
     halted: &mut bool,
-) {
+) -> Vec<MaskedBreach> {
+    // Paged by the caller off this path, so a slow webhook never holds back a later halt.
+    let mut masked = Vec::new();
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
     let mut next_counters = BreachCounters {
@@ -836,8 +853,14 @@ async fn evaluate_and_maybe_halt(
 
         let Some(breach) = evaluate_insolvency(c, s, env.saturating_add(adj), tolerance) else {
             // Only a flipped verdict pages: a few seconds of settled rows are normal.
-            if let Some(masked) = evaluate_insolvency(c, s, env, tolerance) {
-                report_masked_breach(config, webhook_client, &mint, &masked, adj).await;
+            if let Some(breach) = evaluate_insolvency(c, s, env, tolerance) {
+                let masked_breach = MaskedBreach {
+                    mint,
+                    breach,
+                    adjustment: adj,
+                };
+                log_masked_breach(&masked_breach);
+                masked.push(masked_breach);
             }
             continue;
         };
@@ -958,6 +981,7 @@ async fn evaluate_and_maybe_halt(
     }
 
     *breach_counters = next_counters;
+    masked
 }
 
 /// Fire every fail-closed lever for a confirmed insolvency. Each is best-effort
@@ -1058,45 +1082,72 @@ async fn freeze_pipelines(
     in_force
 }
 
-/// Log and page a supply breach that only the adjustment explained. With a lagging backend
-/// that is expected, but the same allowance would also hide a real shortfall of that size.
-async fn report_masked_breach(
-    config: &OperatorConfig,
-    webhook_client: &WebhookClient,
-    mint: &Pubkey,
-    masked: &InsolvencyBreach,
+/// A supply breach that only the envelope adjustment explained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaskedBreach {
+    mint: Pubkey,
+    breach: InsolvencyBreach,
     adjustment: u64,
-) {
+}
+
+/// With a lagging backend a masked breach is expected, but the same allowance would also hide
+/// a real shortfall of that size, so it is logged at once and paged.
+fn log_masked_breach(masked: &MaskedBreach) {
     error!(
         reconciliation_alert = true,
-        mint = %mint,
-        supply_gap = masked.supply_gap,
-        envelope = masked.envelope,
-        adjustment,
-        tolerance = masked.tolerance,
+        mint = %masked.mint,
+        supply_gap = masked.breach.supply_gap,
+        envelope = masked.breach.envelope,
+        adjustment = masked.adjustment,
+        tolerance = masked.breach.tolerance,
         "RECONCILIATION ALERT: supply beyond custody is explained only by settled transfers \
          newer than a snapshot; a lagging RPC backend may be hiding a real shortfall"
     );
-    let Some(url) = &config.reconciliation_webhook_url else {
-        return;
-    };
+}
+
+/// Pages masked breaches from its own task, so a slow webhook never delays a halt decision.
+#[derive(Clone, Default)]
+struct MaskedAlerts(Option<mpsc::Sender<MaskedBreach>>);
+
+impl MaskedAlerts {
+    /// Starts the delivery task, which ends once every sender is dropped. No URL, no task.
+    fn spawn(webhook_url: Option<String>, webhook_client: WebhookClient) -> Self {
+        let Some(url) = webhook_url else {
+            return Self(None);
+        };
+        let (tx, mut rx) = mpsc::channel(MASKED_ALERT_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(masked) = rx.recv().await {
+                post_masked_breach(&webhook_client, &url, &masked).await;
+            }
+        });
+        Self(Some(tx))
+    }
+
+    /// Never waits: a full queue drops the page and keeps the tick moving.
+    fn send(&self, masked: MaskedBreach) {
+        let Some(tx) = &self.0 else {
+            return;
+        };
+        let mint = masked.mint;
+        if tx.try_send(masked).is_err() {
+            warn!(mint = %mint, "Masked-breach alert queue full; webhook page dropped");
+        }
+    }
+}
+
+async fn post_masked_breach(webhook_client: &WebhookClient, url: &str, masked: &MaskedBreach) {
     let payload = serde_json::json!({
         "alert": "envelope_adjustment_changed_verdict",
-        "mint": mint.to_string(),
-        "supply_gap": masked.supply_gap,
-        "envelope": masked.envelope,
-        "adjustment": adjustment,
-        "tolerance": masked.tolerance,
+        "mint": masked.mint.to_string(),
+        "supply_gap": masked.breach.supply_gap,
+        "envelope": masked.breach.envelope,
+        "adjustment": masked.adjustment,
+        "tolerance": masked.breach.tolerance,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    if let Err(e) = webhook_client
-        .post_json(
-            url,
-            &payload,
-            &format!("envelope adjustment for mint {mint}"),
-        )
-        .await
-    {
+    let context = format!("envelope adjustment for mint {}", masked.mint);
+    if let Err(e) = webhook_client.post_json(url, &payload, &context).await {
         error!(
             "Failed to send envelope adjustment webhook after {} attempts: {}",
             e.attempts(),
@@ -2809,6 +2860,7 @@ mod tests {
             &fast_rpc(env.channel.url()),
             test_instance(),
             &test_webhook_client(),
+            &MaskedAlerts::default(),
             &None,
             &mut None,
             counters,
@@ -3526,6 +3578,7 @@ mod tests {
             &channel_rpc,
             test_instance(),
             &webhook_client,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3581,6 +3634,7 @@ mod tests {
             &rpc,
             test_instance(),
             &webhook,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3602,6 +3656,7 @@ mod tests {
             &rpc,
             test_instance(),
             &webhook,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3993,23 +4048,18 @@ mod tests {
         (hook, alert)
     }
 
-    /// The alert fires only when the adjustment turned a breach into no breach, not whenever
+    /// The alert is raised only when the adjustment turned a breach into no breach, not whenever
     /// it is non-zero, and the gauge reports it every tick.
     #[tokio::test]
     async fn the_adjustment_alerts_only_when_it_changes_the_verdict() {
         // (custody, adjustment, alerts): supply 1200, envelope 100, zero tolerance.
         for (custody, adj, alerts) in [(1_000u64, 150u64, 1usize), (1_100, 150, 0), (800, 150, 0)] {
-            let (hook, alert) = masked_hook(alerts).await;
-            let config = OperatorConfig {
-                reconciliation_webhook_url: Some(hook.url()),
-                ..recon_config_zero_tolerance()
-            };
             let storage = Arc::new(Storage::Mock(MockStorage::new()));
             let mint = Pubkey::new_unique();
             let mut counters = BreachCounters::default();
-            evaluate_and_maybe_halt(
+            let masked = evaluate_and_maybe_halt(
                 &storage,
-                &config,
+                &recon_config_zero_tolerance(),
                 &None,
                 &test_webhook_client(),
                 &HashMap::from([(mint, custody)]),
@@ -4024,7 +4074,8 @@ mod tests {
                 &mut false,
             )
             .await;
-            alert.assert_async().await;
+            assert_eq!(masked.len(), alerts, "custody {custody}");
+            assert!(masked.iter().all(|m| m.mint == mint && m.adjustment == adj));
             assert_eq!(
                 crate::metrics::OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT
                     .with_label_values(&[&mint.to_string()])
@@ -4032,6 +4083,111 @@ mod tests {
                 adj as f64
             );
         }
+    }
+
+    fn masked_breach() -> MaskedBreach {
+        MaskedBreach {
+            mint: Pubkey::new_unique(),
+            breach: InsolvencyBreach {
+                supply_gap: 200,
+                envelope: 100,
+                tolerance: 0,
+            },
+            adjustment: 150,
+        }
+    }
+
+    /// A queued masked breach reaches the webhook from the delivery task.
+    #[tokio::test]
+    async fn a_queued_masked_breach_is_paged() {
+        let (hook, alert) = masked_hook(1).await;
+        let alerts = MaskedAlerts::spawn(Some(hook.url()), test_webhook_client());
+        alerts.send(masked_breach());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !alert.matched_async().await && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        alert.assert_async().await;
+    }
+
+    /// A full queue drops the page instead of waiting, and no URL means no queue at all.
+    #[tokio::test]
+    async fn a_full_masked_alert_queue_never_waits() {
+        let (tx, _rx) = mpsc::channel(1);
+        let alerts = MaskedAlerts(Some(tx));
+        let sends = async {
+            for _ in 0..=MASKED_ALERT_QUEUE_CAPACITY {
+                alerts.send(masked_breach());
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), sends)
+            .await
+            .expect("send must never wait on a full queue");
+        assert!(MaskedAlerts::spawn(None, test_webhook_client()).0.is_none());
+    }
+
+    /// A webhook that never answers must not hold back a halt decided later in the same pass.
+    #[tokio::test]
+    async fn a_hanging_alert_webhook_does_not_delay_a_halt() {
+        // Accepts connections and never replies, so every post waits out its timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(url),
+            ..recon_config_zero_tolerance()
+        };
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        // Supply 1200 over custody 1000 with envelope 100 is a breach only the adjustment
+        // of 150 explains, while liabilities of 2000 are a real shortfall on its third tick.
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, HALT_CONFIRM_TICKS - 1)]),
+            ..Default::default()
+        };
+        let pass = {
+            let storage = storage.clone();
+            async move {
+                evaluate_and_maybe_halt(
+                    &storage,
+                    &config,
+                    &None,
+                    &test_webhook_client(),
+                    &HashMap::from([(mint, 1_000u64)]),
+                    1,
+                    &HashMap::new(),
+                    &HashSet::from([mint]),
+                    &HashMap::from([(mint, 1_200u64)]),
+                    &HashMap::from([(mint, 100u64)]),
+                    &HashMap::from([(mint, 150u64)]),
+                    Some(&HashMap::from([(mint, 2_000u64)])),
+                    &mut counters,
+                    &mut false,
+                )
+                .await
+            }
+        };
+        let pass = tokio::spawn(pass);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut flag = None;
+        while tokio::time::Instant::now() < deadline {
+            flag = storage.is_reconciliation_halted().await.unwrap();
+            if flag.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pass.abort();
+        assert!(
+            flag.is_some_and(|flag| flag.insolvency),
+            "the liability halt must land while the alert webhook hangs"
+        );
     }
 
     // ── missing inputs (input-dark ticks) ─────────────────────────────
@@ -4633,6 +4789,7 @@ mod tests {
             &fast_rpc(env.channel.url()),
             test_instance(),
             &test_webhook_client(),
+            &MaskedAlerts::default(),
             &Some(health.clone()),
             &mut None,
             counters,
