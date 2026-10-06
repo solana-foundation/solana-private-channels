@@ -3,7 +3,6 @@ use {
     private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry},
     solana_commitment_config::CommitmentConfig,
     solana_sdk::{signature::Keypair, signer::Signer},
-    solana_system_interface::instruction as system_instruction,
     std::time::Duration,
 };
 
@@ -40,12 +39,13 @@ pub async fn run_address_index_slot_test(ctx: &PrivateChannelContext) {
 
     let from = Keypair::new();
     let blockhash = ctx.get_blockhash().await.unwrap();
+    let memo_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"address-index-slot".to_vec(),
+    };
     let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[system_instruction::transfer(
-            &from.pubkey(),
-            &Keypair::new().pubkey(),
-            1_000,
-        )],
+        &[memo_ix],
         Some(&from.pubkey()),
         &[&from],
         blockhash,
@@ -53,7 +53,7 @@ pub async fn run_address_index_slot_test(ctx: &PrivateChannelContext) {
     ctx.send_and_check(&tx, Duration::from_secs(5))
         .await
         .unwrap()
-        .expect("the transfer lands in a block");
+        .expect("the memo lands in a block");
 
     let (watermark, latest_block) = wait_caught_up(&rpc, Duration::from_secs(10), "busy").await;
     println!("Caught up after traffic: watermark {watermark}, latest block {latest_block}");
