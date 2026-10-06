@@ -603,6 +603,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
     }
 

@@ -876,3 +876,101 @@ async fn slow_processor_does_not_trip_the_watchdog() {
     stop_watchdog_source(server, cancel, handle).await;
     drain.abort();
 }
+
+/// A provider that keeps sending finalized Slot updates but withholds the blocks with no
+/// program transaction must not freeze the checkpoint: RPC fills the withheld slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slots_without_their_blocks_are_filled_over_rpc() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    const CHECKPOINT: u64 = 100;
+    const RESUME: u64 = 101;
+    const LAST_SLOT: u64 = 160;
+
+    // Every slot is produced and empty, so any range the fill asks for is answered in full.
+    let mut rpc_mock = MockitoServer::new_async().await;
+    let _enumeration = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
+        .with_status(200)
+        .with_body_from_request(|req| {
+            let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let start = body["params"][0].as_u64().unwrap();
+            let end = body["params"][1].as_u64().unwrap();
+            let slots: Vec<u64> = (start..=end).collect();
+            json!({"jsonrpc": "2.0", "result": slots, "id": 1})
+                .to_string()
+                .into_bytes()
+        })
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _blocks = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlock"})))
+        .with_status(200)
+        .with_body_from_request(|req| {
+            let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let slot = body["params"][0].as_u64().unwrap();
+            json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1})
+                .to_string()
+                .into_bytes()
+        })
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let server = MockYellowstoneServer::start().await;
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_mock.url(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Confirmed,
+    ));
+    let mock_storage = MockStorage::new();
+    mock_storage.set_checkpoint("escrow", CHECKPOINT);
+    let storage: Arc<Storage> = Arc::new(Storage::Mock(mock_storage));
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(1024);
+    let cancel = CancellationToken::new();
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(rpc_poller, None, 1_000, 16)
+    .with_storage(storage);
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // Only Slot updates arrive: the provider drops every block that has no escrow transaction.
+    server.enqueue_sequence((RESUME..=LAST_SLOT).map(|slot| Update::ok(slot_update(slot))));
+
+    // Well past the arming gate, so only a re-arm from the lagging slots can complete it.
+    let wanted: HashSet<u64> = (RESUME..=LAST_SLOT - 32).collect();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !wanted.is_subset(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let mut missing: Vec<_> = wanted.difference(&seen).copied().collect();
+            missing.sort_unstable();
+            panic!("withheld slots were never filled; missing: {missing:?}");
+        }
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(remaining, rx.recv()).await
+        {
+            seen.insert(slot);
+        }
+    }
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    server.shutdown().await;
+}

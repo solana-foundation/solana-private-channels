@@ -153,6 +153,11 @@ const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Tear the connection down if a keepalive PING goes unanswered this long.
 const GRPC_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How far a finalized Slot may run past the last delivered block before the blocks in between
+/// count as withheld. The pinned plugin sends each Block before its Slot, so this is only slack
+/// for other providers, and small enough that RPC refills them faster than refunds re-check.
+const WITHHELD_BLOCK_SLOTS: u64 = 32;
+
 /// Reconnect when no new Slot or Block arrives in this window; pings alone do not count.
 const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -760,6 +765,50 @@ async fn connect_and_stream(
                                 break;
                             };
                             gate_target = Some(target);
+                        }
+                    }
+                    // Blocks withheld behind a Slot are filled over RPC, or the checkpoint freezes.
+                    let covered = last_forwarded.as_ref().map(|b| b.slot).max(gate_target);
+                    if let Some(covered) =
+                        covered.filter(|c| slot_update.slot > c + WITHHELD_BLOCK_SLOTS)
+                    {
+                        metrics::INDEXER_RPC_ERRORS
+                            .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                            .inc();
+                        #[cfg(feature = "datasource-rpc")]
+                        let rearmed = match gap_ctx {
+                            Some(ctx) => {
+                                warn!(
+                                    "Yellowstone slot {} arrived without the blocks after slot {covered}; filling them over RPC",
+                                    slot_update.slot
+                                );
+                                let armed_target = arm_reconnect_gap(
+                                    slot_update.slot,
+                                    startup_floor,
+                                    ctx,
+                                    &tx,
+                                    &cancellation_token,
+                                    RECONNECT_GAP_RETRY_BACKOFF,
+                                    backfill_handle,
+                                )
+                                .await
+                                .map_err(DataSourceError::Rpc)?;
+                                let Some(target) = armed_target else {
+                                    break;
+                                };
+                                gate_target = Some(gate_target.map_or(target, |t| t.max(target)));
+                                true
+                            }
+                            None => false,
+                        };
+                        #[cfg(not(feature = "datasource-rpc"))]
+                        let rearmed = false;
+                        // A reconnect cannot recover the slots without RPC repair, so only report.
+                        if !rearmed {
+                            error!(
+                                "Yellowstone slot {} arrived without the blocks after slot {covered}, and no RPC repair is configured",
+                                slot_update.slot
+                            );
                         }
                     }
                     progress.handled(slot_update.slot, arrived);

@@ -303,6 +303,9 @@ pub struct PendingRemint {
     /// Coverage waits taken without charging `finality_check_attempts`.
     /// In memory only: a restart re-captures a later bound, so it starts a fresh wait.
     pub coverage_waits: u32,
+    /// Set the first time the entry reaches the release-record gate, which restarts the
+    /// attempt counter once. In memory only, so a restart grants one more restart.
+    pub record_gate_reached: bool,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.

@@ -166,6 +166,7 @@ fn make_pending_remint(
         coverage_slot: None,
         coverage_checkpoint: None,
         coverage_waits: 0,
+        record_gate_reached: false,
     }
 }
 
@@ -194,6 +195,7 @@ fn make_pending_remint_with_lvbh(
         coverage_slot: None,
         coverage_checkpoint: None,
         coverage_waits: 0,
+        record_gate_reached: false,
     }
 }
 

@@ -864,6 +864,12 @@ pub async fn process_pending_remints(
                 }
                 // The payout record is the last gate, and the only one whose answer survives a rotation.
                 BitmapVerdict::Unknown(_) | BitmapVerdict::Clear => {
+                    // Getting here ends the signature and bitmap waits, so the attempts they spent
+                    // are refunded once, leaving room for a transient error at the record gate.
+                    if !entry.record_gate_reached {
+                        entry.record_gate_reached = true;
+                        entry.finality_check_attempts = 0;
+                    }
                     match release_record(state, &mut entry).await {
                         ReleaseRecord::Found(reason) => {
                             error!("Refusing to remint nonce {}: {}", nonce_label, reason);
@@ -1703,6 +1709,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1753,6 +1760,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1800,6 +1808,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1859,6 +1868,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1914,6 +1924,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1987,6 +1998,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         // Entry 2: immature — must not be touched at all.
@@ -2011,6 +2023,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2114,6 +2127,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2182,6 +2196,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
     }
 
@@ -2657,7 +2672,10 @@ mod tests {
             "a lagging first coverage read must not escalate"
         );
         assert_eq!(state.pending_remints.len(), 1);
-        assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+        assert_eq!(
+            state.pending_remints[0].finality_check_attempts, 0,
+            "reaching the record gate restarts the counter"
+        );
         assert_eq!(
             persisted_attempts(&mock, 99),
             persisted,
@@ -2678,7 +2696,7 @@ mod tests {
     }
 
     /// A checkpoint that does not move is a stuck indexer, not one catching up. Only the
-    /// first read is free; the next one is charged and escalates at the shared cap.
+    /// first read is free; later frozen reads are charged and escalate at the shared cap.
     #[tokio::test]
     async fn a_frozen_checkpoint_gets_one_free_wait_then_escalates() {
         ensure_test_signer();
@@ -2702,7 +2720,14 @@ mod tests {
             "the first coverage read is free"
         );
         assert_eq!(state.pending_remints.len(), 1);
-        assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+
+        for charged in 1..MAX_FINALITY_CHECK_ATTEMPTS {
+            mature(&mut state);
+            process_pending_remints(&mut state, &storage_tx).await;
+            assert!(storage_rx.try_recv().is_err(), "charge {charged} defers");
+            assert_eq!(state.pending_remints[0].finality_check_attempts, charged);
+        }
 
         mature(&mut state);
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2713,8 +2738,8 @@ mod tests {
         assert!(state.pending_remints.is_empty());
     }
 
-    /// Coverage that cannot be measured is not progress, so each of these is charged
-    /// on the very first read and escalates at the shared cap.
+    /// Coverage that cannot be measured is not progress, so each of these is charged on the
+    /// very first read, against the counter the record gate just restarted.
     #[tokio::test]
     async fn unreadable_coverage_inputs_are_charged() {
         for case in ["checkpoint read error", "no checkpoint", "getSlot error"] {
@@ -2732,21 +2757,108 @@ mod tests {
                     .unwrap(),
                 _ => {}
             }
+            seed_pending_remint_row(&mock, 99, 2);
             let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
             queue_dead_remint(&mut state, 3);
             state.pending_remints[0].finality_check_attempts = 2;
             process_pending_remints(&mut state, &storage_tx).await;
 
-            let update = storage_rx.try_recv().expect(case);
-            assert_eq!(update.status, TransactionStatus::ManualReview, "{case}");
-            assert!(state.pending_remints.is_empty(), "{case}");
+            assert!(storage_rx.try_recv().is_err(), "{case}");
+            assert_eq!(state.pending_remints.len(), 1, "{case}");
+            assert_eq!(
+                state.pending_remints[0].finality_check_attempts, 1,
+                "{case}"
+            );
+            assert_eq!(persisted_attempts(&mock, 99).0, 1, "{case}");
         }
+    }
+
+    /// The predictable signature and bitmap waits can spend two attempts before the record
+    /// gate is reached. Reaching it restarts the counter once, so a single transient error
+    /// after that, here a failed checkpoint read after a free wait, is charged, not escalated.
+    #[tokio::test]
+    async fn a_transient_error_after_reaching_the_record_gate_does_not_escalate() {
+        ensure_test_signer();
+        let (mut server, _mocks) = record_gate_server().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 8_970)
+            .await
+            .unwrap();
+        seed_pending_remint_row(&mock, 99, 2);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].finality_check_attempts = 2;
+
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(storage_rx.try_recv().is_err(), "the first read is free");
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
+
+        mock.set_should_fail("get_committed_checkpoint", true);
+        mature(&mut state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "one transient error after reaching the gate must not escalate"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        assert_eq!(persisted_attempts(&mock, 99).0, 1);
+    }
+
+    /// A failed bound read on the very first arrival at the record gate is charged against
+    /// the restarted counter, not against the two attempts the earlier gates spent.
+    #[tokio::test]
+    async fn a_get_slot_error_on_first_arrival_does_not_escalate() {
+        ensure_test_signer();
+        let (server, _mocks) = record_gate_server().await;
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 2);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].finality_check_attempts = 2;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(storage_rx.try_recv().is_err());
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        assert!(state.pending_remints[0].record_gate_reached);
+    }
+
+    /// The restart happens once per entry, or a persistent error at the record gate would
+    /// reset the counter every tick and never escalate.
+    #[tokio::test]
+    async fn the_record_gate_restarts_the_counter_only_once() {
+        ensure_test_signer();
+        let (server, _mocks) = record_gate_server().await;
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 2);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].finality_check_attempts = 2;
+        state.pending_remints[0].record_gate_reached = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an entry already past its restart is charged as before");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(state.pending_remints.is_empty());
     }
 
     /// An indexer that keeps moving but never reaches the bound (a bound read from a node
     /// far ahead, or a crawling indexer) must still end in ManualReview: free waits run
-    /// out after `MAX_COVERAGE_WAITS`, and the next read is charged.
+    /// out after `MAX_COVERAGE_WAITS`, and later reads are charged up to the shared cap.
     #[tokio::test]
     async fn free_coverage_waits_are_capped() {
         ensure_test_signer();
@@ -2770,15 +2882,22 @@ mod tests {
             mature(&mut state);
             process_pending_remints(&mut state, &storage_tx).await;
             assert!(storage_rx.try_recv().is_err(), "wait {wait} must be free");
-            assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+            assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
             assert_eq!(state.pending_remints[0].coverage_waits, wait);
         }
 
-        mock.update_committed_checkpoint("escrow", checkpoint + 1)
-            .await
-            .unwrap();
-        mature(&mut state);
-        process_pending_remints(&mut state, &storage_tx).await;
+        for charged in 1..=MAX_FINALITY_CHECK_ATTEMPTS {
+            checkpoint += 1;
+            mock.update_committed_checkpoint("escrow", checkpoint)
+                .await
+                .unwrap();
+            mature(&mut state);
+            process_pending_remints(&mut state, &storage_tx).await;
+            if charged < MAX_FINALITY_CHECK_ATTEMPTS {
+                assert!(storage_rx.try_recv().is_err(), "charge {charged} defers");
+                assert_eq!(state.pending_remints[0].finality_check_attempts, charged);
+            }
+        }
         let update = storage_rx
             .try_recv()
             .expect("past the cap a coverage wait is charged");
@@ -2847,7 +2966,7 @@ mod tests {
             "the first coverage read after a restart is free"
         );
         assert_eq!(state.pending_remints.len(), 1);
-        assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 0);
         assert_eq!(persisted_attempts(&mock, 99).0, 2);
     }
 
@@ -3433,6 +3552,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         }
     }
 
@@ -3483,6 +3603,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         };
 
         let _outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
@@ -3565,6 +3686,8 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            // Already past its one counter restart, so the next charge hits the cap.
+            record_gate_reached: true,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3648,6 +3771,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3725,6 +3849,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -3807,6 +3932,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4202,6 +4328,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4272,6 +4399,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4334,6 +4462,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4400,6 +4529,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -4478,6 +4608,7 @@ mod tests {
             coverage_slot: None,
             coverage_checkpoint: None,
             coverage_waits: 0,
+            record_gate_reached: false,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
