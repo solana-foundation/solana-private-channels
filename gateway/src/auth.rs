@@ -18,7 +18,8 @@ use std::str::FromStr;
 use tracing::warn;
 
 use crate::db::{
-    is_wallet_owned_by_user, owned_wallets, owner_change_indexed_from, owner_changes, OwnerChange,
+    is_wallet_owned_by_user, owned_wallets, owner_change_coverage, owner_changes, OwnerChange,
+    OwnerChangeCoverage,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,6 +189,10 @@ const MINT_END: usize = 32;
 const OWNER_OFFSET: usize = 32;
 const OWNER_END: usize = 64;
 
+/// Byte range of the `amount` field: the balance in base units, a u64 LE.
+const AMOUNT_OFFSET: usize = 64;
+const AMOUNT_END: usize = 72;
+
 /// Byte offset of the `delegate` Option discriminant (u32 LE: 0=None, 1=Some).
 const DELEGATE_OPTION_OFFSET: usize = 72;
 
@@ -326,6 +331,39 @@ pub async fn check_account_data_ownership(
     }
 }
 
+/// Whether who may read the account is decided by its own bytes, which can
+/// change between the gateway's check and the node's answer. A wallet's reader
+/// is decided by its address, which cannot.
+pub fn authority_is_in_account_data(program_owner: &str) -> bool {
+    matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
+        || program_owner == DVP_SWAP_PROGRAM.as_str()
+}
+
+/// The balance a token account's bytes hold, or `None` if they are not a token
+/// account.
+pub fn token_account_amount(data: &[u8], program_owner: &str) -> Option<u64> {
+    if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
+        || data.len() < TOKEN_ACCOUNT_SIZE
+    {
+        return None;
+    }
+    let amount: [u8; 8] = data[AMOUNT_OFFSET..AMOUNT_END].try_into().ok()?;
+    Some(u64::from_le_bytes(amount))
+}
+
+/// Whether a `getAccountInfo` asks for the account whole and in a form whose
+/// bytes the gateway can check: no `dataSlice`, and base64. `jsonParsed`
+/// qualifies because the node passes no mint decimals, so it serves token and
+/// swap accounts as base64 either way.
+pub fn asks_for_whole_account(params: &Value) -> bool {
+    let Some(config) = params.get(1).filter(|config| !config.is_null()) else {
+        return true;
+    };
+    let encoding = config.get("encoding").and_then(Value::as_str);
+    config.get("dataSlice").is_none_or(Value::is_null)
+        && matches!(encoding, None | Some("base64") | Some("jsonParsed"))
+}
+
 /// Whether `pubkey` is still the associated token account its own `owner` field
 /// derives to.
 ///
@@ -365,12 +403,14 @@ const MAX_OWNER_CHANGES: i64 = 64;
 
 /// The slot ranges `user_id` may read `pubkey`'s history for.
 ///
-/// `None` means no filtering: the address never changed hands, so all of it is
-/// theirs. `Some(ranges)` keeps only entries whose slot falls inside one of
-/// them, and an empty `Some` hides the page entirely.
+/// `None` means no filtering, which only a wallet address gets: it is its own
+/// identity for as long as it exists. `Some(ranges)` keeps only entries whose
+/// slot falls inside one of them, and an empty `Some` hides the page entirely.
 ///
-/// Only a token account can change hands; a wallet address is its own identity
-/// for as long as it exists, so it never needs a range.
+/// A token account can change hands, so its windows end at the ledger tip read
+/// in the same snapshot as its chain. The chain holds every handoff up to that
+/// tip, so a handoff after it, which the node may already show when it serves
+/// the page, is outside every window.
 pub async fn resolve_owned_slot_ranges(
     data: &[u8],
     program_owner: &str,
@@ -392,16 +432,23 @@ pub async fn resolve_owned_slot_ranges(
         return Ok(Some(Vec::new()));
     };
 
-    // Handoffs are only recorded from this slot on. Below it an empty table
-    // means the rows were not being written yet, not that nothing happened.
-    let Some(indexed_from) = owner_change_indexed_from(auth_db).await? else {
-        warn!("Ledger records no owner-change watermark; serving no history for {pubkey}");
-        record_scope_outcome("no_watermark");
+    // One snapshot for the coverage and the chain, so the chain holds every
+    // handoff up to the tip whichever server answers the history query.
+    let mut snapshot = auth_db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *snapshot)
+        .await?;
+
+    let Some(coverage) = owner_change_coverage(&mut snapshot).await? else {
+        warn!("Ledger records no owner-change watermark or tip; serving no history for {pubkey}");
+        record_scope_outcome("no_coverage");
         return Ok(Some(Vec::new()));
     };
 
     // One past the cap, so a full page is how an over-long chain announces itself.
-    let changes = owner_changes(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
+    let changes = owner_changes(&mut snapshot, &address, MAX_OWNER_CHANGES + 1).await?;
+    // The wallet lookup below needs no snapshot.
+    snapshot.commit().await?;
     if changes.is_empty() {
         // No row is only evidence of no handoff while the address still derives
         // from its owner. An owner it does not derive to was moved without one
@@ -412,13 +459,13 @@ pub async fn resolve_owned_slot_ranges(
             record_scope_outcome("unrecorded_handoff");
             return Ok(Some(Vec::new()));
         }
-        // A ledger recorded from genesis can vouch for the whole history.
-        if indexed_from == 0 {
-            record_scope_outcome("never_handed_on");
-            return Ok(None);
-        }
-        record_scope_outcome("watermarked");
-        return Ok(Some(vec![(indexed_from, i64::MAX)]));
+        // Never handed on, so every slot the chain vouches for is theirs.
+        record_scope_outcome(if coverage.indexed_from == 0 {
+            "never_handed_on"
+        } else {
+            "watermarked"
+        });
+        return Ok(Some(clip_to_coverage(vec![(0, i64::MAX)], coverage)));
     }
     // Past the cap what we hold is a suffix of the timeline. Every window inside
     // it is still accounted for by the handoffs on either side of it, so the cap
@@ -445,12 +492,10 @@ pub async fn resolve_owned_slot_ranges(
     let owned = owned_wallets(auth_db, user_id, &candidates).await?;
 
     let current_owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
-    let ranges = slot_ranges_for_owner(&changes, &current_owner, &owned, chain_is_complete)
-        .into_iter()
-        .filter_map(|(first, last)| {
-            (last >= indexed_from).then_some((first.max(indexed_from), last))
-        })
-        .collect::<Vec<_>>();
+    let ranges = clip_to_coverage(
+        slot_ranges_for_owner(&changes, &current_owner, &owned, chain_is_complete),
+        coverage,
+    );
 
     if ranges.is_empty() {
         // Either the chain did not account for the current owner, or none of
@@ -465,6 +510,20 @@ pub async fn resolve_owned_slot_ranges(
     }
 
     Ok(Some(ranges))
+}
+
+/// Clip `ranges` to the slots the chain vouches for: none below the watermark,
+/// where handoffs were not recorded yet, and none above the tip, where one may
+/// have landed since. A window left empty is dropped.
+fn clip_to_coverage(ranges: Vec<(i64, i64)>, coverage: OwnerChangeCoverage) -> Vec<(i64, i64)> {
+    ranges
+        .into_iter()
+        .filter_map(|(first, last)| {
+            let first = first.max(coverage.indexed_from);
+            let last = last.min(coverage.tip);
+            (first <= last).then_some((first, last))
+        })
+        .collect()
 }
 
 /// Rebuild an address's ownership timeline from its handoffs and keep the
@@ -702,6 +761,17 @@ pub fn auth_unavailable_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": { "code": -32004, "message": "Service unavailable: could not verify account ownership" }
+        })
+        .to_string(),
+    )
+}
+
+/// 400 body for a token or swap account asked for, or served, in a shape whose
+/// bytes the gateway cannot check.
+pub fn whole_account_only_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32602, "message": "Invalid params: token and swap accounts are served whole, as base64" }
         })
         .to_string(),
     )

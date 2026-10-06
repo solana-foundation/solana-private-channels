@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -27,8 +27,11 @@ pub struct OwnerChange {
 /// deleted, so reading from the oldest end would let churn that has long since
 /// scrolled past decide what the current owner may read. The caller decides what
 /// a chain that fills the limit means.
+///
+/// Takes a connection so it can be read in one snapshot with
+/// `owner_change_coverage`.
 pub async fn owner_changes(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     address: &[u8],
     limit: i64,
 ) -> Result<Vec<OwnerChange>, sqlx::Error> {
@@ -43,7 +46,7 @@ pub async fn owner_changes(
     )
     .bind(address)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
 
     // Taken newest first to bound the read, handed back oldest first because
@@ -75,23 +78,50 @@ pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> Result<Option<Role>,
     }))
 }
 
-/// The first slot the ledger's handoff table is known to cover, or `None` when
-/// the node has not recorded one.
-///
-/// Anything below it predates the recording, so an absent handoff there means
-/// "not written yet" rather than "never happened".
-pub async fn owner_change_indexed_from(pool: &PgPool) -> Result<Option<i64>, sqlx::Error> {
-    let value: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT value FROM public.metadata WHERE key = $1")
-            .bind("owner_change_indexed_from_slot")
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+/// Mirror the node's metadata keys.
+const OWNER_CHANGE_INDEXED_FROM_KEY: &str = "owner_change_indexed_from_slot";
+const LATEST_SLOT_KEY: &str = "latest_slot";
 
-    Ok(value.and_then(|bytes| {
-        let slot: [u8; 8] = bytes.as_slice().try_into().ok()?;
-        Some(i64::from_be_bytes(slot))
-    }))
+/// The slots the ledger's handoff table can vouch for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerChangeCoverage {
+    /// First slot handoffs are recorded from. Below it an absent handoff means
+    /// "not written yet" rather than "never happened".
+    pub indexed_from: i64,
+    /// Newest slot the ledger has committed.
+    pub tip: i64,
+}
+
+/// The watermark and the tip, or `None` if either is missing.
+///
+/// Read in the same snapshot as `owner_changes`: the node commits the tip with
+/// its block's handoffs, so that chain holds every handoff at or below it. The
+/// watermark is stored big-endian and the tip as a little-endian counter.
+pub async fn owner_change_coverage(
+    connection: &mut PgConnection,
+) -> Result<Option<OwnerChangeCoverage>, sqlx::Error> {
+    let rows: Vec<(String, Vec<u8>)> =
+        sqlx::query_as("SELECT key, value FROM public.metadata WHERE key = ANY($1)")
+            .bind([OWNER_CHANGE_INDEXED_FROM_KEY, LATEST_SLOT_KEY])
+            .fetch_all(&mut *connection)
+            .await?;
+
+    let mut indexed_from = None;
+    let mut tip = None;
+    for (key, value) in rows {
+        let Ok(bytes) = <[u8; 8]>::try_from(value.as_slice()) else {
+            continue;
+        };
+        match key.as_str() {
+            OWNER_CHANGE_INDEXED_FROM_KEY => indexed_from = Some(i64::from_be_bytes(bytes)),
+            LATEST_SLOT_KEY => tip = i64::try_from(u64::from_le_bytes(bytes)).ok(),
+            _ => {}
+        }
+    }
+
+    Ok(indexed_from
+        .zip(tip)
+        .map(|(indexed_from, tip)| OwnerChangeCoverage { indexed_from, tip }))
 }
 
 /// Which of `pubkeys` are verified wallets of `user_id`, in one round trip.

@@ -348,6 +348,25 @@ fn token_account_response(owner_bytes: &[u8; 32], delegate_bytes: Option<&[u8; 3
     .to_string()
 }
 
+/// Build a getTokenAccountBalance JSON-RPC response in the node's shape. Its
+/// `uiAmountString` is only right for `decimals: 0`; no test reads it back.
+fn token_balance_response(amount: u64, decimals: u8) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 1},
+            "value": {
+                "amount": amount.to_string(),
+                "decimals": decimals,
+                "uiAmount": amount as f64 / 10_f64.powi(decimals as i32),
+                "uiAmountString": amount.to_string()
+            }
+        }
+    })
+    .to_string()
+}
+
 /// Where an untouched ATA of `owner` actually sits, for the all-zero mint
 /// `token_account_response` builds.
 ///
@@ -455,7 +474,19 @@ async fn init_owner_change_table(pool: &PgPool) {
     .await
     .unwrap();
     set_owner_change_watermark(pool, 0).await;
+
+    // The node writes this with every block, in the transaction that records
+    // the block's handoffs, as a little-endian counter.
+    sqlx::query("INSERT INTO metadata (key, value) VALUES ('latest_slot', $1)")
+        .bind(LEDGER_TIP.to_le_bytes().to_vec())
+        .execute(pool)
+        .await
+        .unwrap();
 }
+
+/// The newest slot the ledger has committed, as `init_owner_change_table`
+/// writes it. No history scope reaches past it.
+const LEDGER_TIP: i64 = 1_000;
 
 /// Declare that handoffs are recorded from `slot` onward.
 async fn set_owner_change_watermark(pool: &PgPool, slot: i64) {
@@ -1023,6 +1054,165 @@ async fn test_get_account_info_operator_bypasses_ownership_check() {
     assert_eq!(res.status(), 200);
 }
 
+/// The account is the caller's when the gateway checks it and handed on by the
+/// time the node serves it, as when the two reads reach replicas at different
+/// heights. What is served is what gets checked, so the new owner's account is
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_refuses_an_account_handed_on_after_the_check() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let previous_owner = [70u8; 32];
+    let new_owner = [71u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(previous_owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // The ownership fetch sees the caller's account, the proxied call the new owner's.
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&previous_owner, None),
+        token_account_response(&new_owner, None),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [bs58::encode([72u8; 32]).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// A slice or an encoding the gateway does not decode would come back as bytes
+/// it cannot check, and a slice can line another field up where the owner sits.
+/// A token account asked for in those shapes is refused before the node is.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_refuses_token_account_shapes_it_cannot_check() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner = [73u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let (backend, requests) =
+        start_recording_mock_backend(vec![token_account_response(&owner, None)]).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let refused_configs = [
+        json!({"encoding": "base64", "dataSlice": {"offset": 44, "length": 165}}),
+        json!({"encoding": "base58"}),
+        json!({"encoding": "base64+zstd"}),
+        json!({"encoding": "binary"}),
+    ];
+    for config in &refused_configs {
+        let res = Client::new()
+            .post(format!("http://{}", addr))
+            .bearer_auth(&token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAccountInfo",
+                "params": [bs58::encode([74u8; 32]).into_string(), config]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400, "{config} must be refused");
+    }
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        refused_configs.len(),
+        "only the ownership fetches reach the node"
+    );
+}
+
+/// `jsonParsed` is let through because the node serves a token account in it
+/// as base64. Were it ever to parse one, the gateway could not check the bytes
+/// and must refuse them rather than serve them.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_refuses_a_response_it_cannot_check() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner = [75u8; 32];
+    let owner_pubkey = bs58::encode(owner).into_string();
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &owner_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let parsed_account = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 1},
+            "value": {
+                "lamports": 2_039_280,
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": {
+                    "program": "spl-token",
+                    "parsed": {"type": "account", "info": {"owner": owner_pubkey}},
+                    "space": 165
+                },
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string();
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&owner, None),
+        parsed_account,
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [bs58::encode([76u8; 32]).into_string(), {"encoding": "jsonParsed"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
 /// `getTokenAccountBalance` is gated by the same ownership rules as
 /// `getAccountInfo`. A user may only call it for an ATA they own.
 #[tokio::test(flavor = "multi_thread")]
@@ -1039,7 +1229,11 @@ async fn test_get_token_account_balance_gated_by_ownership() {
     let ata_pubkey = bs58::encode([18u8; 32]).into_string();
 
     // Owned ATA → 200.
-    let backend = start_mock_backend_with_body(token_account_response(&wallet_bytes, None)).await;
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&wallet_bytes, None),
+        token_balance_response(0, 6),
+    ])
+    .await;
     let addr = start_gateway(
         pool.clone(),
         "http://127.0.0.1:1".to_string(),
@@ -1106,10 +1300,10 @@ async fn test_get_token_account_balance_delegate_is_proxied() {
     let token = generate_token(user_id, "user");
 
     let ata_pubkey = bs58::encode([49u8; 32]).into_string();
-    let backend = start_mock_backend_with_body(token_account_response(
-        &unrelated_owner,
-        Some(&delegate_bytes),
-    ))
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&unrelated_owner, Some(&delegate_bytes)),
+        token_balance_response(0, 6),
+    ])
     .await;
     let addr = start_gateway(
         pool,
@@ -1132,6 +1326,82 @@ async fn test_get_token_account_balance_delegate_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// The delegation is revoked and the balance moves between the gateway's check
+/// and the node's answer. The caller gets the balance held in the bytes that
+/// passed the check, not what the account holds by the time the node reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_token_account_balance_serves_the_balance_it_authorized() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate = [77u8; 32];
+    let owner = [78u8; 32];
+    let authorized_amount: u64 = 1_234_500;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(delegate).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // What the ownership fetch sees: delegated to the caller.
+    let mut account = vec![0u8; 165];
+    account[32..64].copy_from_slice(&owner);
+    account[64..72].copy_from_slice(&authorized_amount.to_le_bytes());
+    account[72..76].copy_from_slice(&[1, 0, 0, 0]);
+    account[76..108].copy_from_slice(&delegate);
+    let authorized_account = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "value": {
+                "lamports": 2_039_280,
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": [BASE64.encode(&account), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string();
+
+    // What the node answers once the delegation is gone and the balance moved.
+    let backend = start_mock_backend_with_sequence(vec![
+        authorized_account,
+        token_balance_response(9_000_000, 6),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountBalance",
+            "params": [bs58::encode([79u8; 32]).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        body["result"]["value"],
+        json!({
+            "amount": authorized_amount.to_string(),
+            "decimals": 6,
+            "uiAmount": 1.2345,
+            "uiAmountString": "1.2345"
+        })
+    );
 }
 
 /// An expired operator JWT must be rejected with 401 on operator-only methods.
@@ -1730,8 +2000,8 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        None,
-        "the owner of an account that never moved reads its history unscoped"
+        Some(json!([[0, LEDGER_TIP]])),
+        "the owner of an account that never moved reads its history up to the tip"
     );
 }
 
@@ -1780,7 +2050,7 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        None,
+        Some(json!([[0, LEDGER_TIP]])),
         "a delegate on the account must not narrow what its owner reads"
     );
 }
@@ -1927,7 +2197,7 @@ async fn test_get_signatures_for_address_excludes_slots_before_a_handoff() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([[handoff_slot + 1, i64::MAX]])),
+        Some(json!([[handoff_slot + 1, LEDGER_TIP]])),
         "the node must be asked only for what landed after the handoff"
     );
 }
@@ -1996,7 +2266,7 @@ async fn test_get_signatures_for_address_returns_both_windows_of_a_returning_own
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([[0, 1], [5, i64::MAX]])),
+        Some(json!([[0, 1], [5, LEDGER_TIP]])),
         "slot 3 belonged to the interim owner, and slots 2 and 4 are handoffs"
     );
 }
@@ -2048,8 +2318,109 @@ async fn test_get_signatures_for_address_withholds_history_below_the_watermark()
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([[recording_began, i64::MAX]])),
+        Some(json!([[recording_began, LEDGER_TIP]])),
         "slots before recording began cannot be attributed to anyone"
+    );
+}
+
+/// The tip is how far the chain the gateway read can vouch for. Without one
+/// no slot is vouched for, so the page is empty rather than unscoped.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_serves_nothing_without_a_ledger_tip() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+    sqlx::query("DELETE FROM metadata WHERE key = 'latest_slot'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let owner = [1u8; 32];
+    let token_account = untouched_ata_of(&owner);
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([])),
+        "with no tip there is no slot the chain vouches for"
+    );
+}
+
+/// The node starts recording one slot past the newest block it had, so until
+/// the next block commits the watermark is above the tip and no slot is covered.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_serves_nothing_while_the_watermark_is_past_the_tip() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+    set_owner_change_watermark(&pool, LEDGER_TIP + 1).await;
+
+    let owner = [1u8; 32];
+    let token_account = untouched_ata_of(&owner);
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        Some(json!([])),
+        "an empty window is served as nothing, not forwarded inverted"
     );
 }
 
@@ -2103,7 +2474,7 @@ async fn test_get_signatures_for_address_same_slot_handoffs_follow_execution_ord
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([[0, slot - 1], [slot + 1, i64::MAX]])),
+        Some(json!([[0, slot - 1], [slot + 1, LEDGER_TIP]])),
         "the owner handed the account away and took it back, so both sides are theirs"
     );
 }
@@ -2183,15 +2554,15 @@ async fn test_get_signatures_for_address_churned_chain_still_serves_the_newest_w
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([[handback_slot + 1, i64::MAX]])),
+        Some(json!([[handback_slot + 1, LEDGER_TIP]])),
         "churn below the cap must not cost the owner the window they hold now"
     );
 }
 
-/// An address that never changed hands is not scoped at all, so an ordinary
-/// user's history comes back whole.
+/// An address that never changed hands still ends at the tip read with its
+/// chain. Left open, a handoff that landed after that read would be in scope.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_get_signatures_for_address_unhandled_account_is_not_scoped() {
+async fn test_get_signatures_for_address_unhandled_account_reads_up_to_the_tip() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
     init_owner_change_table(&pool).await;
@@ -2232,8 +2603,8 @@ async fn test_get_signatures_for_address_unhandled_account_is_not_scoped() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        None,
-        "an address that never changed hands is asked for unscoped"
+        Some(json!([[0, LEDGER_TIP]])),
+        "an address that never changed hands is asked for everything up to the tip"
     );
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(returned_signatures(&body), vec!["sig3", "sig2", "sig1"]);

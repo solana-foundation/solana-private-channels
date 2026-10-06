@@ -3,9 +3,11 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    auth_unavailable_body, check_account_data_ownership, check_request_auth, db_error_body,
-    decode_account_data, forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
-    resolve_owned_slot_ranges, role_check_error_body, verify_bearer, AuthDecision, Role,
+    asks_for_whole_account, auth_unavailable_body, authority_is_in_account_data,
+    check_account_data_ownership, check_request_auth, db_error_body, decode_account_data,
+    forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
+    resolve_owned_slot_ranges, role_check_error_body, token_account_amount, verify_bearer,
+    whole_account_only_body, AuthDecision, Role,
 };
 use crate::db::get_user_role;
 use clap::Parser;
@@ -355,6 +357,8 @@ struct CallPolicy {
     /// Inclusive slot windows this caller owned the address for, passed to the
     /// node so `limit` counts rows they may see. `None` asks for everything.
     slot_ranges: Option<Vec<(i64, i64)>>,
+    /// What the response must be held to before it reaches the caller.
+    response_check: Option<ResponseCheck>,
 }
 
 impl CallPolicy {
@@ -363,8 +367,21 @@ impl CallPolicy {
         Self {
             redact_errors: false,
             slot_ranges: None,
+            response_check: None,
         }
     }
+}
+
+/// The ownership fetch and the forwarded read are separate reads, and may reach
+/// replicas at different heights, so an account whose authority lives in its
+/// bytes can change hands between them. The response is held to the bytes the
+/// caller is authorized on.
+enum ResponseCheck {
+    /// Run the ownership check again on the account the response carries.
+    AccountBytes { user_id: Uuid, pubkey: String },
+    /// Serve the balance held in the bytes that passed the check, or `None`
+    /// when those bytes were not a token account and so held no balance.
+    AuthorizedBalance(Option<u64>),
 }
 
 /// Add the caller's slot scope to an outgoing `getSignaturesForAddress`.
@@ -385,6 +402,22 @@ fn apply_slot_ranges(request: &mut Value, ranges: &[(i64, i64)]) {
         params[1] = serde_json::json!({});
     }
     params[1]["privateChannelSlotRanges"] = serde_json::json!(ranges);
+}
+
+/// `amount` base units as a decimal string with trailing zeros trimmed, the way
+/// the node's `real_number_string_trimmed` writes `uiAmountString`.
+fn ui_amount_string(amount: u64, decimals: u8) -> String {
+    let decimals = usize::from(decimals);
+    if decimals == 0 {
+        return amount.to_string();
+    }
+    // Padded so there is always a digit before the point.
+    let mut digits = format!("{amount:0width$}", width = decimals + 1);
+    digits.insert(digits.len() - decimals, '.');
+    digits
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// Tracks how many connections each client IP currently holds. Entries are
@@ -1094,6 +1127,7 @@ impl Gateway {
             return Ok(CallPolicy {
                 redact_errors: redacts_transaction_errors_for(claims.as_ref(), method),
                 slot_ranges: None,
+                response_check: None,
             });
         }
 
@@ -1117,6 +1151,7 @@ impl Gateway {
                 return Ok(CallPolicy {
                     redact_errors: redact,
                     slot_ranges: None,
+                    response_check: None,
                 })
             }
             AuthDecision::Reject(status, body) => (status, body),
@@ -1178,9 +1213,41 @@ impl Gateway {
                             },
                             _ => None,
                         };
+                        // The forwarded read may see the account after it changed
+                        // hands, so it is held to the bytes this check was made on.
+                        let response_check = match &fetched {
+                            AccountFetch::Found { program_owner, .. }
+                                if method == "getAccountInfo"
+                                    && authority_is_in_account_data(program_owner) =>
+                            {
+                                if !asks_for_whole_account(params) {
+                                    return Err(self.reject_with_metrics(
+                                        method_label,
+                                        StatusCode::BAD_REQUEST,
+                                        whole_account_only_body(),
+                                        start,
+                                    ));
+                                }
+                                Some(ResponseCheck::AccountBytes {
+                                    user_id,
+                                    pubkey: pubkey.clone(),
+                                })
+                            }
+                            AccountFetch::Found {
+                                data,
+                                program_owner,
+                            } if method == "getTokenAccountBalance" => {
+                                Some(ResponseCheck::AuthorizedBalance(token_account_amount(
+                                    data,
+                                    program_owner,
+                                )))
+                            }
+                            _ => None,
+                        };
                         return Ok(CallPolicy {
                             redact_errors: redact,
                             slot_ranges,
+                            response_check,
                         });
                     }
                     AuthDecision::Reject(status, body) => (status, body),
@@ -1207,6 +1274,97 @@ impl Gateway {
             return Err(self.closing_error_response(status, Some(body)));
         }
         Err(self.error_response(status, Some(body)))
+    }
+
+    /// Hold a buffered response to what its caller was authorized on. `Ok`
+    /// carries the body to serve, `Err` the status and body to refuse with.
+    async fn check_response(
+        &self,
+        check: &ResponseCheck,
+        method: &str,
+        body: Bytes,
+    ) -> Result<Bytes, (StatusCode, Option<Bytes>)> {
+        let Some(auth_db) = &self.auth_db else {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Some(db_error_body())));
+        };
+        let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
+            return Err((StatusCode::BAD_GATEWAY, None));
+        };
+
+        match check {
+            ResponseCheck::AuthorizedBalance(authorized) => {
+                // An error carries no balance.
+                let Some(value) = json
+                    .get_mut("result")
+                    .and_then(|result| result.get_mut("value"))
+                else {
+                    return Ok(body);
+                };
+                // Decimals belong to the mint, which the account's address fixes
+                // and whose decimals never change, so the node's read holds.
+                let decimals = value
+                    .get("decimals")
+                    .and_then(Value::as_u64)
+                    .and_then(|decimals| u8::try_from(decimals).ok());
+                let (Some(amount), Some(decimals)) = (*authorized, decimals) else {
+                    return Err((StatusCode::BAD_GATEWAY, None));
+                };
+                value["amount"] = Value::from(amount.to_string());
+                value["uiAmount"] = Value::from(amount as f64 / 10_f64.powi(i32::from(decimals)));
+                value["uiAmountString"] = Value::from(ui_amount_string(amount, decimals));
+                Ok(Bytes::from(json.to_string()))
+            }
+            ResponseCheck::AccountBytes { user_id, pubkey } => {
+                // An error carries no account, and a null value is one closed
+                // since the check. Neither shows anyone's state.
+                let Some(account) = json
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .filter(|value| !value.is_null())
+                else {
+                    return Ok(body);
+                };
+                let program_owner = account
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let served = match account
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                {
+                    Some([Value::String(encoded), Value::String(encoding)])
+                        if encoding == "base64" =>
+                    {
+                        decode_account_data(encoded)
+                    }
+                    _ => None,
+                };
+                let data = match served {
+                    Some(data) => data,
+                    None if authority_is_in_account_data(program_owner) => {
+                        return Err((StatusCode::BAD_REQUEST, Some(whole_account_only_body())))
+                    }
+                    // A wallet's reader is decided by its address, not its bytes.
+                    None => Vec::new(),
+                };
+
+                match check_account_data_ownership(
+                    &data,
+                    program_owner,
+                    pubkey,
+                    method,
+                    *user_id,
+                    auth_db,
+                )
+                .await
+                {
+                    AuthDecision::Proceed => Ok(body),
+                    AuthDecision::Reject(status, rejection) => Err((status, Some(rejection))),
+                    AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
+                }
+            }
+        }
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.
@@ -1607,7 +1765,7 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                if !call_policy.redact_errors {
+                if !call_policy.redact_errors && call_policy.response_check.is_none() {
                     // The status line goes out now; a later body abort counts as upstream_timeout.
                     Self::record_metrics(
                         None,
@@ -1624,7 +1782,7 @@ impl Gateway {
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
-                // Rewriting the page means buffering it instead of streaming.
+                // Checking or rewriting the response means buffering it instead of streaming.
                 let collected = match tokio::time::timeout_at(deadline, body.collect()).await {
                     Ok(Ok(collected)) => collected.to_bytes(),
                     Ok(Err(e)) => {
@@ -1653,6 +1811,48 @@ impl Gateway {
                         return Ok(self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None));
                     }
                 };
+                let checked = match &call_policy.response_check {
+                    None => collected,
+                    Some(check) => match tokio::time::timeout_at(
+                        deadline,
+                        self.check_response(check, method, collected),
+                    )
+                    .await
+                    {
+                        Ok(Ok(body)) => body,
+                        Ok(Err((status, body))) => {
+                            let error_type = if status == StatusCode::BAD_GATEWAY {
+                                "backend_error"
+                            } else {
+                                "auth_rejected"
+                            };
+                            Self::record_metrics(
+                                Some(error_type),
+                                method_label,
+                                target_label,
+                                &status.as_u16().to_string(),
+                                start.elapsed().as_secs_f64(),
+                            );
+                            return Ok(self.error_response(status, body));
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Checking the response to {} did not finish within {:?}",
+                                method, self.limits.upstream_timeout
+                            );
+                            Self::record_metrics(
+                                Some(AUTH_TIMEOUT),
+                                method_label,
+                                target_label,
+                                "504",
+                                start.elapsed().as_secs_f64(),
+                            );
+                            return Ok(
+                                self.closing_error_response(StatusCode::GATEWAY_TIMEOUT, None)
+                            );
+                        }
+                    },
+                };
                 // Recorded once the body is in, so status and duration match what the client gets.
                 Self::record_metrics(
                     None,
@@ -1661,7 +1861,11 @@ impl Gateway {
                     &status,
                     start.elapsed().as_secs_f64(),
                 );
-                let rewritten = redact_transaction_errors(collected);
+                let rewritten = if call_policy.redact_errors {
+                    redact_transaction_errors(checked)
+                } else {
+                    checked
+                };
 
                 // Rewriting changes the length, so let hyper re-frame the body.
                 parts.headers.remove(hyper::header::CONTENT_LENGTH);
@@ -2661,6 +2865,26 @@ mod tests {
             request["params"][1]["privateChannelSlotRanges"],
             json!([[5, 10]])
         );
+    }
+
+    /// A balance the gateway writes itself must read exactly as the node would
+    /// have written it.
+    #[test]
+    fn ui_amount_string_matches_the_node_formatting() {
+        for (amount, decimals, expected) in [
+            (1_234_500, 6, "1.2345"),
+            (1_000_000, 6, "1"),
+            (5, 6, "0.000005"),
+            (0, 6, "0"),
+            (42, 0, "42"),
+            (u64::MAX, 9, "18446744073.709551615"),
+        ] {
+            assert_eq!(
+                ui_amount_string(amount, decimals),
+                expected,
+                "{amount} at {decimals} decimals"
+            );
+        }
     }
 
     /// Both legs of the balance probe (InsufficientFunds above the source
