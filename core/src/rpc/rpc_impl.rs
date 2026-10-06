@@ -9,6 +9,7 @@ use {
                 JSON_RPC_SERVER_ERROR,
             },
             get_account_info_impl::get_account_info_impl,
+            get_address_index_slot_impl::{get_address_index_slot_impl, AddressIndexSlot},
             get_block_height_impl::get_block_height_impl,
             get_block_impl::get_block_impl,
             get_block_time_impl::get_block_time_impl,
@@ -208,6 +209,11 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     async fn get_first_available_block(&self) -> RpcResult<u64> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_first_available_block_impl(read_deps).await
+    }
+
+    async fn get_address_index_slot(&self) -> RpcResult<AddressIndexSlot> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_address_index_slot_impl(read_deps).await
     }
 
     async fn get_blocks(

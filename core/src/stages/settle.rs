@@ -1487,7 +1487,27 @@ async fn settle_transactions(
 
         // Closed channel = writer gone; escalate to exit. The budget wait is
         // inside the timing window so a park on rows reads like a park on depth.
-        if !addr_sig_rows.is_empty() {
+        if addr_sig_rows.is_empty() {
+            // A slot-only marker lets the watermark reach idle blocks. Sent only
+            // into an empty queue and never awaited, so it cannot park the
+            // settler or crowd out rows; a skipped one only keeps the watermark lower.
+            if publishers.address_signatures.capacity()
+                == publishers.address_signatures.max_capacity()
+            {
+                if let Some(permit) = publishers.rows_budget.empty_permit() {
+                    let marker = AddressSignatureBatch {
+                        rows: Vec::new(),
+                        slot: next_slot as i64,
+                        permit,
+                    };
+                    if let Err(mpsc::error::TrySendError::Closed(_)) =
+                        publishers.address_signatures.try_send(marker)
+                    {
+                        warn!("Address-index writer is gone; empty block marker dropped");
+                    }
+                }
+            }
+        } else {
             let send_t0 = tokio::time::Instant::now();
             let Some(permit) = publishers
                 .rows_budget
@@ -1498,6 +1518,7 @@ async fn settle_transactions(
             };
             let batch = AddressSignatureBatch {
                 rows: addr_sig_rows,
+                slot: next_slot as i64,
                 permit,
             };
             match publishers.address_signatures.send(batch).await {
@@ -2037,6 +2058,7 @@ mod tests {
     /// The same for a block's address-index rows.
     fn rows_msg(rows: Vec<AddressSignatureRow>) -> AddressSignatureBatch {
         AddressSignatureBatch {
+            slot: rows.last().map_or(0, |r| r.slot),
             rows,
             permit: crate::stages::test_permit(),
         }
@@ -5302,8 +5324,16 @@ mod tests {
             1,
             "the committed batch must be counted once, not committed again by the final flush"
         );
+        // Skip empty-block markers: only a batch with rows proves the block shipped.
+        let mut shipped = false;
+        while let Ok(batch) = address_signatures_rx.try_recv() {
+            if !batch.rows.is_empty() {
+                shipped = true;
+                break;
+            }
+        }
         assert!(
-            address_signatures_rx.try_recv().is_ok(),
+            shipped,
             "a committed block's address rows must still be shipped"
         );
     }
@@ -7886,6 +7916,7 @@ mod tests {
             addr_sig_tx
                 .send(AddressSignatureBatch {
                     rows: Vec::new(),
+                    slot: 0,
                     permit,
                 })
                 .await
@@ -8121,48 +8152,102 @@ mod tests {
         assert!(gone.publisher_gone, "a gone dedup is still reported");
     }
 
-    /// A block with no address-index rows must still broadcast the blockhash.
-    /// Guards against nesting the broadcast under the `!addr_sig_rows.is_empty()`
-    /// branch.
+    /// A block with no address-index rows must still broadcast the blockhash,
+    /// and sends a slot-only marker only into an empty writer queue so it can
+    /// never park the settler or crowd out rows.
     #[tokio::test(flavor = "multi_thread")]
-    async fn broadcasts_with_empty_address_signatures() {
-        let (mut db, _pg) = start_test_postgres().await;
+    async fn empty_block_sends_a_slot_marker_without_parking() {
+        struct Case {
+            name: &'static str,
+            capacity: usize,
+            held: Option<AddressSignatureBatch>,
+            expect_marker: bool,
+        }
+        let cases = [
+            Case {
+                name: "free",
+                capacity: 2,
+                held: None,
+                expect_marker: true,
+            },
+            Case {
+                name: "busy",
+                capacity: 2,
+                held: Some(rows_msg(vec![AddressSignatureRow {
+                    address: vec![1; 32],
+                    slot: 3,
+                    signature: vec![1; 64],
+                }])),
+                expect_marker: false,
+            },
+            Case {
+                name: "full",
+                capacity: 1,
+                held: Some(rows_msg(Vec::new())),
+                expect_marker: false,
+            },
+        ];
 
-        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
-        let settled_accounts_tx = SettledInbox::new();
-        let (settled_blockhashes_tx, mut settled_blockhashes_rx) =
-            mpsc::channel(TEST_BLOCKHASH_SINK);
+        for case in cases {
+            let (mut db, _pg) = start_test_postgres().await;
+            let (addr_sig_tx, mut addr_sig_rx) =
+                mpsc::channel::<AddressSignatureBatch>(case.capacity);
+            let held = case.held.is_some();
+            if let Some(batch) = case.held {
+                addr_sig_tx.send(batch).await.unwrap();
+            }
+            let settled_accounts_tx = SettledInbox::new();
+            let (settled_blockhashes_tx, mut settled_blockhashes_rx) =
+                mpsc::channel(TEST_BLOCKHASH_SINK);
 
-        // Empty processing results: no addr-index rows produced.
-        let result = settle_transactions(
-            9 + 1,
-            Some(LastBlock {
-                slot: 9,
-                blockhash: Hash::new_unique(),
-                block_height: 9,
-            }),
-            &mut db,
-            None,
-            &[],
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            Some(BlockPublishers {
-                blockhashes: &settled_blockhashes_tx,
-                blockhash_progress: &BlockhashProgress::default(),
-                accounts: &settled_accounts_tx,
-                address_signatures: &addr_sig_tx,
-                rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
-            }),
-            settle_now(),
-            SETTLE_ATTEMPT_TIMEOUT,
-        )
-        .await
-        .unwrap();
-
-        let blockhash = tokio::time::timeout(Duration::from_secs(2), settled_blockhashes_rx.recv())
+            // Empty processing results: no addr-index rows produced.
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                settle_transactions(
+                    9 + 1,
+                    Some(LastBlock {
+                        slot: 9,
+                        blockhash: Hash::new_unique(),
+                        block_height: 9,
+                    }),
+                    &mut db,
+                    None,
+                    &[],
+                    &(Arc::new(NoopMetrics) as SharedMetrics),
+                    Some(BlockPublishers {
+                        blockhashes: &settled_blockhashes_tx,
+                        blockhash_progress: &BlockhashProgress::default(),
+                        accounts: &settled_accounts_tx,
+                        address_signatures: &addr_sig_tx,
+                        rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
+                    }),
+                    settle_now(),
+                    SETTLE_ATTEMPT_TIMEOUT,
+                ),
+            )
             .await
-            .expect("blockhash broadcast even with empty addr-index rows")
-            .expect("blockhash channel open");
-        assert_eq!(blockhash, result.blockhash);
+            .unwrap_or_else(|_| panic!("{}: an empty block must not park", case.name))
+            .unwrap();
+
+            let blockhash =
+                tokio::time::timeout(Duration::from_secs(2), settled_blockhashes_rx.recv())
+                    .await
+                    .expect("blockhash broadcast even with empty addr-index rows")
+                    .expect("blockhash channel open");
+            assert_eq!(blockhash, result.blockhash, "{}", case.name);
+
+            if held {
+                addr_sig_rx.try_recv().expect("the held batch");
+            }
+            match addr_sig_rx.try_recv() {
+                Ok(marker) => {
+                    assert!(case.expect_marker, "{}: no marker expected", case.name);
+                    assert!(marker.rows.is_empty(), "{}", case.name);
+                    assert_eq!(marker.slot, 10, "{}", case.name);
+                }
+                Err(_) => assert!(!case.expect_marker, "{}: marker expected", case.name),
+            }
+        }
     }
 
     /// The broadcasts are non-fatal. With dedup's receiver dropped, the settle

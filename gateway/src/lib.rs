@@ -99,6 +99,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "isBlockhashValid",
     "getSignaturesForAddress",
     "simulateTransaction",
+    "getAddressIndexSlot",
 ];
 
 #[derive(Parser, Debug, Clone)]
@@ -2276,7 +2277,7 @@ mod tests {
     /// land in the "unknown" bucket and disappear from the per-method panels.
     #[test]
     fn slot_enumeration_methods_have_their_own_metric_label() {
-        for method in ["getBlocks", "getBlocksWithLimit"] {
+        for method in ["getBlocks", "getBlocksWithLimit", "getAddressIndexSlot"] {
             assert!(
                 KNOWN_RPC_METHODS.contains(&method),
                 "{method} would be recorded under the \"unknown\" metric label"
