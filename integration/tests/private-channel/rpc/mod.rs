@@ -1,6 +1,7 @@
 mod test_batch_atomicity;
 mod test_context;
 // mod test_cors; // Disabled - CORS is now handled by the gateway
+mod test_address_index_slot;
 mod test_blockhash_validation;
 mod test_channel_anchor;
 mod test_dedup_persistence;
@@ -46,6 +47,7 @@ mod test_admin_vm_initialize_mint_persists;
 // parallel-SVM SnapshotCallback coverage.
 mod test_parallel_svm_burst;
 
+pub use test_address_index_slot::run_address_index_slot_test;
 pub use test_blockhash_validation::run_blockhash_validation_test;
 pub use test_channel_anchor::run_channel_anchor_test;
 pub use test_context::{PrivateChannelContext, SolanaContext};

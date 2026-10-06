@@ -63,11 +63,13 @@ pub struct Claims {
 /// Methods that require a valid JWT with the Operator role.
 /// Callers without a token receive 401; callers with a User-role JWT receive 403.
 /// `getSignatureStatusSnapshot` returns raw errors and opens a DB transaction, so operators only.
+/// `getAddressIndexSlot` is channel internals only resync needs, via the internal listener.
 const OPERATOR_ONLY_METHODS: &[&str] = &[
     "getBlock",
     "getTransaction",
     "simulateTransaction",
     "getSignatureStatusSnapshot",
+    "getAddressIndexSlot",
 ];
 
 /// Methods that require a valid JWT. For User-role callers an ownership check
@@ -329,9 +331,8 @@ pub async fn check_account_data_ownership(
 /// Whether `pubkey` is still the associated token account its own `owner` field
 /// derives to.
 ///
-/// A user's token accounts are all ATAs: the ingress allowlist limits System to
-/// `Transfer`, so `CreateAccount` is unreachable and only the ATA program can
-/// make them. An ATA's address is derived from the wallet that owned it at
+/// A user's token accounts are all ATAs: the ingress allowlist refuses System,
+/// so `CreateAccount` is unreachable and only the ATA program can make them. An ATA's address is derived from the wallet that owned it at
 /// creation, and nothing rewrites the address afterwards. So an owner the
 /// address no longer derives to is proof the owner field was moved, whatever
 /// moved it, including a CPI this gateway never sees.
@@ -835,6 +836,25 @@ mod tests {
     fn signature_status_snapshot_is_operator_only() {
         let method = "getSignatureStatusSnapshot";
         assert!(is_gated(method));
+        assert!(matches!(
+            check_request_auth(None, method, &json!([])),
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::User)), method, &json!([])),
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::Operator)), method, &json!([])),
+            AuthDecision::Proceed
+        ));
+    }
+
+    /// Resync reads index progress through the internal listener, so nothing
+    /// outside the operator's own services needs it on the public one.
+    #[test]
+    fn address_index_slot_is_operator_only() {
+        let method = "getAddressIndexSlot";
         assert!(matches!(
             check_request_auth(None, method, &json!([])),
             AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)

@@ -539,6 +539,18 @@ fn script_channel_floor(mock: &MockRpcServer) {
     for _ in 0..RESYNC_ATTEMPTS * 2 {
         mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     }
+    script_channel_caught_up(mock);
+}
+
+/// Report a channel address index that covers its newest block, so the catch-up gate
+/// passes on every resync attempt.
+fn script_channel_caught_up(mock: &MockRpcServer) {
+    for _ in 0..RESYNC_ATTEMPTS * 2 {
+        mock.enqueue(
+            "getAddressIndexSlot",
+            Reply::result(json!({"watermark": 100, "latestBlock": 100})),
+        );
+    }
 }
 
 /// Answer the startup supply invariant with "no channel mint exists yet".
@@ -1142,6 +1154,132 @@ async fn resync_does_not_remint_serviced_deposit() -> Result<(), Box<dyn std::er
     );
 
     mock.shutdown().await;
+    Ok(())
+}
+
+/// A channel whose address index trails its newest block can return a short history
+/// that omits a serviced mint. Resync refuses before reading it, then passes once the
+/// index catches up and rebuilds the serviced deposit completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_refuses_while_the_channel_index_lags_then_recovers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("resync_index_lag").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+
+    // Headroom so every event's block is confirmed-available and inside the range.
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+
+    let discovery = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Escrow,
+        instance: Some(env.instance),
+        channel_url: String::new(),
+        genesis,
+    };
+    // A pending rebuilt row, as an earlier run that lost its database would leave it.
+    let keys = discovery.discover().await;
+    let deposits = keys_of_type(&keys, "deposit");
+    assert_eq!(deposits.len(), 1, "exactly one deposit row expected");
+    let dep = deposits[0].clone();
+    let rows_before = row_count(&db_url).await;
+
+    // Phase A: the index trails, and the history it would serve is short.
+    let lagging = MockRpcServer::start().await;
+    lagging.enqueue_sequence(
+        "getAddressIndexSlot",
+        std::iter::repeat_n(
+            Reply::result(json!({"watermark": 90, "latestBlock": 100})),
+            RESYNC_ATTEMPTS * 2,
+        ),
+    );
+    // An unpruned floor, so only the index gate can refuse this run.
+    script_channel_histories(&lagging, &[], &[]);
+    lagging.enqueue_sequence(
+        "getFirstAvailableBlock",
+        std::iter::repeat_n(Reply::result(json!(0)), RESYNC_ATTEMPTS * 2),
+    );
+    let service = make_channel_resync_service(
+        validator.rpc_url(),
+        new_storage(&db_url).await,
+        ProgramType::Escrow,
+        Some(env.instance),
+        lagging.url(),
+        CHANNEL_AUTHORITY,
+    )
+    .with_index_catch_up_budget(Duration::ZERO);
+    let result = run_resync(&service, genesis).await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::ConsumedSetUnavailable { .. }
+            ))
+        ),
+        "a lagging index must refuse, got {result:?}"
+    );
+    assert_eq!(row_count(&db_url).await, rows_before, "the drop never ran");
+    assert_eq!(
+        lagging.call_count("getSignaturesForAddress"),
+        0,
+        "the short history is never read"
+    );
+    lagging.shutdown().await;
+
+    // Phase B: the first poll still trails, the next one has caught up. Queued before the
+    // history helper so FIFO order serves the trailing reply first.
+    let catching_up = MockRpcServer::start().await;
+    catching_up.enqueue(
+        "getAddressIndexSlot",
+        Reply::result(json!({"watermark": 90, "latestBlock": 100})),
+    );
+    script_channel_caught_up(&catching_up);
+    let landed = Signature::new_unique();
+    script_channel_consumed(&catching_up, &[(&dep, ConsumedMintKind::Deposit, landed)]);
+    let service = make_channel_resync_service(
+        validator.rpc_url(),
+        new_storage(&db_url).await,
+        ProgramType::Escrow,
+        Some(env.instance),
+        catching_up.url(),
+        CHANNEL_AUTHORITY,
+    );
+    run_resync(&service, genesis)
+        .await
+        .expect("resync passes once the index catches up");
+
+    let st = status_of(&db_url, &dep).await;
+    assert_eq!(
+        st.status, "completed",
+        "serviced deposit must rebuild completed"
+    );
+    assert_eq!(
+        st.counterpart_signature.as_deref(),
+        Some(landed.to_string().as_str()),
+        "completed deposit must carry the channel mint signature"
+    );
+    assert!(
+        catching_up.call_count("getAddressIndexSlot") >= 2,
+        "the gate waited out the trailing reply"
+    );
+
+    catching_up.shutdown().await;
     Ok(())
 }
 
@@ -2319,6 +2457,7 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
         seed_pending_deposit(&db_url, "resync_pruned_seed").await;
 
         let mock = MockRpcServer::start().await;
+        script_channel_caught_up(&mock);
         mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
         mock.enqueue_sequence("getFirstAvailableBlock", floor);
         let service = make_channel_resync_service(
@@ -2342,6 +2481,10 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
         assert_eq!(row_count(&db_url).await, 1, "{label}: the drop never ran");
         assert_eq!(marker(&db_url).await, None, "{label}");
         assert_eq!(active_halt(&db_url).await, None, "{label}");
+        assert!(
+            mock.call_count("getSignaturesForAddress") >= 1,
+            "{label}: the history was enumerated"
+        );
         mock.shutdown().await;
     }
     Ok(())
@@ -2364,6 +2507,7 @@ async fn resync_aborts_when_channel_unreachable_db_intact() -> Result<(), Box<dy
     wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
 
     let mock = MockRpcServer::start().await;
+    script_channel_caught_up(&mock);
     // Channel enumeration fails: the RPC returns an error on every attempt.
     mock.enqueue_sequence(
         "getSignaturesForAddress",
@@ -2396,6 +2540,10 @@ async fn resync_aborts_when_channel_unreachable_db_intact() -> Result<(), Box<dy
         1,
         "pre-existing row must survive: the drop never ran"
     );
+    assert!(
+        mock.call_count("getSignaturesForAddress") >= 1,
+        "the history was enumerated"
+    );
 
     mock.shutdown().await;
     Ok(())
@@ -2421,6 +2569,7 @@ async fn resync_aborts_on_legacy_scheme_memo_db_intact() -> Result<(), Box<dyn s
     // Legacy serial-id memo: prefix present, value is a bare number (not a digest).
     let legacy_memo = "private_channel:mint-idempotency:42";
     let legacy = json!([channel_sig_entry(&Signature::new_unique(), legacy_memo)]);
+    script_channel_caught_up(&mock);
     mock.enqueue("getSignaturesForAddress", Reply::result(legacy));
     mock.enqueue(
         "getTransaction",
@@ -2456,6 +2605,10 @@ async fn resync_aborts_on_legacy_scheme_memo_db_intact() -> Result<(), Box<dyn s
         row_count(&db_url).await,
         1,
         "pre-existing row must survive a cross-scheme abort"
+    );
+    assert!(
+        mock.call_count("getSignaturesForAddress") >= 1,
+        "the history was enumerated"
     );
 
     mock.shutdown().await;
@@ -3136,6 +3289,14 @@ impl Stack {
     }
 }
 
+/// The validator standing in as the channel, behind a mock that reports its address index
+/// caught up: the validator serves the real mint history but has no index progress method.
+async fn caught_up_channel(validator_url: &str) -> MockRpcServer {
+    let channel = MockRpcServer::start_with_upstream(validator_url.to_string()).await;
+    script_channel_caught_up(&channel);
+    channel
+}
+
 /// An escrow resync reconciled against the real channel as `authority`, retried while stopped
 /// workers' sessions close.
 async fn escrow_resync(
@@ -3146,12 +3307,13 @@ async fn escrow_resync(
     authority: Pubkey,
 ) -> Result<(), IndexerError> {
     for _ in 0..40 {
+        let channel = caught_up_channel(rpc_url).await;
         let service = make_channel_resync_service(
             rpc_url.to_string(),
             new_storage(db_url).await,
             ProgramType::Escrow,
             Some(instance),
-            rpc_url.to_string(),
+            channel.url(),
             authority,
         );
         match run_resync(&service, genesis).await {
@@ -3716,6 +3878,7 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
 
     // One slot per round trip and a fast heartbeat, so the kill lands while the fill runs.
     wait_for_finalized_slot(&rpc_url, genesis + MIN_FILL_SLOTS).await;
+    let channel = caught_up_channel(&rpc_url).await;
     let service = ResyncService::new(
         new_storage(&db_url).await,
         Arc::new(RpcPoller::new(
@@ -3736,7 +3899,7 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
     )
     .with_stale_holder_grace(Duration::ZERO)
     .with_channel_reconcile(ChannelReconcileConfig {
-        channel_rpc_url: rpc_url.clone(),
+        channel_rpc_url: channel.url(),
         authority: admin().pubkey(),
     })
     .with_lock_heartbeat_interval(Duration::from_millis(5));

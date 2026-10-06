@@ -1,7 +1,6 @@
 use {
     super::test_context::PrivateChannelContext,
     solana_sdk::{signature::Keypair, signer::Signer},
-    solana_system_interface::instruction as system_instruction,
     solana_transaction_status::UiTransactionEncoding,
 };
 
@@ -10,13 +9,16 @@ pub async fn run_get_transaction_test(ctx: &PrivateChannelContext) {
 
     // First, send a transaction so we have something to query
     let from_keypair = Keypair::new();
-    let to_pubkey = Keypair::new().pubkey();
 
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let transfer_ix = system_instruction::transfer(&from_keypair.pubkey(), &to_pubkey, 1_000);
+    let memo_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: b"get-transaction".to_vec(),
+    };
 
     let transaction = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[transfer_ix],
+        &[memo_ix],
         Some(&from_keypair.pubkey()),
         &[&from_keypair],
         blockhash,

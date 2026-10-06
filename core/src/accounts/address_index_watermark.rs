@@ -1,3 +1,4 @@
+use super::get_latest_slot::LATEST_SLOT_KEY;
 use sqlx::{PgPool, Postgres, Transaction};
 
 pub const ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY: &str = "address_signatures_flushed_slot";
@@ -21,6 +22,34 @@ pub async fn get_address_signatures_flushed_slot(pool: &PgPool) -> sqlx::Result<
         let arr: [u8; 8] = b.as_slice().try_into().ok()?;
         Some(i64::from_be_bytes(arr))
     }))
+}
+
+/// The watermark and the newest committed block slot, read in one statement so
+/// both come from the same snapshot. `None` if either is missing: a caller that
+/// gates on this must refuse rather than guess.
+pub async fn get_address_index_progress(pool: &PgPool) -> sqlx::Result<Option<(i64, u64)>> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT key, value FROM metadata WHERE key = ANY($1)",
+    )
+    .bind(vec![
+        ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY.to_string(),
+        LATEST_SLOT_KEY.to_string(),
+    ])
+    .fetch_all(pool)
+    .await?;
+
+    let mut watermark = None;
+    let mut latest_block = None;
+    for (key, value) in rows {
+        if key == ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY {
+            watermark = <[u8; 8]>::try_from(value.as_slice())
+                .ok()
+                .map(i64::from_be_bytes);
+        } else {
+            latest_block = super::counter::decode(&value);
+        }
+    }
+    Ok(watermark.zip(latest_block))
 }
 
 /// Monotonic UPSERT; never rewinds.
@@ -50,6 +79,55 @@ mod tests {
     use super::*;
     use crate::test_helpers::start_test_postgres_raw;
     use sqlx::postgres::PgPoolOptions;
+
+    /// The two keys use different byte orders, so a swapped decoder would read a huge
+    /// slot and pass every gate. A block committed through the real write path pins both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_progress_reads_the_watermark_and_the_committed_block() {
+        use crate::{accounts::traits::AccountsDB, test_helpers::create_test_block_info};
+        use solana_sdk::hash::Hash;
+
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let pool = postgres_db.pool.clone();
+        assert_eq!(db.get_address_index_progress().await.unwrap(), None);
+
+        db.write_batch(
+            &[],
+            vec![],
+            Some(create_test_block_info(300, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            None,
+            "a missing watermark must read as None, not 0"
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        upsert_address_signatures_flushed_slot_in_tx(&mut tx, 200)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            Some((200, 300))
+        );
+
+        sqlx::query("DELETE FROM metadata WHERE key = $1")
+            .bind(LATEST_SLOT_KEY)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_address_index_progress().await.unwrap(),
+            None,
+            "a missing newest block must read as None"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn get_watermark_returns_none_when_unset() {
