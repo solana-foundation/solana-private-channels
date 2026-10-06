@@ -34,10 +34,12 @@ pub struct DedupArgs {
 /// isBlockhashValid can tell a window still catching up from an absent hash.
 #[derive(Debug, Default)]
 pub struct BlockhashProgress {
-    /// Bumped by the settler before the block's hash becomes readable.
+    /// Bumped by the settler's retire step, before the block is cut.
     pub announced: AtomicU64,
     /// Bumped by dedup once the hash is in the live window.
     pub ingested: AtomicU64,
+    /// Executor admissions that will send results, bumped under the window's read lock.
+    pub admissions: AtomicU64,
 }
 
 /// Bounded ingress queue from RPC into the pipeline; when full it rejects new
@@ -150,6 +152,32 @@ fn ingest_blockhashes(
             dedup_cache.remove(&expired);
         }
     }
+    // The settler pops hashes too, and those never reach the loop above. The
+    // window check comes before the cache check, so pruning loses no replay guard.
+    let live: HashSet<&Hash> = bh_list.iter().collect();
+    dedup_cache.retain(|blockhash, _| live.contains(blockhash));
+}
+
+/// Called by the settler before it cuts a block. Announces the block and pops the
+/// hashes it expires, leaving the window where dedup's ingest of the block would.
+/// Returns the number popped and the executor admissions made before the pop.
+pub(crate) fn retire_expiring_blockhashes(
+    live_blockhashes: &RwLock<LinkedList<Hash>>,
+    max_blockhashes: usize,
+    progress: &BlockhashProgress,
+) -> (usize, u64) {
+    let mut bh_list = live_blockhashes.write().expect("blockhash lock poisoned");
+    // Announced under the lock, so a reader that misses a popped hash reads
+    // "catching up" until dedup ingests this block, which is after its commit.
+    let announced = progress.announced.fetch_add(1, Ordering::SeqCst) + 1;
+    let pending = announced.saturating_sub(progress.ingested.load(Ordering::Acquire));
+    let mut popped = 0;
+    // Stops on an empty list too: with dedup gone `pending` keeps growing.
+    while bh_list.len() as u64 + pending > max_blockhashes as u64 && bh_list.pop_front().is_some() {
+        popped += 1;
+    }
+    // Read under the write lock: any admission bumped under a read guard is visible.
+    (popped, progress.admissions.load(Ordering::Acquire))
 }
 
 /// Pure computation: build `(live_blockhashes, dedup_cache)` from an ordered
@@ -741,6 +769,147 @@ mod tests {
             4,
             "evicted hashes were still taken in"
         );
+    }
+
+    fn window_of(live: &RwLock<LinkedList<Hash>>) -> Vec<Hash> {
+        live.read().unwrap().iter().copied().collect()
+    }
+
+    /// Ingest `hashes` in one call, the way dedup takes in a backlog.
+    fn ingest_all(
+        hashes: &[Hash],
+        live: &RwLock<LinkedList<Hash>>,
+        cache: &mut HashMap<Hash, HashSet<Hash>>,
+        max_blockhashes: usize,
+        progress: &BlockhashProgress,
+    ) {
+        let (tx, mut rx) = mpsc::channel(hashes.len().max(1));
+        for hash in hashes {
+            tx.try_send(*hash).unwrap();
+        }
+        ingest_blockhashes(None, &mut rx, live, cache, max_blockhashes, progress);
+    }
+
+    /// Retiring ahead of a block must leave the window where dedup's own ingest
+    /// of that block would, so dedup's later ingest pops nothing more.
+    #[test]
+    fn retiring_then_ingesting_matches_ingesting_alone() {
+        for (window_len, lag, max) in [(3usize, 0usize, 3usize), (2, 0, 3), (3, 2, 3), (1, 0, 1)] {
+            let window: Vec<Hash> = (0..window_len).map(|_| Hash::new_unique()).collect();
+            // `lag` blocks announced but not ingested, plus the block being cut.
+            let incoming: Vec<Hash> = (0..=lag).map(|_| Hash::new_unique()).collect();
+
+            let control = RwLock::new(window.iter().copied().collect::<LinkedList<_>>());
+            ingest_all(
+                &incoming,
+                &control,
+                &mut HashMap::new(),
+                max,
+                &BlockhashProgress::default(),
+            );
+            let control = window_of(&control);
+
+            let live = RwLock::new(window.iter().copied().collect::<LinkedList<_>>());
+            let progress = BlockhashProgress::default();
+            progress.announced.store(lag as u64, Ordering::SeqCst);
+            retire_expiring_blockhashes(&live, max, &progress);
+
+            let case = format!("window {window_len}, lag {lag}, max {max}");
+            assert_eq!(
+                progress.announced.load(Ordering::SeqCst),
+                lag as u64 + 1,
+                "{case}: the retire announces the block"
+            );
+            let kept: Vec<Hash> = control
+                .iter()
+                .copied()
+                .filter(|h| window.contains(h))
+                .collect();
+            assert_eq!(
+                window_of(&live),
+                kept,
+                "{case}: retire keeps what ingest keeps"
+            );
+
+            ingest_all(&incoming, &live, &mut HashMap::new(), max, &progress);
+            assert_eq!(window_of(&live), control, "{case}: then ingest matches");
+        }
+    }
+
+    /// With dedup gone the settler is the only one moving the window, one hash
+    /// per block, and an empty window must not spin under the write lock.
+    #[test]
+    fn retiring_without_dedup_drops_one_hash_per_block_and_stops_when_empty() {
+        let max = 3usize;
+        let live = Arc::new(RwLock::new(
+            (0..max)
+                .map(|_| Hash::new_unique())
+                .collect::<LinkedList<_>>(),
+        ));
+        let progress = Arc::new(BlockhashProgress::default());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (thread_live, thread_progress) = (Arc::clone(&live), Arc::clone(&progress));
+        std::thread::spawn(move || {
+            let popped: Vec<usize> = (0..max + 3)
+                .map(|_| retire_expiring_blockhashes(&thread_live, max, &thread_progress).0)
+                .collect();
+            done_tx.send(popped).unwrap();
+        });
+        let popped = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("retire must return on an empty window");
+
+        assert_eq!(popped, vec![1, 1, 1, 0, 0, 0]);
+        assert!(window_of(&live).is_empty());
+    }
+
+    /// The executor bumps admissions while it holds the read guard, so a retire
+    /// must read the counter after it gets the write lock, never before.
+    #[test]
+    fn retire_reads_admissions_under_its_write_lock() {
+        let live = Arc::new(RwLock::new(LinkedList::from([Hash::new_unique()])));
+        let progress = Arc::new(BlockhashProgress::default());
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (reader_live, reader_progress) = (Arc::clone(&live), Arc::clone(&progress));
+        let reader = std::thread::spawn(move || {
+            let guard = reader_live.read().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            reader_progress.admissions.fetch_add(1, Ordering::Release);
+            drop(guard);
+        });
+
+        held_rx.recv().unwrap();
+        let (_, admissions) = retire_expiring_blockhashes(&live, 1, &progress);
+        reader.join().unwrap();
+        assert_eq!(admissions, 1, "the admission made under the guard is seen");
+    }
+
+    /// Hashes the settler retires never reach dedup's own pop, so ingest must
+    /// drop their replay entries itself.
+    #[test]
+    fn ingest_drops_cache_entries_of_retired_hashes() {
+        let max = 3usize;
+        let window: Vec<Hash> = (0..max).map(|_| Hash::new_unique()).collect();
+        let live = RwLock::new(window.iter().copied().collect::<LinkedList<_>>());
+        let mut cache: HashMap<Hash, HashSet<Hash>> = window
+            .iter()
+            .map(|h| (*h, HashSet::from([Hash::new_unique()])))
+            .collect();
+        let progress = BlockhashProgress::default();
+
+        assert_eq!(retire_expiring_blockhashes(&live, max, &progress).0, 1);
+        ingest_all(&[Hash::new_unique()], &live, &mut cache, max, &progress);
+
+        assert!(
+            !cache.contains_key(&window[0]),
+            "retired hash entry is gone"
+        );
+        for kept in &window[1..] {
+            assert!(cache.contains_key(kept), "a live hash keeps its entry");
+        }
     }
 
     /// The bound is the number of live blocks, and block cadence is not an input
