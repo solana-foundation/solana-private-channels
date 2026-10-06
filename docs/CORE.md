@@ -178,11 +178,13 @@ This eliminates the operational overhead of funding user accounts for off-chain 
 These synthesized lamports are the only lamports in the channel that were never deposited, so the execution stage treats them as a loan the transaction must repay. After a successful regular transaction, every writable account the SVM loaded that BOB had never seen is examined:
 
 - A synthesized fee payer must end holding the same amount it was handed. Whatever it is short by is the unrepaid part of the loan.
-- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one.
+- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one. A new System-owned account with no data does not count as a creation, and at most 4 accounts per transaction may be created while the float is short (CreateDvp's 4 is the most any flow needs).
 - While any of the float is missing, no account that already existed may end richer than it started. Counting creations does not prove the float paid for them, so without this a creation funded by real money could licence a fabricated lamport landing somewhere durable. With the float intact, pre-existing accounts move real lamports freely.
-- If the shortfall exceeds the allowance, or a pre-existing balance grew while the float was short, the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
+- If the shortfall exceeds the allowance, a pre-existing balance grew while the float was short, or more than 4 accounts were created while it was short, the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
 
 Lamports sent *to* a synthesized payer are burned with it. Persisting the payer would graduate an address the channel invented into durable state, and returning them would mean rewriting the sender, so neither is safe. This is not a loss of deposited value: deposits mint tokens, never lamports, so every lamport in the channel began as a float or an admin mint's existence floor. It is also load-bearing for `CancelDvp`, where the settlement authority signs, pays, and receives the closed escrows' rent, ending above its float.
+
+Lamports that would bring a new System account into being are burned the same way, in every transaction, so no sequence of transactions can turn the float into a plain wallet. Ingress refuses every top-level System instruction, but a token `CloseAccount` or a DvP close can still pay lamports to an address the channel has never seen. That address is never created: if the float paid for it, the transaction fails with `UnbalancedTransaction`; if existing lamports paid for it, the transaction succeeds and they are burned.
 
 Because the SVM already enforces per-instruction lamport conservation, blocking the fabricated lamports at their source means every other balance is made of lamports that already existed, so no other account needs inspecting. Accounts a transaction merely carries as writable keys are never rewritten.
 
@@ -215,7 +217,7 @@ Solana Private Channels restricts which programs can execute in the payment chan
 | **SPL Token** | Supported | Token-2022 is **not** admitted at ingress; the escrow program on Mainnet accepts it, the channel does not |
 | **SPL Associated Token Account** | Supported | ATA creation and lookup |
 | **SPL Memo** | Supported | Memo attachments |
-| **System Program** | Supported | `Transfer` only; `CreateAccount`, `Allocate` and their seeded forms are rejected |
+| **System Program** | Not supported at top level | Every System instruction is refused at ingress, `Transfer` included; still reachable as a CPI target of the allowlisted programs |
 | **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
 | **DvP Swap Program** | Supported | Delivery-versus-payment swaps |
 
