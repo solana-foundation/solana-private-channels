@@ -54,7 +54,7 @@ pub async fn get_signature_status_snapshot_impl(
         })?;
 
     Ok(RpcStatusSnapshot {
-        block_height: snapshot.block_height.unwrap_or(0),
+        block_height: snapshot.block_height,
         first_available_block: snapshot.first_available_block,
         value: snapshot
             .transactions

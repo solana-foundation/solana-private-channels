@@ -1176,6 +1176,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use test_utils::channel_shim::ChannelShim;
     use test_utils::operator_helper::start_private_channel_to_solana_operator;
 
     println!("=== Operator Lifecycle: Boot Halts When DB Is Ahead Of The Bitmap ===");
@@ -1255,9 +1256,11 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     .await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
-        test_validator.rpc_url(),
+        channel_shim.url(),
         db_url.clone(),
         operator_keypair,
         env.instance,

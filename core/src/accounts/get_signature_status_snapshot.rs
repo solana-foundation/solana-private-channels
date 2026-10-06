@@ -1,8 +1,8 @@
 use {
     super::{
-        get_block_height::read_block_height, get_first_available_block::read_first_available_block,
-        get_transaction::read_transaction, postgres::PostgresAccountsDB, traits::AccountsDB,
-        types::StoredTransaction,
+        get_block_height::read_block_height_counter,
+        get_first_available_block::read_first_available_block, get_transaction::read_transaction,
+        postgres::PostgresAccountsDB, traits::AccountsDB, types::StoredTransaction,
     },
     anyhow::{Context, Result},
     solana_sdk::signature::Signature,
@@ -10,8 +10,7 @@ use {
 
 /// Transaction lookups, block height and ledger floor, all read from one committed state.
 pub struct StatusSnapshot {
-    /// `None` on a node that has produced no block yet.
-    pub block_height: Option<u64>,
+    pub block_height: u64,
     pub first_available_block: u64,
     /// One entry per requested signature, in order; `None` means absent from this state.
     pub transactions: Vec<Option<StoredTransaction>>,
@@ -44,7 +43,10 @@ async fn snapshot_postgres(
         .await
         .context("Failed to pin the status snapshot to one state")?;
 
-    let block_height = read_block_height(&mut tx).await?;
+    // The counter only: the top-slot fallback runs ahead of the height and would expire live attempts.
+    let block_height = read_block_height_counter(&mut *tx)
+        .await?
+        .context("The block height counter is missing, so no absence can be proven")?;
     let first_available_block = read_first_available_block(&mut tx).await?;
     let mut transactions = Vec::with_capacity(signatures.len());
     for signature in signatures {

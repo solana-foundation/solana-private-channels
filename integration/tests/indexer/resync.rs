@@ -3208,7 +3208,7 @@ fn admin() -> Keypair {
 /// Both indexers and both operators, wired to one validator as the single-node harness runs them.
 struct Stack {
     workers: Vec<Worker>,
-    // The validator has no status snapshot, so the escrow operator reads the channel through this.
+    // The validator has no status snapshot, so both operators read the channel through this.
     _channel: ChannelShim,
 }
 
@@ -3260,11 +3260,12 @@ impl Stack {
                 .await,
             );
         }
+        let channel_url = channel.url();
         workers.push(
             Worker::spawn(move || async move {
                 start_private_channel_to_solana_operator_with_config(
-                    rpc.clone(),
                     rpc,
+                    channel_url,
                     db,
                     admin(),
                     instance,

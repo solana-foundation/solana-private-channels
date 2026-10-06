@@ -399,7 +399,7 @@ async fn signature_status_snapshot_is_never_split_by_a_concurrent_block() {
                 .get_signature_status_snapshot(&reader_sigs)
                 .await
                 .unwrap();
-            let height = snapshot.block_height.unwrap();
+            let height = snapshot.block_height;
             assert_eq!(snapshot.first_available_block, 1);
             for (index, found) in snapshot.transactions.iter().enumerate() {
                 let tx_height = index as u64 + 1;
@@ -428,6 +428,52 @@ async fn signature_status_snapshot_is_never_split_by_a_concurrent_block() {
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     let checked = reads.await.unwrap();
     assert!(checked > 0, "the reader never took a snapshot");
+}
+
+/// A missing height counter fails the snapshot instead of using the top slot, which runs ahead of the height.
+#[tokio::test(flavor = "multi_thread")]
+async fn signature_status_snapshot_never_substitutes_the_top_slot_for_a_lost_height() {
+    let (mut db, _pg) = start_postgres().await;
+    let tx = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 1);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    // Slot 50 at height 5, as after a long idle stretch.
+    let mut block = create_test_block_info(50, Hash::new_unique());
+    block.block_height = Some(5);
+    db.write_batch(
+        &[],
+        vec![(sig, &tx, 50, 1_700_000_050, &processed)],
+        Some(block),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_signature_status_snapshot(&[sig])
+            .await
+            .unwrap()
+            .block_height,
+        5
+    );
+
+    let AccountsDB::Postgres(ref pg) = db else {
+        panic!("start_postgres returns a Postgres handle");
+    };
+    sqlx::query("DELETE FROM metadata WHERE key = 'block_height'")
+        .execute(pg.pool.as_ref())
+        .await
+        .unwrap();
+
+    let err = match db.get_signature_status_snapshot(&[sig]).await {
+        Ok(snapshot) => panic!(
+            "a lost counter must fail the snapshot, got height {}",
+            snapshot.block_height
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("block height counter is missing"),
+        "unexpected error: {err:#}"
+    );
 }
 
 // ── Slot Commit Guard ─────────────────────────────────────────────────────────

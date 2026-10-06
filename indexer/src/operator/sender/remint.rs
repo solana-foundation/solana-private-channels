@@ -2919,6 +2919,64 @@ mod tests {
         );
     }
 
+    /// A journaled attempt the snapshot proves dead is retired by the claim, and only then is a new MintTo sent.
+    #[tokio::test]
+    async fn execute_deferred_remint_retires_a_dead_attempt_and_resends() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        state.confirmation_poll_interval_ms = 1;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let prior = Signature::new_unique();
+        mock.remint_signatures.lock().unwrap().insert(
+            716,
+            vec![StoredSig {
+                signature: prior.to_string(),
+                last_valid_block_height: 100,
+                blockhash_slot: Some(50),
+            }],
+        );
+        // Absent, expired (height 200 past lvbh 100) and retained (floor 10 below slot 50): Dead.
+        let _snapshot = mock_status_snapshot(&mut rpc_server, "null", 200, 10).await;
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let send = mock_send_echoing_signature(&mut rpc_server).await.expect(1);
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        seed_pending_remint_row(&mock, 716, 0);
+
+        let entry = make_matured_remint(716, 77);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        // Unless the claim retires the dead attempt it reports the slot held elsewhere and nothing is sent.
+        send.assert_async().await;
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "the fresh remint finalized, so the entry resolves"
+        );
+        let update = storage_rx
+            .try_recv()
+            .expect("the fresh remint must resolve the row");
+        assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert_ne!(
+            update.remint_signature.as_deref(),
+            Some(prior.to_string().as_str()),
+            "the recorded remint is the new MintTo, not the dead attempt"
+        );
+    }
+
     /// The signature has to reach the journal before it reaches the network, or
     /// a crash in the send window leaves nothing for the next pass to classify.
     #[tokio::test]
