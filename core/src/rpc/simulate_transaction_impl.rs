@@ -227,8 +227,8 @@ pub async fn simulate_transaction(
         transaction: Arc::new(sanitized_tx),
         index: 0,
     });
-    // Simulation runs a single transaction; intra-batch parallelism is
-    // unnecessary, so disable it (max_svm_workers=1 forces sequential path).
+    // One transaction, so max_svm_workers=1. The deps keep a private admission counter:
+    // a simulation sends no results, so the node's counter would stall the settler.
     let mut execution_deps = get_execution_deps(
         read_deps.accounts_db.clone(),
         // A throwaway BOB that nothing settles into.
