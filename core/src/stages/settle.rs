@@ -11,7 +11,10 @@ use {
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
-        stages::{AddressSignatureBatch, BlockhashProgress, WeightBudget, MAX_QUEUED_ADDRESS_ROWS},
+        stages::{
+            retire_expiring_blockhashes, AddressSignatureBatch, BlockhashProgress, WeightBudget,
+            MAX_QUEUED_ADDRESS_ROWS,
+        },
     },
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
@@ -29,10 +32,10 @@ use {
     },
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
-        collections::{hash_map::Entry, HashMap},
+        collections::{hash_map::Entry, HashMap, LinkedList},
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc,
+            Arc, RwLock,
         },
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
@@ -164,6 +167,9 @@ pub struct ExecutedBatch {
     pub transactions: Vec<SanitizedTransaction>,
     /// The executor's generation for the account writes in this batch.
     pub generation: u64,
+    /// Set on the last message of an executor admission to that admission's
+    /// number. The settler waits on it before cutting a block that retired a hash.
+    pub admission: Option<u64>,
     /// The executor's in-flight byte budget for this batch. Nothing reads it:
     /// dropping it wherever this message ends is what returns the bytes.
     pub permit: OwnedSemaphorePermit,
@@ -293,9 +299,9 @@ impl SettledInbox {
     }
 }
 
-/// Cap on buffered account bytes before the settler stops draining the executor.
-/// Far below Postgres' 1 GB limit for one bytea, and small enough that committing
-/// a full buffer still finishes inside the stage health margin.
+/// Cap on buffered account bytes before the settler stops draining the executor, far
+/// below Postgres' 1 GB bytea limit and small enough to commit inside the health margin.
+/// A block that waits on an admission can reach about 512 MiB, still under that limit.
 pub(crate) const MAX_BUFFERED_SETTLE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cap on address rows buffered for one block. It bounds every row kind a block
@@ -363,10 +369,9 @@ struct SettleResult {
 #[derive(Clone, Copy)]
 struct BlockPublishers<'a> {
     /// Advances the dedup window. Until dedup holds the hash, transactions
-    /// built on it are dropped. Bounded to dedup's window.
+    /// built on it are dropped. The hash this block expires was retired before
+    /// the cut. Bounded to dedup's window.
     blockhashes: &'a mpsc::Sender<Hash>,
-    /// Counts each block once before its commit, so RPC can tell dedup is behind.
-    blockhash_progress: &'a BlockhashProgress,
     /// Acks the commit to BOB, which unpins the settled accounts. A merge into
     /// an inbox rather than a send, so it never waits on BOB.
     accounts: &'a SettledInbox,
@@ -531,6 +536,10 @@ pub struct SettleArgs {
     /// The slot last published to the DB, read by isBlockhashValid for its context.
     pub settled_slot: Arc<AtomicU64>,
     pub blockhash_progress: Arc<BlockhashProgress>,
+    /// The dedup window, the same Arc dedup and the executor hold. The settler
+    /// retires expiring hashes from it before each block.
+    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    pub max_blockhashes: usize,
     /// Told what the startup warm-up left the cache in, so an AIO read path
     /// trusts Redis only after this settler has purged and stamped it.
     pub cache_aligned: Option<oneshot::Sender<CacheState>>,
@@ -554,6 +563,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         writer_epoch,
         settled_slot,
         blockhash_progress,
+        live_blockhashes,
+        max_blockhashes,
         cache_aligned,
     } = args;
     let handle = tokio::spawn(async move {
@@ -575,6 +586,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             writer_epoch: Option<u64>,
             settled_slot: Arc<AtomicU64>,
             blockhash_progress: Arc<BlockhashProgress>,
+            live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+            max_blockhashes: usize,
             cache_aligned: Option<oneshot::Sender<CacheState>>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
@@ -729,6 +742,11 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // Settled bytes and address rows since the last block; gate the recv arm below.
             let mut buffered_account_bytes = 0usize;
             let mut buffered_rows = 0usize;
+            // The last executor admission whose results are all buffered.
+            let mut received_through = 0u64;
+            // The slot already retired for, so a block that is cut twice (the final
+            // flush after a break) neither retires nor announces again.
+            let mut retired_slot: Option<u64> = None;
 
             // Tick-driven block production: the blocktime tick is the sole
             // trigger for producing blocks.  Between ticks, execution results
@@ -798,9 +816,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             }
                         }
 
-                        let num_results = processing_results.len();
                         if !should_produce_block(
-                            num_results > 0,
+                            !processing_results.is_empty(),
                             last_block.is_none(),
                             tick.saturating_duration_since(last_block_at),
                         ) {
@@ -829,6 +846,35 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             next_slot += 1;
                             continue;
                         }
+                        // Retire the hash this block expires before cutting it, then
+                        // wait for every result admitted before the retire, so a tx on
+                        // that hash lands in this block or never runs.
+                        if retired_slot != Some(next_slot) {
+                            retired_slot = Some(next_slot);
+                            let (popped, admissions) = retire_expiring_blockhashes(
+                                &live_blockhashes,
+                                max_blockhashes,
+                                &blockhash_progress,
+                            );
+                            // Nothing expired means nothing admitted can break the deadline.
+                            if popped > 0
+                                && !collect_admitted(
+                                    &mut execution_results_rx,
+                                    admissions,
+                                    &mut processing_results,
+                                    &mut buffered_account_bytes,
+                                    &mut buffered_rows,
+                                    &mut received_through,
+                                    &heartbeat,
+                                    &metrics,
+                                )
+                                .await
+                            {
+                                break;
+                            }
+                        }
+                        // Counted after the wait, which can add results to this block.
+                        let num_results = processing_results.len();
                         if buffered_account_bytes >= MAX_BUFFERED_SETTLE_BYTES
                             || buffered_rows >= MAX_BUFFERED_SETTLE_ROWS
                         {
@@ -843,7 +889,6 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             &metrics,
                             Some(BlockPublishers {
                                 blockhashes: &settled_blockhashes_tx,
-                                blockhash_progress: &blockhash_progress,
                                 accounts: &settled_accounts_tx,
                                 address_signatures: &address_signatures_tx,
                                 rows_budget: &rows_budget,
@@ -970,36 +1015,18 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         if buffered_account_bytes < MAX_BUFFERED_SETTLE_BYTES
                             && buffered_rows < MAX_BUFFERED_SETTLE_ROWS => {
                         match result {
-                            Some(ExecutedBatch { output: svm_output, transactions, generation, .. }) => {
-                                heartbeat.record_input();
-                                debug!("Settle worker received output with {} transactions", transactions.len());
-                                if svm_output.processing_results.len() != transactions.len() {
-                                    error!("Processing results and transactions length mismatch");
+                            Some(batch) => {
+                                if !buffer_batch(
+                                    batch,
+                                    &mut processing_results,
+                                    &mut buffered_account_bytes,
+                                    &mut buffered_rows,
+                                    &mut received_through,
+                                    &heartbeat,
+                                    &metrics,
+                                ) {
                                     break;
                                 }
-                                debug!("Extending {} processing results", svm_output.processing_results.len());
-                                // Measured before the extend consumes both vectors.
-                                buffered_account_bytes += retained_account_bytes(
-                                    &svm_output.processing_results,
-                                    &transactions,
-                                );
-                                buffered_rows += retained_rows(&transactions);
-                                metrics.settler_buffered_account_bytes(buffered_account_bytes);
-                                // Each result keeps its own generation: a block acknowledges
-                                // only the writes it commits, never a whole batch at once.
-                                // The last write to an account wins, which needs generations
-                                // to arrive in order. One executor and one queue guarantee it.
-                                debug_assert!(
-                                    processing_results
-                                        .last()
-                                        .is_none_or(|buffered: &BufferedResult| buffered.generation <= generation),
-                                    "results must reach the settler in generation order"
-                                );
-                                processing_results.extend(BufferedResult::stamp(
-                                    svm_output.processing_results,
-                                    transactions,
-                                    generation,
-                                ));
                             }
                             None => {
                                 info!("Settle worker stopped - channel closed");
@@ -1014,6 +1041,15 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // Flush any results buffered between the last tick and the loop
             // exit — without this, the final partial block is silently dropped
             if !processing_results.is_empty() {
+                // No wait here: the loop has stopped, and results it never
+                // received are never committed, so they cannot land late.
+                if retired_slot != Some(next_slot) {
+                    retire_expiring_blockhashes(
+                        &live_blockhashes,
+                        max_blockhashes,
+                        &blockhash_progress,
+                    );
+                }
                 let num_results = processing_results.len();
                 match settle_with_retry(
                     next_slot,
@@ -1024,7 +1060,6 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     &metrics,
                     Some(BlockPublishers {
                         blockhashes: &settled_blockhashes_tx,
-                        blockhash_progress: &blockhash_progress,
                         accounts: &settled_accounts_tx,
                         address_signatures: &address_signatures_tx,
                         rows_budget: &rows_budget,
@@ -1088,6 +1123,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             writer_epoch,
             settled_slot,
             blockhash_progress,
+            live_blockhashes,
+            max_blockhashes,
             cache_aligned,
         )
         .await
@@ -1117,6 +1154,112 @@ fn compute_blockhash(
     parts.push(&time_bytes);
     parts.extend(signatures.iter().map(|s| s.as_ref()));
     hashv(&parts)
+}
+
+/// Take one executor message into the next block's buffer. Returns `false` on
+/// a length mismatch, which stops the settler.
+fn buffer_batch(
+    batch: ExecutedBatch,
+    processing_results: &mut Vec<BufferedResult>,
+    buffered_account_bytes: &mut usize,
+    buffered_rows: &mut usize,
+    received_through: &mut u64,
+    heartbeat: &crate::health::StageHeartbeat,
+    metrics: &SharedMetrics,
+) -> bool {
+    let ExecutedBatch {
+        output: svm_output,
+        transactions,
+        generation,
+        admission,
+        ..
+    } = batch;
+    heartbeat.record_input();
+    debug!(
+        "Settle worker received output with {} transactions",
+        transactions.len()
+    );
+    if svm_output.processing_results.len() != transactions.len() {
+        error!("Processing results and transactions length mismatch");
+        return false;
+    }
+    debug!(
+        "Extending {} processing results",
+        svm_output.processing_results.len()
+    );
+    // Measured before the extend consumes both vectors.
+    *buffered_account_bytes +=
+        retained_account_bytes(&svm_output.processing_results, &transactions);
+    *buffered_rows += retained_rows(&transactions);
+    metrics.settler_buffered_account_bytes(*buffered_account_bytes);
+    // Each result keeps its own generation, so a block acks only the writes it commits.
+    // The last write wins, which needs generations in order; one executor and one queue give that.
+    debug_assert!(
+        processing_results
+            .last()
+            .is_none_or(|buffered: &BufferedResult| buffered.generation <= generation),
+        "results must reach the settler in generation order"
+    );
+    processing_results.extend(BufferedResult::stamp(
+        svm_output.processing_results,
+        transactions,
+        generation,
+    ));
+    if let Some(admission) = admission {
+        *received_through = (*received_through).max(admission);
+    }
+    true
+}
+
+/// How often a held block reports that it is still waiting on an admission.
+const ADMISSION_WAIT_REPORT: Duration = Duration::from_secs(1);
+
+/// Receive until the last message of admission `target` is buffered or the executor
+/// is gone. Ignores the buffer gate: a parked executor is freed only by receiving.
+/// Returns `false` on a length mismatch.
+#[allow(clippy::too_many_arguments)]
+async fn collect_admitted(
+    execution_results_rx: &mut mpsc::Receiver<ExecutedBatch>,
+    target: u64,
+    processing_results: &mut Vec<BufferedResult>,
+    buffered_account_bytes: &mut usize,
+    buffered_rows: &mut usize,
+    received_through: &mut u64,
+    heartbeat: &crate::health::StageHeartbeat,
+    metrics: &SharedMetrics,
+) -> bool {
+    // No timeout: cutting the block early would let the admitted tx land late.
+    let started = Instant::now();
+    while *received_through < target {
+        let batch =
+            match tokio::time::timeout(ADMISSION_WAIT_REPORT, execution_results_rx.recv()).await {
+                Ok(Some(batch)) => batch,
+                // Every admitted result that will ever arrive is buffered.
+                Ok(None) => return true,
+                Err(_) => {
+                    // The held block is pending work, so a stall turns /health red.
+                    heartbeat.record_input();
+                    warn!(
+                        "Block held {:?} waiting on admission {target}, received through {}",
+                        started.elapsed(),
+                        received_through
+                    );
+                    continue;
+                }
+            };
+        if !buffer_batch(
+            batch,
+            processing_results,
+            buffered_account_bytes,
+            buffered_rows,
+            received_through,
+            heartbeat,
+            metrics,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Record executed transactions that could not be committed, then drop them.
@@ -1175,15 +1318,6 @@ async fn settle_with_retry(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-
-    // Once per block, not per attempt: every attempt rebuilds the same hash. A block
-    // that never commits fails the settler, so the count cannot stay ahead on a live node.
-    if let Some(publishers) = publishers {
-        publishers
-            .blockhash_progress
-            .announced
-            .fetch_add(1, Ordering::SeqCst);
-    }
 
     let has_work = !processing_results.is_empty();
     let mut backoff = SETTLE_RETRY_BACKOFF_BASE;
@@ -1872,7 +2006,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &blockhashes_tx,
-                blockhash_progress: &BlockhashProgress::default(),
                 accounts: inbox,
                 address_signatures: &address_signatures_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -2051,6 +2184,7 @@ mod tests {
             output,
             transactions,
             generation,
+            admission: None,
             permit: crate::stages::test_permit(),
         }
     }
@@ -2184,6 +2318,48 @@ mod tests {
         SettlerSinks,
         Arc<crate::health::StageHeartbeat>,
     ) {
+        let settler = start_test_settler(
+            url,
+            blocktime_ms,
+            capacity,
+            metrics,
+            shutdown,
+            writer_epoch,
+            Arc::default(),
+            crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
+            Arc::default(),
+        )
+        .await;
+        (
+            settler.exec_tx,
+            settler.inbox,
+            settler.handle,
+            settler.sinks,
+            settler.heartbeat,
+        )
+    }
+
+    /// Everything a test may hold of a settler it started.
+    struct TestSettler {
+        exec_tx: mpsc::Sender<ExecutedBatch>,
+        inbox: SettledInbox,
+        handle: WorkerHandle,
+        sinks: SettlerSinks,
+        heartbeat: Arc<crate::health::StageHeartbeat>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_test_settler(
+        url: String,
+        blocktime_ms: u64,
+        capacity: usize,
+        metrics: SharedMetrics,
+        shutdown: CancellationToken,
+        writer_epoch: Option<u64>,
+        live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+        max_blockhashes: usize,
+        blockhash_progress: Arc<BlockhashProgress>,
+    ) -> TestSettler {
         let (exec_tx, exec_rx) = mpsc::channel(capacity);
         let inbox = SettledInbox::new();
         let (settled_blockhashes_tx, blockhashes_rx) = mpsc::channel(TEST_BLOCKHASH_SINK);
@@ -2205,20 +2381,274 @@ mod tests {
             heartbeat: Arc::clone(&heartbeat),
             writer_epoch,
             settled_slot: Arc::default(),
-            blockhash_progress: Arc::default(),
+            blockhash_progress,
+            live_blockhashes,
+            max_blockhashes,
             cache_aligned: None,
         })
         .await;
-        (
+        TestSettler {
             exec_tx,
             inbox,
             handle,
-            SettlerSinks {
+            sinks: SettlerSinks {
                 _blockhashes_rx: blockhashes_rx,
                 _address_signatures_rx: address_signatures_rx,
             },
             heartbeat,
+        }
+    }
+
+    /// A settler over a seeded dedup window, with `admissions` already counted
+    /// before its first tick. Returns the window and counters it shares.
+    #[allow(clippy::type_complexity)]
+    async fn settler_with_window(
+        url: String,
+        blocktime_ms: u64,
+        window: &[Hash],
+        max_blockhashes: usize,
+        admissions: u64,
+        shutdown: CancellationToken,
+    ) -> (
+        mpsc::Sender<ExecutedBatch>,
+        WorkerHandle,
+        Arc<RwLock<LinkedList<Hash>>>,
+        Arc<BlockhashProgress>,
+        SettlerSinks,
+    ) {
+        let live = Arc::new(RwLock::new(window.iter().copied().collect()));
+        let progress = Arc::new(BlockhashProgress::default());
+        progress.admissions.store(admissions, Ordering::SeqCst);
+        let settler = start_test_settler(
+            url,
+            blocktime_ms,
+            RESULTS_CAP,
+            Arc::new(NoopMetrics),
+            shutdown,
+            None,
+            Arc::clone(&live),
+            max_blockhashes,
+            Arc::clone(&progress),
         )
+        .await;
+        (
+            settler.exec_tx,
+            settler.handle,
+            live,
+            progress,
+            settler.sinks,
+        )
+    }
+
+    fn window_of(live: &RwLock<LinkedList<Hash>>) -> Vec<Hash> {
+        live.read().unwrap().iter().copied().collect()
+    }
+
+    /// Poll until `hash` has left the window, which is the settler's retire.
+    async fn await_retired(live: &RwLock<LinkedList<Hash>>, hash: Hash) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while window_of(live).contains(&hash) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settler never retired the expiring hash"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// One tiny executed transfer, tagged as the last message of `admission`.
+    fn tagged_transfer(admission: Option<u64>) -> (ExecutedBatch, Signature) {
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let sig = *tx.signature();
+        let mut batch = batch_of(
+            LoadAndExecuteSanitizedTransactionsOutput {
+                processing_results: vec![Ok(make_executed(vec![(
+                    from.pubkey(),
+                    AccountSharedData::new(1, 0, &Pubkey::default()),
+                )]))],
+                error_metrics: Default::default(),
+                execute_timings: Default::default(),
+                balance_collector: None,
+            },
+            vec![tx],
+            1,
+        );
+        batch.admission = admission;
+        (batch, sig)
+    }
+
+    async fn block_signatures(db: &AccountsDB, slot: u64) -> Vec<Signature> {
+        db.get_block(slot)
+            .await
+            .unwrap()
+            .expect("block exists")
+            .transaction_signatures
+    }
+
+    /// A tx admitted on the hash the next block expires must land in that block,
+    /// so a reader that sees the height past the hash's deadline also sees the tx.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_holds_until_results_admitted_before_its_retirement_arrive() {
+        for sent_before_the_tick in [true, false] {
+            let (db, pg) = start_test_postgres().await;
+            let url = postgres_container_url(&pg, "test_db").await;
+            let pool = test_pool(&db);
+            let (x, a, b) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
+            let (exec_tx, _handle, live, progress, _sinks) =
+                settler_with_window(url, 100, &[x, a, b], 3, 1, CancellationToken::new()).await;
+
+            let (batch, sig) = tagged_transfer(Some(1));
+            if sent_before_the_tick {
+                exec_tx.send(batch).await.unwrap();
+            } else {
+                await_retired(&live, x).await;
+                assert_eq!(
+                    progress.announced.load(Ordering::SeqCst),
+                    1,
+                    "the retire announces the held block, so the retired hash reads catching up"
+                );
+                assert!(
+                    !await_block(&pool, 0, Duration::from_millis(500)).await,
+                    "the block must wait for the admitted result"
+                );
+                exec_tx.send(batch).await.unwrap();
+            }
+
+            assert!(await_block(&pool, 0, Duration::from_secs(30)).await);
+            assert_eq!(
+                block_signatures(&db, 0).await,
+                vec![sig],
+                "the admitted tx lands in the block that expires its hash (before={sent_before_the_tick})"
+            );
+            assert_eq!(window_of(&live), vec![a, b]);
+        }
+    }
+
+    /// An executor that dies mid-admission must not hold the block forever, and
+    /// the final flush after a broken wait must not retire or announce twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_executor_releases_a_held_block() {
+        for mismatch in [false, true] {
+            let (db, pg) = start_test_postgres().await;
+            let url = postgres_container_url(&pg, "test_db").await;
+            let (x, a, b) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
+            let (exec_tx, handle, live, progress, _sinks) =
+                settler_with_window(url, 100, &[x, a, b], 3, 1, CancellationToken::new()).await;
+
+            await_retired(&live, x).await;
+            let (batch, sig) = tagged_transfer(None);
+            exec_tx.send(batch).await.unwrap();
+            if mismatch {
+                // Stops the settler mid-wait, so the final flush cuts the block.
+                let (mut broken, _) = tagged_transfer(Some(1));
+                broken.output.processing_results.clear();
+                exec_tx.send(broken).await.unwrap();
+            } else {
+                drop(exec_tx);
+            }
+
+            let exited = tokio::time::timeout(Duration::from_secs(30), handle.handle).await;
+            assert!(
+                exited.is_ok(),
+                "the held block must be released (mismatch={mismatch})"
+            );
+            assert_eq!(block_signatures(&db, 0).await, vec![sig]);
+            assert_eq!(
+                window_of(&live),
+                vec![a, b],
+                "retired once (mismatch={mismatch})"
+            );
+            assert_eq!(
+                progress.announced.load(Ordering::SeqCst),
+                1,
+                "announced once (mismatch={mismatch})"
+            );
+        }
+    }
+
+    /// In a drain dedup is gone, so the settler alone moves the window: one hash
+    /// per block, and an empty window must not stop it committing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_window_keeps_retiring_while_dedup_is_gone() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let window = [Hash::new_unique(), Hash::new_unique(), Hash::new_unique()];
+        let (exec_tx, _handle, live, _progress, sinks) =
+            settler_with_window(url, 100, &window, 3, 0, shutdown).await;
+        let SettlerSinks {
+            _blockhashes_rx,
+            _address_signatures_rx,
+        } = sinks;
+        drop(_blockhashes_rx);
+
+        assert!(await_block(&pool, 0, Duration::from_secs(30)).await);
+        let mut lengths = vec![window_of(&live).len()];
+        let mut tip = 0;
+        for _ in 0..4 {
+            let (batch, _) = tagged_transfer(None);
+            exec_tx.send(batch).await.unwrap();
+            tip = await_block_above(&pool, tip, Duration::from_secs(30))
+                .await
+                .expect("the settler keeps committing");
+            lengths.push(window_of(&live).len());
+        }
+        assert_eq!(lengths, vec![2, 1, 0, 0, 0]);
+    }
+
+    /// A wait on an executor that is alive but never sends must show up on /health.
+    #[tokio::test]
+    async fn a_stalled_wait_turns_the_settler_unhealthy() {
+        let (_exec_tx, mut exec_rx) = mpsc::channel::<ExecutedBatch>(1);
+        let heartbeat = crate::health::StageHeartbeat::new();
+        assert!(heartbeat.is_healthy());
+        let waited = tokio::time::timeout(
+            ADMISSION_WAIT_REPORT + Duration::from_millis(500),
+            collect_admitted(
+                &mut exec_rx,
+                1,
+                &mut Vec::new(),
+                &mut 0,
+                &mut 0,
+                &mut 0,
+                &heartbeat,
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+            ),
+        )
+        .await;
+        assert!(waited.is_err(), "the wait has no timeout of its own");
+        assert!(
+            !heartbeat.is_healthy(),
+            "a stalled wait must not read healthy"
+        );
+    }
+
+    /// The wait must bypass the buffer gate. A full buffer shuts the receive
+    /// arm, and a wait through that arm would never see the tagged result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_block_drains_past_a_full_buffer() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let (x, a, b) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
+        let (exec_tx, _handle, live, _progress, _sinks) =
+            settler_with_window(url, 100, &[x, a, b], 3, 1, CancellationToken::new()).await;
+
+        let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
+        let big = *txs[0].signature();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
+        await_retired(&live, x).await;
+        let (batch, sig) = tagged_transfer(Some(1));
+        exec_tx.send(batch).await.unwrap();
+
+        assert!(
+            await_block(&pool, 0, Duration::from_secs(30)).await,
+            "the held block must commit past a full buffer"
+        );
+        assert_eq!(block_signatures(&db, 0).await, vec![big, sig]);
     }
 
     /// Current wall clock in nanoseconds, the value the worker pins per settle.
@@ -2427,6 +2857,7 @@ mod tests {
                 output,
                 transactions,
                 generation: 1,
+                admission: None,
                 permit,
             })
             .await
@@ -2881,6 +3312,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -2940,6 +3373,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::clone(&settled_slot),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -2998,6 +3433,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::clone(&progress),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -3509,6 +3946,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -4774,6 +5213,7 @@ mod tests {
             output(),
             txs,
             generation,
+            None,
             crate::stages::execution::MAX_SEND_CHUNK_BYTES,
             3,
             &budget,
@@ -5180,6 +5620,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -5235,6 +5677,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -5298,6 +5742,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -5365,6 +5811,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: Some(aligned_tx),
         })
         .await;
@@ -5564,6 +6012,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -6513,7 +6963,6 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -6606,7 +7055,6 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7321,6 +7769,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -7423,6 +7873,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -7721,6 +8173,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -7789,6 +8243,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -7866,7 +8322,6 @@ mod tests {
             &metrics,
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
-                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &budget,
@@ -7935,7 +8390,6 @@ mod tests {
                 &metrics,
                 Some(BlockPublishers {
                     blockhashes: &settled_blockhashes_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &budget,
@@ -8007,7 +8461,6 @@ mod tests {
                 &metrics,
                 Some(BlockPublishers {
                     blockhashes: &settled_blockhashes_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8081,7 +8534,6 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &parked_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8137,7 +8589,6 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
-                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8216,7 +8667,6 @@ mod tests {
                     &(Arc::new(NoopMetrics) as SharedMetrics),
                     Some(BlockPublishers {
                         blockhashes: &settled_blockhashes_tx,
-                        blockhash_progress: &BlockhashProgress::default(),
                         accounts: &settled_accounts_tx,
                         address_signatures: &addr_sig_tx,
                         rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8272,7 +8722,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
-                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8321,7 +8770,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
-                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8392,6 +8840,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
@@ -8488,6 +8938,8 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            live_blockhashes: Arc::default(),
+            max_blockhashes: crate::nodes::node::DEFAULT_MAX_BLOCKHASHES,
             cache_aligned: None,
         })
         .await;
