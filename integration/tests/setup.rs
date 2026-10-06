@@ -109,15 +109,14 @@ pub fn transfer_tokens_transaction(
     )
 }
 
-/// Builds a signed v0 System transfer carrying `num_lookups` declared address
+/// Builds a signed v0 memo naming `to`, carrying `num_lookups` declared address
 /// table lookups. Only admission is under test, so the payer needs no funding.
 ///
-/// With `ix_uses_lookup` the transfer's recipient is taken from the first
+/// With `ix_uses_lookup` the memo's `to` is taken from the first
 /// lookup-supplied key, the shape whose account index nothing can resolve here.
-pub fn v0_system_transfer(
+pub fn v0_memo_transaction(
     from: &Keypair,
     to: &Pubkey,
-    lamports: u64,
     recent_blockhash: Hash,
     num_lookups: usize,
     ix_uses_lookup: bool,
@@ -141,13 +140,12 @@ pub fn v0_system_transfer(
             num_readonly_signed_accounts: 0,
             num_readonly_unsigned_accounts: 1,
         },
-        account_keys: vec![from.pubkey(), *to, system_program::ID],
+        account_keys: vec![from.pubkey(), *to, spl_memo::id()],
         recent_blockhash,
         instructions: vec![CompiledInstruction {
             program_id_index: 2,
             accounts: vec![0, recipient_index],
-            // System Transfer: 4-byte variant tag 2 followed by a u64 amount.
-            data: [2u32.to_le_bytes().as_slice(), &lamports.to_le_bytes()].concat(),
+            data: b"lookup-admission".to_vec(),
         }],
         address_table_lookups,
     });
