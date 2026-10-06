@@ -42,7 +42,9 @@ part is the adjustment `<A>`, exported per mint as
 `private_channel_operator_reconciliation_envelope_adjustment_raw`. When the adjustment is
 the only thing keeping a mint from breaching, the operator logs
 `RECONCILIATION ALERT` and posts `{"alert": "envelope_adjustment_changed_verdict", ...}`
-to the reconciliation webhook. One such page is expected under RPC lag; pages that keep
+to the reconciliation webhook. Such a masked tick holds the mint's breach count rather
+than resetting it, so a shortfall masked on some ticks still halts once it breaches on
+three ticks that are not clean. One such page is expected under RPC lag; pages that keep
 coming mean a lagging backend could be hiding a real shortfall of that size, so check
 the custody RPC and the channel read node for lag.
 

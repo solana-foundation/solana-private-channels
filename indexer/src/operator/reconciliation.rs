@@ -861,6 +861,10 @@ async fn evaluate_and_maybe_halt(
                 };
                 log_masked_breach(&masked_breach);
                 masked.push(masked_breach);
+                // The adjustment can over-count, so a masked tick holds the streak, never resets it.
+                if let Some(&held) = breach_counters.supply.get(&mint) {
+                    next_counters.supply.insert(mint, held);
+                }
             }
             continue;
         };
@@ -4083,6 +4087,46 @@ mod tests {
                 adj as f64
             );
         }
+    }
+
+    /// A masked tick is no evidence either way, so it holds a breach streak instead of resetting
+    /// it, and a real shortfall masked every third tick still halts.
+    #[tokio::test]
+    async fn a_masked_tick_holds_the_breach_streak() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+        // Supply 1500 over custody 1000 with envelope 0: a real shortfall of 500. An adjustment
+        // of 600 masks it.
+        for (adj, expected) in [(0u64, 1u32), (0, 2), (600, 2), (0, 3)] {
+            evaluate_and_maybe_halt(
+                &storage,
+                &recon_config_zero_tolerance(),
+                &None,
+                &test_webhook_client(),
+                &HashMap::from([(mint, 1_000u64)]),
+                1,
+                &HashMap::new(),
+                &HashSet::from([mint]),
+                &HashMap::from([(mint, 1_500u64)]),
+                &HashMap::new(),
+                &HashMap::from([(mint, adj)]),
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+            assert_eq!(
+                counters.supply.get(&mint).copied(),
+                Some(expected),
+                "adj {adj}"
+            );
+        }
+        assert!(
+            halted,
+            "the masked tick must not break the streak to a halt"
+        );
     }
 
     fn masked_breach() -> MaskedBreach {
