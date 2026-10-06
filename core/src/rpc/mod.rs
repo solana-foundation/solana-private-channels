@@ -488,10 +488,6 @@ mod tests {
                 get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None).await,
             ),
             (
-                "getBlocks with no end",
-                get_blocks_impl::get_blocks_impl(&deps, 0, None, None).await,
-            ),
-            (
                 "getBlocksWithLimit 10_001",
                 get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 10_001, None)
                     .await,
@@ -501,6 +497,30 @@ mod tests {
             let err = result.expect_err(name);
             assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE, "{name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_end_get_blocks_is_sized_by_the_newest_block() {
+        let (mut db, _pg) = start_pg().await;
+        for slot in [5, 20_000] {
+            db.store_block(make_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+        let deps = make_read_deps(db);
+        let _held = hold_every_block_list_permit(&deps);
+
+        // A few slots below the newest block is a small listing, so it needs no permit.
+        let near_tip = get_blocks_impl::get_blocks_impl(&deps, 19_995, None, None)
+            .await
+            .expect("a listing near the tip is not capped");
+        assert_eq!(near_tip, vec![20_000]);
+
+        // Far below the newest block is still a large listing.
+        let err = get_blocks_impl::get_blocks_impl(&deps, 0, None, None)
+            .await
+            .expect_err("a large listing with no end is still capped");
+        assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -321,6 +321,11 @@ impl Limits {
     pub fn block_list_slots(pool_size: u32) -> NonZeroUsize {
         NonZeroUsize::new(pool_size as usize / 4).unwrap_or(NonZeroUsize::MIN)
     }
+
+    /// Listing slots one client may hold: a quarter of them, so one address cannot take them all.
+    fn block_lists_per_ip(&self) -> usize {
+        (self.max_forwarded_block_lists.get() / 4).max(1)
+    }
 }
 
 pub struct Gateway {
@@ -348,6 +353,8 @@ pub struct Gateway {
     read_slots: Arc<Semaphore>,
     /// Permits for public block listings in flight, sized by `max_forwarded_block_lists`.
     block_list_slots: Arc<Semaphore>,
+    /// Listing slots each client holds, capped by `Limits::block_lists_per_ip`.
+    block_list_ip_counts: IpConnCounts,
 }
 
 #[derive(Clone, Copy)]
@@ -494,6 +501,12 @@ impl Drop for IpConnGuard {
     }
 }
 
+/// A public listing's share of the client's quota and of the global listing budget.
+struct BlockListSlot {
+    _client: IpConnGuard,
+    _permit: OwnedSemaphorePermit,
+}
+
 /// Upstream response body that errors once the request deadline passes, even mid-stream. An
 /// error, unlike a clean end, makes hyper drop the connection, so a cut-off page can't pass as complete.
 struct DeadlineBody {
@@ -502,7 +515,7 @@ struct DeadlineBody {
     /// Held until the body ends, so a streaming read keeps its read slot.
     _read_permit: Option<OwnedSemaphorePermit>,
     /// Held until the body ends, so a slow reader cannot free its listing slot early.
-    _block_list_permit: Option<OwnedSemaphorePermit>,
+    _block_list_permit: Option<BlockListSlot>,
 }
 
 impl DeadlineBody {
@@ -519,7 +532,7 @@ impl DeadlineBody {
         }
     }
 
-    fn with_block_list_permit(mut self, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn with_block_list_permit(mut self, permit: Option<BlockListSlot>) -> Self {
         self._block_list_permit = permit;
         self
     }
@@ -806,6 +819,7 @@ impl Gateway {
             block_list_slots: Arc::new(Semaphore::new(
                 Limits::default().max_forwarded_block_lists.get(),
             )),
+            block_list_ip_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1552,14 +1566,25 @@ impl Gateway {
             None
         };
 
-        // Public block listings of any span share a global budget below the read node's pool;
-        // only this layer can tell them from the indexer's. Held until the exchange ends, streamed
-        // body included, so slow readers cannot pin more read slots than the listing budget.
+        // Public listings of any span share a budget below the read node's pool, and each client
+        // gets only a share of it. Held until the streamed body ends, so slow readers cannot pin
+        // more read slots than the budget. Only this layer can tell them from the indexer's.
         let block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
         {
-            match Arc::clone(&self.block_list_slots).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
+            let client = try_acquire_ip(
+                &self.block_list_ip_counts,
+                rate_key,
+                self.limits.block_lists_per_ip(),
+            );
+            let permit = client
+                .as_ref()
+                .and_then(|_| Arc::clone(&self.block_list_slots).try_acquire_owned().ok());
+            match (client, permit) {
+                (Some(client), Some(permit)) => Some(BlockListSlot {
+                    _client: client,
+                    _permit: permit,
+                }),
+                _ => {
                     warn!("Block listing capacity reached, shedding {}", method);
                     metrics::GATEWAY_REJECTED_TOTAL
                         .with_label_values(&[BLOCK_LIST_CAPACITY])
@@ -3784,6 +3809,55 @@ mod tests {
         let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
             .await
             .expect("a listing should be forwarded once the slot is free")
+            .unwrap();
+        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_take_every_block_list_slot() {
+        let read_node = start_stalled_body_backend().await;
+        let limits = Limits {
+            upstream_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let per_client = limits.block_lists_per_ip();
+        assert!(per_client < limits.max_forwarded_block_lists.get());
+        let addr =
+            start_gateway_with_limits("http://127.0.0.1:1", &format!("http://{read_node}"), limits)
+                .await;
+
+        // This client fills its own share with listings that never finish streaming.
+        let mut buf = [0u8; 1024];
+        let mut streaming = Vec::new();
+        for _ in 0..per_client {
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            conn.write_all(rpc_request("getBlocks").as_bytes())
+                .await
+                .unwrap();
+            let n = conn.read(&mut buf).await.unwrap();
+            assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+            streaming.push(conn);
+        }
+
+        // Global slots are still free, but this client gets no more of them.
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        over.write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        assert_status(&read_to_close(&mut over).await, 503);
+
+        // Once its listings end, its share is free again.
+        for mut conn in streaming {
+            read_to_close(&mut conn).await;
+        }
+        let mut again = TcpStream::connect(addr).await.unwrap();
+        again
+            .write_all(rpc_request("getBlocks").as_bytes())
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), again.read(&mut buf))
+            .await
+            .expect("a listing should be forwarded once the client's share is free")
             .unwrap();
         assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
     }
