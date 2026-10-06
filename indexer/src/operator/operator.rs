@@ -1225,6 +1225,35 @@ mod tests {
         }
     }
 
+    /// A release in a generation the chain has not reached yet is a false claim too.
+    #[tokio::test]
+    async fn preflight_refuses_a_release_above_the_bitmap_generation() {
+        let ahead = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        for bitmap_exists in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server);
+            let _account = if bitmap_exists {
+                mock_bitmap_account(&mut server, 0, &[])
+            } else {
+                mock_bitmap_not_found(&mut server)
+            };
+
+            let result = run_preflight_with(
+                Arc::new(Storage::Mock(completed_withdrawal(ahead as i64))),
+                make_rpc_client(&server.url()),
+            )
+            .await;
+
+            match result {
+                Err(OperatorError::Program(crate::error::ProgramError::BitmapDivergence {
+                    db_only,
+                    ..
+                })) => assert_eq!(db_only, vec![ahead], "bitmap_exists={bitmap_exists}"),
+                other => panic!("bitmap_exists={bitmap_exists}: must refuse, got {other:?}"),
+            }
+        }
+    }
+
     /// A lost sender lock explains a failed read, but must never hide a real divergence.
     #[tokio::test]
     async fn preflight_lock_loss_outranks_only_a_non_verdict() {

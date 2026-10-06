@@ -213,7 +213,7 @@ pub(crate) async fn release_seen_at_confirmed(
     Ok(bitmap.is_consumed(nonce))
 }
 
-/// Boot check of the current generation's released nonces against Completed rows.
+/// Boot check of released nonces, from the current generation up, against Completed rows.
 /// A set bit with no Completed row is repaired in place and boot continues.
 /// A Completed row with a clear bit claims a release the chain never made, so boot refuses.
 pub(crate) async fn validate_bitmap_consistency(
@@ -381,16 +381,19 @@ async fn confirm_divergence(
     diff_bitmap(storage, &bitmap).await
 }
 
-/// Split the current generation into "database only" and "chain only" nonces.
-/// Both sides are restricted to the window the bitmap covers, because outside it
-/// the bits were cleared by a rotation and mean nothing.
+/// Split the nonces from the current generation up into "database only" and "chain only".
+/// Older generations are skipped because a rotation cleared their bits. Later ones are
+/// kept because the chain cannot release a nonce before rotating into its generation.
 async fn diff_bitmap(
     storage: &Storage,
     bitmap: &BitmapState,
 ) -> Result<(Vec<u64>, Vec<u64>), OperatorError> {
-    // Saturating so a corrupt generation yields an empty window, never a panic.
-    let min_nonce = bitmap.generation.saturating_mul(NONCES_PER_GENERATION);
-    let max_nonce = min_nonce.saturating_add(NONCES_PER_GENERATION);
+    // The nonce column is signed, so both bounds stop at i64::MAX. A corrupt generation gives an empty window.
+    let max_nonce = i64::MAX as u64;
+    let min_nonce = bitmap
+        .generation
+        .saturating_mul(NONCES_PER_GENERATION)
+        .min(max_nonce);
 
     let completed: HashSet<u64> = storage
         .get_completed_withdrawal_nonces(min_nonce, max_nonce)

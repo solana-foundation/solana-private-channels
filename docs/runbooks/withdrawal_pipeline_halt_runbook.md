@@ -58,7 +58,9 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    (`BOOT_RECONCILE_BUDGET`); if it runs out, the diff below still decides
    whether the operator may start.
 3. **Diffs the bitmap** for the generation the bitmap is currently on against
-   `completed` withdrawals whose nonce falls in that generation's window.
+   `completed` withdrawals whose nonce falls in that generation's window or any
+   later one. Later generations count because the chain cannot release a nonce
+   before it rotates into that generation.
 4. **Repairs chain-ahead nonces in place.** For each nonce whose bit is set with
    no `completed` row, the operator loads that withdrawal's stored broadcast
    signatures and classifies them on-chain. A landed signature marks the row
@@ -106,7 +108,7 @@ Grep the operator logs for `Withdrawal bitmap divergence` to confirm, and check
 that the process is crash-looping at boot (not running with a halted pipeline).
 
 If the instance's bitmap account does not exist, the operator diffs against an
-empty generation 0, so every `completed` withdrawal in that window shows up in
+empty generation 0, so every `completed` withdrawal, in any generation, shows up in
 `db_only`. A log line `Withdrawal bitmap does not exist` before the divergence
 almost always means `escrow_instance_id` points at the wrong instance, or `rpc_url`
 at the wrong cluster. Check both first, before touching any row.
