@@ -3,6 +3,7 @@ use crate::{
     indexer::datasource::common::parser::resolve_account,
     indexer::datasource::common::types::*,
     indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions},
+    operator::utils::account_util::find_instance_pda,
 };
 
 use borsh::BorshDeserialize;
@@ -50,6 +51,12 @@ const EVENT_DECIMALS_INDEX: usize = 73;
 // DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
 // (same offset, different event)
 const EVENT_AMOUNT_INDEX: usize = 73;
+// DepositEvent identity fields: instance_seed(32) after disc, user(32) before amount(8),
+// then recipient(32) and mint(32).
+const DEPOSIT_EVENT_INSTANCE_SEED_INDEX: usize = 9;
+const DEPOSIT_EVENT_USER_INDEX: usize = 41;
+const DEPOSIT_EVENT_RECIPIENT_INDEX: usize = 81;
+const DEPOSIT_EVENT_MINT_INDEX: usize = 113;
 
 // ******************************************************************************************
 // Instruction types
@@ -316,24 +323,82 @@ pub fn parse_escrow_instruction(
     }
 }
 
-/// Decode an inner instruction and return its amount only if it is the escrow program's DepositEvent self-CPI; the program-id check stops a foreign instruction whose data merely starts with the event tag from being read as the event.
-fn deposit_event_amount(inner: &InnerInstruction, account_keys: &[Pubkey]) -> Option<u64> {
-    let program_id = account_keys.get(inner.instruction.program_id_index as usize)?;
-    if program_id.to_string() != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
+/// Every field of an escrow DepositEvent self-CPI.
+struct DecodedDepositEvent {
+    instance_seed: Pubkey,
+    user: Pubkey,
+    amount: u64,
+    recipient: Pubkey,
+    mint: Pubkey,
+}
+
+fn is_escrow_program(inner: &InnerInstruction, account_keys: &[Pubkey]) -> bool {
+    account_keys
+        .get(inner.instruction.program_id_index as usize)
+        .is_some_and(|program_id| program_id.to_string() == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+}
+
+/// Decode an inner instruction only if it is the escrow program's DepositEvent self-CPI; the program-id check stops a foreign instruction whose data merely starts with the event tag from being read as the event.
+fn decode_deposit_event(
+    inner: &InnerInstruction,
+    account_keys: &[Pubkey],
+) -> Option<DecodedDepositEvent> {
+    if !is_escrow_program(inner, account_keys) {
         return None;
     }
     let event_data = bs58::decode(&inner.instruction.data).into_vec().ok()?;
-    if event_data.len() >= 145
-        && event_data.starts_with(EVENT_IX_TAG_LE)
-        && event_data[EVENT_DISCRIMINATOR_INDEX] == DEPOSIT_EVENT_DISCRIMINATOR
+    if event_data.len() < 145
+        || !event_data.starts_with(EVENT_IX_TAG_LE)
+        || event_data[EVENT_DISCRIMINATOR_INDEX] != DEPOSIT_EVENT_DISCRIMINATOR
     {
-        // The `>= 145` length guard guarantees this slice is exactly 8 bytes.
-        let amount_bytes: [u8; 8] = event_data[EVENT_AMOUNT_INDEX..EVENT_AMOUNT_INDEX + 8]
-            .try_into()
-            .ok()?;
-        Some(u64::from_le_bytes(amount_bytes))
+        return None;
+    }
+    // The `>= 145` length guard keeps every slice below in bounds.
+    let key_at = |index: usize| Pubkey::try_from(&event_data[index..index + 32]).ok();
+    let amount_bytes: [u8; 8] = event_data[EVENT_AMOUNT_INDEX..EVENT_AMOUNT_INDEX + 8]
+        .try_into()
+        .ok()?;
+    Some(DecodedDepositEvent {
+        instance_seed: key_at(DEPOSIT_EVENT_INSTANCE_SEED_INDEX)?,
+        user: key_at(DEPOSIT_EVENT_USER_INDEX)?,
+        amount: u64::from_le_bytes(amount_bytes),
+        recipient: key_at(DEPOSIT_EVENT_RECIPIENT_INDEX)?,
+        mint: key_at(DEPOSIT_EVENT_MINT_INDEX)?,
+    })
+}
+
+fn deposit_event_amount(inner: &InnerInstruction, account_keys: &[Pubkey]) -> Option<u64> {
+    decode_deposit_event(inner, account_keys).map(|event| event.amount)
+}
+
+fn stackless_deposit_error(reason: &str) -> ParserError {
+    ParserError::InstructionParseFailed {
+        reason: format!("CPI deposit without stack height: {reason}"),
+    }
+}
+
+/// Errors unless the event names the deposit's own user, mint, recipient and instance.
+fn check_event_matches_deposit(
+    event: &DecodedDepositEvent,
+    accounts: &DepositAccounts,
+    data: &DepositData,
+) -> Result<(), ParserError> {
+    let mismatched = if event.user != accounts.user {
+        Some("user")
+    } else if event.mint != accounts.mint {
+        Some("mint")
+    } else if event.recipient != data.recipient.unwrap_or(accounts.user) {
+        Some("recipient")
+    } else if find_instance_pda(&event.instance_seed) != accounts.instance {
+        Some("instance")
     } else {
         None
+    };
+    match mismatched {
+        Some(field) => Err(stackless_deposit_error(&format!(
+            "DepositEvent {field} does not match the deposit"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -555,9 +620,8 @@ fn parse_deposit(
     // deeper (a higher stack height). Take that deeper run, which ends as soon as
     // the height drops back to this deposit's level, and read the event from it.
     //
-    // A CPI deposit with no stack height can't be scoped to its subtree, so a
-    // set holding several deposits would attribute the wrong amount. Rather than
-    // guess, error out. A top-level deposit needs no
+    // A CPI deposit with no stack height falls back to call order and binds the
+    // event to the deposit's accounts. A top-level deposit needs no
     // stage 2: its whole set is its own subtree.
     let scoped_set = inner_instructions
         .iter()
@@ -574,13 +638,27 @@ fn parse_deposit(
                 .take_while(|inner| inner.stack_height.is_some_and(|h| h > own_height))
                 .find_map(|inner| deposit_event_amount(inner, account_keys))
         }
-        // CPI deposit with no depth: can't isolate the subtree, so refuse to guess.
-        // Occurs only when the data source omits stack height (e.g. an old RPC node
-        // or a Geyser feed that doesn't emit stackHeight).
-        (Some(_), Some(_)) => {
-            return Err(ParserError::InstructionParseFailed {
-                reason: "CPI deposit without stack height: cannot scope DepositEvent".to_string(),
-            });
+        // No depth: entries are in call order and nothing inside a Deposit can call the
+        // escrow except its own EmitEvent, so the first escrow entry after it is its event.
+        // Never skip past that entry, so a source that dropped the event fails closed.
+        (Some(set), Some(inner_loc)) => {
+            let start = inner_loc.inner_index as usize + 1;
+            let first_escrow = set
+                .instructions
+                .iter()
+                .skip(start)
+                .find(|inner| is_escrow_program(inner, account_keys))
+                .ok_or_else(|| stackless_deposit_error("no escrow entry after it"))?;
+            let event = decode_deposit_event(first_escrow, account_keys).ok_or_else(|| {
+                stackless_deposit_error("first escrow entry after it is not a DepositEvent")
+            })?;
+            check_event_matches_deposit(&event, &accounts, &ix_data)?;
+            tracing::debug!(
+                top_level_index = location.top_level_index,
+                inner_index = inner_loc.inner_index,
+                "CPI deposit without stack height read its event by call order"
+            );
+            Some(event.amount)
         }
         // Top-level deposit: the whole set is its subtree, so scan it directly.
         (Some(set), None) => set
@@ -1593,44 +1671,231 @@ mod tests {
         );
     }
 
-    /// A CPI deposit whose location carries no stack height can't be scoped to
-    /// its own subtree, so the parser errors (drops it) rather than risk reading
-    /// a neighbouring deposit's event amount.
-    #[test]
-    fn cpi_deposit_without_stack_height_errors_rather_than_guess() {
-        let borsh_data = create_deposit_borsh_data();
-        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
-        let account_keys = create_n_account_keys(12);
+    // ============================================================================
+    // CPI deposit without stack height: positional fallback
+    // ============================================================================
 
-        // Two deposits share one set, so guessing would be ambiguous.
-        let inner_set = vec![InnerInstructions {
-            index: 4,
-            instructions: vec![
-                deposit_ix_inner(2),
-                deposit_event_inner(300, 3),
-                deposit_ix_inner(2),
-                deposit_event_inner(400, 3),
-            ],
-        }];
+    /// Instance seed whose PDA sits at key 2, the Deposit's instance account.
+    fn stackless_seed() -> Pubkey {
+        Pubkey::new_from_array([7u8; 32])
+    }
 
-        let result = parse_deposit(
-            &borsh_data,
-            &instruction,
-            &account_keys,
-            &inner_set,
+    /// Keys where user is key 1, instance is the seed's PDA (key 2) and mint is key 3.
+    fn stackless_keys() -> Vec<Pubkey> {
+        let mut keys = create_n_account_keys(12);
+        keys[2] = crate::operator::utils::account_util::find_instance_pda(&stackless_seed());
+        keys
+    }
+
+    /// An escrow DepositEvent with every field set and no stack height.
+    fn stackless_event(
+        instance_seed: Pubkey,
+        user: Pubkey,
+        amount: u64,
+        recipient: Pubkey,
+        mint: Pubkey,
+    ) -> InnerInstruction {
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: ESCROW_PROGRAM_KEY_INDEX,
+                accounts: vec![],
+                data: bs58::encode(
+                    crate::test_utils::escrow_fixtures::deposit_event_bytes_full(
+                        instance_seed,
+                        user,
+                        amount,
+                        recipient,
+                        mint,
+                    ),
+                )
+                .into_string(),
+            },
+            stack_height: None,
+        }
+    }
+
+    /// The event a Deposit with no recipient emits over `stackless_keys`.
+    fn bound_event(keys: &[Pubkey], amount: u64) -> InnerInstruction {
+        stackless_event(stackless_seed(), keys[1], amount, keys[1], keys[3])
+    }
+
+    /// An inner escrow Deposit instruction with no stack height.
+    fn stackless_deposit_ix() -> InnerInstruction {
+        InnerInstruction {
+            stack_height: None,
+            ..deposit_ix_inner(2)
+        }
+    }
+
+    /// A non-escrow entry (key 0) with no stack height, such as the token transfer.
+    fn stackless_foreign_ix() -> InnerInstruction {
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: "transfer".to_string(),
+            },
+            stack_height: None,
+        }
+    }
+
+    /// Parse the CPI deposit at `inner_index` of top-level set 4, with no stack height.
+    fn parse_stackless(
+        borsh_data: &[u8],
+        keys: &[Pubkey],
+        inner_set: &[InnerInstructions],
+        inner_index: u32,
+    ) -> Result<Option<EscrowInstruction>, ParserError> {
+        parse_deposit(
+            borsh_data,
+            &create_instruction_with_accounts(12, "dummy".to_string()),
+            keys,
+            inner_set,
             InstructionLocation {
                 top_level_index: 4,
                 inner: Some(InnerLocation {
-                    inner_index: 0,
+                    inner_index,
                     stack_height: None,
                 }),
             },
-        );
+        )
+    }
 
-        let err = result.unwrap_err().to_string();
+    fn deposit_amount_of(ix: EscrowInstruction) -> u64 {
+        match ix {
+            EscrowInstruction::Deposit { event, .. } => event.amount,
+            _ => panic!("expected Deposit"),
+        }
+    }
+
+    /// Two CPI deposits in one set, no stack heights: each reads the first escrow
+    /// entry after it, skipping the non-escrow token transfer in between.
+    #[test]
+    fn stackless_cpi_deposits_in_one_set_read_their_own_events() {
+        let keys = stackless_keys();
+        //   [0] deposit A  [1] token transfer  [2] event 300
+        //   [3] deposit B  [4] token transfer  [5] event 400
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![
+                stackless_deposit_ix(),
+                stackless_foreign_ix(),
+                bound_event(&keys, 300),
+                stackless_deposit_ix(),
+                stackless_foreign_ix(),
+                bound_event(&keys, 400),
+            ],
+        }];
+        let data = create_deposit_borsh_data();
+
+        let a = parse_stackless(&data, &keys, &inner_set, 0)
+            .unwrap()
+            .unwrap();
+        let b = parse_stackless(&data, &keys, &inner_set, 3)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(deposit_amount_of(a), 300, "deposit A reads its own event");
+        assert_eq!(deposit_amount_of(b), 400, "deposit B reads its own event");
+    }
+
+    /// An explicit recipient must match the event's recipient field.
+    #[test]
+    fn stackless_cpi_deposit_with_explicit_recipient_binds_it() {
+        let keys = stackless_keys();
+        let recipient = Pubkey::new_unique();
+        let data = crate::test_utils::escrow_fixtures::deposit_borsh(1000, Some(recipient));
+        let event = |r| stackless_event(stackless_seed(), keys[1], 250, r, keys[3]);
+        let set = |r| {
+            vec![InnerInstructions {
+                index: 4,
+                instructions: vec![stackless_deposit_ix(), event(r)],
+            }]
+        };
+
+        let ok = parse_stackless(&data, &keys, &set(recipient), 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(deposit_amount_of(ok), 250);
+
+        // The event names the user, but the deposit asked for `recipient`.
+        let err = parse_stackless(&data, &keys, &set(keys[1]), 0)
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains("cannot scope DepositEvent"),
-            "CPI deposit without stack height must error: {err}"
+            err.contains("recipient does not match"),
+            "explicit recipient mismatch must error: {err}"
+        );
+    }
+
+    /// Each identity field of the event must match the deposit, or the parse errors.
+    #[test]
+    fn stackless_cpi_deposit_rejects_event_that_does_not_match() {
+        let keys = stackless_keys();
+        let other = Pubkey::new_unique();
+        let (seed, user, mint) = (stackless_seed(), keys[1], keys[3]);
+        let cases = [
+            ("user", stackless_event(seed, other, 1, user, mint)),
+            ("mint", stackless_event(seed, user, 1, user, other)),
+            // No recipient in the deposit, so the event must name the user.
+            ("recipient", stackless_event(seed, user, 1, other, mint)),
+            ("instance", stackless_event(other, user, 1, user, mint)),
+        ];
+
+        for (field, event) in cases {
+            let inner_set = vec![InnerInstructions {
+                index: 4,
+                instructions: vec![stackless_deposit_ix(), event],
+            }];
+            let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{field} does not match")),
+                "{field} mismatch must error: {err}"
+            );
+        }
+    }
+
+    /// No escrow entry after the deposit means its event is missing, so the parse errors.
+    #[test]
+    fn stackless_cpi_deposit_without_escrow_entry_after_it_errors() {
+        let keys = stackless_keys();
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![stackless_deposit_ix(), stackless_foreign_ix()],
+        }];
+
+        let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no escrow entry after it"),
+            "missing event must error: {err}"
+        );
+    }
+
+    /// A source that dropped deposit A's event shows deposit B as A's next escrow
+    /// entry. A must error, never borrow B's amount.
+    #[test]
+    fn stackless_cpi_deposit_with_dropped_event_errors_not_borrows() {
+        let keys = stackless_keys();
+        //   [0] deposit A  (event dropped)  [1] deposit B  [2] event 400
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![
+                stackless_deposit_ix(),
+                stackless_deposit_ix(),
+                bound_event(&keys, 400),
+            ],
+        }];
+
+        let err = parse_stackless(&create_deposit_borsh_data(), &keys, &inner_set, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a DepositEvent"),
+            "dropped event must error, not borrow the next deposit's: {err}"
         );
     }
 

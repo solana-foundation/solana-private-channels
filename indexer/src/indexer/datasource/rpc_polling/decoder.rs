@@ -1970,6 +1970,95 @@ mod tests {
         assert_eq!(result[0].inner_index, None);
     }
 
+    /// A getBlock response whose inner instructions carry `stackHeight: null` or
+    /// omit it still decodes both CPI deposits, each with its own event amount.
+    #[test]
+    fn real_parser_decodes_cpi_deposits_without_stack_heights() {
+        use crate::operator::utils::account_util::find_instance_pda;
+        use crate::test_utils::escrow_fixtures::deposit_event_bytes_full;
+
+        // Escrow at key 0, foreign router at key 1 (also the user), instance PDA at 2, mint at 3.
+        let instance_seed = test_pubkey(50);
+        let mut account_keys: Vec<String> = (0u8..12)
+            .map(|index| test_pubkey(index).to_string())
+            .collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        account_keys[2] = find_instance_pda(&instance_seed).to_string();
+        let (user, mint) = (test_pubkey(1), test_pubkey(3));
+        let event = |amount: u64| {
+            bs58::encode(deposit_event_bytes_full(
+                instance_seed,
+                user,
+                amount,
+                user,
+                mint,
+            ))
+            .into_string()
+        };
+        let deposit = bs58::encode(deposit_ix_bytes(1000, None)).into_string();
+
+        let response = json!({
+            "blockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
+            "parentSlot": 99u64,
+            "transactions": [{
+                "transaction": {
+                    "signatures": [test_sig("stackless")],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 1
+                        },
+                        "accountKeys": account_keys,
+                        "recentBlockhash": "Fu11pcSvhJBX3sNaE1FzsXC6jPx5wJPTaWrdsfmMPnos",
+                        "instructions": [{
+                            "programIdIndex": 1,
+                            "accounts": [],
+                            "data": "router"
+                        }]
+                    }
+                },
+                "meta": {
+                    "err": null,
+                    "status": { "Ok": null },
+                    "fee": 5000,
+                    "logMessages": [],
+                    "loadedAddresses": { "writable": [], "readonly": [] },
+                    // Older nodes send `stackHeight: null`; some omit the key.
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [
+                            { "programIdIndex": 0, "accounts": (0u8..12).collect::<Vec<u8>>(), "data": deposit, "stackHeight": null },
+                            { "programIdIndex": 0, "accounts": [], "data": event(300) },
+                            { "programIdIndex": 0, "accounts": (0u8..12).collect::<Vec<u8>>(), "data": deposit },
+                            { "programIdIndex": 0, "accounts": [], "data": event(480), "stackHeight": null }
+                        ]
+                    }]
+                }
+            }]
+        });
+
+        let block: RpcBlock = serde_json::from_value(response)
+            .expect("a getBlock response without stack heights must deserialize");
+
+        let result = parse_block(&block, 100, ProgramType::Escrow, None)
+            .expect("CPI deposits without stack heights decode");
+
+        assert_eq!(result.len(), 2, "both CPI deposits are indexed");
+        assert_eq!(result[0].inner_index, Some(0));
+        assert_eq!(
+            deposit_amount(&result[0]),
+            300,
+            "deposit A reads its own event"
+        );
+        assert_eq!(result[1].inner_index, Some(2));
+        assert_eq!(
+            deposit_amount(&result[1]),
+            480,
+            "deposit B reads its own event"
+        );
+    }
+
     /// A successful pre-memo release has 13 accounts. It must decode on replay,
     /// or backfill stalls on the slot; one account fewer still fails it closed.
     #[test]
