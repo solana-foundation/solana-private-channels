@@ -78,6 +78,9 @@ pub struct MintCache {
     /// Per-mint slot the mint provably existed at, recorded by the caller that
     /// proved it. Absent means unproven, which keeps a missing account retryable.
     existence_floor: HashMap<String, u64>,
+    /// Highest slot a withdrawal gate read has answered at. Slots are chain-wide,
+    /// so no later gate read may answer below it, for any mint.
+    slot_high_water: u64,
 }
 
 /// Outcome of resolving a mint's transfer-hook accounts.
@@ -99,6 +102,7 @@ impl MintCache {
             storage,
             rpc_client: None,
             existence_floor: HashMap::new(),
+            slot_high_water: 0,
         }
     }
 
@@ -107,6 +111,7 @@ impl MintCache {
             storage,
             rpc_client: Some(rpc_client),
             existence_floor: HashMap::new(),
+            slot_high_water: 0,
         }
     }
 
@@ -129,6 +134,17 @@ impl MintCache {
     /// The slot this mint was proved to exist at, if any.
     pub fn existence_floor(&self, mint: &Pubkey) -> Option<u64> {
         self.existence_floor.get(&mint.to_string()).copied()
+    }
+
+    /// Raise the high-water mark to `slot` if it is higher. Gate reads call this
+    /// before any bail, so a blocked gate cannot leave it behind.
+    pub fn observe_slot(&mut self, slot: u64) {
+        self.slot_high_water = self.slot_high_water.max(slot);
+    }
+
+    /// The highest slot a gate read has answered at, or 0 before the first.
+    pub fn slot_high_water(&self) -> u64 {
+        self.slot_high_water
     }
 
     /// Mint decimals from the DB, or from RPC when no DB row exists.

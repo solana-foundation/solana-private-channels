@@ -553,6 +553,7 @@ fn build_release_funds(
 /// reads bind to.
 async fn read_withdrawal_allowed_mint(
     processor_state: &mut ProcessorState,
+    storage: &Storage,
     transaction: &DbTransaction,
 ) -> Result<Result<(AllowedMint, u64), BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
@@ -573,19 +574,32 @@ async fn read_withdrawal_allowed_mint(
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
     let commitment = rpc.rpc_client.commitment();
 
-    // Require the read to answer at or past the tip, so a backend behind it errors
-    // instead of serving gate state an admin has since changed. A lagging replica that
-    // also served the tip still passes.
-    let min_slot = rpc
+    // A backend behind the bound errors instead of serving gate state an admin has
+    // since changed. The tip comes from the same endpoint, so a lagging backend can
+    // report its own old one. The escrow checkpoint covers every change at or below
+    // it on this chain, pause and freeze included, and the high-water mark every slot
+    // this process has seen. No backend can lower either.
+    let tip = rpc
         .get_latest_blockhash_with_context(commitment)
         .await
         .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
         .0;
+    let checkpoint = with_storage_backoff("escrow checkpoint read", transaction.id, || {
+        storage.get_committed_checkpoint(ProgramType::Escrow.as_label())
+    })
+    .await?;
+    let min_slot = tip
+        .max(checkpoint.unwrap_or(0))
+        .max(processor_state.mint_cache.slot_high_water());
 
     let response = rpc
         .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(min_slot))
         .await
         .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
+
+    // Raised before the bails below, so a blocked gate cannot leave the bar behind.
+    let gate_slot = response.context.slot;
+    processor_state.mint_cache.observe_slot(gate_slot);
 
     // Owned by anything else means the address collides with an unrelated account
     // rather than carrying the escrow's permission, which release would reject.
@@ -622,7 +636,6 @@ async fn read_withdrawal_allowed_mint(
     // Creating that account required the escrow to read the mint, so the mint existed
     // at or before this slot. The pre-flight reads bind to it, which is what lets a
     // missing mint be permanent instead of a node that has not caught up.
-    let gate_slot = response.context.slot;
     processor_state
         .mint_cache
         .record_existence_floor(&mint, gate_slot);
@@ -929,14 +942,19 @@ pub async fn process_release_funds(
             // target-chain lookup that would read as an infrastructure failure.
             // The account also carries the reviewed mint profile, which the steps
             // below read instead of resolving the mint themselves.
-            let (allowed_mint, gate_slot) =
-                match read_withdrawal_allowed_mint(processor_state, &transaction).await? {
-                    Ok(gate_read) => gate_read,
-                    Err(bail) => {
-                        park_row(&storage_tx, pt_label, &transaction, bail).await;
-                        return Ok(());
-                    }
-                };
+            let (allowed_mint, gate_slot) = match read_withdrawal_allowed_mint(
+                processor_state,
+                &storage,
+                &transaction,
+            )
+            .await?
+            {
+                Ok(gate_read) => gate_read,
+                Err(bail) => {
+                    park_row(&storage_tx, pt_label, &transaction, bail).await;
+                    return Ok(());
+                }
+            };
 
             // Build first so row-data poison, such as a NULL nonce or an
             // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
@@ -2065,6 +2083,141 @@ mod tests {
         assert!(
             update.is_none(),
             "a reopened gate must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The tip comes from the same endpoint as the gate read, so a lagging backend
+    /// can report its own old tip and then serve the gate as it was before the
+    /// reopen. The escrow checkpoint already covers the indexed reopen, and nothing
+    /// that backend says can lower it.
+    #[tokio::test]
+    async fn a_lagging_tip_is_overruled_by_the_escrow_checkpoint() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let lagging_tip_slot = 900;
+        let checkpoint_slot = 1_000;
+        storage
+            .update_committed_checkpoint(ProgramType::Escrow.as_label(), checkpoint_slot)
+            .await
+            .unwrap();
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, lagging_tip_slot);
+        // The lagging backend has not seen the reopen.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            lagging_tip_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            checkpoint_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a reopen the indexer has seen must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// Once a gate read has answered at a slot, no later read may answer below it,
+    /// even when that read bailed. The old floor skipped the bail, which is how a
+    /// block left it behind the reopen.
+    #[tokio::test]
+    async fn a_slot_already_seen_is_never_lowered() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let seen_slot = 1_000;
+        let lagging_tip_slot = 900;
+
+        // Blocked for real when first read.
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, seen_slot);
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            seen_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (_, first_update, _) =
+            run_one_withdrawal(&mut ps, storage.clone(), withdrawal_for(&mint, 5)).await;
+        assert!(
+            first_update.is_some(),
+            "the first withdrawal must park on the blocked gate"
+        );
+
+        // Reopened, but the next request lands on a backend that has not seen it.
+        server.reset();
+        mock_tip(&mut server, lagging_tip_slot);
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            lagging_tip_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            seen_slot,
+        );
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 6)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a read below a slot already seen must not park the row: {:?}",
             update.and_then(|parked| parked.error_message)
         );
         assert!(
