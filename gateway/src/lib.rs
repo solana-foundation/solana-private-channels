@@ -503,7 +503,7 @@ impl Drop for IpConnGuard {
 
 /// A public listing's share of the client's quota and of the global listing budget.
 struct BlockListSlot {
-    _client: IpConnGuard,
+    client: IpConnGuard,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -514,8 +514,8 @@ struct DeadlineBody {
     sleep: Pin<Box<tokio::time::Sleep>>,
     /// Held until the body ends, so a streaming read keeps its read slot.
     _read_permit: Option<OwnedSemaphorePermit>,
-    /// Held until the body ends, so a slow reader cannot free its listing slot early.
-    _block_list_permit: Option<BlockListSlot>,
+    /// Held until the body ends, so one slow-reading client cannot pin more than its share.
+    _block_list_client: Option<IpConnGuard>,
 }
 
 impl DeadlineBody {
@@ -528,12 +528,12 @@ impl DeadlineBody {
             inner,
             sleep: Box::pin(tokio::time::sleep_until(deadline)),
             _read_permit: read_permit,
-            _block_list_permit: None,
+            _block_list_client: None,
         }
     }
 
-    fn with_block_list_permit(mut self, permit: Option<BlockListSlot>) -> Self {
-        self._block_list_permit = permit;
+    fn with_block_list_client(mut self, client: Option<IpConnGuard>) -> Self {
+        self._block_list_client = client;
         self
     }
 }
@@ -1567,8 +1567,7 @@ impl Gateway {
         };
 
         // Public listings of any span share a budget below the read node's pool, and each client
-        // gets only a share of it. Held until the streamed body ends, so slow readers cannot pin
-        // more read slots than the budget. Only this layer can tell them from the indexer's.
+        // gets only a share of it. Only this layer can tell them from the indexer's.
         let block_list_permit = if access == Access::Public && BLOCK_LIST_METHODS.contains(&method)
         {
             let client = try_acquire_ip(
@@ -1581,7 +1580,7 @@ impl Gateway {
                 .and_then(|_| Arc::clone(&self.block_list_slots).try_acquire_owned().ok());
             match (client, permit) {
                 (Some(client), Some(permit)) => Some(BlockListSlot {
-                    _client: client,
+                    client,
                     _permit: permit,
                 }),
                 _ => {
@@ -1717,12 +1716,14 @@ impl Gateway {
                         &status,
                         start.elapsed().as_secs_f64(),
                     );
+                    // The node's pool is free once headers arrive, so the global listing slot
+                    // goes now and only the client's share waits for the body.
                     let body = DeadlineBody::new(
                         body.map_err(BoxError::from).boxed_unsync(),
                         deadline,
                         read_permit,
                     )
-                    .with_block_list_permit(block_list_permit);
+                    .with_block_list_client(block_list_permit.map(|slot| slot.client));
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -3768,20 +3769,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_block_list_keeps_its_slot_until_the_body_ends() {
+    async fn streamed_block_list_frees_its_global_slot_at_headers() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
         let read_node = start_stalled_body_backend().await;
-        let addr = start_gateway_with_limits(
-            "http://127.0.0.1:1",
-            &format!("http://{read_node}"),
-            Limits {
-                max_forwarded_block_lists: NonZeroUsize::new(1).unwrap(),
+        let gateway = Arc::new(
+            Gateway::new(
+                "http://127.0.0.1:1".to_string(),
+                format!("http://{read_node}"),
+                "*".to_string(),
+                None,
+                None,
+            )
+            .with_limits(Limits {
                 upstream_timeout: Duration::from_secs(1),
                 ..Default::default()
-            },
-        )
-        .await;
+            }),
+        );
+        let slots = Arc::clone(&gateway.block_list_slots);
+        let all = slots.available_permits();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, Access::Public).await;
+        });
 
-        // The first listing has its headers back and is mid-body.
+        // The listing has its headers back and its body never finishes.
         let mut streaming = TcpStream::connect(addr).await.unwrap();
         streaming
             .write_all(rpc_request("getBlocks").as_bytes())
@@ -3791,26 +3805,8 @@ mod tests {
         let n = streaming.read(&mut buf).await.unwrap();
         assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
 
-        // A slow reader must not free the listing slot while its body is still streaming.
-        let mut second = TcpStream::connect(addr).await.unwrap();
-        second
-            .write_all(rpc_request("getBlocks").as_bytes())
-            .await
-            .unwrap();
-        assert_status(&read_to_close(&mut second).await, 503);
-
-        // Once the body ends, the slot is free again.
-        read_to_close(&mut streaming).await;
-        let mut third = TcpStream::connect(addr).await.unwrap();
-        third
-            .write_all(rpc_request("getBlocks").as_bytes())
-            .await
-            .unwrap();
-        let n = tokio::time::timeout(Duration::from_secs(2), third.read(&mut buf))
-            .await
-            .expect("a listing should be forwarded once the slot is free")
-            .unwrap();
-        assert_status(&String::from_utf8_lossy(&buf[..n]), 200);
+        // The node is done with the database by then, so an unread body holds no global slot.
+        assert_eq!(slots.available_permits(), all);
     }
 
     #[tokio::test]

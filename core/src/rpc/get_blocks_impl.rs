@@ -33,26 +33,8 @@ pub async fn get_blocks_impl(
         ));
     }
 
-    // With no end only blocks up to the newest one can match, so a call near the tip stays small.
-    let span = match end_slot {
-        Some(_) => range,
-        None => read_deps
-            .accounts_db
-            .newest_block_slot()
-            .await
-            .map_err(|e| {
-                custom_error(
-                    JSON_RPC_SERVER_ERROR,
-                    format!("Failed to get blocks: {}", e),
-                )
-            })?
-            .map_or(0, |newest| {
-                newest.min(effective_end).saturating_sub(start_slot)
-            }),
-    };
-
     // Bound to a name so the permit is held until the scan finishes.
-    let _permit = read_deps.block_list_permit(span)?;
+    let _permit = read_deps.block_list_permit(start_slot, range).await?;
 
     read_deps
         .accounts_db

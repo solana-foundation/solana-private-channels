@@ -78,11 +78,25 @@ pub struct ReadDeps {
 }
 
 impl ReadDeps {
-    /// A permit for a block listing of `span` slots, or none when the span is small
-    /// enough to run uncapped. Refused rather than queued: the server has no request
+    /// A permit for a block listing of `span` slots after `start_slot`, or none when the span
+    /// is small enough to run uncapped. Refused rather than queued: the server has no request
     /// timeout, so a queue would hold connections open behind the running scans.
-    pub(crate) fn block_list_permit(&self, span: u64) -> RpcResult<Option<SemaphorePermit<'_>>> {
+    pub(crate) async fn block_list_permit(
+        &self,
+        start_slot: u64,
+        span: u64,
+    ) -> RpcResult<Option<SemaphorePermit<'_>>> {
         if span <= MAX_UNCAPPED_BLOCK_SPAN {
+            return Ok(None);
+        }
+        // Only blocks up to the newest one can match, so a large span near the tip stays small.
+        let newest = self.accounts_db.newest_block_slot().await.map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get blocks: {}", e),
+            )
+        })?;
+        if newest.map_or(0, |newest| newest.saturating_sub(start_slot)) <= MAX_UNCAPPED_BLOCK_SPAN {
             return Ok(None);
         }
         self.block_list_permits

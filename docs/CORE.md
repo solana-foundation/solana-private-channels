@@ -283,7 +283,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max loaded accounts data | 64 MB | [`core/src/processor.rs`](../core/src/processor.rs) |
 | Max signatures per `getSignatureStatuses` | 256 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max slot range for `getBlocks`, max limit for `getBlocksWithLimit` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
-| Max concurrent `getBlocks`/`getBlocksWithLimit` spanning more than 10,000 (a `getBlocks` with no end spans up to the newest block) | pool size / 8 (at least 1), the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max concurrent `getBlocks`/`getBlocksWithLimit` spanning more than 10,000 (a span counts only up to the newest block) | pool size / 8 (at least 1), the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max addresses per `simulateTransaction` | the transaction's own account count (matches Agave) | [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) |
 | Max encoded bytes for `simulateTransaction` accounts | 5 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max concurrent `simulateTransaction` calls | 8, the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |

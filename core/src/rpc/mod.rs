@@ -478,11 +478,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn large_block_lists_are_refused_when_every_permit_is_held() {
-        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+    async fn large_block_lists_are_sized_by_the_newest_block() {
+        let (mut db, _pg) = start_pg().await;
+        for slot in [5, 20_000] {
+            db.store_block(make_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+        let deps = make_read_deps(db);
         let _held = hold_every_block_list_permit(&deps);
 
-        let cases = [
+        // A large range that starts a few slots below the newest block is a small listing.
+        let near_tip = [
+            (
+                "getBlocks no end",
+                get_blocks_impl::get_blocks_impl(&deps, 19_995, None, None).await,
+            ),
+            (
+                "getBlocks end past the tip",
+                get_blocks_impl::get_blocks_impl(&deps, 19_995, Some(40_000), None).await,
+            ),
+            (
+                "getBlocksWithLimit 500_000",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(
+                    &deps, 19_995, 500_000, None,
+                )
+                .await,
+            ),
+        ];
+        for (name, result) in near_tip {
+            assert_eq!(result.expect(name), vec![20_000], "{name}");
+        }
+
+        // Far below the newest block is still a large listing.
+        let far_below = [
+            (
+                "getBlocks no end",
+                get_blocks_impl::get_blocks_impl(&deps, 0, None, None).await,
+            ),
             (
                 "getBlocks span 10_001",
                 get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None).await,
@@ -493,34 +526,10 @@ mod tests {
                     .await,
             ),
         ];
-        for (name, result) in cases {
+        for (name, result) in far_below {
             let err = result.expect_err(name);
             assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE, "{name}");
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn no_end_get_blocks_is_sized_by_the_newest_block() {
-        let (mut db, _pg) = start_pg().await;
-        for slot in [5, 20_000] {
-            db.store_block(make_block_info(slot, Hash::new_unique()))
-                .await
-                .unwrap();
-        }
-        let deps = make_read_deps(db);
-        let _held = hold_every_block_list_permit(&deps);
-
-        // A few slots below the newest block is a small listing, so it needs no permit.
-        let near_tip = get_blocks_impl::get_blocks_impl(&deps, 19_995, None, None)
-            .await
-            .expect("a listing near the tip is not capped");
-        assert_eq!(near_tip, vec![20_000]);
-
-        // Far below the newest block is still a large listing.
-        let err = get_blocks_impl::get_blocks_impl(&deps, 0, None, None)
-            .await
-            .expect_err("a large listing with no end is still capped");
-        assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -560,15 +569,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn failed_large_block_lists_do_not_leak_permits() {
-        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+    async fn large_block_lists_release_their_permits() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(20_000, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
         let calls = deps.block_list_permits.available_permits() + 1;
 
         for _ in 0..calls {
-            let err = get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None)
+            let blocks = get_blocks_impl::get_blocks_impl(&deps, 0, Some(20_000), None)
                 .await
-                .expect_err("the store is unreachable");
-            assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+                .expect("a free permit is taken and handed back");
+            assert_eq!(blocks, vec![20_000]);
         }
     }
 
