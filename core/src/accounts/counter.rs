@@ -1,5 +1,6 @@
 /// Encoding for the u64 counters kept in the `metadata` table, matching the
-/// little-endian form `transaction_count` already uses.
+/// little-endian form `transaction_count` already uses. The gateway decodes
+/// `latest_slot` in this form too (`gateway/src/db.rs`).
 pub fn encode(value: u64) -> [u8; 8] {
     value.to_le_bytes()
 }
