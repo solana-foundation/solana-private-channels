@@ -113,6 +113,9 @@ pub struct TransactionStatusUpdate {
     /// True when a remint was attempted but failed (ManualReview). Lets consumers
     /// distinguish "remint tried and failed" from "remint never attempted".
     pub remint_attempted: bool,
+    /// The caller already wrote `status` under its incarnation's fence, so the
+    /// writer only alerts. Writing it again could hit a row re-armed since.
+    pub alert_only: bool,
 }
 
 /// A Mint or InitializeMint transaction that has been sent but not yet confirmed.

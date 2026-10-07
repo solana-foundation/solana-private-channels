@@ -36,6 +36,7 @@ fn make_update(id: i64, status: TransactionStatus) -> TransactionStatusUpdate {
         processed_at: Some(Utc::now()),
         remint_signature: None,
         remint_attempted: false,
+        alert_only: false,
     }
 }
 

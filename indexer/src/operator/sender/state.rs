@@ -4,8 +4,8 @@ use crate::error::OperatorError;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::{
-    fetch_bitmap_generation, fetch_consumed_nonces, find_withdrawal_bitmap_pda, BitmapState,
-    RetryConfig, RpcClientWithRetry,
+    fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
+    find_withdrawal_bitmap_pda, BitmapState, RetryConfig, RpcClientWithRetry,
 };
 use crate::operator::{
     MintCache, SourceEventId, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo,
@@ -213,11 +213,9 @@ pub(crate) async fn release_seen_at_confirmed(
     Ok(bitmap.is_consumed(nonce))
 }
 
-/// Boot pre-flight diffing the current generation's released nonces against the
-/// ones the database calls Completed. A consumed nonce with no Completed row is
-/// lost bookkeeping for a release that did land, so it is repaired in place and
-/// boot continues. A Completed row with a clear bit claims a release the chain
-/// never performed, so boot refuses.
+/// Boot check of released nonces, from the current generation up, against Completed rows.
+/// A set bit with no Completed row is repaired in place and boot continues.
+/// A Completed row with a clear bit claims a release the chain never made, so boot refuses.
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
@@ -238,13 +236,25 @@ pub(crate) async fn validate_bitmap_consistency(
 
     // Finalized, not the client's commitment: releases stay processing until final, and a
     // fork-only bit on such a row would otherwise send it to manual review at boot.
-    let bitmap = fetch_consumed_nonces(
+    let bitmap = fetch_bitmap_if_present(
         rpc_client,
         &bitmap_pda,
         Some(finalized_anchor(rpc_client).await?),
         CommitmentConfig::finalized(),
     )
     .await?;
+    // The program creates the bitmap with the instance and never closes it, so absent
+    // at a finalized slot means nothing was ever released. That is an empty generation 0.
+    let bitmap = bitmap.unwrap_or_else(|| {
+        warn!(
+            bitmap = %bitmap_pda,
+            "Withdrawal bitmap does not exist; diffing against an empty generation 0"
+        );
+        BitmapState {
+            generation: 0,
+            consumed: Vec::new(),
+        }
+    });
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
 
     // The bitmap and the database are read at different instants, so a release
@@ -256,10 +266,8 @@ pub(crate) async fn validate_bitmap_consistency(
             nonces = ?db_only,
             "Completed withdrawals appear unconsumed on-chain; re-reading the bitmap before halting"
         );
-        // A re-read that cannot be taken clears nothing, so the first verdict
-        // stands. Letting the read error escape instead would turn the one
-        // divergence this check exists to stop into a startup warning, because
-        // the caller only refuses to start on the divergence itself.
+        // A re-read that cannot be taken clears nothing, so the first verdict stands
+        // and the divergence is reported, not a vaguer read error.
         match confirm_divergence(storage, rpc_client, &bitmap_pda).await {
             Ok((rediffed_db_only, rediffed_chain_only)) => {
                 db_only = rediffed_db_only;
@@ -373,16 +381,19 @@ async fn confirm_divergence(
     diff_bitmap(storage, &bitmap).await
 }
 
-/// Split the current generation into "database only" and "chain only" nonces.
-/// Both sides are restricted to the window the bitmap covers, because outside it
-/// the bits were cleared by a rotation and mean nothing.
+/// Split the nonces from the current generation up into "database only" and "chain only".
+/// Older generations are skipped because a rotation cleared their bits. Later ones are
+/// kept because the chain cannot release a nonce before rotating into its generation.
 async fn diff_bitmap(
     storage: &Storage,
     bitmap: &BitmapState,
 ) -> Result<(Vec<u64>, Vec<u64>), OperatorError> {
-    // Saturating so a corrupt generation yields an empty window, never a panic.
-    let min_nonce = bitmap.generation.saturating_mul(NONCES_PER_GENERATION);
-    let max_nonce = min_nonce.saturating_add(NONCES_PER_GENERATION);
+    // The nonce column is signed, so both bounds stop at i64::MAX. A corrupt generation gives an empty window.
+    let max_nonce = i64::MAX as u64;
+    let min_nonce = bitmap
+        .generation
+        .saturating_mul(NONCES_PER_GENERATION)
+        .min(max_nonce);
 
     let completed: HashSet<u64> = storage
         .get_completed_withdrawal_nonces(min_nonce, max_nonce)
@@ -597,6 +608,7 @@ async fn resolve_chain_ahead_nonce(
         error_message: Some(reason),
         remint_signature: None,
         remint_attempted: false,
+        alert_only: false,
     };
     send_guaranteed(storage_tx, update, "transaction status update")
         .await
@@ -652,6 +664,7 @@ impl SenderState {
                 error_message: Some(format!("recovery failed: {}", reason)),
                 remint_signature: None,
                 remint_attempted: false,
+                alert_only: false,
             },
             "transaction status update",
         )

@@ -185,5 +185,5 @@ Dashboard JSON + alerting rules live under [`monitoring/`](../monitoring/) — e
 ## Potential future improvements
 
 - **Encrypt `secrets.yml` with SOPS+age** so it can live in git instead of travelling out of band.
-- **Harden runtime alert delivery** (timeouts, retries, rate-limit, dead-letter) — today it's a fire-and-forget POST to `ALERT_WEBHOOK_URL`. Until then, route alerts via Grafana, which handles those concerns.
+- **Harden runtime alert delivery** (timeouts, retries, rate-limit, dead-letter) — today each alert is posted once to `ALERT_WEBHOOK_URL` (10s timeout) from a bounded queue that drops and counts overflow. Until then, route alerts via Grafana, which handles those concerns.
 - **CI-built images via GHCR** instead of building on the deploy host (~3 min faster, pull-only deploys).

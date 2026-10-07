@@ -1,3 +1,6 @@
+use private_channel_withdraw_program_client::{
+    instructions::SET_WITHDRAW_CONFIG_DISCRIMINATOR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+};
 use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::SanitizedTransaction;
@@ -20,6 +23,41 @@ pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {
     ADMIN_INSTRUCTIONS_MAP
         .get(program_id)
         .is_some_and(|set| set.contains(&instruction_type))
+}
+
+const SPL_SET_AUTHORITY: u8 = 6;
+const SPL_MINT_TO: u8 = 7;
+const SPL_FREEZE_ACCOUNT: u8 = 10;
+const SPL_THAW_ACCOUNT: u8 = 11;
+const SPL_MINT_TO_CHECKED: u8 = 14;
+
+/// `SetAuthority` authority types that live on a mint rather than a token account.
+const AUTHORITY_TYPE_MINT_TOKENS: u8 = 0;
+const AUTHORITY_TYPE_FREEZE_ACCOUNT: u8 = 1;
+
+/// Instructions a mint's own authority signs: SPL mint, freeze, thaw and mint-side
+/// `SetAuthority`, and the withdraw config. They run as normal transactions, so a key
+/// dropped from the admin set could still sign them. Requiring a configured admin signer
+/// means that key can no longer use them alone.
+pub fn requires_admin_signer(program_id: &Pubkey, data: &[u8]) -> bool {
+    let Some(&instruction_type) = data.first() else {
+        return false;
+    };
+    if *program_id == PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID {
+        return instruction_type == SET_WITHDRAW_CONFIG_DISCRIMINATOR;
+    }
+    if *program_id != spl_token::id() {
+        return false;
+    }
+    match instruction_type {
+        SPL_MINT_TO | SPL_FREEZE_ACCOUNT | SPL_THAW_ACCOUNT | SPL_MINT_TO_CHECKED => true,
+        // AccountOwner and CloseAccount stay open: they are a token account owner's own.
+        SPL_SET_AUTHORITY => matches!(
+            data.get(1),
+            Some(&(AUTHORITY_TYPE_MINT_TOKENS | AUTHORITY_TYPE_FREEZE_ACCOUNT))
+        ),
+        _ => false,
+    }
 }
 
 // TODO: Make this configurable at startup

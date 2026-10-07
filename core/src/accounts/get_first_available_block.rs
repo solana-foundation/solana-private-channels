@@ -15,12 +15,20 @@ pub async fn get_first_available_block(db: &AccountsDB) -> Result<u64> {
 }
 
 async fn get_first_available_block_postgres(db: &PostgresAccountsDB) -> Result<u64> {
-    let pool = db.pool.clone();
+    let mut conn = db
+        .pool
+        .acquire()
+        .await
+        .context("Failed to acquire a connection for the first available block")?;
+    read_first_available_block(&mut conn).await
+}
 
+/// The ledger floor on one connection, so a caller can read it inside its own transaction.
+pub(super) async fn read_first_available_block(conn: &mut sqlx::PgConnection) -> Result<u64> {
     let metadata_slot = sqlx::query_scalar::<_, Option<Vec<u8>>>(
         "SELECT value FROM metadata WHERE key = 'first_available_block'",
     )
-    .fetch_optional(pool.as_ref())
+    .fetch_optional(&mut *conn)
     .await
     .context("Failed to query first_available_block metadata")?
     .flatten()
@@ -31,7 +39,7 @@ async fn get_first_available_block_postgres(db: &PostgresAccountsDB) -> Result<u
     }
 
     let slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM blocks")
-        .fetch_one(pool.as_ref())
+        .fetch_one(&mut *conn)
         .await
         .context("Failed to query first available block")?;
 

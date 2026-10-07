@@ -81,6 +81,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getTokenAccountBalance",
     "getLatestBlockhash",
     "getSignatureStatuses",
+    "getSignatureStatusSnapshot",
     "getTransactionCount",
     "getFirstAvailableBlock",
     "getBlocks",

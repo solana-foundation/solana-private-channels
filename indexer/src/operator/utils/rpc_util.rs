@@ -53,10 +53,23 @@ fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     match rpc_err {
         // Method not supported by this RPC endpoint — protocol-level rejection.
         RpcError::RpcResponseError { code: -32601, .. } => true,
-        // "AccountNotFound" is a definitive answer, not a transient failure.
-        RpcError::ForUser(msg) => msg.contains("AccountNotFound"),
+        // "AccountNotFound" is a definitive answer, not a transient failure. The client
+        // prefixes every getAccountInfo failure with it, so a node refusing a min-slot
+        // read only looks permanent. It catches up, so retry it.
+        RpcError::ForUser(msg) => {
+            msg.contains("AccountNotFound") && !msg.contains("RPC response error -32016")
+        }
         _ => false,
     }
+}
+
+/// The channel's `getSignatureStatusSnapshot` answer, every field from one committed state.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureStatusSnapshot {
+    pub block_height: u64,
+    pub first_available_block: u64,
+    pub value: Vec<Option<solana_transaction_status::TransactionStatus>>,
 }
 
 pub struct RpcClientWithRetry {
@@ -444,6 +457,30 @@ impl RpcClientWithRetry {
             || async {
                 self.rpc_client
                     .get_signature_statuses_with_history(signatures)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Statuses, block height and ledger floor from one channel database snapshot.
+    pub async fn get_signature_status_snapshot(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<SignatureStatusSnapshot, Box<client_error::Error>> {
+        let params =
+            serde_json::json!([signatures.iter().map(|s| s.to_string()).collect::<Vec<_>>()]);
+        self.with_retry(
+            "get_signature_status_snapshot",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .send::<SignatureStatusSnapshot>(
+                        RpcRequest::Custom {
+                            method: "getSignatureStatusSnapshot",
+                        },
+                        params.clone(),
+                    )
                     .await
             },
         )

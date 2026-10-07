@@ -8,7 +8,9 @@ use crate::operator::instruction_util::{
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
 use crate::operator::utils::mint_util::{HookExtras, MintCache};
-use crate::operator::utils::storage_util::with_storage_backoff;
+use crate::operator::utils::storage_util::{
+    fenced_terminal_write, with_storage_backoff, FencedWrite,
+};
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
     MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
@@ -154,26 +156,46 @@ impl BailReason {
     }
 }
 
-/// Emit a `ManualReview` status update for a single row via the shared storage
-/// writer channel.  Reuses `TransactionStatusUpdate` so the existing
-/// DbTransactionWriter path handles both the DB write and the alert webhook.
+/// Move one row to `ManualReview` and alert on it. Returns whether the park
+/// counts: false when the row has moved past this incarnation, which sends
+/// nothing, or the write could not be verified, which still alerts.
+///
+/// The write is a CAS on the fetch-time `updated_at`, so a park for an
+/// incarnation recovery already requeued cannot terminalize the next one. The
+/// update sent afterwards only fires the alert and never writes the row.
 async fn quarantine_single(
+    storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
     transaction: &DbTransaction,
     error_message: String,
-) {
+) -> bool {
+    let outcome = fenced_terminal_write(
+        storage,
+        pt_label,
+        "quarantine",
+        transaction.id,
+        TransactionStatus::ManualReview,
+        &error_message,
+        || storage.try_quarantine_processing(transaction.id, transaction.updated_at, None, None),
+    )
+    .await;
+    if outcome == FencedWrite::Stale {
+        return false;
+    }
+
     let update = TransactionStatusUpdate {
         transaction_id: transaction.id,
         trace_id: Some(transaction.trace_id.clone()),
         status: TransactionStatus::ManualReview,
         counterpart_signature: None,
         processed_at: Some(Utc::now()),
-        error_message: Some(error_message),
+        error_message: Some(outcome.alert_message(&error_message)),
         remint_signature: None,
         remint_attempted: false,
+        alert_only: true,
     };
-    // send_guaranteed: losing a quarantine update is worse than blocking briefly —
-    // the DB row would stay `Processing` and never alert.
+    // send_guaranteed: this send is the park's only alert.
     if let Err(e) = send_guaranteed(storage_tx, update, "quarantine status update").await {
         // The only way this can fail is a closed channel, which means the storage
         // writer is already gone and the supervisor is about to restart us anyway.
@@ -183,19 +205,22 @@ async fn quarantine_single(
             "Failed to send quarantine update (storage writer down): {}", e
         );
     }
+    outcome == FencedWrite::Applied
 }
 
 /// Park one row in `ManualReview` and record why, leaving the pipeline running.
 async fn park_row(
+    storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     pt_label: &str,
     transaction: &DbTransaction,
     bail: BailReason,
 ) {
-    metrics::OPERATOR_TRANSACTION_QUARANTINED
-        .with_label_values(&[pt_label, bail.label])
-        .inc();
-    quarantine_single(storage_tx, transaction, bail.message).await;
+    if quarantine_single(storage, storage_tx, pt_label, transaction, bail.message).await {
+        metrics::OPERATOR_TRANSACTION_QUARANTINED
+            .with_label_values(&[pt_label, bail.label])
+            .inc();
+    }
 }
 
 /// Halt the withdrawal pipeline after a poison-pill is detected.
@@ -215,6 +240,7 @@ async fn park_row(
 async fn halt_withdrawal_pipeline(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
     fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
     poison: Option<&DbTransaction>,
 ) {
@@ -225,7 +251,9 @@ async fn halt_withdrawal_pipeline(
     let mut drained = 0u64;
     while let Ok(buffered) = fetcher_rx.try_recv() {
         quarantine_single(
+            storage,
             storage_tx,
+            pt_label,
             &buffered,
             "withdrawal pipeline halted after poison-pill".to_string(),
         )
@@ -276,7 +304,11 @@ async fn requeue_single_prebroadcast(
     transaction: &DbTransaction,
 ) {
     match storage
-        .try_requeue_prebroadcast(transaction.id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .try_requeue_prebroadcast(
+            transaction.id,
+            transaction.updated_at,
+            MAX_RECOVERY_REQUEUE_ATTEMPTS,
+        )
         .await
     {
         Ok(RequeueOutcome::Requeued { attempts }) => {
@@ -290,7 +322,7 @@ async fn requeue_single_prebroadcast(
                 "Requeued withdrawal to Pending after a pre-broadcast transient error"
             );
         }
-        Ok(RequeueOutcome::AtCap) => {
+        Ok(RequeueOutcome::AtCap { .. }) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
                 .inc();
@@ -303,7 +335,7 @@ async fn requeue_single_prebroadcast(
         Ok(RequeueOutcome::NotProcessing) => warn!(
             txn_id = transaction.id,
             trace_id = %transaction.trace_id,
-            "Pre-broadcast requeue skipped: row no longer Processing"
+            "Pre-broadcast requeue skipped: row has moved past this incarnation"
         ),
         Err(e) => warn!(
             txn_id = transaction.id,
@@ -339,7 +371,7 @@ async fn requeue_or_quarantine_head(
             attempts = transaction.recovery_requeue_attempts,
             "Withdrawal failed after max pre-broadcast requeues; quarantining"
         );
-        quarantine_single(storage_tx, transaction, reason).await;
+        quarantine_single(storage, storage_tx, pt_label, transaction, reason).await;
     } else {
         requeue_single_prebroadcast(storage, pt_label, transaction).await;
     }
@@ -549,11 +581,13 @@ fn build_release_funds(
 /// lifetime answers for a mint that may no longer be the one at that address. The
 /// returned account is the operator's only source for those properties, so the
 /// pre-flight and hook resolution take it from here instead of resolving the mint
-/// themselves.
+/// themselves. It comes with the slot the read answered at, which the pre-flight
+/// reads bind to.
 async fn read_withdrawal_allowed_mint(
     processor_state: &mut ProcessorState,
+    storage: &Storage,
     transaction: &DbTransaction,
-) -> Result<Result<AllowedMint, BailReason>, OperatorError> {
+) -> Result<Result<(AllowedMint, u64), BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
         reason: e.to_string(),
@@ -566,33 +600,38 @@ async fn read_withdrawal_allowed_mint(
         .instance_pda;
     let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
 
-    // A floor already proves this account existed, so it doubles as the freshness
-    // anchor and spares the extra round-trip on every withdrawal after the first.
-    let recorded_floor = processor_state.mint_cache.existence_floor(&mint);
-
     let rpc = processor_state
         .mint_cache
         .rpc_client()
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
     let commitment = rpc.rpc_client.commitment();
 
-    // A null only proves "never allowlisted" if the node has caught up. Anchor on the
-    // tip it reports and require the read to answer at or past it, so a lagging backend
-    // errors instead of denying an allowlist entry it simply has not seen yet.
-    let min_slot = match recorded_floor {
-        Some(floor) => floor,
-        None => {
-            rpc.get_latest_blockhash_with_context(commitment)
-                .await
-                .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
-                .0
-        }
-    };
+    // A backend behind the bound errors instead of serving gate state an admin has
+    // since changed. The tip comes from the same endpoint, so a lagging backend can
+    // report its own old one. The escrow checkpoint covers every change at or below
+    // it on this chain, pause and freeze included, and the high-water mark every slot
+    // this process has seen. No backend can lower either.
+    let tip = rpc
+        .get_latest_blockhash_with_context(commitment)
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
+        .0;
+    let checkpoint = with_storage_backoff("escrow checkpoint read", transaction.id, || {
+        storage.get_committed_checkpoint(ProgramType::Escrow.as_label())
+    })
+    .await?;
+    let min_slot = tip
+        .max(checkpoint.unwrap_or(0))
+        .max(processor_state.mint_cache.slot_high_water());
 
     let response = rpc
         .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(min_slot))
         .await
         .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
+
+    // Raised before the bails below, so a blocked gate cannot leave the bar behind.
+    let gate_slot = response.context.slot;
+    processor_state.mint_cache.observe_slot(gate_slot);
 
     // Owned by anything else means the address collides with an unrelated account
     // rather than carrying the escrow's permission, which release would reject.
@@ -627,12 +666,12 @@ async fn read_withdrawal_allowed_mint(
     }
 
     // Creating that account required the escrow to read the mint, so the mint existed
-    // at or before this slot. Later mint reads bind to it, which is what lets a
+    // at or before this slot. The pre-flight reads bind to it, which is what lets a
     // missing mint be permanent instead of a node that has not caught up.
     processor_state
         .mint_cache
-        .record_existence_floor(&mint, response.context.slot);
-    Ok(Ok(allowed_mint))
+        .record_existence_floor(&mint, gate_slot);
+    Ok(Ok((allowed_mint, gate_slot)))
 }
 
 /// `ExtensionType` discriminants, as the escrow program folds them into
@@ -670,12 +709,15 @@ async fn check_withdrawal_preflights(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     // The reads below only report a mint absent once the node has passed the slot that
     // allowlisted it, so the account was closed rather than merely not yet visible.
     // Neither that nor a drifted profile is fixed by retrying, so both park the row
     // instead of restarting us.
-    match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint).await {
+    match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint, gate_slot)
+        .await
+    {
         Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
             Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_TARGET_MINT_MISSING,
@@ -704,6 +746,7 @@ async fn check_withdrawal_preflights_inner(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
@@ -729,7 +772,7 @@ async fn check_withdrawal_preflights_inner(
     if allowed_mint.has_freeze_authority
         && processor_state
             .mint_cache
-            .is_ata_frozen(&instance_ata)
+            .is_ata_frozen(&instance_ata, gate_slot)
             .await?
     {
         return Ok(Some(BailReason::new(
@@ -749,7 +792,12 @@ async fn check_withdrawal_preflights_inner(
     let has_permanent_delegate =
         has_extension(allowed_mint.extensions, EXTENSION_BIT_PERMANENT_DELEGATE);
 
-    if is_pausable && processor_state.mint_cache.check_paused(&mint).await? {
+    if is_pausable
+        && processor_state
+            .mint_cache
+            .check_paused(&mint, gate_slot)
+            .await?
+    {
         return Ok(Some(BailReason::new(
             metrics::BAIL_REASON_MINT_PAUSED,
             format!("mint paused: {mint}"),
@@ -823,6 +871,7 @@ async fn attach_hook_extras(
     transaction: &DbTransaction,
     release_funds_tx: &mut TransactionBuilder,
     allowed_mint: &AllowedMint,
+    gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
     let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
         return Ok(None);
@@ -868,6 +917,7 @@ async fn attach_hook_extras(
             &instance_pda,
             transaction.amount.value(),
             MAX_HOOK_EXTRAS_LEGACY_TX,
+            gate_slot,
         )
         .await?
     {
@@ -924,14 +974,19 @@ pub async fn process_release_funds(
             // target-chain lookup that would read as an infrastructure failure.
             // The account also carries the reviewed mint profile, which the steps
             // below read instead of resolving the mint themselves.
-            let allowed_mint =
-                match read_withdrawal_allowed_mint(processor_state, &transaction).await? {
-                    Ok(allowed_mint) => allowed_mint,
-                    Err(bail) => {
-                        park_row(&storage_tx, pt_label, &transaction, bail).await;
-                        return Ok(());
-                    }
-                };
+            let (allowed_mint, gate_slot) = match read_withdrawal_allowed_mint(
+                processor_state,
+                &storage,
+                &transaction,
+            )
+            .await?
+            {
+                Ok(gate_read) => gate_read,
+                Err(bail) => {
+                    park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
+                    return Ok(());
+                }
+            };
 
             // Build first so row-data poison, such as a NULL nonce or an
             // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
@@ -946,9 +1001,10 @@ pub async fn process_release_funds(
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
             if let Some(bail) =
-                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint).await?
+                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint, gate_slot)
+                    .await?
             {
-                park_row(&storage_tx, pt_label, &transaction, bail).await;
+                park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
             }
 
@@ -959,10 +1015,11 @@ pub async fn process_release_funds(
                 &transaction,
                 &mut release_funds_tx,
                 &allowed_mint,
+                gate_slot,
             )
             .await?
             {
-                park_row(&storage_tx, pt_label, &transaction, bail).await;
+                park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
             }
 
@@ -990,13 +1047,23 @@ pub async fn process_release_funds(
                         "Quarantining withdrawal and halting pipeline: {}",
                         err
                     );
-                    metrics::OPERATOR_TRANSACTION_QUARANTINED
-                        .with_label_values(&[pt_label, reason])
-                        .inc();
-                    quarantine_single(&storage_tx, &transaction, err.to_string()).await;
+                    if quarantine_single(
+                        &storage,
+                        &storage_tx,
+                        pt_label,
+                        &transaction,
+                        err.to_string(),
+                    )
+                    .await
+                    {
+                        metrics::OPERATOR_TRANSACTION_QUARANTINED
+                            .with_label_values(&[pt_label, reason])
+                            .inc();
+                    }
                     halt_withdrawal_pipeline(
                         &storage,
                         &storage_tx,
+                        pt_label,
                         &mut fetcher_rx,
                         Some(&transaction),
                     )
@@ -1177,6 +1244,7 @@ pub async fn process_deposit_funds(
                 .await?
             else {
                 park_row(
+                    &storage,
                     &storage_tx,
                     pt_label,
                     &transaction,
@@ -1265,10 +1333,19 @@ pub async fn process_deposit_funds(
                         "Quarantining deposit to ManualReview: {}",
                         err
                     );
-                    metrics::OPERATOR_TRANSACTION_QUARANTINED
-                        .with_label_values(&[pt_label, reason])
-                        .inc();
-                    quarantine_single(&storage_tx, &transaction, err.to_string()).await;
+                    if quarantine_single(
+                        &storage,
+                        &storage_tx,
+                        pt_label,
+                        &transaction,
+                        err.to_string(),
+                    )
+                    .await
+                    {
+                        metrics::OPERATOR_TRANSACTION_QUARANTINED
+                            .with_label_values(&[pt_label, reason])
+                            .inc();
+                    }
                 }
                 ErrorDisposition::Transient | ErrorDisposition::Fatal => {
                     return Err(err);
@@ -1304,12 +1381,13 @@ mod tests {
     use solana_sdk::program_option::COption;
     use solana_sdk::program_pack::Pack;
     use spl_token_2022::extension::{
-        confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensionsMut,
-        StateWithExtensionsMut,
+        confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
+        BaseStateWithExtensionsMut, StateWithExtensionsMut,
     };
     use spl_token_2022::state::{
         Account as Token2022AccountState, AccountState, Mint as Token2022MintState,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fee the seeded mints rows carry, as their AllowMint would have set it.
     const TEST_WITHDRAW_FEE: u64 = 1_000;
@@ -1454,9 +1532,8 @@ mod tests {
         }
     }
 
-    /// Treat `mint` as already proved to exist on the target chain, so the
-    /// allowlist read needs no freshness anchor and mint reads can report a
-    /// missing account as permanent.
+    /// Treat `mint` as already proved to exist on the target chain, so mint reads
+    /// can report a missing account as permanent.
     ///
     /// This no longer skips any gate: the withdrawal gate and the mint profile
     /// are read from the `AllowedMint` account on every withdrawal, so a test
@@ -1557,6 +1634,7 @@ mod tests {
         let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, mint);
 
         let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1);
         mock_account_read(
             &mut server,
             &allowed_mint_pda,
@@ -1645,6 +1723,68 @@ mod tests {
             .create()
     }
 
+    /// Answer `getLatestBlockhash` at `slot`, the tip the allowlist read binds to.
+    fn mock_tip(server: &mut mockito::ServerGuard, slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": slot},
+                        "value": {
+                            "blockhash": Hash::new_unique().to_string(),
+                            "lastValidBlockHeight": 1_000u64
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Answer `getAccountInfo` for `address` only when the read is bound to
+    /// `min_context_slot`, standing in for a backend whose state is as of that slot.
+    fn mock_account_read_at_slot(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        owner: &Pubkey,
+        data: Vec<u8>,
+        min_context_slot: u64,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(address.to_string()),
+                mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{min_context_slot}\b"#)),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": min_context_slot},
+                        "value": {
+                            "owner": owner.to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&data), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
     /// A withdrawal processor whose target chain answers every account read with
     /// `response`, which for these tests is the allowlist account the gate reads.
     fn processor_state_answering(
@@ -1677,6 +1817,14 @@ mod tests {
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Mirror the fetcher, which leaves the row Processing in storage.
+        if let Storage::Mock(ref mock) = *storage {
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            if !rows.iter().any(|row| row.id == txn.id) {
+                rows.push(txn.clone());
+            }
+        }
 
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
@@ -1717,6 +1865,32 @@ mod tests {
             mint: Pubkey::new_unique(),
             owner: Pubkey::new_unique(),
             state: AccountState::Initialized,
+            ..Default::default()
+        };
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+        data
+    }
+
+    /// Bytes of a Token-2022 mint carrying `PausableConfig` with `paused` as given.
+    fn pausable_mint_bytes(paused: bool) -> Vec<u8> {
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&[
+            ExtensionType::Pausable,
+        ])
+        .expect("a fixed-length extension has a calculable mint length");
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data)
+                .expect("a zeroed buffer holds an uninitialized mint");
+        state
+            .init_extension::<PausableConfig>(true)
+            .expect("the extension fits the calculated length")
+            .paused = paused.into();
+        state.base = Token2022MintState {
+            decimals: 6,
+            is_initialized: true,
             ..Default::default()
         };
         state.pack_base();
@@ -1919,6 +2093,488 @@ mod tests {
         );
     }
 
+    /// An admin blocked and then reopened the gate while the operator kept running.
+    /// The floor recorded before the block is still satisfied by a backend that has
+    /// not seen the reopen, and that backend answers with the gate blocked. Binding
+    /// the read to the current tip instead keeps the row from parking on stale state.
+    #[tokio::test]
+    async fn a_reopened_gate_is_read_at_the_tip_not_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let floor_slot = 100;
+        let tip_slot = 1_000;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // A backend from before the reopen still has the gate blocked.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            tip_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+        // Recorded when this process last served the mint, before the block.
+        ps.mint_cache.record_existence_floor(&mint, floor_slot);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a reopened gate must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The tip comes from the same endpoint as the gate read, so a lagging backend
+    /// can report its own old tip and then serve the gate as it was before the
+    /// reopen. The escrow checkpoint already covers the indexed reopen, and nothing
+    /// that backend says can lower it.
+    #[tokio::test]
+    async fn a_lagging_tip_is_overruled_by_the_escrow_checkpoint() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let lagging_tip_slot = 900;
+        let checkpoint_slot = 1_000;
+        storage
+            .update_committed_checkpoint(ProgramType::Escrow.as_label(), checkpoint_slot)
+            .await
+            .unwrap();
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, lagging_tip_slot);
+        // The lagging backend has not seen the reopen.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            lagging_tip_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            checkpoint_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a reopen the indexer has seen must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// Once a gate read has answered at a slot, no later read may answer below it,
+    /// even when that read bailed. The old floor skipped the bail, which is how a
+    /// block left it behind the reopen.
+    #[tokio::test]
+    async fn a_slot_already_seen_is_never_lowered() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let seen_slot = 1_000;
+        let lagging_tip_slot = 900;
+
+        // Blocked for real when first read.
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, seen_slot);
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            seen_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (_, first_update, _) =
+            run_one_withdrawal(&mut ps, storage.clone(), withdrawal_for(&mint, 5)).await;
+        assert!(
+            first_update.is_some(),
+            "the first withdrawal must park on the blocked gate"
+        );
+
+        // Reopened, but the next request lands on a backend that has not seen it.
+        server.reset();
+        mock_tip(&mut server, lagging_tip_slot);
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, true, false),
+            lagging_tip_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+            seen_slot,
+        );
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 6)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "a read below a slot already seen must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The pause read is bound to the slot the gate read just answered at. A backend
+    /// from before an unpause still satisfies the old floor and answers with the
+    /// mint paused, so that slot has to come from the tip too.
+    #[tokio::test]
+    async fn an_unpaused_mint_is_read_at_the_tip_not_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let allowed_mint = allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PAUSABLE);
+        let floor_slot = 100;
+        let tip_slot = 1_000;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // The gate is open on every backend, so only the pause read can park the row.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint.clone(),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint,
+            tip_slot,
+        );
+        // A backend from before the unpause still has the mint paused.
+        mock_account_read_at_slot(
+            &mut server,
+            &mint,
+            &spl_token_2022::id(),
+            pausable_mint_bytes(true),
+            floor_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &mint,
+            &spl_token_2022::id(),
+            pausable_mint_bytes(false),
+            tip_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+        // Recorded when this process last served the mint, before the pause.
+        ps.mint_cache.record_existence_floor(&mint, floor_slot);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            update.is_none(),
+            "an unpaused mint must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// The issuer froze and then thawed the escrow ATA while the operator kept
+    /// running. A backend that has not seen the thaw still reports it frozen, so the
+    /// ATA read has to carry the slot the gate read answered at. Only a read bound to
+    /// that slot is answered here.
+    #[tokio::test]
+    async fn a_thawed_escrow_is_read_at_the_gate_slot() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let instance_pda = release_funds_state.instance_pda;
+        let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
+        let instance_ata =
+            get_associated_token_address_with_program_id(&instance_pda, &mint, &spl_token::id());
+        let gate_slot = 1_000;
+
+        // Token account, 165-byte base layout: state at 108, 1 means Initialized.
+        let mut thawed_ata = vec![0u8; 165];
+        thawed_ata[108] = 1;
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, gate_slot);
+        // Pinned with a freeze authority, which is what makes the pre-flight read
+        // the escrow ATA.
+        mock_account_read_at_slot(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, true),
+            gate_slot,
+        );
+        mock_account_read_at_slot(
+            &mut server,
+            &instance_ata,
+            &spl_token::id(),
+            thawed_ata,
+            gate_slot,
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "the escrow ATA read must carry the gate slot: {outcome:?}"
+        );
+        assert!(update.is_none(), "a thawed escrow must not park the row");
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// A backend that cannot answer at the tip refuses the gate read. That has to stay
+    /// a transient error the row is requeued on, never a park, or a lagging backend
+    /// strands the row again.
+    #[tokio::test]
+    async fn a_backend_behind_the_tip_leaves_the_row_transient() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let txn = withdrawal_for(&mint, 5);
+        let txn_id = txn.id;
+        seed_processing_row(&storage, &txn);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1_000);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(allowed_mint_pda.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32016,
+                        "message": "Minimum context slot has not been reached"
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(rpc_at(&server.url())),
+            ),
+        };
+
+        let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage.clone(), txn).await;
+
+        assert!(
+            matches!(outcome, Err(OperatorError::RpcError(_))),
+            "a refused read must surface as transient, got {outcome:?}"
+        );
+        assert!(update.is_none(), "a refused read must not park the row");
+        assert!(builder.is_none(), "nothing may be dispatched");
+        assert_eq!(
+            row_status(&storage, txn_id),
+            Some(TransactionStatus::Pending),
+            "the row must be requeued for another attempt"
+        );
+    }
+
+    /// A backend a slot or two behind the bar refuses the gate read, and the next one
+    /// answers. That skew has to clear inside the read, not restart the operator and
+    /// spend one of the row's requeue attempts.
+    #[tokio::test]
+    async fn a_gate_read_refused_by_a_lagging_backend_is_retried() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let tip_slot = 1_000;
+        let allowed_mint = allowed_mint_bytes(false, false, false);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // The first backend has not reached the tip yet, the next one has.
+        let gate_reads = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(allowed_mint_pda.to_string()),
+            ]))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let reply = if gate_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": -32016,
+                            "message": "Minimum context slot has not been reached"
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "context": {"slot": tip_slot},
+                            "value": {
+                                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                                "lamports": 1_000_000u64,
+                                "data": [STANDARD.encode(&allowed_mint), "base64"],
+                                "executable": false,
+                                "rentEpoch": 0
+                            }
+                        }
+                    })
+                };
+                reply.to_string().into_bytes()
+            })
+            .create();
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::RetryConfig {
+                        max_attempts: 2,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                )),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "a refusal the next attempt clears must not restart the task: {outcome:?}"
+        );
+        assert!(
+            update.is_none(),
+            "a refusal the next attempt clears must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
     /// A `freeze_authority` holder can freeze the pooled escrow ATA, stranding every
     /// depositor for that mint. Parking makes that visible instead of dispatching a
     /// release the token program is certain to reject.
@@ -1944,6 +2600,7 @@ mod tests {
         ata_data[108] = 2;
 
         let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, 1);
         // Pinned with a freeze authority, which is the only reason the pre-flight
         // reads the escrow ATA at all.
         let _allowlist_mock = mock_account_read(
@@ -2013,6 +2670,7 @@ mod tests {
 
         // Recreated as SPL: the same AllowedMint account now pins the SPL program.
         server.reset();
+        mock_tip(&mut server, 1);
         mock_account_read(
             &mut server,
             &find_allowed_mint_pda(&instance_pda, &mint),
@@ -2649,6 +3307,7 @@ mod tests {
             Some(NONCES_PER_GENERATION as i64),
             TransactionType::Withdrawal,
         );
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -2703,6 +3362,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Withdrawal,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -3123,11 +3783,11 @@ mod tests {
         let _status = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+                r#""method"\s*:\s*"getSignatureStatusSnapshot""#.into(),
             ))
             .with_status(200)
             .with_body(
-                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+                r#"{"jsonrpc":"2.0","result":{"blockHeight":200,"firstAvailableBlock":0,"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
             )
             .create();
 
@@ -3274,6 +3934,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Deposit,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -3361,6 +4022,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Deposit,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -3437,6 +4099,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Withdrawal,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -3492,6 +4155,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Withdrawal,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -3633,8 +4297,10 @@ mod tests {
             Some(9),
             crate::storage::common::models::TransactionType::Withdrawal,
         );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        seed_processing_row(&storage, &txn);
 
-        quarantine_single(&storage_tx, &txn, "bad row".into()).await;
+        quarantine_single(&storage, &storage_tx, "withdraw", &txn, "bad row".into()).await;
 
         let update = storage_rx.recv().await.expect("update was sent");
         assert_eq!(update.transaction_id, 77);
@@ -3645,6 +4311,11 @@ mod tests {
         assert_eq!(update.error_message.as_deref(), Some("bad row"));
         assert_eq!(update.remint_signature, None);
         assert!(!update.remint_attempted);
+        assert!(update.alert_only, "the park already wrote the row");
+        assert_eq!(
+            row_status(&storage, txn.id),
+            Some(TransactionStatus::ManualReview)
+        );
     }
 
     /// A closed `storage_tx` is observable at startup-shutdown race — we
@@ -3662,8 +4333,201 @@ mod tests {
             crate::storage::common::models::TransactionType::Withdrawal,
         );
 
+        // Seeded so the write applies and the send reaches the closed channel.
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        seed_processing_row(&storage, &txn);
+
         // Must not panic.  send_guaranteed will log and return Err; we swallow it.
-        quarantine_single(&storage_tx, &txn, "closed".into()).await;
+        quarantine_single(&storage, &storage_tx, "withdraw", &txn, "closed".into()).await;
+    }
+
+    /// A park that reaches the row after recovery requeued it and the fetcher
+    /// locked it again belongs to the old incarnation, so it must not
+    /// terminalize the new one.
+    #[tokio::test]
+    async fn a_late_park_cannot_terminalize_a_requeued_incarnation() {
+        let mock = MockStorage::new();
+        let mut txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(0),
+            TransactionType::Withdrawal,
+        );
+        txn.status = TransactionStatus::Pending;
+        mock.pending_transactions.lock().unwrap().push(txn);
+        let storage = Storage::Mock(mock.clone());
+
+        let stale = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(storage
+            .try_requeue_processing(stale.id, stale.updated_at)
+            .await
+            .unwrap());
+        let current = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_ne!(
+            current.updated_at, stale.updated_at,
+            "the re-lock is a new incarnation"
+        );
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        quarantine_single(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &stale,
+            "withdrawals blocked".to_string(),
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a park for the old incarnation must not reach the writer"
+        );
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(row.status, TransactionStatus::Processing);
+        assert_eq!(row.updated_at, current.updated_at);
+    }
+
+    /// A park whose write cannot be verified may have committed, and nothing
+    /// retries a committed park, so it still pages. The alert writes nothing, so
+    /// a park that never committed stays Processing for recovery.
+    #[tokio::test]
+    async fn an_unverified_park_still_pages_without_writing() {
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(0),
+            TransactionType::Withdrawal,
+        );
+        let mock = MockStorage::new();
+        mock.set_should_fail("try_quarantine_processing", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        seed_processing_row(&storage, &txn);
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+
+        let counted = quarantine_single(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &txn,
+            "withdrawals blocked".to_string(),
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an unverified park must still page");
+        assert!(update.alert_only, "the writer must not write it");
+        assert!(update
+            .error_message
+            .is_some_and(|message| message.contains("unverified")));
+        assert!(!counted, "only a verified park counts");
+        assert_eq!(
+            row_status(&storage, txn.id),
+            Some(TransactionStatus::Processing)
+        );
+    }
+
+    /// A park whose write did not apply is not counted as a quarantine.
+    #[tokio::test]
+    async fn a_park_that_did_not_apply_is_not_counted() {
+        // Only this test uses the label, so no parallel test moves the series.
+        let label = "test_park_not_applied";
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(0),
+            TransactionType::Withdrawal,
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let quarantined =
+            metrics::OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&["withdraw", label]);
+        let before = quarantined.get();
+
+        park_row(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &txn,
+            BailReason::new(label, "withdrawals blocked".to_string()),
+        )
+        .await;
+
+        assert_eq!(quarantined.get() - before, 0.0);
+    }
+
+    /// A park whose first write landed rides out a blip on the re-read that
+    /// confirms it, so it counts as applied and pages without the unverified flag.
+    #[tokio::test]
+    async fn a_park_whose_reread_blips_still_alerts() {
+        let reason = "withdrawals blocked";
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(0),
+            TransactionType::Withdrawal,
+        );
+        let mock = MockStorage::new();
+        // What the first, committed attempt left behind.
+        let mut landed = txn.clone();
+        landed.status = TransactionStatus::ManualReview;
+        mock.pending_transactions.lock().unwrap().push(landed);
+        mock.set_fail_times("get_transaction_status", 1);
+        let storage = Arc::new(Storage::Mock(mock));
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+
+        let counted =
+            quarantine_single(&storage, &storage_tx, "withdraw", &txn, reason.to_string()).await;
+
+        // An unverified park pages too, so only these tell the retry apart.
+        assert!(counted, "the retried re-read must confirm the park");
+        let update = storage_rx.try_recv().expect("the park must still page");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(update.error_message.as_deref(), Some(reason));
+    }
+
+    /// A retried park whose first write landed but whose reply was lost finds the
+    /// row already ManualReview. It must still page.
+    #[tokio::test]
+    async fn a_park_whose_write_already_landed_still_alerts() {
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(0),
+            TransactionType::Withdrawal,
+        );
+        let mock = MockStorage::new();
+        // What the first, committed attempt left behind.
+        let mut landed = txn.clone();
+        landed.status = TransactionStatus::ManualReview;
+        mock.pending_transactions.lock().unwrap().push(landed);
+        let storage = Arc::new(Storage::Mock(mock));
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+
+        quarantine_single(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &txn,
+            "withdrawals blocked".to_string(),
+        )
+        .await;
+
+        let update = storage_rx.try_recv().expect("the park must still page");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
     // ── halt_withdrawal_pipeline ────────────────────────────────────────
@@ -3690,7 +4554,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         // No in-flight rows were buffered — no channel-side quarantines.
         assert!(storage_rx.try_recv().is_err());
@@ -3708,25 +4572,17 @@ mod tests {
     #[tokio::test]
     async fn halt_withdrawal_pipeline_drains_every_buffered_row() {
         let mock = MockStorage::new();
-        let storage = Storage::Mock(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(16);
         let (fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(8);
 
         for id in 1..=5 {
-            fetcher_tx
-                .send(make_db_transaction(
-                    id,
-                    &Pubkey::new_unique().to_string(),
-                    &Pubkey::new_unique().to_string(),
-                    Some(id),
-                    TransactionType::Withdrawal,
-                ))
-                .await
-                .unwrap();
+            let txn = seed_active_withdrawal(&mock, id, Some(id), TransactionStatus::Processing);
+            fetcher_tx.send(txn).await.unwrap();
         }
         drop(fetcher_tx);
+        let storage = Storage::Mock(mock);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         let mut ids = Vec::new();
         while let Ok(update) = storage_rx.try_recv() {
@@ -3743,29 +4599,22 @@ mod tests {
     /// outcome than swallowing both.
     #[tokio::test]
     async fn halt_withdrawal_pipeline_db_failure_still_drains_channel() {
+        let txn_id = 42;
         let mock = MockStorage::new();
         mock.set_should_fail("quarantine_active_withdrawals", true);
-        let storage = Storage::Mock(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(4);
         let (fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        fetcher_tx
-            .send(make_db_transaction(
-                42,
-                &Pubkey::new_unique().to_string(),
-                &Pubkey::new_unique().to_string(),
-                Some(7),
-                TransactionType::Withdrawal,
-            ))
-            .await
-            .unwrap();
+        let txn = seed_active_withdrawal(&mock, txn_id, Some(7), TransactionStatus::Processing);
+        fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
+        let storage = Storage::Mock(mock);
 
         // Must not panic; must complete.
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, "withdraw", &mut fetcher_rx, None).await;
 
         let update = storage_rx.recv().await.expect("buffered row quarantined");
-        assert_eq!(update.transaction_id, 42);
+        assert_eq!(update.transaction_id, txn_id);
         assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
@@ -3803,7 +4652,14 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+        halt_withdrawal_pipeline(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &mut fetcher_rx,
+            Some(&poison),
+        )
+        .await;
 
         let rows = match &storage {
             Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
@@ -3828,7 +4684,14 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+        halt_withdrawal_pipeline(
+            &storage,
+            &storage_tx,
+            "withdraw",
+            &mut fetcher_rx,
+            Some(&poison),
+        )
+        .await;
 
         let rows = match &storage {
             Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
@@ -3947,6 +4810,7 @@ mod tests {
             Some(NONCES_PER_GENERATION as i64),
             crate::storage::common::models::TransactionType::Withdrawal,
         );
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -4128,16 +4992,15 @@ mod tests {
         insert_mint_row(&storage, &valid_mint_4);
 
         // poison, valid, poison, valid
-        fetcher_tx
-            .send(make_db_transaction(
-                1,
-                "not_a_valid_pubkey",
-                &Pubkey::new_unique().to_string(),
-                None,
-                crate::storage::common::models::TransactionType::Deposit,
-            ))
-            .await
-            .unwrap();
+        let bad_mint = make_db_transaction(
+            1,
+            "not_a_valid_pubkey",
+            &Pubkey::new_unique().to_string(),
+            None,
+            crate::storage::common::models::TransactionType::Deposit,
+        );
+        seed_processing_row(&storage, &bad_mint);
+        fetcher_tx.send(bad_mint).await.unwrap();
         fetcher_tx
             .send(make_db_transaction(
                 2,
@@ -4148,16 +5011,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        fetcher_tx
-            .send(make_db_transaction(
-                3,
-                &Pubkey::new_unique().to_string(),
-                "not_a_valid_pubkey",
-                None,
-                crate::storage::common::models::TransactionType::Deposit,
-            ))
-            .await
-            .unwrap();
+        let bad_recipient = make_db_transaction(
+            3,
+            &Pubkey::new_unique().to_string(),
+            "not_a_valid_pubkey",
+            None,
+            crate::storage::common::models::TransactionType::Deposit,
+        );
+        seed_processing_row(&storage, &bad_recipient);
+        fetcher_tx.send(bad_recipient).await.unwrap();
         fetcher_tx
             .send(make_db_transaction(
                 4,
@@ -4279,6 +5141,9 @@ mod tests {
             Some(3),
             TransactionType::Withdrawal,
         );
+        seed_processing_row(&storage, &poison);
+        seed_processing_row(&storage, &in_flight_a);
+        seed_processing_row(&storage, &in_flight_b);
         fetcher_tx.send(poison).await.unwrap();
         fetcher_tx.send(in_flight_a).await.unwrap();
         fetcher_tx.send(in_flight_b).await.unwrap();
@@ -4414,6 +5279,7 @@ mod tests {
             release_refused_on_chain: false,
         };
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -4516,6 +5382,8 @@ mod tests {
             release_refused_on_chain: false,
         };
 
+        // Seeded so a wrong park would land and send, letting the check below fail.
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -4570,6 +5438,7 @@ mod tests {
             crate::storage::common::models::TransactionType::Deposit,
         );
 
+        seed_processing_row(&storage, &txn);
         fetcher_tx.send(txn).await.unwrap();
         drop(fetcher_tx);
 
@@ -4648,16 +5517,15 @@ mod tests {
 
         let parked_id = 7;
         let minted_id = 8;
-        fetcher_tx
-            .send(make_db_transaction(
-                parked_id,
-                &unknown_fee_mint.to_string(),
-                &Pubkey::new_unique().to_string(),
-                None,
-                TransactionType::Deposit,
-            ))
-            .await
-            .unwrap();
+        let parked = make_db_transaction(
+            parked_id,
+            &unknown_fee_mint.to_string(),
+            &Pubkey::new_unique().to_string(),
+            None,
+            TransactionType::Deposit,
+        );
+        seed_processing_row(&storage, &parked);
+        fetcher_tx.send(parked).await.unwrap();
         fetcher_tx
             .send(make_db_transaction(
                 minted_id,

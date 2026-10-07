@@ -219,6 +219,13 @@ gauge_vec!(
     &["mint"]
 );
 
+gauge_vec!(
+    OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
+    "private_channel_operator_reconciliation_envelope_adjustment_raw",
+    "Raw tokens of settled transfers newer than the custody or supply snapshot, allowed on top of the in-flight envelope",
+    &["mint"]
+);
+
 counter_vec!(
     OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
     "private_channel_operator_reconciliation_liability_unknown_total",
@@ -403,6 +410,9 @@ pub fn init_labels(program_type: &str) {
         "jit_missing_claim_lease",
         "malformed_status_response",
         "status_poll_rpc_error",
+        "alert_queue_full",
+        "alert_drain_dropped",
+        "alert_post_failed",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }
@@ -537,6 +547,7 @@ pub fn init() {
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
+        OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
     );
 }
 

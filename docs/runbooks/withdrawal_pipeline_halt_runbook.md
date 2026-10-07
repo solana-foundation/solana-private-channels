@@ -12,13 +12,15 @@ The diff is **directional**, and the two directions mean opposite things:
 | **Chain ahead** - bit set, no `completed` row | A release landed and only its bookkeeping was lost. The money already moved correctly. | Names the nonces, resolves each from its broadcast signatures, and **starts anyway**. |
 | **DB ahead** - `completed` row, bit clear | The database believes in a release the chain never made. Every later decision would rest on a false history. | **Refuses to start.** |
 
-Only the DB-ahead direction halts. That is the whole subject of this runbook.
+Only the DB-ahead direction halts on a verdict. The operator also refuses to
+start when the diff cannot be run at all, because nothing runs it again later;
+see [Bitmap check could not run on startup](#bitmap-check-could-not-run-on-startup).
 
-This halt has **no dedicated "pipeline halted" alert**. A refuse-to-start
+These halts have **no dedicated "pipeline halted" alert**. A refuse-to-start
 surfaces as the operator process exiting at boot (a crash-loop under the
-supervisor) with `Withdrawal bitmap divergence` in the error logs, and a
-`private_channel_operator_transaction_errors_total{error_reason="bitmap_divergence"}`
-increment. No withdrawal is ever marked `failed` by this path. Recognize it by
+supervisor) with `Withdraw boot pre-flight failed, refusing to start` in the
+error logs. A divergence also logs `Withdrawal bitmap divergence` and increments
+`private_channel_operator_transaction_errors_total{error_reason="bitmap_divergence"}`. No withdrawal is ever marked `failed` by this path. Recognize it by
 the boot-time crash-loop plus the log markers, not a single halt event, and it is
 not routed by the dispatch table in [`README.md`](README.md).
 
@@ -56,7 +58,9 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    (`BOOT_RECONCILE_BUDGET`); if it runs out, the diff below still decides
    whether the operator may start.
 3. **Diffs the bitmap** for the generation the bitmap is currently on against
-   `completed` withdrawals whose nonce falls in that generation's window.
+   `completed` withdrawals whose nonce falls in that generation's window or any
+   later one. Later generations count because the chain cannot release a nonce
+   before it rotates into that generation.
 4. **Repairs chain-ahead nonces in place.** For each nonce whose bit is set with
    no `completed` row, the operator loads that withdrawal's stored broadcast
    signatures and classifies them on-chain. A landed signature marks the row
@@ -102,6 +106,12 @@ own.
 
 Grep the operator logs for `Withdrawal bitmap divergence` to confirm, and check
 that the process is crash-looping at boot (not running with a halted pipeline).
+
+If the instance's bitmap account does not exist, the operator diffs against an
+empty generation 0, so every `completed` withdrawal, in any generation, shows up in
+`db_only`. A log line `Withdrawal bitmap does not exist` before the divergence
+almost always means `escrow_instance_id` points at the wrong instance, or `rpc_url`
+at the wrong cluster. Check both first, before touching any row.
 
 ### Diagnosis - the nonces are already named
 
@@ -177,3 +187,43 @@ persists after correcting the named rows and restarting.
 - The RPC endpoint used for verification.
 - Confirmation that `Withdrawal bitmap verification passed` appeared on the
   post-fix restart.
+
+---
+
+## Bitmap check could not run on startup
+
+### Symptom
+
+- The withdraw operator exits at boot and the supervisor restarts it in a loop.
+- The error log reads `Withdraw boot pre-flight failed, refusing to start: Program error:
+  Withdrawal bitmap unavailable: ...`, or a `Storage error:` or `Account error:` instead.
+- No row is marked `failed` by this check. No `bitmap_divergence` increment.
+
+### Why the operator refuses
+
+The diff is the only check that a `completed` row matches a set bit, and nothing
+runs it after boot. Once the bitmap rotates, the old generation's bits are gone,
+so starting without the diff could let a false `completed` row go unnoticed for
+good. Refusing is the safe default; the supervisor's restart is the retry.
+
+A bitmap account that does not exist is not this case. It is read as an empty
+generation 0 and diffed normally, so a fresh deployment with an empty database
+still starts.
+
+### Resolution
+
+1. Read the error after `refusing to start:`.
+   - `Withdrawal bitmap unavailable` with an RPC error: the Solana `rpc_url` did not
+     answer at a finalized slot. Restore the endpoint or point the operator at a
+     healthy one.
+   - A storage error: the database read of `completed` withdrawals failed. Restore
+     the database.
+   - `Account error: Failed to deserialize account data for <bitmap>`: the account at the bitmap
+     address is not a withdrawal bitmap. Check `escrow_instance_id` and the program
+     ID, then [escalate](_escalation.md) (Tier 2) if both are right.
+2. Do nothing else. The next restart reruns the check and the operator starts on
+   its own once it passes (`Withdrawal bitmap verification passed`).
+
+If the error is `The Withdraw sender lock was lost during the boot pre-flight`,
+the sender lock was lost during the pre-flight. Treat it as a sender lock
+problem, not a bitmap problem.

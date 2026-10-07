@@ -1,6 +1,7 @@
 use {
     crate::rpc::{
         get_address_index_slot_impl::AddressIndexSlot,
+        get_signature_status_snapshot_impl::RpcStatusSnapshot,
         get_signatures_for_address_impl::SignaturesForAddressConfig,
     },
     jsonrpsee::{core::RpcResult, proc_macros::rpc},
@@ -95,6 +96,13 @@ pub trait PrivateChannelRpc {
         signatures: Vec<String>,
         config: Option<RpcSignatureStatusConfig>,
     ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>>;
+
+    /// Statuses, block height and ledger floor from one snapshot, for proving an absence
+    #[method(name = "getSignatureStatusSnapshot")]
+    async fn get_signature_status_snapshot(
+        &self,
+        signatures: Vec<String>,
+    ) -> RpcResult<RpcStatusSnapshot>;
 
     /// Get the current transaction count
     #[method(name = "getTransactionCount")]
