@@ -298,11 +298,18 @@ impl Storage {
 
     /// Per-mint sum of every unsettled transaction amount (pending / processing /
     /// parked / pending_remint), used as the in-flight envelope by the runtime
-    /// reconciliation halt decision.
+    /// reconciliation halt decision, plus settled rows above each type's bound.
     pub async fn get_in_flight_amounts_by_mint(
         &self,
+        deposits_after: Option<u64>,
+        withdrawals_after: Option<u64>,
     ) -> Result<Vec<MintInFlightAmount>, StorageError> {
-        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(self).await
+        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(
+            self,
+            deposits_after,
+            withdrawals_after,
+        )
+        .await
     }
 
     /// Set the durable reconciliation halt flag. Idempotent.
@@ -2812,7 +2819,10 @@ mod tests {
                 TransactionStatus::ManualReview,
             ));
         }
-        let rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        let rows = storage
+            .get_in_flight_amounts_by_mint(None, None)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].mint_address, "mint_a");
         assert_eq!(rows[0].in_flight_amount, BigDecimal::from(1500u64));
@@ -2831,7 +2841,10 @@ mod tests {
                 TransactionStatus::Processing,
             ));
         }
-        let mut rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        let mut rows = storage
+            .get_in_flight_amounts_by_mint(None, None)
+            .await
+            .unwrap();
         rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].mint_address, "mint_a");
@@ -2844,9 +2857,135 @@ mod tests {
     async fn in_flight_empty_is_absent() {
         let (storage, _mock) = make_mock_storage();
         assert!(storage
-            .get_in_flight_amounts_by_mint()
+            .get_in_flight_amounts_by_mint(None, None)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    fn sloted_txn(
+        id: i64,
+        kind: TransactionType,
+        status: TransactionStatus,
+        slot: i64,
+        amount: u64,
+    ) -> DbTransaction {
+        let mut t = in_flight_txn(id, "mint_a", amount, status);
+        t.transaction_type = kind;
+        t.slot = slot;
+        t
+    }
+
+    /// (in_flight, adjustment) for mint_a under the given bounds.
+    async fn envelope_parts(
+        storage: &Storage,
+        deposits_after: Option<u64>,
+        withdrawals_after: Option<u64>,
+    ) -> (BigDecimal, BigDecimal) {
+        let rows = storage
+            .get_in_flight_amounts_by_mint(deposits_after, withdrawals_after)
+            .await
+            .unwrap();
+        rows.into_iter()
+            .find(|r| r.mint_address == "mint_a")
+            .map(|r| (r.in_flight_amount, r.adjustment_amount))
+            .unwrap_or_default()
+    }
+
+    /// Terminal rows count only strictly above their own type's bound, and an in-flight row
+    /// above a bound is still counted once, as in-flight.
+    #[tokio::test]
+    async fn envelope_adds_terminal_rows_above_each_types_bound() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(sloted_txn(1, Deposit, Completed, 1_000, 1));
+            db.push(sloted_txn(2, Deposit, Completed, 1_001, 2));
+            db.push(sloted_txn(3, Deposit, Failed, 1_002, 4));
+            db.push(sloted_txn(4, Withdrawal, Completed, 10, 8));
+            db.push(sloted_txn(5, Withdrawal, ManualReview, 11, 16));
+            // Above the deposit bound but a withdrawal, whose bound it is below.
+            db.push(sloted_txn(6, Withdrawal, Completed, 5_000, 32));
+            db.push(sloted_txn(7, Deposit, Processing, 2_000, 64));
+        }
+        let (in_flight, adjustment) = envelope_parts(&storage, Some(1_000), Some(10)).await;
+        assert_eq!(in_flight, BigDecimal::from(64u64));
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32));
+
+        // Raising the withdrawal bound drops every withdrawal, leaving the deposits.
+        let (_, adjustment) = envelope_parts(&storage, Some(1_000), Some(5_000)).await;
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4));
+    }
+
+    /// A missing bound skips its arm instead of counting that type's whole history.
+    #[tokio::test]
+    async fn envelope_without_a_bound_skips_that_arm() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(sloted_txn(1, Deposit, Completed, 1, 1));
+            db.push(sloted_txn(2, Withdrawal, Completed, 1, 2));
+        }
+        let zero = BigDecimal::from(0u64);
+        assert_eq!(envelope_parts(&storage, None, None).await.1, zero);
+        assert_eq!(
+            envelope_parts(&storage, Some(0), None).await.1,
+            BigDecimal::from(1u64)
+        );
+        assert_eq!(
+            envelope_parts(&storage, None, Some(0)).await.1,
+            BigDecimal::from(2u64)
+        );
+        assert_eq!(
+            envelope_parts(&storage, Some(u64::MAX), Some(u64::MAX))
+                .await
+                .1,
+            zero
+        );
+    }
+
+    /// Every status is either in the envelope or counted by the slot arms; a new status
+    /// must be classified here before this compiles.
+    #[tokio::test]
+    async fn every_status_is_counted_exactly_once_above_the_bound() {
+        use TransactionStatus::*;
+        fn in_envelope(status: TransactionStatus) -> bool {
+            match status {
+                Pending | Processing | Parked | PendingRemint => true,
+                Completed | Failed | FailedReminted | ManualReview => false,
+            }
+        }
+        let all = [
+            Pending,
+            Processing,
+            Parked,
+            PendingRemint,
+            Completed,
+            Failed,
+            FailedReminted,
+            ManualReview,
+        ];
+        for (i, status) in all.into_iter().enumerate() {
+            for kind in [TransactionType::Deposit, TransactionType::Withdrawal] {
+                let (storage, mock) = make_mock_storage();
+                mock.pending_transactions
+                    .lock()
+                    .unwrap()
+                    .push(sloted_txn(i as i64, kind, status, 50, 7));
+                let (in_flight, adjustment) = envelope_parts(&storage, Some(10), Some(10)).await;
+                let seven = BigDecimal::from(7u64);
+                let zero = BigDecimal::from(0u64);
+                let expected = if in_envelope(status) {
+                    (seven, zero)
+                } else {
+                    (zero, seven)
+                };
+                assert_eq!((in_flight, adjustment), expected, "{status:?} {kind:?}");
+            }
+        }
     }
 }

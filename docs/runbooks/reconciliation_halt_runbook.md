@@ -32,7 +32,21 @@ mint, each with its own consecutive-tick counter:
 On-chain supply is already net of burns (the program burns channel tokens at
 withdrawal initiation, not at release), so the supply check does **not** trust
 the DB ledger; it catches over-issuance. Its halt reason reads
-`... custody <C> short of supply by <GAP>, envelope <E> tolerance <T> ...`.
+`... custody <C> short of supply by <GAP>, envelope <E> (adjustment <A>) tolerance <T> ...`.
+
+A snapshot can be older than a transfer that already settled: custody read below a
+completed deposit's Solana slot, or supply read below a released withdrawal's burn.
+So the allowance also counts settled deposits above the tick's lowest custody slot and
+settled withdrawals above the channel block the supply reads were checked against; that
+part is the adjustment `<A>`, exported per mint as
+`private_channel_operator_reconciliation_envelope_adjustment_raw`. When the adjustment is
+the only thing keeping a mint from breaching, the operator logs
+`RECONCILIATION ALERT` and posts `{"alert": "envelope_adjustment_changed_verdict", ...}`
+to the reconciliation webhook. Such a masked tick holds the mint's breach count rather
+than resetting it, so a shortfall masked on some ticks still halts once it breaches on
+three ticks that are not clean. One such page is expected under RPC lag; pages that keep
+coming mean a lagging backend could be hiding a real shortfall of that size, so check
+the custody RPC and the channel read node for lag.
 
 The liability check catches a custody drain that the supply check cannot see
 while unminted (`pending`, `failed`, `manual_review`) deposits pad the gap.

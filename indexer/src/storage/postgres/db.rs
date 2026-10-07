@@ -237,6 +237,9 @@ const DROP_STATEMENTS: [&str; 11] = [
 /// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
 const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
 
+/// Statuses the reconciliation envelope counts as unsettled.
+const ENVELOPE_STATUSES: &str = "('pending', 'processing', 'parked', 'pending_remint')";
+
 /// Statuses that can still have a broadcast in flight whether or not a journal survives.
 const UNSETTLED_STATUSES: &str = "('processing', 'pending_remint', 'manual_review')";
 
@@ -484,6 +487,15 @@ impl PostgresDb {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_slot ON transactions (slot)")
             .execute(&self.pool)
             .await?;
+
+        // Channel slots sit far below Solana slots, so `slot > anchor` on the shared slot index would
+        // walk every deposit. Withdrawals only, so the build is small; plain like the rest of init.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_transactions_withdrawal_slot \
+             ON transactions (slot) WHERE transaction_type = 'withdrawal'",
+        )
+        .execute(&self.pool)
+        .await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_transactions_initiator ON transactions (initiator)",
@@ -3260,22 +3272,48 @@ impl PostgresDb {
     /// envelope). Both types are summed as a deliberate over-approximation: a
     /// larger envelope only ever delays detection of a real insolvency, never
     /// fabricates a false halt.
+    ///
+    /// Settled deposits above `deposits_after` and settled withdrawals above `withdrawals_after`
+    /// are summed apart as the adjustment; one statement, so each row is counted once.
     pub async fn get_in_flight_amounts_by_mint_internal(
         &self,
+        deposits_after: Option<i64>,
+        withdrawals_after: Option<i64>,
     ) -> Result<Vec<MintInFlightAmount>, sqlx::Error> {
         // Sum of every in-flight row per mint: the supply-vs-custody transient bound.
         // Deposits and pending_remint raise supply; burn-side withdrawals over-count but only widen it, never false-halt.
-        sqlx::query_as::<_, MintInFlightAmount>(
+        // `slot` holds Solana slots for deposits and channel slots for withdrawals, so each arm has its own bound.
+        let mut rows = format!("status IN {ENVELOPE_STATUSES}");
+        let mut binds = Vec::new();
+        for (kind, bound) in [
+            ("deposit", deposits_after),
+            ("withdrawal", withdrawals_after),
+        ] {
+            if let Some(bound) = bound {
+                binds.push(bound);
+                rows.push_str(&format!(
+                    " OR (transaction_type = '{kind}' AND slot > ${})",
+                    binds.len()
+                ));
+            }
+        }
+        let sql = format!(
             r#"
             SELECT mint AS mint_address,
-                   COALESCE(SUM(amount), 0)::NUMERIC AS in_flight_amount
+                   COALESCE(SUM(amount) FILTER (WHERE status IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                       AS in_flight_amount,
+                   COALESCE(SUM(amount) FILTER (WHERE status NOT IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                       AS adjustment_amount
             FROM transactions
-            WHERE status IN ('pending', 'processing', 'parked', 'pending_remint')
+            WHERE {rows}
             GROUP BY mint
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
+            "#
+        );
+        let mut query = sqlx::query_as::<_, MintInFlightAmount>(&sql);
+        for bound in binds {
+            query = query.bind(bound);
+        }
+        query.fetch_all(&self.pool).await
     }
 
     /// Set (or refresh) the durable reconciliation halt flag. Idempotent on the

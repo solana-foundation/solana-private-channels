@@ -22,6 +22,9 @@ pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>, bool)
 /// In-memory mirror of `pending_release_signatures`, keyed by transaction id.
 pub type ReleaseSignatureMap = HashMap<i64, Vec<StoredSig>>;
 
+/// Envelope read bounds as (deposits_after, withdrawals_after).
+type EnvelopeBounds = (Option<u64>, Option<u64>);
+
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
@@ -32,6 +35,8 @@ pub struct MockStorage {
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     /// Storage operation names in call order, for tests that pin read ordering.
     pub call_order: std::sync::Arc<Mutex<Vec<String>>>,
+    /// Bounds the last envelope read was given.
+    pub last_envelope_bounds: std::sync::Arc<Mutex<Option<EnvelopeBounds>>>,
     /// Per-op latency, for tests that need a write still in flight when a deadline passes.
     pub delays: std::sync::Arc<Mutex<HashMap<String, std::time::Duration>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
@@ -584,12 +589,15 @@ impl MockStorage {
 
     pub async fn get_in_flight_amounts_by_mint(
         &self,
+        deposits_after: Option<u64>,
+        withdrawals_after: Option<u64>,
     ) -> Result<Vec<MintInFlightAmount>, StorageError> {
         self.check_should_fail("get_in_flight_amounts_by_mint")?;
-        // Mirror the Postgres query: sum amounts per mint over the unsettled
-        // statuses across every transaction store the mock holds, deduped by id.
+        *self.last_envelope_bounds.lock().unwrap() = Some((deposits_after, withdrawals_after));
+        // Mirror the Postgres query: per mint, unsettled rows into the envelope and settled rows
+        // above their own type's bound into the adjustment, across every store, deduped by id.
         let mut seen_ids = std::collections::HashSet::new();
-        let mut sums: HashMap<String, BigDecimal> = HashMap::new();
+        let mut sums: HashMap<String, (BigDecimal, BigDecimal)> = HashMap::new();
         {
             let pending = self.pending_transactions.lock().unwrap();
             let singles = self.inserted_single_transactions.lock().unwrap();
@@ -602,23 +610,39 @@ impl MockStorage {
                 if !seen_ids.insert(t.id) {
                     continue;
                 }
-                if matches!(
+                let in_envelope = matches!(
                     t.status,
                     TransactionStatus::Pending
                         | TransactionStatus::Processing
                         | TransactionStatus::Parked
                         | TransactionStatus::PendingRemint
-                ) {
-                    *sums.entry(t.mint.clone()).or_default() += BigDecimal::from(t.amount.value());
+                );
+                let bound = match t.transaction_type {
+                    TransactionType::Deposit => deposits_after,
+                    TransactionType::Withdrawal => withdrawals_after,
+                };
+                let above = bound.is_some_and(|b| t.slot > i64::try_from(b).unwrap_or(i64::MAX));
+                if !in_envelope && !above {
+                    continue;
+                }
+                let entry = sums.entry(t.mint.clone()).or_default();
+                let amount = BigDecimal::from(t.amount.value());
+                if in_envelope {
+                    entry.0 += amount;
+                } else {
+                    entry.1 += amount;
                 }
             }
         }
         Ok(sums
             .into_iter()
-            .map(|(mint_address, in_flight_amount)| MintInFlightAmount {
-                mint_address,
-                in_flight_amount,
-            })
+            .map(
+                |(mint_address, (in_flight_amount, adjustment_amount))| MintInFlightAmount {
+                    mint_address,
+                    in_flight_amount,
+                    adjustment_amount,
+                },
+            )
             .collect())
     }
 

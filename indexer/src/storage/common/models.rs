@@ -190,6 +190,8 @@ pub struct ServicedRow {
 pub struct MintInFlightAmount {
     pub mint_address: String,
     pub in_flight_amount: BigDecimal,
+    /// Settled rows newer than the snapshot they are compared with, counted on top of the envelope.
+    pub adjustment_amount: BigDecimal,
 }
 
 /// Mint metadata stored
