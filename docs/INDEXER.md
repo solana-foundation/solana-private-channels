@@ -190,7 +190,7 @@ Each indexed instruction is keyed on the triple **`(signature, instruction_index
 - `instruction_index` — absolute position of the top-level instruction (or, for a CPI, of its top-level ancestor) in the transaction.
 - `inner_index` — `NULL` for a top-level instruction; otherwise the instruction's position in the **flattened inner-instruction list** of that top-level ancestor.
 
-**This works at any CPI depth, not just one level.** The validator flattens *every* CPI depth under a top-level instruction into a single inner-instruction list (`meta.innerInstructions[i].instructions`), each entry carrying a `stackHeight`. So a deposit invoked two or more hops deep (`A → B → escrow.Deposit`) is still one entry in that flat list with a unique `inner_index` — `inner_index` is a flat position, **not** a nesting level. Deposit-event scoping likewise keys on `stackHeight` (it walks the contiguous run of deeper entries after the deposit), so it resolves the correct `DepositEvent` regardless of nesting depth.
+**This works at any CPI depth, not just one level.** The validator flattens *every* CPI depth under a top-level instruction into a single inner-instruction list (`meta.innerInstructions[i].instructions`), each entry carrying a `stackHeight`. So a deposit invoked two or more hops deep (`A → B → escrow.Deposit`) is still one entry in that flat list with a unique `inner_index` — `inner_index` is a flat position, **not** a nesting level. Deposit-event scoping likewise keys on `stackHeight` (it walks the contiguous run of deeper entries after the deposit), so it resolves the correct `DepositEvent` regardless of nesting depth. When a source omits the CPI deposit's own `stackHeight`, the parser takes the first escrow entry after the deposit instead. The list is in call order and nothing inside a Deposit can call the escrow except its own event self-CPI, so that entry must be this deposit's `DepositEvent`. It must also name the deposit's instance, user, recipient and mint, or the slot fails to decode.
 
 **Locations**: identity column [`indexer/src/storage/common/models.rs`](../indexer/src/storage/common/models.rs); position capture [`InstructionLocation`/`InnerLocation`](../indexer/src/indexer/datasource/common/types.rs); event scoping `parse_deposit` in [`escrow.rs`](../indexer/src/indexer/datasource/common/parser/escrow.rs).
 
@@ -258,7 +258,7 @@ Runs alongside the three-stage pipeline to detect and resolve discrepancies betw
 
 #### DB Transaction Writer
 
-Handles batched database writes for transaction status updates from the operator pipeline.
+Writes operator status updates one at a time and posts their alert webhooks from a separate bounded queue, so a slow endpoint never delays a write. Once the pipeline is running, `Failed` and `ManualReview` outcomes for a `processing` row are written by their producer as a CAS on that incarnation's `updated_at` and reach the writer as alert-only updates, so a late outcome cannot terminalize a row recovery has requeued. The writer still writes deposit `Completed`, `pending_remint` outcomes and boot repair itself, none of which can meet a second incarnation.
 
 **Location**: [`indexer/src/operator/db_transaction_writer.rs`](../indexer/src/operator/db_transaction_writer.rs)
 

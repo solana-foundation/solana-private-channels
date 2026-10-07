@@ -2074,6 +2074,33 @@ async fn try_requeue_processing_increments_recovery_counter(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn try_fail_processing_refuses_an_earlier_incarnation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("fail_fence", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let stale = updated_at_of(&pool, id).await;
+    assert!(storage.try_requeue_processing(id, stale).await?);
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    assert!(
+        !storage.try_fail_processing(id, stale).await?,
+        "a lease from the earlier incarnation must not fail the row"
+    );
+    assert_eq!(status_of(&pool, id).await, "processing");
+
+    let current = updated_at_of(&pool, id).await;
+    assert!(storage.try_fail_processing(id, current).await?);
+    assert_eq!(status_of(&pool, id).await, "failed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
@@ -2426,20 +2453,29 @@ async fn try_requeue_prebroadcast_requeues_under_cap_then_caps(
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let first_lock = updated_at_of(&pool, id).await;
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 1).await?,
+        storage.try_requeue_prebroadcast(id, first_lock, 1).await?,
         RequeueOutcome::Requeued { attempts: 1 }
     );
     assert_eq!(status_of(&pool, id).await, "pending");
     assert_eq!(requeue_attempts_of(&pool, id).await, 1);
 
-    // At the cap (max 1, attempts 1): leave Processing, counter unchanged.
+    // At the cap (max 1, attempts 1): leave Processing, counter unchanged, but
+    // the write still bumps `updated_at` and hands back the new lease.
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let locked = updated_at_of(&pool, id).await;
+    let RequeueOutcome::AtCap { lease } = storage.try_requeue_prebroadcast(id, locked, 1).await?
+    else {
+        panic!("at the cap the write must report AtCap");
+    };
+    assert_ne!(lease, locked, "the capped write must bump updated_at");
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 1).await?,
-        RequeueOutcome::AtCap
+        lease,
+        updated_at_of(&pool, id).await,
+        "the lease must be the row's current updated_at"
     );
     assert_eq!(
         status_of(&pool, id).await,
@@ -2463,13 +2499,52 @@ async fn try_requeue_prebroadcast_not_processing_is_noop() -> Result<(), Box<dyn
     txn.withdrawal_nonce = Some(0);
     let id = storage.insert_db_transaction(&txn).await?;
 
-    // Never locked, so still Pending: the WHERE status = 'processing' finds no row.
+    // Never locked, so still Pending: the WHERE status = 'processing' finds no row,
+    // even with the row's own `updated_at` presented as the lease.
+    let current = updated_at_of(&pool, id).await;
     assert_eq!(
-        storage.try_requeue_prebroadcast(id, 3).await?,
+        storage.try_requeue_prebroadcast(id, current, 3).await?,
         RequeueOutcome::NotProcessing
     );
     assert_eq!(status_of(&pool, id).await, "pending");
     assert_eq!(requeue_attempts_of(&pool, id).await, 0);
+    Ok(())
+}
+
+/// A lease from an earlier incarnation matches nothing, at the cap included, so
+/// a stale attempt neither requeues the row nor bumps the claim it now holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_prebroadcast_refuses_an_earlier_incarnation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("prebroadcast_stale", TransactionType::Withdrawal);
+    txn.withdrawal_nonce = Some(0);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    let stale = updated_at_of(&pool, id).await;
+    assert!(storage.try_requeue_processing(id, stale).await?);
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    let current = updated_at_of(&pool, id).await;
+
+    for max_attempts in [3, 1] {
+        assert_eq!(
+            storage
+                .try_requeue_prebroadcast(id, stale, max_attempts)
+                .await?,
+            RequeueOutcome::NotProcessing,
+            "a stale lease must match nothing (max_attempts {max_attempts})"
+        );
+    }
+    assert_eq!(status_of(&pool, id).await, "processing");
+    assert_eq!(
+        updated_at_of(&pool, id).await,
+        current,
+        "the current claim must survive"
+    );
     Ok(())
 }
 

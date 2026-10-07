@@ -2014,21 +2014,22 @@ impl PostgresDb {
     /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
     /// survives restarts.
     ///
-    /// Deliberately ungated on `updated_at`: it only ever re-arms a row that is
-    /// already going back in the queue, so the worst a stale caller can do is
-    /// requeue an incarnation someone else owns and spend one of its capped
-    /// attempts. It can never authorize a broadcast; that decision is gated by
-    /// `claim_and_persist_signature`, which does present the generational token.
+    /// Gated on `updated_at`, so a stale caller matches nothing. Even at the cap
+    /// the write bumps the row, which would fail the claim of an incarnation
+    /// someone else owns, and the bumped value it returns is only a lease
+    /// because the write proved the caller still owned the row.
     pub async fn try_requeue_prebroadcast_internal(
         &self,
         transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
         max_attempts: i32,
     ) -> Result<RequeueOutcome, sqlx::Error> {
         // One atomic write enforces the cap: the CASE requeues (and increments) only
         // while under max_attempts, otherwise leaves the row Processing. RETURNING the
         // post-update count plus whether the row is now Pending distinguishes the
-        // three outcomes without a separate counter read that could fail.
-        let row: Option<(i32, bool)> = sqlx::query_as(
+        // three outcomes without a separate counter read that could fail. The
+        // trigger bumps `updated_at` even at the cap, so it is returned as the lease.
+        let row: Option<(i32, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
             r#"
             UPDATE transactions
             SET status = CASE WHEN recovery_requeue_attempts < $2
@@ -2038,18 +2039,20 @@ impl PostgresDb {
                               ELSE recovery_requeue_attempts END
             WHERE id = $1
               AND status = 'processing'
-            RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued
+              AND updated_at = $3
+            RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued, updated_at
             "#,
         )
         .bind(transaction_id)
         .bind(max_attempts)
+        .bind(expected_updated_at)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(match row {
             None => RequeueOutcome::NotProcessing,
-            Some((attempts, true)) => RequeueOutcome::Requeued { attempts },
-            Some((_, false)) => RequeueOutcome::AtCap,
+            Some((attempts, true, _)) => RequeueOutcome::Requeued { attempts },
+            Some((_, false, lease)) => RequeueOutcome::AtCap { lease },
         })
     }
 
@@ -2218,6 +2221,30 @@ impl PostgresDb {
         .bind(expected_updated_at)
         .bind(counterpart_signature)
         .bind(release_signatures)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Processing` → `Failed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_fail_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'failed',
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
         .execute(&self.pool)
         .await?;
 

@@ -454,7 +454,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} found an instruction whose discriminator it supports but whose payload it cannot decode, so it is refusing to checkpoint past that slot; the deposit or withdrawal row that drives operator processing was never written. Unlike missing_meta the block itself is well-formed, so replaying the slot re-parses identical bytes and fails identically: retrying the same endpoint is a no-op. Repoint the datasource (for Yellowstone, the backfill gap-fill RPC) at an endpoint that serves innerInstructions with stackHeight, or fix the parser if a program's instruction layout changed. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} found an instruction whose discriminator it supports but whose payload it cannot decode, so it is refusing to checkpoint past that slot; the deposit or withdrawal row that drives operator processing was never written. Unlike missing_meta the block itself is well-formed, so replaying the slot re-parses identical bytes and fails identically: retrying the same endpoint is a no-op. Repoint the datasource (for Yellowstone, the backfill gap-fill RPC) at an endpoint that serves complete innerInstructions, or fix the parser if a program's instruction layout changed. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: critical
         data:
@@ -493,7 +493,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed that omits stackHeight on inner instructions, which makes every CPI deposit undecodable) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits stackHeight, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
+          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed with incomplete inner instructions, which leaves CPI deposits without their event) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits complete inner instructions, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
         labels:
           severity: warning
         data:
@@ -986,6 +986,45 @@ groups:
             datasourceUid: prometheus
             model:
               expr: max by (job, program_type) (private_channel_operator_reconciliation_input_dark_ticks)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: operator-alert-delivery-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: alerts-dropped
+        title: "Operator dropped transaction alerts; the webhook stream is incomplete"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) dropped transaction alert webhooks ({{ $labels.error_reason }}): its alert queue was full, a shutdown drain ran out of time, or a post failed (the endpoint errored or did not answer within 10s), most likely because the webhook endpoint is down, slow or hanging. The dropped transactions are recorded in the database and each logged its ERROR line, but nobody was paged for them. A shutdown drop logs their ids as transaction_ids; a failed post logs its id in a 'Failed to send webhook alert for transaction' WARN line. Check the webhook endpoint, then list recent outcomes with: SELECT id, transaction_type, status, updated_at FROM transactions WHERE status IN ('manual_review', 'failed', 'failed_reminted') ORDER BY updated_at DESC."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason=~"alert_queue_full|alert_drain_dropped|alert_post_failed"}[5m])
               instant: true
               refId: A
           - refId: C

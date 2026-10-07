@@ -356,8 +356,8 @@ fn make_mint_builder_for_caller_arm(mint: Pubkey) -> MintToBuilder {
 
 /// Drive the caller arm with `Ok(MintNotInitialized)` after seeding the
 /// mint_builders entry. Pulled out so each test reads as a wire-script plus
-/// assertions block. `claim_lease` is the ownership lease the JIT re-fire
-/// presents; only the Retry outcome needs one.
+/// assertions block. `claim_lease` is the ownership lease the JIT re-fire and
+/// the Transient requeue present; ManualReview outcomes run without one.
 async fn drive_caller_arm_with_jit_setup(
     state: &mut private_channel_indexer::operator::sender::types::SenderState,
     txn_id: i64,
@@ -530,11 +530,12 @@ async fn mint_not_initialized_jit_transient_requeues_deposit() {
     );
 
     let txn_id: i64 = 5004;
+    let claim_lease = chrono::Utc::now();
     if let Storage::Mock(mock_storage) = &*state.storage {
-        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 0);
+        seed_processing_deposit(mock_storage, txn_id, claim_lease, 0);
     }
 
-    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
+    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, Some(claim_lease), &storage_tx).await;
 
     assert!(
         storage_rx.try_recv().is_err(),
@@ -576,11 +577,12 @@ async fn mint_not_initialized_jit_transient_at_cap_leaves_processing() {
     // The cap constant is crate-private to the indexer, so this mirrors its
     // value rather than importing it.
     let txn_id: i64 = 5005;
+    let claim_lease = chrono::Utc::now();
     if let Storage::Mock(mock_storage) = &*state.storage {
-        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 3);
+        seed_processing_deposit(mock_storage, txn_id, claim_lease, 3);
     }
 
-    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
+    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, Some(claim_lease), &storage_tx).await;
 
     assert!(
         storage_rx.try_recv().is_err(),

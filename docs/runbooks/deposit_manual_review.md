@@ -200,10 +200,11 @@ Compare the displayed `Mint authority` to the operator's current
 admin pubkey.
 
 - **Authority mismatch — current authority still accessible.**
-  Treasury / admin signs
+  Treasury / admin signs, with the current operator admin as fee payer
+  since the node requires a configured admin signer,
 
   ```bash
-  spl-token authorize <mint> mint-authority <new-authority>
+  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --url <private-channel-rpc>
   ```
 
   to point the mint at the current operator admin. Then re-arm to
