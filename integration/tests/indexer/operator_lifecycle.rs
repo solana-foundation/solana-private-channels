@@ -1738,7 +1738,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     let user_pubkey = env.users[0].pubkey();
 
     // The release really happens, so nonce 0's bit is genuinely set on-chain.
-    helpers::release_funds_on_chain(
+    let release_sig = helpers::release_funds_on_chain(
         &client,
         &admin,
         env.instance,
@@ -1750,6 +1750,19 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     )
     .await?;
     let balance_after_release = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    // The gate reads the bit at finalized, so the release has to get there first.
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(60);
+    while client
+        .get_signature_status_with_commitment(&release_sig, CommitmentConfig::finalized())
+        .await?
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "release never finalized"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     // The withdrawal row this release belongs to, about to be queued for a remint
     // with a signature that was never broadcast and whose blockhash is long
@@ -1835,6 +1848,8 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         finality_check_attempts: 0,
         release_refused_on_chain: false,
         coverage_slot: None,
+        coverage_checkpoint: None,
+        free_waits: 0,
     });
 
     let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel::<TransactionStatusUpdate>(10);
@@ -1847,6 +1862,14 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         update.status,
         private_channel_indexer::storage::common::models::TransactionStatus::ManualReview,
         "a consumed nonce must escalate rather than remint"
+    );
+    assert!(
+        update
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("consumed on-chain")),
+        "the escalation must come from the bit, not a side path: {:?}",
+        update.error_message
     );
     assert!(
         !update.remint_attempted,

@@ -301,6 +301,11 @@ pub struct PendingRemint {
     /// kept. A restart re-captures a later slot, which only asks for more
     /// coverage than before, never less.
     pub coverage_slot: Option<u64>,
+    /// Escrow checkpoint at the last coverage read; tells a catching-up indexer from a stuck one.
+    pub coverage_checkpoint: Option<u64>,
+    /// Expected waits taken without charging `finality_check_attempts`.
+    /// In memory only: a restart re-captures a later bound, so it starts a fresh wait.
+    pub free_waits: u32,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.

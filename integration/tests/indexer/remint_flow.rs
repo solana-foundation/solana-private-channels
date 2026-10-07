@@ -164,6 +164,8 @@ fn make_pending_remint(
         finality_check_attempts,
         release_refused_on_chain: false,
         coverage_slot: None,
+        coverage_checkpoint: None,
+        free_waits: 0,
     }
 }
 
@@ -190,6 +192,8 @@ fn make_pending_remint_with_lvbh(
         finality_check_attempts,
         release_refused_on_chain: false,
         coverage_slot: None,
+        coverage_checkpoint: None,
+        free_waits: 0,
     }
 }
 
@@ -469,9 +473,10 @@ async fn process_pending_remints_defers_when_sig_within_blockhash_validity() {
     );
     assert_eq!(state.pending_remints.len(), 1, "entry must be re-queued");
     assert_eq!(
-        state.pending_remints[0].finality_check_attempts, 1,
-        "deferral counter must increment by 1"
+        state.pending_remints[0].finality_check_attempts, 0,
+        "an expected liveness wait must not spend an attempt"
     );
+    assert_eq!(state.pending_remints[0].free_waits, 1);
     mock.shutdown().await;
 }
 
@@ -521,7 +526,7 @@ async fn process_pending_remints_defers_when_sig_confirmed_not_finalized() {
         "a confirmed-but-not-finalized sig must defer the remint"
     );
     assert_eq!(state.pending_remints.len(), 1);
-    assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    assert_eq!(state.pending_remints[0].free_waits, 1);
     mock.shutdown().await;
 }
 
@@ -529,8 +534,8 @@ async fn process_pending_remints_defers_when_sig_confirmed_not_finalized() {
 // (d.3) Liveness gate at cap → ManualReview with liveness reason.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Entry already at MAX-1 attempts. On this tick the sig is still live,
-// so the cap fires. The escalation message must identify the cause as
+// Entry already at MAX-1 attempts with its free waits spent. On this tick
+// the sig is still live, so the cap fires. The escalation message must identify the cause as
 // liveness, not an RPC failure, so operators can triage correctly.
 #[tokio::test]
 async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
@@ -541,6 +546,7 @@ async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
     state
         .pending_remints
         .push(make_pending_remint_with_lvbh(96, 8, sig, 1_000, 2));
+    state.pending_remints[0].free_waits = 20;
 
     mock.enqueue(
         "getSignatureStatuses",

@@ -112,6 +112,9 @@ pub(crate) enum ReleaseVerdict {
     NotLanded,
     /// The chain could not answer, which is not the same as answering "no".
     Uncertain(String),
+    /// Finality has not yet passed the attempt's validity window, so the bits cannot answer
+    /// yet. Unlike `Uncertain` this is expected and clears as the chain moves.
+    Pending(String),
 }
 
 /// Prove on-chain whether withdrawal `nonce` was released, before anything acts
@@ -152,7 +155,7 @@ pub(crate) async fn verify_release_landed(
         ));
     };
     if tip_height <= max_lvbh {
-        return ReleaseVerdict::Uncertain(format!(
+        return ReleaseVerdict::Pending(format!(
             "finalized tip height {tip_height} is not past the attempt's last valid block \
              height {max_lvbh}, so the bits are too stale to prove non-release"
         ));
@@ -863,6 +866,8 @@ impl SenderState {
                 // into a manual one. Anything else is held to the ordinary gate.
                 release_refused_on_chain: tx.release_refused_on_chain,
                 coverage_slot: None,
+                coverage_checkpoint: None,
+                free_waits: 0,
             });
         }
 

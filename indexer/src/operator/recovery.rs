@@ -685,7 +685,9 @@ async fn check_withdrawal(
                      recorded broadcast signature"
                 ),
             },
-            ReleaseVerdict::Uncertain(reason) => wait_or_escalate(row, nonce, reason),
+            ReleaseVerdict::Uncertain(reason) | ReleaseVerdict::Pending(reason) => {
+                wait_or_escalate(row, nonce, reason)
+            }
         };
     }
 
@@ -724,7 +726,9 @@ async fn check_withdrawal(
                          recorded signature is dead; the release landed under an unrecorded one"
                     ),
                 },
-                ReleaseVerdict::Uncertain(reason) => wait_or_escalate(row, nonce, reason),
+                ReleaseVerdict::Uncertain(reason) | ReleaseVerdict::Pending(reason) => {
+                    wait_or_escalate(row, nonce, reason)
+                }
             }
         }
         SigFinality::Live(reason) => WithdrawalAction::LeaveProcessing { reason },
@@ -754,7 +758,7 @@ async fn verified_release(
     let label = match &verdict {
         ReleaseVerdict::Landed { .. } => "landed",
         ReleaseVerdict::NotLanded => "not_landed",
-        ReleaseVerdict::Uncertain(_) => "uncertain",
+        ReleaseVerdict::Uncertain(_) | ReleaseVerdict::Pending(_) => "uncertain",
     };
     OPERATOR_RELEASE_VERIFY
         .with_label_values(&[site, label])
