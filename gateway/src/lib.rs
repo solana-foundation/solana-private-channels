@@ -2995,6 +2995,22 @@ mod tests {
         }
     }
 
+    /// A bad config or an outage on the auth path is not a rejected caller, so
+    /// each is counted under what failed.
+    #[test]
+    fn auth_failures_are_labelled_by_what_failed() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, "invalid_params"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "auth_db_error"),
+            (StatusCode::BAD_GATEWAY, "backend_error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "auth_fetch_unavailable"),
+            (StatusCode::UNAUTHORIZED, "auth_rejected"),
+            (StatusCode::FORBIDDEN, "auth_rejected"),
+        ] {
+            assert_eq!(auth_error_type(status), expected, "{status}");
+        }
+    }
+
     /// A served account identical to the one already checked keeps that check's
     /// verdict, wallet lookup included. The auth database here is unreachable,
     /// so a second lookup would turn the reply into a 500.

@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use private_channel_gateway::metrics::{GATEWAY_ERRORS_TOTAL, GATEWAY_HISTORY_SCOPED_TOTAL};
+use private_channel_gateway::metrics::GATEWAY_HISTORY_SCOPED_TOTAL;
 use private_channel_gateway::{serve, Access, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -1513,11 +1513,11 @@ async fn test_checked_methods_pass_through_a_non_json_upstream_error() {
     }
 }
 
-/// A bad config and a database outage are not rejected callers, so neither is
-/// counted as one. The outage hits the second ownership check, after the first
-/// one passed.
+/// The account changed after the first ownership check passed, so the reply is
+/// checked again, and a wallet lookup that fails there refuses it rather than
+/// serving bytes nobody vouched for.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_auth_failures_are_counted_by_what_failed() {
+async fn test_get_account_info_fails_closed_when_the_recheck_cannot_read_wallets() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
 
@@ -1551,8 +1551,8 @@ async fn test_auth_failures_are_counted_by_what_failed() {
     );
     let authorized_reply = json_http_response(&token_account_response(&owner, None));
 
-    // Two ownership fetches, then the second request's forwarded call, just
-    // before which the auth database loses its wallets.
+    // The ownership fetch, then the forwarded call, just before which the auth
+    // database loses its wallets.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend = listener.local_addr().unwrap();
     let wallets_db = pool.clone();
@@ -1561,7 +1561,7 @@ async fn test_auth_failures_are_counted_by_what_failed() {
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf).await;
-            let reply = if served < 2 {
+            let reply = if served == 0 {
                 &authorized_reply
             } else {
                 sqlx::query("DROP TABLE private_channel_auth.verified_wallets")
@@ -1581,28 +1581,6 @@ async fn test_auth_failures_are_counted_by_what_failed() {
     )
     .await;
 
-    let invalid_params = GATEWAY_ERRORS_TOTAL.with_label_values(&["invalid_params"]);
-    let invalid_params_before = invalid_params.get();
-    let res = Client::new()
-        .post(format!("http://{}", addr))
-        .bearer_auth(&token)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getAccountInfo",
-            "params": [token_account, {"encoding": "base58"}]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 400);
-    assert!(
-        invalid_params.get() > invalid_params_before,
-        "a refused config must be counted as invalid_params"
-    );
-
-    let auth_db_error = GATEWAY_ERRORS_TOTAL.with_label_values(&["auth_db_error"]);
-    let auth_db_error_before = auth_db_error.get();
     let res = Client::new()
         .post(format!("http://{}", addr))
         .bearer_auth(&token)
@@ -1616,10 +1594,6 @@ async fn test_auth_failures_are_counted_by_what_failed() {
         .await
         .unwrap();
     assert_eq!(res.status(), 500);
-    assert!(
-        auth_db_error.get() > auth_db_error_before,
-        "a failed wallet lookup must be counted as auth_db_error"
-    );
 }
 
 /// `getTokenAccountBalance` is gated by the same ownership rules as
