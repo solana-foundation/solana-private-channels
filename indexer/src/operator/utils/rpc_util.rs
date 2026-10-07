@@ -59,6 +59,15 @@ fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     }
 }
 
+/// The channel's `getSignatureStatusSnapshot` answer, every field from one committed state.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureStatusSnapshot {
+    pub block_height: u64,
+    pub first_available_block: u64,
+    pub value: Vec<Option<solana_transaction_status::TransactionStatus>>,
+}
+
 pub struct RpcClientWithRetry {
     pub rpc_client: Arc<RpcClient>,
     pub retry_config: RetryConfig,
@@ -444,6 +453,30 @@ impl RpcClientWithRetry {
             || async {
                 self.rpc_client
                     .get_signature_statuses_with_history(signatures)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Statuses, block height and ledger floor from one channel database snapshot.
+    pub async fn get_signature_status_snapshot(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<SignatureStatusSnapshot, Box<client_error::Error>> {
+        let params =
+            serde_json::json!([signatures.iter().map(|s| s.to_string()).collect::<Vec<_>>()]);
+        self.with_retry(
+            "get_signature_status_snapshot",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .send::<SignatureStatusSnapshot>(
+                        RpcRequest::Custom {
+                            method: "getSignatureStatusSnapshot",
+                        },
+                        params.clone(),
+                    )
                     .await
             },
         )

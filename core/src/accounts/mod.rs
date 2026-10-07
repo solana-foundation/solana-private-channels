@@ -19,6 +19,7 @@ pub mod get_last_blocks;
 pub mod get_latest_blockhash;
 pub mod get_latest_slot;
 pub mod get_recent_performance_samples;
+pub mod get_signature_status_snapshot;
 pub mod get_signatures_for_address;
 pub mod get_tip;
 pub mod get_transaction;

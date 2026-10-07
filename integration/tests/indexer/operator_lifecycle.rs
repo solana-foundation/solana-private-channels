@@ -83,6 +83,15 @@ async fn seed_mint_status_allowed(
     Ok(())
 }
 
+/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the operator claims it.
+async fn seed_escrow_checkpoint(
+    storage: &Storage,
+    slot: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage.update_committed_checkpoint("escrow", slot).await?;
+    Ok(())
+}
+
 fn default_operator_config(alert_url: Option<String>) -> OperatorConfig {
     OperatorConfig {
         db_poll_interval: Duration::from_millis(500),
@@ -391,6 +400,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .build();
 
     storage.insert_db_transaction(&deposit_txn).await?;
+    seed_escrow_checkpoint(&storage, 1).await?;
 
     // 3. Start a PrivateChannel core node as the mint target. It reports every
     // found transaction as `finalized` instantly, so the operator's finalized
@@ -486,6 +496,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .transaction_type(TransactionType::Deposit)
         .build();
     storage.insert_db_transaction(&deposit_txn).await?;
+    seed_escrow_checkpoint(&storage, 1).await?;
 
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
@@ -725,6 +736,7 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     .transaction_type(TransactionType::Deposit)
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
+    seed_escrow_checkpoint(&storage, 1).await?;
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
     // error leaves the row Processing for recovery to reconcile against the
@@ -873,6 +885,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         storage.insert_db_transaction(&txn).await?;
         signatures.push(sig);
     }
+    seed_escrow_checkpoint(&storage, 1).await?;
 
     // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
     // The mint target is a PrivateChannel node (instant finality), so balances
@@ -1176,6 +1189,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 #[tokio::test(flavor = "multi_thread")]
 async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use test_utils::channel_shim::ChannelShim;
     use test_utils::operator_helper::start_private_channel_to_solana_operator;
 
     println!("=== Operator Lifecycle: Boot Halts When DB Is Ahead Of The Bitmap ===");
@@ -1255,9 +1269,11 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     .await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    // The validator has no status snapshot, so the operator reads the channel through this.
+    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
-        test_validator.rpc_url(),
+        channel_shim.url(),
         db_url.clone(),
         operator_keypair,
         env.instance,

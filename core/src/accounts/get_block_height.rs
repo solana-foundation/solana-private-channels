@@ -1,6 +1,6 @@
 use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
-    anyhow::Result,
+    anyhow::{Context, Result},
     tracing::warn,
 };
 
@@ -49,14 +49,22 @@ where
 }
 
 async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
-    let pool = db.pool.clone();
+    let mut conn = db
+        .pool
+        .acquire()
+        .await
+        .context("Failed to acquire a connection for the block height")?;
+    read_block_height(&mut conn).await
+}
 
-    match read_block_height_counter(pool.as_ref()).await? {
+/// The durable height on one connection: the counter, else the upgrade fallback below.
+pub(super) async fn read_block_height(conn: &mut sqlx::PgConnection) -> Result<Option<u64>> {
+    match read_block_height_counter(&mut *conn).await? {
         Some(height) => Ok(Some(height)),
         // A node upgrading in place has no counter yet. The last stored block
         // carries the height the old build assigned it, so continuing from there
         // keeps every lastValidBlockHeight a client holds valid.
-        None => last_block_height_postgres(db).await,
+        None => last_block_height(conn).await,
     }
 }
 
@@ -66,11 +74,12 @@ async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64
 ///
 /// The dedup restore refuses this substitute on purpose: it would answer for a
 /// counter deleted from a live ledger and wave a window through unproven.
-async fn last_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
-    let pool = db.pool.clone();
-
+async fn last_block_height<'e, E>(executor: E) -> Result<Option<u64>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let result = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
-        .fetch_one(pool.as_ref())
+        .fetch_one(executor)
         .await;
 
     match result {

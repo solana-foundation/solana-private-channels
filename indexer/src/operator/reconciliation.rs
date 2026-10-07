@@ -8,8 +8,9 @@ use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
 use crate::indexer::checkpoint::program_key;
 use crate::metrics::{
-    OPERATOR_RECONCILIATION_INPUT_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
-    OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL, OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
+    OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT, OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
+    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
+    OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
 use crate::operator::escrow_sweep::{
     channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply, EscrowCustody,
@@ -25,6 +26,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -32,6 +34,9 @@ const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
 const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
 const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Masked-breach alerts waiting for the webhook; past this one is dropped, its log line already written.
+const MASKED_ALERT_QUEUE_CAPACITY: usize = 64;
 
 /// Consecutive beyond-envelope, insolvency-direction ticks required before the
 /// pipelines are frozen. Each tick is a fresh finalized read, so a one-off
@@ -129,6 +134,10 @@ pub async fn run_reconciliation(
         WebhookRetryConfig::new(WEBHOOK_MAX_ATTEMPTS, WEBHOOK_BASE_DELAY, WEBHOOK_MAX_DELAY),
     )
     .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
+    let masked_alerts = MaskedAlerts::spawn(
+        config.reconciliation_webhook_url.clone(),
+        webhook_client.clone(),
+    );
 
     // Orphan-mint dedup state
     let mut previously_alerted_orphans: Option<HashSet<i64>> = None;
@@ -163,6 +172,7 @@ pub async fn run_reconciliation(
             &channel_rpc,
             escrow_instance_id,
             &webhook_client,
+            &masked_alerts,
             &health,
             &mut previously_alerted_orphans,
             &mut breach_counters,
@@ -317,6 +327,7 @@ async fn perform_reconciliation_check(
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
     webhook_client: &WebhookClient,
+    masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut BreachCounters,
@@ -332,6 +343,7 @@ async fn perform_reconciliation_check(
         channel_rpc,
         escrow_instance_id,
         webhook_client,
+        masked_alerts,
         health,
         previously_alerted_orphans,
         breach_counters,
@@ -434,6 +446,7 @@ async fn check_invariants(
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
     webhook_client: &WebhookClient,
+    masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut BreachCounters,
@@ -465,15 +478,17 @@ async fn check_invariants(
     let db_mints = fetch_db_mint_set(storage).await?;
     let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id, &db_mints).await?;
 
-    // Envelope (DB) and channel supply (PrivateChannel RPC) are read here, next to
+    // Channel supply (PrivateChannel RPC) and the envelope (DB) are read here, next to
     // custody, because the supply invariant compares all three as one instant. The ledger
     // wait below costs seconds and must never sit between two readings being compared.
     let mut mints: HashSet<Pubkey> = db_mints.iter().map(|(mint, _)| *mint).collect();
-    // A failure of either input holds the breach counters and skips the tick, so a
-    // transient glitch cannot reset a building breach.
-    let (supply, envelope, supply_missing) =
-        match load_halt_inputs(storage, channel_rpc, &mints).await {
-            Ok(inputs) => inputs,
+    let (supply, anchor, supply_missing) = load_halt_inputs(channel_rpc, &mints).await;
+    // Read last, so every transfer custody or supply already shows has its row. An envelope
+    // failure holds the breach counters and skips the tick, so a glitch cannot reset a breach.
+    let (deposits_after, withdrawals_after) = envelope_bounds(&custody.slots, anchor);
+    let (envelope, adjustment) =
+        match fetch_in_flight_envelope(storage, deposits_after, withdrawals_after).await {
+            Ok(envelope) => envelope,
             Err(e) => {
                 warn!("Skipping halt evaluation this tick (counters held): {}", e);
                 return Ok(TickInputs::Missing(format!("halt inputs unavailable: {e}")));
@@ -508,7 +523,7 @@ async fn check_invariants(
         fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
 
-    evaluate_and_maybe_halt(
+    let masked = evaluate_and_maybe_halt(
         storage,
         config,
         health,
@@ -519,11 +534,15 @@ async fn check_invariants(
         &mints,
         &supply,
         &envelope,
+        &adjustment,
         covered.then_some(&liabilities),
         breach_counters,
         halted,
     )
     .await;
+    for masked_breach in masked {
+        masked_alerts.send(masked_breach);
+    }
 
     Ok(match supply_missing.or(ledger_missing) {
         Some(reason) => TickInputs::Missing(reason),
@@ -691,41 +710,50 @@ async fn fetch_ledger_at(
     Ok((all_mints, liabilities))
 }
 
-/// Query the per-mint in-flight envelope (unsettled amount) as u64.
+/// Query the per-mint in-flight envelope (unsettled amount) and the adjustment for settled
+/// rows above the given bounds, both as u64.
 async fn fetch_in_flight_envelope(
     storage: &Arc<Storage>,
-) -> Result<HashMap<Pubkey, u64>, OperatorError> {
+    deposits_after: Option<u64>,
+    withdrawals_after: Option<u64>,
+) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), OperatorError> {
     let rows = storage
-        .get_in_flight_amounts_by_mint()
+        .get_in_flight_amounts_by_mint(deposits_after, withdrawals_after)
         .await
         .map_err(OperatorError::Storage)?;
-    let mut out = HashMap::new();
+    let mut envelope = HashMap::new();
+    let mut adjustment = HashMap::new();
     for row in rows {
         let mint = parse_mint(&row.mint_address)?;
-        out.insert(mint, envelope_to_u64(&row.in_flight_amount));
+        envelope.insert(mint, envelope_to_u64(&row.in_flight_amount));
+        adjustment.insert(mint, envelope_to_u64(&row.adjustment_amount));
     }
-    Ok(out)
+    Ok((envelope, adjustment))
 }
 
-/// Per-mint channel supply, the in-flight envelope, and why any supply is missing.
-type HaltInputs = (HashMap<Pubkey, u64>, HashMap<Pubkey, u64>, Option<String>);
+/// Slots above which a settled transfer may be missing from a snapshot: deposits from custody,
+/// read no lower than its lowest slot, and withdrawals from supply, which the replica serves
+/// at or past the anchor. A missing bound skips that arm instead of counting all history.
+fn envelope_bounds(
+    custody_slots: &HashMap<Pubkey, u64>,
+    anchor: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    (custody_slots.values().copied().min(), anchor)
+}
 
-/// Load the halt inputs: the in-flight envelope (DB) and per-mint channel supply
-/// (PrivateChannel RPC) for the given mint set. An envelope-query failure skips
-/// the whole tick (one DB read), but a single mint's supply read failing must not
-/// blind the others: that mint is omitted from the returned map and held in
-/// `evaluate_and_maybe_halt`, so a flaky read on one mint cannot suppress
-/// detection on a genuinely over-issued one. The tick is still reported missing, and a
-/// supply read older than the channel's newest recent block counts as failed.
+/// Per-mint channel supply, the channel anchor it was read against, and why any supply is missing.
+type HaltInputs = (HashMap<Pubkey, u64>, Option<u64>, Option<String>);
+
+/// Per-mint channel supply (PrivateChannel RPC). A mint whose read fails, or answers behind the
+/// channel's newest recent block, is omitted and held in `evaluate_and_maybe_halt` so it cannot
+/// blind the others; the tick is still reported missing.
 async fn load_halt_inputs(
-    storage: &Arc<Storage>,
     channel_rpc: &Arc<RpcClientWithRetry>,
     mints: &HashSet<Pubkey>,
-) -> Result<HaltInputs, OperatorError> {
-    let envelope = fetch_in_flight_envelope(storage).await?;
+) -> HaltInputs {
     // No mints means no supply to read, so the channel's freshness does not matter.
     if mints.is_empty() {
-        return Ok((HashMap::new(), envelope, None));
+        return (HashMap::new(), None, None);
     }
     let anchor = match channel_anchor(channel_rpc).await {
         Ok(anchor) => anchor,
@@ -734,7 +762,7 @@ async fn load_halt_inputs(
                 "Channel freshness unknown; holding every supply counter this tick: {}",
                 e.reason
             );
-            return Ok((HashMap::new(), envelope, Some(e.reason)));
+            return (HashMap::new(), None, Some(e.reason));
         }
     };
     let mut supply = HashMap::new();
@@ -758,7 +786,7 @@ async fn load_halt_inputs(
         );
         missing = Some(format!("channel supply for mint {mint}: {reason}"));
     }
-    Ok((supply, envelope, missing))
+    (supply, Some(anchor), missing)
 }
 
 fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
@@ -786,10 +814,13 @@ async fn evaluate_and_maybe_halt(
     mints: &HashSet<Pubkey>,
     supply: &HashMap<Pubkey, u64>,
     envelope: &HashMap<Pubkey, u64>,
+    adjustment: &HashMap<Pubkey, u64>,
     liabilities: Option<&HashMap<Pubkey, u64>>,
     breach_counters: &mut BreachCounters,
     halted: &mut bool,
-) {
+) -> Vec<MaskedBreach> {
+    // Paged by the caller off this path, so a slow webhook never holds back a later halt.
+    let mut masked = Vec::new();
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
     let mut next_counters = BreachCounters {
@@ -807,13 +838,34 @@ async fn evaluate_and_maybe_halt(
             if let Some(&held) = breach_counters.supply.get(&mint) {
                 next_counters.supply.insert(mint, held);
             }
+            OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT
+                .with_label_values(&[&mint.to_string()])
+                .set(0.0);
             continue;
         };
         let c = *custody.get(&mint).unwrap_or(&0);
         let env = *envelope.get(&mint).unwrap_or(&0);
+        let adj = *adjustment.get(&mint).unwrap_or(&0);
         let tolerance = insolvency_tolerance_raw(c, config.reconciliation_tolerance_bps);
+        OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT
+            .with_label_values(&[&mint.to_string()])
+            .set(adj as f64);
 
-        let Some(breach) = evaluate_insolvency(c, s, env, tolerance) else {
+        let Some(breach) = evaluate_insolvency(c, s, env.saturating_add(adj), tolerance) else {
+            // Only a flipped verdict pages: a few seconds of settled rows are normal.
+            if let Some(breach) = evaluate_insolvency(c, s, env, tolerance) {
+                let masked_breach = MaskedBreach {
+                    mint,
+                    breach,
+                    adjustment: adj,
+                };
+                log_masked_breach(&masked_breach);
+                masked.push(masked_breach);
+                // The adjustment can over-count, so a masked tick holds the streak, never resets it.
+                if let Some(&held) = breach_counters.supply.get(&mint) {
+                    next_counters.supply.insert(mint, held);
+                }
+            }
             continue;
         };
 
@@ -825,7 +877,8 @@ async fn evaluate_and_maybe_halt(
             warn!(
                 mint = %mint,
                 supply_gap = breach.supply_gap,
-                envelope = breach.envelope,
+                envelope = env,
+                adjustment = adj,
                 tolerance = breach.tolerance,
                 consecutive_ticks = count,
                 "Supply beyond custody past envelope; halt pending confirmation"
@@ -836,10 +889,10 @@ async fn evaluate_and_maybe_halt(
         // Confirmed insolvency: trip the halt once the flag lands; a failed write retries next tick.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
-             envelope {} tolerance {} over {} consecutive finalized ticks",
-            mint, c, breach.supply_gap, breach.envelope, breach.tolerance, count
+             envelope {} (adjustment {}) tolerance {} over {} consecutive finalized ticks",
+            mint, c, breach.supply_gap, env, adj, breach.tolerance, count
         );
-        error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
+        error!(reason = %reason, adjustment = adj, "RECONCILIATION HALT tripped; freezing both pipelines");
         if trip_halt(
             storage,
             health,
@@ -932,6 +985,7 @@ async fn evaluate_and_maybe_halt(
     }
 
     *breach_counters = next_counters;
+    masked
 }
 
 /// Fire every fail-closed lever for a confirmed insolvency. Each is best-effort
@@ -1030,6 +1084,80 @@ async fn freeze_pipelines(
         }
     }
     in_force
+}
+
+/// A supply breach that only the envelope adjustment explained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaskedBreach {
+    mint: Pubkey,
+    breach: InsolvencyBreach,
+    adjustment: u64,
+}
+
+/// With a lagging backend a masked breach is expected, but the same allowance would also hide
+/// a real shortfall of that size, so it is logged at once and paged.
+fn log_masked_breach(masked: &MaskedBreach) {
+    error!(
+        reconciliation_alert = true,
+        mint = %masked.mint,
+        supply_gap = masked.breach.supply_gap,
+        envelope = masked.breach.envelope,
+        adjustment = masked.adjustment,
+        tolerance = masked.breach.tolerance,
+        "RECONCILIATION ALERT: supply beyond custody is explained only by settled transfers \
+         newer than a snapshot; a lagging RPC backend may be hiding a real shortfall"
+    );
+}
+
+/// Pages masked breaches from its own task, so a slow webhook never delays a halt decision.
+#[derive(Clone, Default)]
+struct MaskedAlerts(Option<mpsc::Sender<MaskedBreach>>);
+
+impl MaskedAlerts {
+    /// Starts the delivery task, which ends once every sender is dropped. No URL, no task.
+    fn spawn(webhook_url: Option<String>, webhook_client: WebhookClient) -> Self {
+        let Some(url) = webhook_url else {
+            return Self(None);
+        };
+        let (tx, mut rx) = mpsc::channel(MASKED_ALERT_QUEUE_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(masked) = rx.recv().await {
+                post_masked_breach(&webhook_client, &url, &masked).await;
+            }
+        });
+        Self(Some(tx))
+    }
+
+    /// Never waits: a full queue drops the page and keeps the tick moving.
+    fn send(&self, masked: MaskedBreach) {
+        let Some(tx) = &self.0 else {
+            return;
+        };
+        let mint = masked.mint;
+        if tx.try_send(masked).is_err() {
+            warn!(mint = %mint, "Masked-breach alert queue full; webhook page dropped");
+        }
+    }
+}
+
+async fn post_masked_breach(webhook_client: &WebhookClient, url: &str, masked: &MaskedBreach) {
+    let payload = serde_json::json!({
+        "alert": "envelope_adjustment_changed_verdict",
+        "mint": masked.mint.to_string(),
+        "supply_gap": masked.breach.supply_gap,
+        "envelope": masked.breach.envelope,
+        "adjustment": masked.adjustment,
+        "tolerance": masked.breach.tolerance,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let context = format!("envelope adjustment for mint {}", masked.mint);
+    if let Err(e) = webhook_client.post_json(url, &payload, &context).await {
+        error!(
+            "Failed to send envelope adjustment webhook after {} attempts: {}",
+            e.attempts(),
+            e.message()
+        );
+    }
 }
 
 /// Posts the inputs-dark halt as `{ halt_reason, dark_ticks, timestamp }`, retrying
@@ -1612,6 +1740,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &HashMap::new(),
             None,
             &mut counters,
             &mut halted,
@@ -1647,6 +1776,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1691,6 +1821,7 @@ mod tests {
                 &db_mints,
                 supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1728,6 +1859,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1747,6 +1879,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &HashMap::new(),
             None,
             &mut counters,
             &mut halted,
@@ -1776,6 +1909,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1798,6 +1932,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &HashMap::new(),
             None,
             &mut counters,
             &mut halted,
@@ -1841,6 +1976,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1887,6 +2023,7 @@ mod tests {
                 &db_mints,
                 supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1932,6 +2069,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -1995,6 +2133,7 @@ mod tests {
             mints,
             supply,
             envelope,
+            &HashMap::new(),
             liabilities,
             counters,
             halted,
@@ -2066,6 +2205,7 @@ mod tests {
             &mints,
             &supply,
             &envelope,
+            &HashMap::new(),
             Some(&liabilities),
             &mut counters,
             &mut halted,
@@ -2724,6 +2864,7 @@ mod tests {
             &fast_rpc(env.channel.url()),
             test_instance(),
             &test_webhook_client(),
+            &MaskedAlerts::default(),
             &None,
             &mut None,
             counters,
@@ -3441,6 +3582,7 @@ mod tests {
             &channel_rpc,
             test_instance(),
             &webhook_client,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3496,6 +3638,7 @@ mod tests {
             &rpc,
             test_instance(),
             &webhook,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3517,6 +3660,7 @@ mod tests {
             &rpc,
             test_instance(),
             &webhook,
+            &MaskedAlerts::default(),
             &None,
             &mut orphans,
             &mut counters,
@@ -3618,6 +3762,476 @@ mod tests {
         set_channel(&mut env, 5_000, 10, 10, 600).await;
 
         assert_eq!(supply_tick(&env, mint).await, (Some(2), 1));
+    }
+
+    // ── settled transfers newer than a snapshot ───────────────────────
+
+    /// Add a `kind` row for `mint` at `slot` with `status`.
+    fn seed_row(
+        mock: &MockStorage,
+        mint: Pubkey,
+        kind: crate::storage::common::models::TransactionType,
+        status: crate::storage::common::models::TransactionStatus,
+        slot: i64,
+        amount: u64,
+    ) {
+        let id = seed_orphan_deposit(mock, &format!("{mint}_{slot}_{amount}"));
+        let mut txs = mock.pending_transactions.lock().unwrap();
+        let row = txs.iter_mut().find(|t| t.id == id).unwrap();
+        row.mint = mint.to_string();
+        row.transaction_type = kind;
+        row.status = status;
+        row.slot = slot;
+        row.amount = TokenAmount(amount);
+    }
+
+    /// Runs `ticks` ticks at zero tolerance and returns whether the halt flag is set.
+    async fn halts_within(env: &TickEnv, ticks: usize) -> bool {
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+        for _ in 0..ticks {
+            run_tick(
+                env,
+                &recon_config_zero_tolerance(),
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+        env.storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// Custody at slot 1 already paid a release whose burn (slot 101) the supply read, anchored
+    /// at the channel's block 100, does not show yet. Fully backed, so it must never halt.
+    #[tokio::test]
+    async fn a_withdrawal_released_above_the_anchor_does_not_breach() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 900, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Withdrawal,
+            TransactionStatus::Completed,
+            CHANNEL_TIP as i64 + 1,
+            100,
+        );
+        assert!(!halts_within(&env, 3).await);
+        assert_eq!(
+            *env.mock.last_envelope_bounds.lock().unwrap(),
+            Some((Some(1), Some(CHANNEL_TIP)))
+        );
+    }
+
+    /// Supply already holds a mint for a deposit at Solana slot 2 that custody, read at slot 1,
+    /// does not show yet.
+    #[tokio::test]
+    async fn a_deposit_minted_above_the_custody_slot_does_not_breach() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 900, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+            2,
+            100,
+        );
+        assert!(!halts_within(&env, 3).await);
+    }
+
+    /// A failed deposit whose mint may have landed is counted like a completed one.
+    #[tokio::test]
+    async fn a_failed_deposit_above_the_custody_slot_is_counted() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 900, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Deposit,
+            TransactionStatus::Failed,
+            2,
+            100,
+        );
+        assert!(!halts_within(&env, 3).await);
+    }
+
+    /// Rows the snapshots already cover explain nothing, so the same gap still halts.
+    #[tokio::test]
+    async fn settled_rows_at_the_bound_still_breach() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        for (kind, slot) in [
+            (TransactionType::Deposit, 1),
+            (TransactionType::Withdrawal, CHANNEL_TIP as i64),
+        ] {
+            let mint = Pubkey::new_unique();
+            let env = tick_env(mint, 900, 1_000).await;
+            seed_checkpoint(&env.mock, 1);
+            seed_row(
+                &env.mock,
+                mint,
+                kind,
+                TransactionStatus::Completed,
+                slot,
+                100,
+            );
+            assert!(halts_within(&env, 3).await, "{kind:?} at its bound");
+        }
+    }
+
+    /// A shortfall bigger than the newer transfers still halts.
+    #[tokio::test]
+    async fn a_shortfall_beyond_the_adjustment_still_halts() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 800, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+            2,
+            100,
+        );
+        assert!(halts_within(&env, 3).await);
+    }
+
+    /// Answer channel supply reads with `supply` at `CHANNEL_TIP`, running `on_read` first.
+    async fn mock_channel_supply_hooked(
+        server: &mut mockito::Server,
+        supply: u64,
+        on_read: impl Fn() + Send + Sync + 'static,
+    ) {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        let mint = spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
+        mint.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{CHANNEL_TIP}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+            prog = spl_token::id(),
+        );
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getAccountInfo"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                on_read();
+                body.clone().into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    /// A deposit indexed and minted after custody was read but before supply, still
+    /// `processing`: the envelope is read after supply, so it is counted, and only once.
+    #[tokio::test]
+    async fn a_deposit_minted_between_the_custody_and_supply_reads_is_counted_once() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        // Gap 100 is explained by the row; gap 150 is not, unless the row were counted twice.
+        for (custody, should_halt) in [(900, false), (850, true)] {
+            let mint = Pubkey::new_unique();
+            let mut env = tick_env(mint, custody, 1_000).await;
+            seed_checkpoint(&env.mock, 1);
+            // Each tick reads supply once; the envelope must not have been read yet that tick.
+            let early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (mock, seen, n) = (env.mock.clone(), early.clone(), reads.clone());
+            env.channel.reset();
+            mock_fresh_channel_clock(&mut env.channel).await;
+            mock_channel_supply_hooked(&mut env.channel, 1_000, move || {
+                let tick = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if mock.calls("get_in_flight_amounts_by_mint") != tick {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let raced = mock
+                    .pending_transactions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.mint == mint.to_string());
+                if !raced {
+                    seed_row(
+                        &mock,
+                        mint,
+                        TransactionType::Deposit,
+                        TransactionStatus::Processing,
+                        2,
+                        100,
+                    );
+                }
+            })
+            .await;
+            assert_eq!(
+                halts_within(&env, 3).await,
+                should_halt,
+                "custody {custody}"
+            );
+            assert!(
+                !early.load(std::sync::atomic::Ordering::SeqCst),
+                "the envelope is read after supply"
+            );
+            assert_eq!(env.mock.calls("get_in_flight_amounts_by_mint"), 3);
+        }
+    }
+
+    /// The deposit arm takes the lowest custody slot and the withdrawal arm the channel anchor;
+    /// either missing skips its arm rather than binding 0.
+    #[test]
+    fn envelope_bounds_take_the_lowest_custody_slot_and_the_anchor() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let slots = HashMap::from([(a, 40u64), (b, 7u64)]);
+        assert_eq!(envelope_bounds(&slots, Some(100)), (Some(7), Some(100)));
+        assert_eq!(envelope_bounds(&slots, None), (Some(7), None));
+        assert_eq!(
+            envelope_bounds(&HashMap::new(), Some(100)),
+            (None, Some(100))
+        );
+        assert_eq!(envelope_bounds(&HashMap::new(), None), (None, None));
+    }
+
+    /// A tick whose channel has no fresh anchor still reads the envelope without the withdrawal
+    /// arm and holds the supply counter.
+    #[tokio::test]
+    async fn a_tick_without_an_anchor_skips_the_withdrawal_arm() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 900, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        set_channel(&mut env, 1_000, 10, 10, 600).await;
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Withdrawal,
+            TransactionStatus::Completed,
+            1,
+            100,
+        );
+        assert_eq!(supply_tick(&env, mint).await, (Some(2), 1));
+        assert_eq!(
+            *env.mock.last_envelope_bounds.lock().unwrap(),
+            Some((Some(1), None)),
+            "deposit arm at the custody slot, no withdrawal arm"
+        );
+    }
+
+    /// Webhook server expecting `hits` masked-breach alerts.
+    async fn masked_hook(hits: usize) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut hook = mockito::Server::new_async().await;
+        let alert = hook
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"alert": "envelope_adjustment_changed_verdict"}),
+            ))
+            .with_status(200)
+            .expect(hits)
+            .create_async()
+            .await;
+        (hook, alert)
+    }
+
+    /// The alert is raised only when the adjustment turned a breach into no breach, not whenever
+    /// it is non-zero, and the gauge reports it every tick.
+    #[tokio::test]
+    async fn the_adjustment_alerts_only_when_it_changes_the_verdict() {
+        // (custody, adjustment, alerts): supply 1200, envelope 100, zero tolerance.
+        for (custody, adj, alerts) in [(1_000u64, 150u64, 1usize), (1_100, 150, 0), (800, 150, 0)] {
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let mint = Pubkey::new_unique();
+            let mut counters = BreachCounters::default();
+            let masked = evaluate_and_maybe_halt(
+                &storage,
+                &recon_config_zero_tolerance(),
+                &None,
+                &test_webhook_client(),
+                &HashMap::from([(mint, custody)]),
+                1,
+                &HashMap::new(),
+                &HashSet::from([mint]),
+                &HashMap::from([(mint, 1_200u64)]),
+                &HashMap::from([(mint, 100u64)]),
+                &HashMap::from([(mint, adj)]),
+                None,
+                &mut counters,
+                &mut false,
+            )
+            .await;
+            assert_eq!(masked.len(), alerts, "custody {custody}");
+            assert!(masked.iter().all(|m| m.mint == mint && m.adjustment == adj));
+            assert_eq!(
+                crate::metrics::OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT
+                    .with_label_values(&[&mint.to_string()])
+                    .get(),
+                adj as f64
+            );
+        }
+    }
+
+    /// A masked tick is no evidence either way, so it holds a breach streak instead of resetting
+    /// it, and a real shortfall masked every third tick still halts.
+    #[tokio::test]
+    async fn a_masked_tick_holds_the_breach_streak() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+        // Supply 1500 over custody 1000 with envelope 0: a real shortfall of 500. An adjustment
+        // of 600 masks it.
+        for (adj, expected) in [(0u64, 1u32), (0, 2), (600, 2), (0, 3)] {
+            evaluate_and_maybe_halt(
+                &storage,
+                &recon_config_zero_tolerance(),
+                &None,
+                &test_webhook_client(),
+                &HashMap::from([(mint, 1_000u64)]),
+                1,
+                &HashMap::new(),
+                &HashSet::from([mint]),
+                &HashMap::from([(mint, 1_500u64)]),
+                &HashMap::new(),
+                &HashMap::from([(mint, adj)]),
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+            assert_eq!(
+                counters.supply.get(&mint).copied(),
+                Some(expected),
+                "adj {adj}"
+            );
+        }
+        assert!(
+            halted,
+            "the masked tick must not break the streak to a halt"
+        );
+    }
+
+    fn masked_breach() -> MaskedBreach {
+        MaskedBreach {
+            mint: Pubkey::new_unique(),
+            breach: InsolvencyBreach {
+                supply_gap: 200,
+                envelope: 100,
+                tolerance: 0,
+            },
+            adjustment: 150,
+        }
+    }
+
+    /// A queued masked breach reaches the webhook from the delivery task.
+    #[tokio::test]
+    async fn a_queued_masked_breach_is_paged() {
+        let (hook, alert) = masked_hook(1).await;
+        let alerts = MaskedAlerts::spawn(Some(hook.url()), test_webhook_client());
+        alerts.send(masked_breach());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !alert.matched_async().await && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        alert.assert_async().await;
+    }
+
+    /// A full queue drops the page instead of waiting, and no URL means no queue at all.
+    #[tokio::test]
+    async fn a_full_masked_alert_queue_never_waits() {
+        let (tx, _rx) = mpsc::channel(1);
+        let alerts = MaskedAlerts(Some(tx));
+        let sends = async {
+            for _ in 0..=MASKED_ALERT_QUEUE_CAPACITY {
+                alerts.send(masked_breach());
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), sends)
+            .await
+            .expect("send must never wait on a full queue");
+        assert!(MaskedAlerts::spawn(None, test_webhook_client()).0.is_none());
+    }
+
+    /// A webhook that never answers must not hold back a halt decided later in the same pass.
+    #[tokio::test]
+    async fn a_hanging_alert_webhook_does_not_delay_a_halt() {
+        // Accepts connections and never replies, so every post waits out its timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(url),
+            ..recon_config_zero_tolerance()
+        };
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        // Supply 1200 over custody 1000 with envelope 100 is a breach only the adjustment
+        // of 150 explains, while liabilities of 2000 are a real shortfall on its third tick.
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, HALT_CONFIRM_TICKS - 1)]),
+            ..Default::default()
+        };
+        let pass = {
+            let storage = storage.clone();
+            async move {
+                evaluate_and_maybe_halt(
+                    &storage,
+                    &config,
+                    &None,
+                    &test_webhook_client(),
+                    &HashMap::from([(mint, 1_000u64)]),
+                    1,
+                    &HashMap::new(),
+                    &HashSet::from([mint]),
+                    &HashMap::from([(mint, 1_200u64)]),
+                    &HashMap::from([(mint, 100u64)]),
+                    &HashMap::from([(mint, 150u64)]),
+                    Some(&HashMap::from([(mint, 2_000u64)])),
+                    &mut counters,
+                    &mut false,
+                )
+                .await
+            }
+        };
+        let pass = tokio::spawn(pass);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut flag = None;
+        while tokio::time::Instant::now() < deadline {
+            flag = storage.is_reconciliation_halted().await.unwrap();
+            if flag.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pass.abort();
+        assert!(
+            flag.is_some_and(|flag| flag.insolvency),
+            "the liability halt must land while the alert webhook hangs"
+        );
     }
 
     // ── missing inputs (input-dark ticks) ─────────────────────────────
@@ -4010,6 +4624,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -4058,6 +4673,7 @@ mod tests {
                 &mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -4095,6 +4711,7 @@ mod tests {
                 &mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -4216,6 +4833,7 @@ mod tests {
             &fast_rpc(env.channel.url()),
             test_instance(),
             &test_webhook_client(),
+            &MaskedAlerts::default(),
             &Some(health.clone()),
             &mut None,
             counters,
@@ -4261,6 +4879,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &HashMap::new(),
                 None,
                 &mut counters,
                 &mut halted,
@@ -4948,6 +5567,8 @@ mod tests {
     ) -> i64 {
         use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
         use chrono::Utc;
+        // The orphan query only judges deposits the escrow checkpoint covers.
+        seed_checkpoint(mock, 1);
         let mut txs = mock.pending_transactions.lock().unwrap();
         let id = txs.len() as i64 + 1;
         txs.push(DbTransaction {
