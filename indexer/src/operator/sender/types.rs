@@ -300,12 +300,9 @@ pub struct PendingRemint {
     pub coverage_slot: Option<u64>,
     /// Escrow checkpoint at the last coverage read; tells a catching-up indexer from a stuck one.
     pub coverage_checkpoint: Option<u64>,
-    /// Coverage waits taken without charging `finality_check_attempts`.
+    /// Expected waits taken without charging `finality_check_attempts`.
     /// In memory only: a restart re-captures a later bound, so it starts a fresh wait.
-    pub coverage_waits: u32,
-    /// Set the first time the entry reaches the release-record gate, which restarts the
-    /// attempt counter once. In memory only, so a restart grants one more restart.
-    pub record_gate_reached: bool,
+    pub free_waits: u32,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.

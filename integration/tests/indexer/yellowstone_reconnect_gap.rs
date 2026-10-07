@@ -974,3 +974,132 @@ async fn slots_without_their_blocks_are_filled_over_rpc() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     server.shutdown().await;
 }
+
+/// A fill slower than the Slot stream must still finish. Re-arming on every lagging Slot would
+/// abort it each time and restart it from the same checkpoint, so nothing would ever be filled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_fill_is_not_restarted_by_later_slots() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    const CHECKPOINT: u64 = 100;
+    const RESUME: u64 = 101;
+    const RPC_DELAY: Duration = Duration::from_millis(50);
+
+    // Every reply sleeps, so the RPC server gets its own runtime and the indexer's is never blocked.
+    let (url_tx, url_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut rpc_mock = MockitoServer::new_async().await;
+            let _enumeration = rpc_mock
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
+                .with_status(200)
+                .with_body_from_request(|req| {
+                    std::thread::sleep(RPC_DELAY);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body().unwrap()).unwrap();
+                    let start = body["params"][0].as_u64().unwrap();
+                    let end = body["params"][1].as_u64().unwrap();
+                    let slots: Vec<u64> = (start..=end).collect();
+                    json!({"jsonrpc": "2.0", "result": slots, "id": 1})
+                        .to_string()
+                        .into_bytes()
+                })
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let _blocks = rpc_mock
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({"method": "getBlock"})))
+                .with_status(200)
+                .with_body_from_request(|req| {
+                    std::thread::sleep(RPC_DELAY);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(req.body().unwrap()).unwrap();
+                    let slot = body["params"][0].as_u64().unwrap();
+                    json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1})
+                        .to_string()
+                        .into_bytes()
+                })
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            url_tx.send(rpc_mock.url()).unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    let rpc_url = url_rx.recv().unwrap();
+
+    let server = MockYellowstoneServer::start().await;
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_url,
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Confirmed,
+    ));
+    let mock_storage = MockStorage::new();
+    mock_storage.set_checkpoint("escrow", CHECKPOINT);
+    let storage: Arc<Storage> = Arc::new(Storage::Mock(mock_storage));
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(1024);
+    let cancel = CancellationToken::new();
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(rpc_poller, None, 1_000_000, 16)
+    .with_storage(storage);
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // Slots keep coming far faster than one fill batch takes, and never a block.
+    let server = Arc::new(server);
+    let feeder = {
+        let server = server.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut slot = RESUME;
+            while !cancel.is_cancelled() {
+                server.enqueue(UpdateMatcher, Update::ok(slot_update(slot)));
+                slot += 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+
+    let wanted: HashSet<u64> = (RESUME..=RESUME + 32).collect();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !wanted.is_subset(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let mut missing: Vec<_> = wanted.difference(&seen).copied().collect();
+            missing.sort_unstable();
+            panic!("a slow fill never finished; missing: {missing:?}");
+        }
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(remaining, rx.recv()).await
+        {
+            seen.insert(slot);
+        }
+    }
+
+    cancel.cancel();
+    let _ = feeder.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    if let Ok(server) = Arc::try_unwrap(server) {
+        server.shutdown().await;
+    }
+}

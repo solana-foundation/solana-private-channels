@@ -165,8 +165,7 @@ fn make_pending_remint(
         release_refused_on_chain: false,
         coverage_slot: None,
         coverage_checkpoint: None,
-        coverage_waits: 0,
-        record_gate_reached: false,
+        free_waits: 0,
     }
 }
 
@@ -194,8 +193,7 @@ fn make_pending_remint_with_lvbh(
         release_refused_on_chain: false,
         coverage_slot: None,
         coverage_checkpoint: None,
-        coverage_waits: 0,
-        record_gate_reached: false,
+        free_waits: 0,
     }
 }
 

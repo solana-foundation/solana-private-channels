@@ -769,8 +769,13 @@ async fn connect_and_stream(
                     }
                     // Blocks withheld behind a Slot are filled over RPC, or the checkpoint freezes.
                     let covered = last_forwarded.as_ref().map(|b| b.slot).max(gate_target);
-                    if let Some(covered) =
-                        covered.filter(|c| slot_update.slot > c + WITHHELD_BLOCK_SLOTS)
+                    // Re-arming aborts the running fill, so a slow fill finishes and the next Slot extends it.
+                    #[cfg(feature = "datasource-rpc")]
+                    let filling = backfill_handle.as_ref().is_some_and(|h| !h.is_finished());
+                    #[cfg(not(feature = "datasource-rpc"))]
+                    let filling = false;
+                    if let Some(covered) = covered
+                        .filter(|c| !filling && slot_update.slot > c + WITHHELD_BLOCK_SLOTS)
                     {
                         metrics::INDEXER_RPC_ERRORS
                             .with_label_values(&[program_type.as_label(), "chain_break_stream"])
