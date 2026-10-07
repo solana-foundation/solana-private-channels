@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use private_channel_gateway::metrics::GATEWAY_HISTORY_SCOPED_TOTAL;
+use private_channel_gateway::metrics::{GATEWAY_ERRORS_TOTAL, GATEWAY_HISTORY_SCOPED_TOTAL};
 use private_channel_gateway::{serve, Access, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -1106,6 +1106,49 @@ async fn test_get_account_info_refuses_an_account_handed_on_after_the_check() {
     assert_eq!(res.status(), 403);
 }
 
+/// A swap's readers live in its bytes too, so the served swap is checked again.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_refuses_a_swap_the_caller_left_after_the_check() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let caller = [89u8; 32];
+    let other_party = [90u8; 32];
+    let user_b = [91u8; 32];
+    let settlement_authority = [92u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(caller).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let backend = start_mock_backend_with_sequence(vec![
+        swap_dvp_response(&caller, &user_b, &settlement_authority),
+        swap_dvp_response(&other_party, &user_b, &settlement_authority),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [bs58::encode([93u8; 32]).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
 /// The gateway checks the whole account and cuts the reply from it, so every
 /// shape the node serves still works. `base64+zstd` and `jsonParsed` come back
 /// as base64, which clients decode by the reply's own tag, and a slice changes
@@ -1288,9 +1331,10 @@ async fn test_get_account_info_checks_a_handed_on_account_before_cutting_the_sli
     assert_eq!(res.status(), 403);
 }
 
-/// The node refuses base58 for any account as large as a token account, so the
-/// gateway does too. It also rewrites the config before forwarding, so the node
-/// can no longer refuse a malformed one, and the gateway must.
+/// The node refuses base58 for a whole token account. The gateway refuses it
+/// for a slice too, even one the node would encode, rather than re-encode the
+/// cut. It also rewrites the config before forwarding, so the node can no
+/// longer refuse a malformed one, and the gateway must.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_account_info_refuses_base58_and_malformed_token_account_requests() {
     let (pool, _url, _container) = start_postgres().await;
@@ -1313,6 +1357,7 @@ async fn test_get_account_info_refuses_base58_and_malformed_token_account_reques
 
     let refused_configs = [
         json!({"encoding": "base58"}),
+        json!({"encoding": "base58", "dataSlice": {"offset": 32, "length": 32}}),
         json!({"encoding": "binary"}),
         json!({"encoding": "base65"}),
         json!({"dataSlice": {"offset": -1, "length": 32}}),
@@ -1402,6 +1447,179 @@ async fn test_get_account_info_refuses_a_response_it_cannot_check() {
         .unwrap();
 
     assert_eq!(res.status(), 502);
+}
+
+/// The ownership fetch succeeds, then the load balancer in front of the read
+/// tier sheds the forwarded call with an HTML 429. It carries no account, so it
+/// reaches the client as it came, and the client backs off and retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_checked_methods_pass_through_a_non_json_upstream_error() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner = [85u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let account_reply = json_http_response(&token_account_response(&owner, None));
+    let shed_body = "<html><body>429 Too Many Requests</body></html>";
+    let shed_reply = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        shed_body.len(),
+        shed_body
+    );
+    // Each call takes two connections: the ownership fetch, then the forwarded call.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let reply = if served % 2 == 0 {
+                &account_reply
+            } else {
+                &shed_reply
+            };
+            served += 1;
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    for method in ["getAccountInfo", "getTokenAccountBalance"] {
+        let res = Client::new()
+            .post(format!("http://{}", addr))
+            .bearer_auth(&token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": [bs58::encode([86u8; 32]).into_string()]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 429, "{method}");
+        assert_eq!(res.text().await.unwrap(), shed_body, "{method}");
+    }
+}
+
+/// A bad config and a database outage are not rejected callers, so neither is
+/// counted as one. The outage hits the second ownership check, after the first
+/// one passed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_auth_failures_are_counted_by_what_failed() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner = [87u8; 32];
+    let token_account = bs58::encode([88u8; 32]).into_string();
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // Still the caller's, but the balance moved, so it is checked again.
+    let mut moved = vec![0u8; 165];
+    moved[32..64].copy_from_slice(&owner);
+    moved[64..72].copy_from_slice(&1_234_500u64.to_le_bytes());
+    let moved_reply = json_http_response(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": {"slot": LEDGER_TIP},
+                "value": {
+                    "lamports": 2_039_280,
+                    "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "data": [BASE64.encode(&moved), "base64"],
+                    "executable": false,
+                    "rentEpoch": 0
+                }
+            }
+        })
+        .to_string(),
+    );
+    let authorized_reply = json_http_response(&token_account_response(&owner, None));
+
+    // Two ownership fetches, then the second request's forwarded call, just
+    // before which the auth database loses its wallets.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    let wallets_db = pool.clone();
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let reply = if served < 2 {
+                &authorized_reply
+            } else {
+                sqlx::query("DROP TABLE private_channel_auth.verified_wallets")
+                    .execute(&wallets_db)
+                    .await
+                    .unwrap();
+                &moved_reply
+            };
+            served += 1;
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let invalid_params = GATEWAY_ERRORS_TOTAL.with_label_values(&["invalid_params"]);
+    let invalid_params_before = invalid_params.get();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [token_account, {"encoding": "base58"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    assert!(
+        invalid_params.get() > invalid_params_before,
+        "a refused config must be counted as invalid_params"
+    );
+
+    let auth_db_error = GATEWAY_ERRORS_TOTAL.with_label_values(&["auth_db_error"]);
+    let auth_db_error_before = auth_db_error.get();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [token_account]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 500);
+    assert!(
+        auth_db_error.get() > auth_db_error_before,
+        "a failed wallet lookup must be counted as auth_db_error"
+    );
 }
 
 /// `getTokenAccountBalance` is gated by the same ownership rules as

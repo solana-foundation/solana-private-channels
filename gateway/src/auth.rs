@@ -437,9 +437,9 @@ const MAX_OWNER_CHANGES: i64 = 64;
 
 /// The slot ranges `user_id` may read `pubkey`'s history for.
 ///
-/// `None` means no filtering, which only a wallet address gets: it is its own
-/// identity for as long as it exists. `Some(ranges)` keeps only entries whose
-/// slot falls inside one of them, and an empty `Some` hides the page entirely.
+/// `None` means no filtering, which any non-token account gets: its readers
+/// cannot change. `Some(ranges)` keeps only entries whose slot falls inside one
+/// of them, and an empty `Some` hides the page entirely.
 ///
 /// A token account can change hands, so its windows end at the ledger tip read
 /// in the same snapshot as its chain. The chain holds every handoff up to that

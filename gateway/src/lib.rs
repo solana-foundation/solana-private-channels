@@ -55,6 +55,18 @@ const AUTH_TIMEOUT: &str = "auth_timeout";
 /// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
 const READ_CAPACITY: &str = "read_capacity";
 
+/// Metric error type for a request the auth path refused, by the status it was
+/// refused with, so a bad config or an outage is not counted as a rejected caller.
+fn auth_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_params",
+        StatusCode::INTERNAL_SERVER_ERROR => "auth_db_error",
+        StatusCode::BAD_GATEWAY => "backend_error",
+        StatusCode::SERVICE_UNAVAILABLE => "auth_fetch_unavailable",
+        _ => "auth_rejected",
+    }
+}
+
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
 
@@ -1094,7 +1106,7 @@ impl Gateway {
         Ok(is_operator)
     }
 
-    /// Records an auth-rejection metric and builds the error response.
+    /// Records an auth-path failure metric and builds the error response.
     fn reject_with_metrics(
         &self,
         method_label: &str,
@@ -1103,7 +1115,7 @@ impl Gateway {
         start: Instant,
     ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
         Self::record_metrics(
-            Some("auth_rejected"),
+            Some(auth_error_type(status)),
             method_label,
             "none",
             &status.as_u16().to_string(),
@@ -1315,15 +1327,8 @@ impl Gateway {
             }
         };
 
-        // A 503 here is an upstream failure, not a rejected caller, so it stays out
-        // of the auth-rejection panel.
-        let error_type = if status == StatusCode::SERVICE_UNAVAILABLE {
-            "auth_fetch_unavailable"
-        } else {
-            "auth_rejected"
-        };
         Self::record_metrics(
-            Some(error_type),
+            Some(auth_error_type(status)),
             method_label,
             "none",
             &status.as_u16().to_string(),
@@ -1346,8 +1351,11 @@ impl Gateway {
         let Some(auth_db) = &self.auth_db else {
             return Err((StatusCode::INTERNAL_SERVER_ERROR, Some(db_error_body())));
         };
+        // Not JSON, so not the node's answer: a load balancer's 429 or 503 page.
+        // No client parses an account out of it, and serving it keeps the
+        // upstream status clients retry on.
         let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
-            return Err((StatusCode::BAD_GATEWAY, None));
+            return Ok(body);
         };
 
         match check {
@@ -1926,13 +1934,8 @@ impl Gateway {
                     {
                         Ok(Ok(body)) => body,
                         Ok(Err((status, body))) => {
-                            let error_type = if status == StatusCode::BAD_GATEWAY {
-                                "backend_error"
-                            } else {
-                                "auth_rejected"
-                            };
                             Self::record_metrics(
-                                Some(error_type),
+                                Some(auth_error_type(status)),
                                 method_label,
                                 target_label,
                                 &status.as_u16().to_string(),
