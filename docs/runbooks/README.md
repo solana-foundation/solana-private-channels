@@ -31,10 +31,11 @@ dispatch table below routes by webhook + `transaction_type`.
 >
 > **Two halts have no dedicated alert.** The **withdrawal bitmap boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
-> A chain-ahead divergence is repaired at boot and the operator starts; only
-> a database-ahead divergence makes it **refuse to start**, surfacing as a
-> boot-time crash-loop with `Withdrawal bitmap divergence` in the operator
-> logs. Recognize it by that pattern, not a single alert, and not via this
+> A chain-ahead divergence is repaired at boot and the operator starts; a
+> database-ahead divergence, or a check that cannot run at all, makes it
+> **refuse to start**, surfacing as a boot-time crash-loop with
+> `Withdraw boot pre-flight failed, refusing to start` in the operator logs.
+> Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
 > The **`StartSlotAheadOfCheckpoint`** startup refusal is the other: a
