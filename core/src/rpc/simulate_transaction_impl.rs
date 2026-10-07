@@ -664,6 +664,11 @@ mod tests {
             admin_keys: vec![],
             max_blockhashes: 150,
             simulation_permits: tokio::sync::Semaphore::new(permits),
+            block_list_permits: tokio::sync::Semaphore::new(
+                crate::rpc::constants::block_list_slots(
+                    crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,
+                ),
+            ),
         }
     }
 

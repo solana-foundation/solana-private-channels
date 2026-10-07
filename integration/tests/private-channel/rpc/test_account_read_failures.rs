@@ -12,7 +12,7 @@ use {
         accounts::AccountsDB,
         health::HeartbeatRegistry,
         rpc::{
-            constants::MAX_CONCURRENT_SIMULATIONS,
+            constants::{block_list_slots, MAX_CONCURRENT_SIMULATIONS},
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps,
         },
@@ -63,6 +63,7 @@ async fn start_read_only_rpc() -> (
             admin_keys: vec![],
             max_blockhashes: 150,
             simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
+            block_list_permits: tokio::sync::Semaphore::new(block_list_slots(32)),
         }),
         write_deps: None,
         heartbeats: HeartbeatRegistry::new(),

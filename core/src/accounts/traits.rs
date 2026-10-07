@@ -157,6 +157,10 @@ impl AccountsDB {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
     }
 
+    pub async fn newest_block_slot(&self) -> Result<Option<u64>> {
+        super::get_blocks::newest_block_slot(self).await
+    }
+
     pub async fn get_blocks_with_limit(&self, start_slot: u64, limit: u64) -> Result<Vec<u64>> {
         super::get_blocks_with_limit::get_blocks_with_limit(self, start_slot, limit).await
     }

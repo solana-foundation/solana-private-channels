@@ -25,6 +25,19 @@ pub async fn get_blocks(
     }
 }
 
+/// The newest slot holding a block, read from the same source of truth as the listing.
+pub async fn newest_block_slot(db: &AccountsDB) -> Result<Option<u64>> {
+    let pool = match db {
+        AccountsDB::Postgres(postgres_db) => &postgres_db.pool,
+        AccountsDB::Redis(redis_db) => &redis_db.fallback.pool,
+    };
+    let newest = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
+        .fetch_one(pool.as_ref())
+        .await
+        .context("Failed to query newest block slot")?;
+    Ok(newest.map(|s| s as u64))
+}
+
 async fn get_blocks_postgres(
     db: &PostgresAccountsDB,
     start_slot: u64,

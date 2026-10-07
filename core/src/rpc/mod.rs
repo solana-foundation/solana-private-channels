@@ -98,6 +98,9 @@ mod tests {
             admin_keys: vec![],
             max_blockhashes: TEST_MAX_BLOCKHASHES,
             simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
+            block_list_permits: tokio::sync::Semaphore::new(constants::block_list_slots(
+                crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,
+            )),
         }
     }
 
@@ -466,6 +469,129 @@ mod tests {
         let result =
             get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 500_001, None).await;
         assert!(result.is_err());
+    }
+
+    // ── block listing cap ─────────────────────────────────────────────────
+
+    /// Takes every block listing permit so the next large call finds none free.
+    fn hold_every_block_list_permit(deps: &ReadDeps) -> tokio::sync::SemaphorePermit<'_> {
+        let free = deps.block_list_permits.available_permits() as u32;
+        deps.block_list_permits.try_acquire_many(free).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_block_lists_are_sized_by_the_newest_block() {
+        let (mut db, _pg) = start_pg().await;
+        for slot in [5, 20_000] {
+            db.store_block(make_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+        let deps = make_read_deps(db);
+        let _held = hold_every_block_list_permit(&deps);
+
+        // A large range that starts a few slots below the newest block is a small listing.
+        let near_tip = [
+            (
+                "getBlocks no end",
+                get_blocks_impl::get_blocks_impl(&deps, 19_995, None, None).await,
+            ),
+            (
+                "getBlocks end past the tip",
+                get_blocks_impl::get_blocks_impl(&deps, 19_995, Some(40_000), None).await,
+            ),
+            (
+                "getBlocksWithLimit 500_000",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(
+                    &deps, 19_995, 500_000, None,
+                )
+                .await,
+            ),
+        ];
+        for (name, result) in near_tip {
+            assert_eq!(result.expect(name), vec![20_000], "{name}");
+        }
+
+        // Far below the newest block is still a large listing.
+        let far_below = [
+            (
+                "getBlocks no end",
+                get_blocks_impl::get_blocks_impl(&deps, 0, None, None).await,
+            ),
+            (
+                "getBlocks span 10_001",
+                get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_001), None).await,
+            ),
+            (
+                "getBlocksWithLimit 10_001",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 10_001, None)
+                    .await,
+            ),
+        ];
+        for (name, result) in far_below {
+            let err = result.expect_err(name);
+            assert_eq!(err.code(), error::NODE_AT_CAPACITY_CODE, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncapped_block_lists_are_not_refused() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let _held = hold_every_block_list_permit(&deps);
+
+        // Small spans reach the store, and invalid params are rejected before any permit.
+        let cases = [
+            (
+                "getBlocks span 10_000",
+                get_blocks_impl::get_blocks_impl(&deps, 0, Some(10_000), None).await,
+                error::JSON_RPC_SERVER_ERROR,
+            ),
+            (
+                "getBlocksWithLimit 10_000",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 10_000, None)
+                    .await,
+                error::JSON_RPC_SERVER_ERROR,
+            ),
+            (
+                "getBlocks end before start",
+                get_blocks_impl::get_blocks_impl(&deps, 10, Some(5), None).await,
+                error::INVALID_PARAMS_CODE,
+            ),
+            (
+                "getBlocksWithLimit over max",
+                get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 500_001, None)
+                    .await,
+                error::INVALID_PARAMS_CODE,
+            ),
+        ];
+        for (name, result, code) in cases {
+            let err = result.expect_err(name);
+            assert_eq!(err.code(), code, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_block_lists_release_their_permits() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(20_000, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        let calls = deps.block_list_permits.available_permits() + 1;
+
+        for _ in 0..calls {
+            let blocks = get_blocks_impl::get_blocks_impl(&deps, 0, Some(20_000), None)
+                .await
+                .expect("a free permit is taken and handed back");
+            assert_eq!(blocks, vec![20_000]);
+        }
+    }
+
+    #[test]
+    fn block_list_slots_scale_with_pool() {
+        for (pool, slots) in [(1, 1), (7, 1), (8, 1), (32, 4), (256, 32)] {
+            assert_eq!(constants::block_list_slots(pool), slots, "pool {pool}");
+        }
     }
 
     // ── get_epoch_info ────────────────────────────────────────────────────

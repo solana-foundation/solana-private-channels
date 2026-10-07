@@ -584,6 +584,12 @@ async fn start_services(
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
                 ),
+                // Sized by the same resolver as the pool, so the cap always matches it.
+                block_list_permits: tokio::sync::Semaphore::new(
+                    crate::rpc::constants::block_list_slots(
+                        crate::accounts::postgres::resolve_pool_size(),
+                    ),
+                ),
             })
         }
         NodeMode::Write => None,

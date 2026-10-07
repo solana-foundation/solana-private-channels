@@ -3,7 +3,11 @@ use {
     crate::{
         accounts::AccountsDB,
         rpc::{
-            error::{custom_error, read_not_enabled, write_not_enabled, JSON_RPC_SERVER_ERROR},
+            constants::MAX_UNCAPPED_BLOCK_SPAN,
+            error::{
+                custom_error, node_at_capacity, read_not_enabled, write_not_enabled,
+                JSON_RPC_SERVER_ERROR,
+            },
             get_account_info_impl::get_account_info_impl,
             get_address_index_slot_impl::{get_address_index_slot_impl, AddressIndexSlot},
             get_block_height_impl::get_block_height_impl,
@@ -62,6 +66,7 @@ use {
         collections::LinkedList,
         sync::{atomic::AtomicU64, Arc, RwLock},
     },
+    tokio::sync::SemaphorePermit,
 };
 
 pub struct ReadDeps {
@@ -71,6 +76,37 @@ pub struct ReadDeps {
     pub max_blockhashes: u64,
     /// One permit per running `simulateTransaction`; a call finding none is refused.
     pub simulation_permits: tokio::sync::Semaphore,
+    /// One permit per running block listing wider than `MAX_UNCAPPED_BLOCK_SPAN`.
+    pub block_list_permits: tokio::sync::Semaphore,
+}
+
+impl ReadDeps {
+    /// A permit for a block listing of `span` slots after `start_slot`, or none when the span
+    /// is small enough to run uncapped. Refused rather than queued: the server has no request
+    /// timeout, so a queue would hold connections open behind the running scans.
+    pub(crate) async fn block_list_permit(
+        &self,
+        start_slot: u64,
+        span: u64,
+    ) -> RpcResult<Option<SemaphorePermit<'_>>> {
+        if span <= MAX_UNCAPPED_BLOCK_SPAN {
+            return Ok(None);
+        }
+        // Only blocks up to the newest one can match, so a large span near the tip stays small.
+        let newest = self.accounts_db.newest_block_slot().await.map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get blocks: {}", e),
+            )
+        })?;
+        if newest.map_or(0, |newest| newest.saturating_sub(start_slot)) <= MAX_UNCAPPED_BLOCK_SPAN {
+            return Ok(None);
+        }
+        self.block_list_permits
+            .try_acquire()
+            .map(Some)
+            .map_err(|_| node_at_capacity())
+    }
 }
 
 pub struct WriteDeps {
