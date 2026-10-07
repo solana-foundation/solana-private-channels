@@ -53,8 +53,12 @@ fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     match rpc_err {
         // Method not supported by this RPC endpoint — protocol-level rejection.
         RpcError::RpcResponseError { code: -32601, .. } => true,
-        // "AccountNotFound" is a definitive answer, not a transient failure.
-        RpcError::ForUser(msg) => msg.contains("AccountNotFound"),
+        // "AccountNotFound" is a definitive answer, not a transient failure. The client
+        // prefixes every getAccountInfo failure with it, so a node refusing a min-slot
+        // read only looks permanent. It catches up, so retry it.
+        RpcError::ForUser(msg) => {
+            msg.contains("AccountNotFound") && !msg.contains("RPC response error -32016")
+        }
         _ => false,
     }
 }
