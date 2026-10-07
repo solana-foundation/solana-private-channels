@@ -2236,6 +2236,7 @@ async fn try_requeue_processing_increments_recovery_counter(
 async fn try_fail_processing_refuses_an_earlier_incarnation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
     let txn = make_db_transaction("fail_fence", TransactionType::Deposit);
     let id = storage.insert_db_transaction(&txn).await?;
     storage
