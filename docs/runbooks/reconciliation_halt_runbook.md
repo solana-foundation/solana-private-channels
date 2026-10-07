@@ -32,7 +32,21 @@ mint, each with its own consecutive-tick counter:
 On-chain supply is already net of burns (the program burns channel tokens at
 withdrawal initiation, not at release), so the supply check does **not** trust
 the DB ledger; it catches over-issuance. Its halt reason reads
-`... custody <C> short of supply by <GAP>, envelope <E> tolerance <T> ...`.
+`... custody <C> short of supply by <GAP>, envelope <E> (adjustment <A>) tolerance <T> ...`.
+
+A snapshot can be older than a transfer that already settled: custody read below a
+completed deposit's Solana slot, or supply read below a released withdrawal's burn.
+So the allowance also counts settled deposits above the tick's lowest custody slot and
+settled withdrawals above the channel block the supply reads were checked against; that
+part is the adjustment `<A>`, exported per mint as
+`private_channel_operator_reconciliation_envelope_adjustment_raw`. When the adjustment is
+the only thing keeping a mint from breaching, the operator logs
+`RECONCILIATION ALERT` and posts `{"alert": "envelope_adjustment_changed_verdict", ...}`
+to the reconciliation webhook. Such a masked tick holds the mint's breach count rather
+than resetting it, so a shortfall masked on some ticks still halts once it breaches on
+three ticks that are not clean. One such page is expected under RPC lag; pages that keep
+coming mean a lagging backend could be hiding a real shortfall of that size, so check
+the custody RPC and the channel read node for lag.
 
 The liability check catches a custody drain that the supply check cannot see
 while unminted (`pending`, `failed`, `manual_review`) deposits pad the gap.
@@ -253,13 +267,16 @@ a custody shortfall). Escalate per [`_escalation.md`](_escalation.md); rotate th
 operator/admin key if over-issuance is suspected, and do **not** resume the
 pipelines.
 
-Rotating the channel admin means migrating every receipt mint's authority to the
-new key with SPL `SetAuthority` first. The old key stays the on-chain
-`mint_authority` until you do, so deposits fail with `OwnerMismatch`
-(see [`deposit_failed.md`](deposit_failed.md)) and the old key keeps the ability to
-mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
-rotates on its own. Resync reads each receipt mint's own history as well as the
-new admin's, so deposits the old key minted before the rotation stay terminal.
+Rotating the channel admin means replacing the old key with the new one in
+`PRIVATE_CHANNEL_ADMIN_KEYS` first, then migrating every receipt mint's mint and
+freeze authority to the new key with SPL `SetAuthority`, co-signed by the new
+admin as fee payer. Never migrate while the old key is still listed: until it is
+removed, it can mint and withdraw alone. The old key stays the on-chain
+`mint_authority` until you migrate, so deposits fail with `OwnerMismatch` (see
+[`deposit_failed.md`](deposit_failed.md)). This is separate
+from the escrow `Instance.admin`, which `SetNewAdmin` rotates on its own. Resync
+reads each receipt mint's own history as well as the new admin's, so deposits
+the old key minted before the rotation stay terminal.
 
 The old key also stays each mint's withdraw-fee treasury, exempt from the fee
 and minimum, until a deposit of that mint rewrites it. Sweep its collected fees

@@ -203,9 +203,10 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     let mock = MockRpcServer::start().await;
     mock.enqueue(
-        "getSignatureStatuses",
+        "getSignatureStatusSnapshot",
         Reply::result(json!({
-            "context": {"slot": 200},
+            "blockHeight": 200,
+            "firstAvailableBlock": 0,
             "value": [{
                 "slot": 100,
                 "confirmations": null,
@@ -264,7 +265,7 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     assert_eq!(
-        mock.call_count("getSignatureStatuses"),
+        mock.call_count("getSignatureStatusSnapshot"),
         0,
         "empty-sigs demote must not consult the RPC"
     );
@@ -299,14 +300,11 @@ async fn it2b_deposit_dead_signature_demoted() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Status null + current height (1000) > lvbh (100) → expired/dead.
+    // Null status, height 1000 past lvbh 100, and floor 1 below the journaled slot: dead.
     mock.enqueue(
-        "getSignatureStatuses",
-        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+        "getSignatureStatusSnapshot",
+        Reply::result(json!({"blockHeight": 1000, "firstAvailableBlock": 1, "value": [null]})),
     );
-    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
-    // Ledger floor below the journaled slot, so the window is covered.
-    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(1)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -704,9 +702,9 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // The classifier's status RPC errors every attempt, so Uncertain, so quarantine.
+    // The classifier's snapshot RPC errors every attempt, so Uncertain, so quarantine.
     mock.enqueue_sequence(
-        "getSignatureStatuses",
+        "getSignatureStatusSnapshot",
         vec![
             Reply::error(-32000, "internal"),
             Reply::error(-32000, "internal"),
@@ -770,7 +768,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
         .unwrap();
 
     assert_eq!(
-        mock.call_count("getSignatureStatuses"),
+        mock.call_count("getSignatureStatusSnapshot"),
         0,
         "a malformed stored signature must quarantine before any RPC"
     );

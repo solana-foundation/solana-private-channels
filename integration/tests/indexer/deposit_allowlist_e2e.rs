@@ -62,6 +62,8 @@ async fn start_postgres(
         .await?,
     ));
     storage.init_schema().await?;
+    // Stands in for an indexer whose checkpoint covers every fixture slot, so the orphan query judges them.
+    storage.update_committed_checkpoint("escrow", 1_000).await?;
 
     Ok((storage, container))
 }

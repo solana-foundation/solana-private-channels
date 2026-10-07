@@ -5,7 +5,7 @@ use crate::{
 
 /// Slots are far below `i64::MAX`, so the clamp is unreachable in practice and only
 /// keeps an absurd value from wrapping into a negative bound that matches nothing.
-fn slot_bound(as_of_slot: u64) -> i64 {
+pub(crate) fn slot_bound(as_of_slot: u64) -> i64 {
     i64::try_from(as_of_slot).unwrap_or(i64::MAX)
 }
 

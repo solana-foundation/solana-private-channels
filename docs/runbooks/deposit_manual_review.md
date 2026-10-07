@@ -200,10 +200,11 @@ Compare the displayed `Mint authority` to the operator's current
 admin pubkey.
 
 - **Authority mismatch — current authority still accessible.**
-  Treasury / admin signs
+  Treasury / admin signs, with the current operator admin as fee payer
+  since the node requires a configured admin signer,
 
   ```bash
-  spl-token authorize <mint> mint-authority <new-authority>
+  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --url <private-channel-rpc>
   ```
 
   to point the mint at the current operator admin. Then re-arm to
@@ -309,8 +310,11 @@ are the recovery branches.
 
 #### Step 1 - check whether the gap closed on its own
 
-A race is possible: the gate fired because `mints` was empty at process
-time, but the indexer may have caught up since. Confirm the current state:
+The operator claims a deposit only once the escrow checkpoint
+(`indexer_state.last_committed_slot` for `escrow`) covers its slot, so a
+reconnect repair can no longer cause this refusal. A row quarantined by an
+older operator may still be that race: the mint's history was incomplete at
+process time, but the indexer may have caught up since. Confirm the current state:
 
 ```sql
 SELECT id, signature, mint, slot FROM transactions WHERE id = :transaction_id;

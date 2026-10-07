@@ -835,8 +835,12 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
     // mint_b: a single pending 250.
     insert_transaction(&pool, "b_pend", &mint_b, 250, "deposit", "pending", 7).await?;
 
-    let mut rows = storage.get_in_flight_amounts_by_mint().await?;
+    let mut rows = storage.get_in_flight_amounts_by_mint(None, None).await?;
     rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+    assert!(
+        rows.iter().all(|r| r.adjustment_amount == 0u64),
+        "no bounds, no adjustment"
+    );
 
     let mut by_mint: std::collections::HashMap<String, BigDecimal> = rows
         .into_iter()
@@ -846,5 +850,136 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
     assert_eq!(by_mint.remove(&mint_b), Some(BigDecimal::from(250u64)));
     assert!(by_mint.is_empty(), "no unexpected mints in the envelope");
 
+    Ok(())
+}
+
+/// (in_flight, adjustment) for `mint` under the given bounds.
+async fn envelope_parts(
+    storage: &Storage,
+    mint: &str,
+    deposits_after: Option<u64>,
+    withdrawals_after: Option<u64>,
+) -> Result<(BigDecimal, BigDecimal), Box<dyn std::error::Error>> {
+    let rows = storage
+        .get_in_flight_amounts_by_mint(deposits_after, withdrawals_after)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .find(|r| r.mint_address == mint)
+        .map(|r| (r.in_flight_amount, r.adjustment_amount))
+        .unwrap_or_default())
+}
+
+/// A settled row counts only strictly above its own type's bound: `slot = bound` is excluded,
+/// `bound + 1` included, and a deposit is never judged against the withdrawal bound or back.
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_adjustment_boundary_per_type() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+
+    insert_transaction(&pool, "d_at", &mint, 1, "deposit", "completed", 1_000).await?;
+    insert_transaction(&pool, "d_above", &mint, 2, "deposit", "completed", 1_001).await?;
+    insert_transaction(&pool, "w_at", &mint, 4, "withdrawal", "completed", 10).await?;
+    insert_transaction(&pool, "w_above", &mint, 8, "withdrawal", "completed", 11).await?;
+    // Between the two bounds: above the withdrawal bound only.
+    insert_transaction(&pool, "d_mid", &mint, 16, "deposit", "completed", 500).await?;
+    insert_transaction(&pool, "w_mid", &mint, 32, "withdrawal", "completed", 500).await?;
+
+    let (in_flight, adjustment) = envelope_parts(&storage, &mint, Some(1_000), Some(10)).await?;
+    assert_eq!(in_flight, BigDecimal::from(0u64));
+    assert_eq!(adjustment, BigDecimal::from(2u64 + 8 + 32));
+
+    // One arm at a time.
+    let (_, deposits) = envelope_parts(&storage, &mint, Some(1_000), None).await?;
+    assert_eq!(deposits, BigDecimal::from(2u64));
+    let (_, withdrawals) = envelope_parts(&storage, &mint, None, Some(10)).await?;
+    assert_eq!(withdrawals, BigDecimal::from(8u64 + 32));
+
+    // u64::MAX clamps to i64::MAX and matches nothing rather than wrapping negative.
+    let (_, none) = envelope_parts(&storage, &mint, Some(u64::MAX), Some(u64::MAX)).await?;
+    assert_eq!(none, BigDecimal::from(0u64));
+    Ok(())
+}
+
+/// The same rows and bounds as the Mock storage test give the same sums.
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_adjustment_matches_the_mock() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+
+    insert_transaction(&pool, "r1", &mint, 1, "deposit", "completed", 1_000).await?;
+    insert_transaction(&pool, "r2", &mint, 2, "deposit", "completed", 1_001).await?;
+    insert_transaction(&pool, "r3", &mint, 4, "deposit", "failed", 1_002).await?;
+    insert_transaction(&pool, "r4", &mint, 8, "withdrawal", "completed", 10).await?;
+    insert_transaction(&pool, "r5", &mint, 16, "withdrawal", "manual_review", 11).await?;
+    insert_transaction(&pool, "r6", &mint, 32, "withdrawal", "completed", 5_000).await?;
+    insert_transaction(&pool, "r7", &mint, 64, "deposit", "processing", 2_000).await?;
+
+    let parts = envelope_parts(&storage, &mint, Some(1_000), Some(10)).await?;
+    assert_eq!(
+        parts,
+        (
+            BigDecimal::from(64u64),
+            BigDecimal::from(2u64 + 4 + 16 + 32)
+        )
+    );
+    let (_, adjustment) = envelope_parts(&storage, &mint, Some(1_000), Some(5_000)).await?;
+    assert_eq!(adjustment, BigDecimal::from(2u64 + 4));
+    Ok(())
+}
+
+/// Every status is either in the envelope or counted by its slot arm, never both; a new
+/// status must be classified here before this compiles.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_status_is_counted_exactly_once_above_the_bound(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::models::TransactionStatus::{self, *};
+    fn in_envelope(status: TransactionStatus) -> bool {
+        match status {
+            Pending | Processing | Parked | PendingRemint => true,
+            Completed | Failed | FailedReminted | ManualReview => false,
+        }
+    }
+    let all = [
+        (Pending, "pending"),
+        (Processing, "processing"),
+        (Parked, "parked"),
+        (PendingRemint, "pending_remint"),
+        (Completed, "completed"),
+        (Failed, "failed"),
+        (FailedReminted, "failed_reminted"),
+        (ManualReview, "manual_review"),
+    ];
+    let (pool, storage, _pg) = start_postgres().await?;
+    for (status, label) in all {
+        for kind in ["deposit", "withdrawal"] {
+            let mint = Pubkey::new_unique().to_string();
+            let sig = format!("{label}_{kind}");
+            insert_transaction(&pool, &sig, &mint, 7, kind, label, 50).await?;
+            let parts = envelope_parts(&storage, &mint, Some(10), Some(10)).await?;
+            let (seven, zero) = (BigDecimal::from(7u64), BigDecimal::from(0u64));
+            let expected = if in_envelope(status) {
+                (seven, zero)
+            } else {
+                (zero, seven)
+            };
+            assert_eq!(parts, expected, "{label} {kind}");
+        }
+    }
+    Ok(())
+}
+
+/// Schema init runs at every boot, so the withdrawal slot index must survive a second run.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_slot_index_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage.init_schema().await?;
+    let def: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_transactions_withdrawal_slot'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(def.contains("(slot)"), "{def}");
+    assert!(def.contains("'withdrawal'"), "{def}");
     Ok(())
 }

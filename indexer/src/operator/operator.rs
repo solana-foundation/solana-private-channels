@@ -189,9 +189,8 @@ pub async fn run(
     // diff the on-chain bitmap against the database BEFORE any row is fetched,
     // locked, or processed.
     //
-    // Only a database that claims a release the chain never made is a
-    // refuse-to-start. The opposite direction, a release the chain made that the
-    // database never recorded, is repaired in place and startup continues.
+    // A database that claims a release the chain never made, or a check that could not
+    // run, refuses to start. A release the database never recorded is repaired in place.
     if program_type == crate::config::ProgramType::Withdraw {
         // The main rpc_client is the chain where the instance and releases live.
         let preflight = under_live_lock(
@@ -563,7 +562,7 @@ pub async fn run(
 }
 
 /// Reconcile in-flight releases, then diff the on-chain bitmap against the
-/// database. Only a genuine `BitmapDivergence` returns `Err` (refuse to start).
+/// database. Returns `Ok` only when the check ran and found them consistent.
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
@@ -575,8 +574,7 @@ async fn run_withdraw_preflight(
     // Idempotent passes absorb rows that flip Processing to terminal across iterations.
     const MAX_RECONCILE_PASSES: u32 = 8;
 
-    // Best-effort: a reconcile error must not block startup. Validation is the gate,
-    // and a transient DB error here would otherwise crash-loop the operator at boot.
+    // Best-effort: the bitmap check below is the gate, so a reconcile error only warns.
     if let Err(e) = recovery::boot_reconcile_processing(
         storage,
         rpc_client,
@@ -601,8 +599,7 @@ async fn run_withdraw_preflight(
     // withdrawal and remint the burn. This returns before our sender is spawned,
     // and the sender lock held since startup keeps any other operator's out. The
     // completion runs on that lock's session, so it cannot land once the lock is lost.
-    // Best-effort for the same reason as the reconcile above: validation is the
-    // gate, and a transient error here must not crash-loop the operator.
+    // Best-effort for the same reason as the reconcile above.
     // Time-bounded because startup waits on it: an unbounded pass over a large
     // backlog on a degraded RPC would hold withdrawals down indefinitely.
     if let Err(e) = recovery::reconcile_landed_withdrawals(
@@ -623,36 +620,32 @@ async fn run_withdraw_preflight(
         );
     }
 
-    // Only a genuine divergence is a refuse-to-start. Any other error (instance or
-    // bitmap not yet on-chain, RPC failure, DB read failure) means we could not run
-    // the check at all; start anyway and let the recovery worker re-validate, which
-    // never marks a row Failed. Refusing on those would crash-loop the operator on
-    // any transient boot condition.
-    match sender::validate_bitmap_consistency(
+    // Any result short of a verdict refuses to start. Nothing re-runs this check later,
+    // so starting without it could let a rotation erase the evidence of a divergence.
+    let verdict = sender::validate_bitmap_consistency(
         storage,
         rpc_client,
         fallback_rpc_client,
         Some(instance_pda),
         storage_tx,
     )
-    .await
-    {
-        Ok(()) => Ok(()),
+    .await;
+    match verdict {
+        // Once the sender lock is lost, report that instead of a read error.
+        // A divergence is still reported as itself.
         Err(e)
-            if matches!(
-                e,
-                OperatorError::Program(crate::error::ProgramError::BitmapDivergence { .. })
-            ) =>
+            if cancellation_token.is_cancelled()
+                && !matches!(
+                    e,
+                    OperatorError::Program(crate::error::ProgramError::BitmapDivergence { .. })
+                ) =>
         {
-            Err(e)
+            warn!("Withdrawal bitmap check failed after the sender lock was lost: {e}");
+            Err(OperatorError::SenderLockLostAtBoot {
+                program_type: crate::config::ProgramType::Withdraw,
+            })
         }
-        Err(e) => {
-            warn!(
-                "Could not validate the withdrawal bitmap at boot, starting anyway: {}",
-                e
-            );
-            Ok(())
-        }
+        other => other,
     }
 }
 
@@ -843,6 +836,7 @@ mod tests {
                 error_message: Some("boot reconcile".to_string()),
                 remint_signature: None,
                 remint_attempted: false,
+                alert_only: false,
             })
             .expect("queue the update");
         let handle = tokio::spawn(async move {
@@ -955,7 +949,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
 
-    // Single attempt with negligible backoff so an AccountNotFound resolves fast.
+    // Single attempt with negligible backoff so a failed read resolves fast.
     fn make_rpc_client(url: &str) -> RpcClientWithRetry {
         RpcClientWithRetry::with_retry_config(
             url.to_string(),
@@ -1043,7 +1037,9 @@ mod tests {
         storage: Arc<Storage>,
         client: RpcClientWithRetry,
     ) -> Result<(), OperatorError> {
-        run_preflight_capturing(storage, client).await.0
+        run_preflight_capturing(storage, client, CancellationToken::new())
+            .await
+            .0
     }
 
     /// Same pre-flight, but hands back the status updates it emitted. The
@@ -1052,13 +1048,13 @@ mod tests {
     async fn run_preflight_capturing(
         storage: Arc<Storage>,
         client: RpcClientWithRetry,
+        token: CancellationToken,
     ) -> (
         Result<(), OperatorError>,
         Vec<sender::TransactionStatusUpdate>,
     ) {
         let client = Arc::new(client);
         let (storage_tx, mut rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
-        let token = CancellationToken::new();
         let result = run_withdraw_preflight(
             &storage,
             &client,
@@ -1091,9 +1087,8 @@ mod tests {
         assert!(result.is_ok(), "agreeing state must start: {result:?}");
     }
 
-    /// Regression guard: a bitmap not yet on-chain surfaces as AccountNotFound,
-    /// which must NOT refuse to start. Refusing here would crash-loop the
-    /// operator on a fresh deployment.
+    /// A bitmap not yet on-chain with an empty database must start, or a fresh deployment
+    /// would never come up.
     #[tokio::test]
     async fn preflight_starts_when_bitmap_not_found() {
         let mut server = mockito::Server::new_async().await;
@@ -1102,7 +1097,7 @@ mod tests {
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
             result.is_ok(),
-            "AccountNotFound must start anyway, not refuse: {result:?}"
+            "an absent bitmap with no releases must start: {result:?}"
         );
     }
 
@@ -1120,14 +1115,8 @@ mod tests {
         );
     }
 
-    /// The one refuse-to-start: the database claims a release the chain never
-    /// made, so every later decision would rest on a false history.
-    #[tokio::test]
-    async fn preflight_refuses_to_start_when_db_is_ahead() {
-        let mut server = mockito::Server::new_async().await;
-        let _anchor = mock_finalized_anchor(&mut server);
-        let _account = mock_bitmap_account(&mut server, 0, &[]);
-
+    /// A database holding one Completed withdrawal at `nonce`.
+    fn completed_withdrawal(nonce: i64) -> MockStorage {
         let mock = MockStorage::new();
         let now = chrono::Utc::now();
         mock.pending_transactions
@@ -1144,7 +1133,7 @@ mod tests {
                 amount: TokenAmount(1_000),
                 memo: None,
                 transaction_type: TransactionType::Withdrawal,
-                withdrawal_nonce: Some(7),
+                withdrawal_nonce: Some(nonce),
                 status: TransactionStatus::Completed,
                 created_at: now,
                 updated_at: now,
@@ -1160,9 +1149,19 @@ mod tests {
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
             });
+        mock
+    }
+
+    /// The database claims a release the chain never made, so every later decision
+    /// would rest on a false history.
+    #[tokio::test]
+    async fn preflight_refuses_to_start_when_db_is_ahead() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_account(&mut server, 0, &[]);
 
         let result = run_preflight_with(
-            Arc::new(Storage::Mock(mock)),
+            Arc::new(Storage::Mock(completed_withdrawal(7))),
             make_rpc_client(&server.url()),
         )
         .await;
@@ -1175,6 +1174,123 @@ mod tests {
                 ))
             ),
             "a real divergence must refuse to start: {result:?}"
+        );
+    }
+
+    /// A check that could not run gives no verdict, so the operator must not start.
+    #[tokio::test]
+    async fn preflight_refuses_to_start_when_the_bitmap_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(500)
+            .with_body("node down")
+            .create();
+
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::BitmapUnavailable { .. }
+                ))
+            ),
+            "an unreadable bitmap must refuse to start: {result:?}"
+        );
+    }
+
+    /// No bitmap means no release ever happened, so a Completed row is a false claim.
+    #[tokio::test]
+    async fn preflight_refuses_when_the_bitmap_is_absent_but_the_db_has_releases() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_not_found(&mut server);
+
+        let result = run_preflight_with(
+            Arc::new(Storage::Mock(completed_withdrawal(7))),
+            make_rpc_client(&server.url()),
+        )
+        .await;
+
+        match result {
+            Err(OperatorError::Program(crate::error::ProgramError::BitmapDivergence {
+                db_only,
+                ..
+            })) => assert_eq!(db_only, vec![7]),
+            other => panic!("a release on a missing bitmap must refuse: {other:?}"),
+        }
+    }
+
+    /// A release in a generation the chain has not reached yet is a false claim too.
+    #[tokio::test]
+    async fn preflight_refuses_a_release_above_the_bitmap_generation() {
+        let ahead = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        for bitmap_exists in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server);
+            let _account = if bitmap_exists {
+                mock_bitmap_account(&mut server, 0, &[])
+            } else {
+                mock_bitmap_not_found(&mut server)
+            };
+
+            let result = run_preflight_with(
+                Arc::new(Storage::Mock(completed_withdrawal(ahead as i64))),
+                make_rpc_client(&server.url()),
+            )
+            .await;
+
+            match result {
+                Err(OperatorError::Program(crate::error::ProgramError::BitmapDivergence {
+                    db_only,
+                    ..
+                })) => assert_eq!(db_only, vec![ahead], "bitmap_exists={bitmap_exists}"),
+                other => panic!("bitmap_exists={bitmap_exists}: must refuse, got {other:?}"),
+            }
+        }
+    }
+
+    /// A lost sender lock explains a failed read, but must never hide a real divergence.
+    #[tokio::test]
+    async fn preflight_lock_loss_outranks_only_a_non_verdict() {
+        let lost = CancellationToken::new();
+        lost.cancel();
+
+        // No anchor mock, so the check cannot run.
+        let server = mockito::Server::new_async().await;
+        let (result, _) = run_preflight_capturing(
+            Arc::new(Storage::Mock(MockStorage::new())),
+            make_rpc_client(&server.url()),
+            lost.clone(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OperatorError::SenderLockLostAtBoot { .. })),
+            "a failed read after the lock is lost must report the lost lock: {result:?}"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_account(&mut server, 0, &[]);
+        let (result, _) = run_preflight_capturing(
+            Arc::new(Storage::Mock(completed_withdrawal(7))),
+            make_rpc_client(&server.url()),
+            lost,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::BitmapDivergence { .. }
+                ))
+            ),
+            "a divergence must be reported even after the lock is lost: {result:?}"
         );
     }
 
@@ -1279,6 +1395,7 @@ mod tests {
         let (result, updates) = run_preflight_capturing(
             Arc::new(Storage::Mock(mock.clone())),
             make_rpc_client(&server.url()),
+            CancellationToken::new(),
         )
         .await;
 

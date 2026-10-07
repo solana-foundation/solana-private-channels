@@ -7,6 +7,7 @@ use private_channel_escrow_program_client::{
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 
 const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
@@ -169,6 +170,26 @@ pub async fn fetch_consumed_nonces(
     min_context_slot: Option<u64>,
     commitment: CommitmentConfig,
 ) -> Result<BitmapState, OperatorError> {
+    fetch_bitmap_if_present(rpc_client, bitmap_pda, min_context_slot, commitment)
+        .await?
+        .ok_or_else(|| {
+            ProgramError::BitmapUnavailable {
+                reason: format!("bitmap {bitmap_pda} not found"),
+            }
+            .into()
+        })
+}
+
+/// Same read as `fetch_consumed_nonces`, but a bitmap that was never created is `None`.
+///
+/// Lamports sent to the uncreated address leave a system-owned account with no data. It
+/// holds no release bit either, so it also counts as never created.
+pub async fn fetch_bitmap_if_present(
+    rpc_client: &RpcClientWithRetry,
+    bitmap_pda: &Pubkey,
+    min_context_slot: Option<u64>,
+    commitment: CommitmentConfig,
+) -> Result<Option<BitmapState>, OperatorError> {
     // Named as a bitmap failure rather than a generic transport one because
     // callers branch on it. An unreadable bitmap leaves a withdrawal row alone
     // for the recovery worker, where an error they do not recognise marks the
@@ -180,13 +201,15 @@ pub async fn fetch_consumed_nonces(
             reason: format!("get_account_info({bitmap_pda}): {e}"),
         })?;
 
-    let account = response
-        .value
-        .ok_or_else(|| ProgramError::BitmapUnavailable {
-            reason: format!("bitmap {bitmap_pda} not found"),
-        })?;
+    let Some(account) = response.value else {
+        return Ok(None);
+    };
+    if account.owner == SYSTEM_PROGRAM_ID && account.data.is_empty() {
+        return Ok(None);
+    }
 
     parse_withdrawal_bitmap(&account.data)
+        .map(Some)
         .map_err(|e| match e {
             AccountError::AccountDeserializationFailed { reason, .. } => {
                 AccountError::AccountDeserializationFailed {
@@ -440,6 +463,69 @@ mod tests {
             ),
             "an unreadable bitmap must be distinguishable from any other failure: {err:?}"
         );
+    }
+
+    /// A bitmap that was never created reads as `None` for the boot check, while every
+    /// other caller keeps seeing it as unavailable.
+    #[tokio::test]
+    async fn absent_bitmap_is_none_here_and_unavailable_there() {
+        use crate::error::ProgramError;
+        use crate::operator::utils::rpc_util::RetryConfig;
+        use solana_commitment_config::CommitmentConfig;
+
+        // Lamports sent to the uncreated address leave a system-owned account with no data.
+        let funded_but_uncreated = serde_json::json!({
+            "owner": SYSTEM_PROGRAM_ID.to_string(),
+            "lamports": 1_000u64,
+            "data": ["", "base64"],
+            "executable": false,
+            "rentEpoch": 0
+        });
+        for (label, value) in [
+            ("missing", serde_json::Value::Null),
+            ("system-owned and empty", funded_but_uncreated),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _read = server
+                .mock("POST", "/")
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"context": {"slot": 1}, "value": value}
+                    })
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+            let rpc = RpcClientWithRetry::with_retry_config(
+                server.url(),
+                RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            );
+
+            let present =
+                fetch_bitmap_if_present(&rpc, &pk(9), None, CommitmentConfig::finalized())
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: must be a clean answer: {e:?}"));
+            assert!(present.is_none(), "{label}: must read as absent");
+
+            let err = fetch_consumed_nonces(&rpc, &pk(9), None, CommitmentConfig::finalized())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OperatorError::Program(ProgramError::BitmapUnavailable { .. })
+                ),
+                "{label}: other callers must still see an unavailable bitmap: {err:?}"
+            );
+        }
     }
 
     /// The read runs at the commitment the caller asks for, not the client's, so a release

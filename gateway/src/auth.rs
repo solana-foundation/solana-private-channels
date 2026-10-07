@@ -62,11 +62,13 @@ pub struct Claims {
 
 /// Methods that require a valid JWT with the Operator role.
 /// Callers without a token receive 401; callers with a User-role JWT receive 403.
+/// `getSignatureStatusSnapshot` returns raw errors and opens a DB transaction, so operators only.
 /// `getAddressIndexSlot` is channel internals only resync needs, via the internal listener.
 const OPERATOR_ONLY_METHODS: &[&str] = &[
     "getBlock",
     "getTransaction",
     "simulateTransaction",
+    "getSignatureStatusSnapshot",
     "getAddressIndexSlot",
 ];
 
@@ -827,6 +829,25 @@ mod tests {
     fn operator_only_operator_role_proceeds() {
         let decision = check_request_auth(Some(&claims(Role::Operator)), "getBlock", &json!([]));
         assert!(matches!(decision, AuthDecision::Proceed));
+    }
+
+    /// The snapshot carries raw execution errors and opens a database transaction per call.
+    #[test]
+    fn signature_status_snapshot_is_operator_only() {
+        let method = "getSignatureStatusSnapshot";
+        assert!(is_gated(method));
+        assert!(matches!(
+            check_request_auth(None, method, &json!([])),
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::User)), method, &json!([])),
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+        assert!(matches!(
+            check_request_auth(Some(&claims(Role::Operator)), method, &json!([])),
+            AuthDecision::Proceed
+        ));
     }
 
     /// Resync reads index progress through the internal listener, so nothing

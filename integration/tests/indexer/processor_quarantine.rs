@@ -4,16 +4,15 @@
 //! — when the processor encounters an `OperatorError::InvalidPubkey`
 //! (classified as `Quarantine("invalid_pubkey")`), it must:
 //!
-//!   (a) emit a `ManualReview` status update for the offending row via
-//!       `quarantine_single`
+//!   (a) park the offending row in `ManualReview` via `quarantine_single`
 //!   (b) halt the withdrawal pipeline if this is a withdrawal row
 //!       (`halt_withdrawal_pipeline` + the withdrawal-dispatch arm)
 //!
 //! Strategy: seed a `Deposit` row with a malformed `mint` string
 //! ("definitely-not-base58"). `Pubkey::from_str` fails, the processor
-//! classifies it as Quarantine, and emits a ManualReview update via
-//! the storage writer. We assert the recorded `status_updates`
-//! contains exactly one entry with `ManualReview` status for our row.
+//! classifies it as Quarantine, and parks the row with a CAS on its
+//! claim. The writer only alerts on it, so we assert the row's own
+//! status rather than the writer's `status_updates`.
 //!
 //! Deposits (Escrow program type) don't halt the pipeline — they
 //! quarantine the single row and keep flowing (614-635 path). This
@@ -65,44 +64,46 @@ fn make_bad_deposit(id: i64) -> DbTransaction {
 
 /// A deposit row with an unparseable mint pubkey must be quarantined
 /// to `ManualReview` via the processor's InvalidPubkey → Quarantine
-/// classification. The mock storage should record exactly that update.
+/// classification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn processor_quarantines_deposit_with_malformed_mint_string() {
     let escrow_instance = Pubkey::new_unique();
     let keypair = Keypair::new();
+    let txn_id = 501;
 
     let harness = start_solana_to_private_channel_operator_with_mocks(escrow_instance, keypair)
         .await
         .expect("harness start");
 
-    // Seed the bad row and wait for the processor to quarantine it.
+    // Seed the bad row with a covering checkpoint and wait for the processor to quarantine it.
+    harness.storage.set_checkpoint("escrow", 100);
     harness
         .storage
         .pending_transactions
         .lock()
         .unwrap()
-        .push(make_bad_deposit(501));
+        .push(make_bad_deposit(txn_id));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let found = loop {
-        let updates = harness.storage.status_updates.lock().unwrap().clone();
-        if let Some(hit) = updates
+    let status = loop {
+        let status = harness
+            .storage
+            .pending_transactions
+            .lock()
+            .unwrap()
             .iter()
-            .find(|(id, status, _, _)| *id == 501 && *status == TransactionStatus::ManualReview)
-        {
-            break Some(hit.clone());
-        }
-        if std::time::Instant::now() > deadline {
-            break None;
+            .find(|txn| txn.id == txn_id)
+            .map(|txn| txn.status);
+        if status == Some(TransactionStatus::ManualReview) || std::time::Instant::now() > deadline {
+            break status;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
-    assert!(
-        found.is_some(),
-        "processor must quarantine the malformed deposit to ManualReview within 10s — \
-         got updates {:?}",
-        harness.storage.status_updates.lock().unwrap().clone()
+    assert_eq!(
+        status,
+        Some(TransactionStatus::ManualReview),
+        "processor must quarantine the malformed deposit to ManualReview within 10s"
     );
 
     harness.shutdown().await;
