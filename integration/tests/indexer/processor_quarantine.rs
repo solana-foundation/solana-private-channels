@@ -75,7 +75,8 @@ async fn processor_quarantines_deposit_with_malformed_mint_string() {
         .await
         .expect("harness start");
 
-    // Seed the bad row and wait for the processor to quarantine it.
+    // Seed the bad row with a covering checkpoint and wait for the processor to quarantine it.
+    harness.storage.set_checkpoint("escrow", 100);
     harness
         .storage
         .pending_transactions
