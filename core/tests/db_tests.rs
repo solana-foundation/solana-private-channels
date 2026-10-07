@@ -363,6 +363,119 @@ async fn test_get_transaction_roundtrip() {
     assert_eq!(stored.block_time, 1_700_000_005);
 }
 
+/// Snapshots taken while blocks land must agree: the tx at height k is found iff k <= height.
+#[tokio::test(flavor = "multi_thread")]
+async fn signature_status_snapshot_is_never_split_by_a_concurrent_block() {
+    const BLOCKS: u64 = 200;
+    let (mut writer, _pg) = start_postgres().await;
+    let reader = writer.clone();
+
+    let mut sigs = Vec::new();
+    let mut txs = Vec::new();
+    for _ in 1..=BLOCKS {
+        let tx = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 1);
+        sigs.push(*tx.signature());
+        txs.push(tx);
+    }
+    let processed = make_executed_tx(vec![]);
+
+    // The floor needs at least one block, so the first one lands before reading starts.
+    writer
+        .write_batch(
+            &[],
+            vec![(sigs[0], &txs[0], 1, 1_700_000_001, &processed)],
+            Some(create_test_block_info(1, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_done = done.clone();
+    let reader_sigs = sigs.clone();
+    let reads = tokio::spawn(async move {
+        let mut checked = 0u64;
+        while !reader_done.load(std::sync::atomic::Ordering::SeqCst) {
+            let snapshot = reader
+                .get_signature_status_snapshot(&reader_sigs)
+                .await
+                .unwrap();
+            let height = snapshot.block_height;
+            assert_eq!(snapshot.first_available_block, 1);
+            for (index, found) in snapshot.transactions.iter().enumerate() {
+                let tx_height = index as u64 + 1;
+                assert_eq!(
+                    found.is_some(),
+                    tx_height <= height,
+                    "transaction at height {tx_height} disagrees with snapshot height {height}"
+                );
+            }
+            checked += 1;
+        }
+        checked
+    });
+
+    for k in 2..=BLOCKS {
+        let i = (k - 1) as usize;
+        writer
+            .write_batch(
+                &[],
+                vec![(sigs[i], &txs[i], k, 1_700_000_000 + k as i64, &processed)],
+                Some(create_test_block_info(k, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let checked = reads.await.unwrap();
+    assert!(checked > 0, "the reader never took a snapshot");
+}
+
+/// A missing height counter fails the snapshot instead of using the top slot, which runs ahead of the height.
+#[tokio::test(flavor = "multi_thread")]
+async fn signature_status_snapshot_never_substitutes_the_top_slot_for_a_lost_height() {
+    let (mut db, _pg) = start_postgres().await;
+    let tx = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 1);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    // Slot 50 at height 5, as after a long idle stretch.
+    let mut block = create_test_block_info(50, Hash::new_unique());
+    block.block_height = Some(5);
+    db.write_batch(
+        &[],
+        vec![(sig, &tx, 50, 1_700_000_050, &processed)],
+        Some(block),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_signature_status_snapshot(&[sig])
+            .await
+            .unwrap()
+            .block_height,
+        5
+    );
+
+    let AccountsDB::Postgres(ref pg) = db else {
+        panic!("start_postgres returns a Postgres handle");
+    };
+    sqlx::query("DELETE FROM metadata WHERE key = 'block_height'")
+        .execute(pg.pool.as_ref())
+        .await
+        .unwrap();
+
+    let err = match db.get_signature_status_snapshot(&[sig]).await {
+        Ok(snapshot) => panic!(
+            "a lost counter must fail the snapshot, got height {}",
+            snapshot.block_height
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("block height counter is missing"),
+        "unexpected error: {err:#}"
+    );
+}
+
 // ── Slot Commit Guard ─────────────────────────────────────────────────────────
 
 /// A batch whose block does not extend the stored ledger must be rejected whole.

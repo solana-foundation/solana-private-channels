@@ -3185,11 +3185,11 @@ mod tests {
         let _status = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+                r#""method"\s*:\s*"getSignatureStatusSnapshot""#.into(),
             ))
             .with_status(200)
             .with_body(
-                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+                r#"{"jsonrpc":"2.0","result":{"blockHeight":200,"firstAvailableBlock":0,"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
             )
             .create();
 

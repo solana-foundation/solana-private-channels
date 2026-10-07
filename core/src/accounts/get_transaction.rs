@@ -26,12 +26,23 @@ async fn get_transaction_postgres(
     signature: &Signature,
 ) -> Result<Option<StoredTransaction>> {
     let pool = Arc::clone(&db.pool);
+    read_transaction(pool.as_ref(), signature).await
+}
+
+/// The Postgres lookup on any executor, so a caller can run it inside its own transaction.
+pub(super) async fn read_transaction<'e, E>(
+    executor: E,
+    signature: &Signature,
+) -> Result<Option<StoredTransaction>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let sig_bytes = signature.as_ref().to_vec();
     let sig_str = signature.to_string();
 
     let row = sqlx::query("SELECT data FROM transactions WHERE signature = $1")
         .bind(&sig_bytes)
-        .fetch_optional(pool.as_ref())
+        .fetch_optional(executor)
         .await
         .with_context(|| format!("Failed to read transaction {}", sig_str))?;
 

@@ -15,6 +15,7 @@ mod get_first_available_block_impl;
 mod get_latest_blockhash_impl;
 mod get_recent_blockhash_impl;
 mod get_recent_performance_samples_impl;
+mod get_signature_status_snapshot_impl;
 mod get_signature_statuses_impl;
 mod get_signatures_for_address_impl;
 mod get_slot_impl;
@@ -33,6 +34,7 @@ mod simulate_transaction_impl;
 
 pub use {
     api::PrivateChannelRpcServer,
+    get_signature_status_snapshot_impl::RpcStatusSnapshot,
     handler::{create_rpc_module, handle_request},
     rpc_impl::{ReadDeps, WriteDeps},
 };
