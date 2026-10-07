@@ -4379,6 +4379,8 @@ mod tests {
         let txn_id = 31;
         let mock = MockStorage::new();
         push_processing_deposit_row(&mock, txn_id);
+        // Deposits are claimed only once the escrow checkpoint covers their slot.
+        mock.set_checkpoint("escrow", 100);
         let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
         let storage = Storage::Mock(mock.clone());
         assert!(storage
@@ -4967,6 +4969,8 @@ mod tests {
 
         let mock = MockStorage::new();
         push_processing_deposit_row(&mock, txn_id);
+        // Deposits are claimed only once the escrow checkpoint covers their slot.
+        mock.set_checkpoint("escrow", 100);
         let stale_lease = row_updated_at(&mock, txn_id).expect("seeded row present");
         let storage = Storage::Mock(mock.clone());
         assert!(storage

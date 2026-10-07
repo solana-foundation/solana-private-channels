@@ -78,6 +78,9 @@ pub struct MintCache {
     /// Per-mint slot the mint provably existed at, recorded by the caller that
     /// proved it. Absent means unproven, which keeps a missing account retryable.
     existence_floor: HashMap<String, u64>,
+    /// Highest slot a withdrawal gate read has answered at. Slots are chain-wide,
+    /// so no later gate read may answer below it, for any mint.
+    slot_high_water: u64,
 }
 
 /// Outcome of resolving a mint's transfer-hook accounts.
@@ -99,6 +102,7 @@ impl MintCache {
             storage,
             rpc_client: None,
             existence_floor: HashMap::new(),
+            slot_high_water: 0,
         }
     }
 
@@ -107,6 +111,7 @@ impl MintCache {
             storage,
             rpc_client: Some(rpc_client),
             existence_floor: HashMap::new(),
+            slot_high_water: 0,
         }
     }
 
@@ -126,10 +131,20 @@ impl MintCache {
         self.existence_floor.contains_key(&mint.to_string())
     }
 
-    /// The slot this mint was proved to exist at, if any. Doubles as the freshness
-    /// anchor for reads that would otherwise have to establish one.
+    /// The slot this mint was proved to exist at, if any.
     pub fn existence_floor(&self, mint: &Pubkey) -> Option<u64> {
         self.existence_floor.get(&mint.to_string()).copied()
+    }
+
+    /// Raise the high-water mark to `slot` if it is higher. Gate reads call this
+    /// before any bail, so a blocked gate cannot leave it behind.
+    pub fn observe_slot(&mut self, slot: u64) {
+        self.slot_high_water = self.slot_high_water.max(slot);
+    }
+
+    /// The highest slot a gate read has answered at, or 0 before the first.
+    pub fn slot_high_water(&self) -> u64 {
+        self.slot_high_water
     }
 
     /// Mint decimals from the DB, or from RPC when no DB row exists.
@@ -159,15 +174,17 @@ impl MintCache {
     /// Live check of the `PausableConfig.paused` flag. Intended for the
     /// pre-flight pause check in the operator's ReleaseFunds path: only
     /// call this once the reviewed profile says the mint is pausable.
-    pub async fn check_paused(&self, mint: &Pubkey) -> Result<bool, OperatorError> {
-        let floor = self.existence_floor(mint);
+    ///
+    /// `min_slot` is the slot the withdrawal's `AllowedMint` read answered at, so a
+    /// backend that has not seen an unpause cannot answer.
+    pub async fn check_paused(&self, mint: &Pubkey, min_slot: u64) -> Result<bool, OperatorError> {
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError("check_paused requires an RPC client".to_string())
         })?;
 
         // Same split as the metadata fetch: a proven-absent mint is deterministic,
         // an unreachable or unconvinced node is not.
-        let account = read_target_mint_account(rpc, mint, floor).await?;
+        let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
 
         let state =
             StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
@@ -190,21 +207,21 @@ impl MintCache {
     }
 
     /// Hook program the mint's `TransferHook` points at, or `None` for a mint
-    /// with no hook.
+    /// with no hook. Read at or past `min_slot`, as `check_paused` is.
     async fn transfer_hook_program(
         &mut self,
         mint: &Pubkey,
+        min_slot: u64,
     ) -> Result<Option<Pubkey>, OperatorError> {
         let mint_str = mint.to_string();
 
-        let floor = self.existence_floor(mint);
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError(format!(
                 "MintCache needs RPC to resolve the transfer hook for mint {mint_str}",
             ))
         })?;
 
-        let account = read_target_mint_account(rpc, mint, floor).await?;
+        let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
 
         let state =
             StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
@@ -229,6 +246,7 @@ impl MintCache {
     /// Resolved per withdrawal rather than cached, since an
     /// `ExtraAccountMetaList` can derive accounts from the amount and
     /// destination.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_hook_extras(
         &mut self,
         mint: &Pubkey,
@@ -237,8 +255,9 @@ impl MintCache {
         authority: &Pubkey,
         amount: u64,
         max_extras: usize,
+        min_slot: u64,
     ) -> Result<HookExtras, OperatorError> {
-        let Some(hook_program) = self.transfer_hook_program(mint).await? else {
+        let Some(hook_program) = self.transfer_hook_program(mint, min_slot).await? else {
             return Ok(HookExtras::Resolved(Vec::new()));
         };
 
@@ -379,13 +398,16 @@ impl MintCache {
     /// `get_ata_balance` so a delegated mint's balance check keeps its own
     /// round-trip; only a mint that is both freezable and delegated pays twice.
     /// Only call this after `has_freeze_authority` came back true.
-    pub async fn is_ata_frozen(&self, ata: &Pubkey) -> Result<bool, OperatorError> {
+    ///
+    /// `min_slot` is the slot the withdrawal's `AllowedMint` read answered at, so a
+    /// backend that has not seen a thaw cannot answer.
+    pub async fn is_ata_frozen(&self, ata: &Pubkey, min_slot: u64) -> Result<bool, OperatorError> {
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError("is_ata_frozen requires an RPC client".to_string())
         })?;
 
         let response = rpc
-            .get_account_with_context(ata, rpc.rpc_client.commitment())
+            .get_account_with_context_min_slot(ata, rpc.rpc_client.commitment(), Some(min_slot))
             .await
             .map_err(|e| OperatorError::RpcError(format!("get_account({ata}): {e}")))?;
 
@@ -748,7 +770,7 @@ mod tests {
         let cache = MintCache::new(storage);
 
         let err = cache
-            .is_ata_frozen(&create_test_mint())
+            .is_ata_frozen(&create_test_mint(), 1)
             .await
             .expect_err("is_ata_frozen should require RPC");
         assert!(
@@ -773,7 +795,7 @@ mod tests {
             let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
 
             assert_eq!(
-                cache.is_ata_frozen(&Pubkey::new_unique()).await.unwrap(),
+                cache.is_ata_frozen(&Pubkey::new_unique(), 1).await.unwrap(),
                 frozen
             );
         }
@@ -785,7 +807,7 @@ mod tests {
         let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
 
         let frozen = cache
-            .is_ata_frozen(&Pubkey::new_unique())
+            .is_ata_frozen(&Pubkey::new_unique(), 1)
             .await
             .expect("a missing ATA is not a transient failure");
         assert!(!frozen, "an account that does not exist cannot be frozen");
@@ -927,7 +949,7 @@ mod tests {
         let authority = Pubkey::new_unique();
 
         let resolved = cache
-            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15, 1)
             .await
             .unwrap();
         assert!(
@@ -947,6 +969,22 @@ mod tests {
             StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data).unwrap();
         let hook = state.init_extension::<TransferHook>(true).unwrap();
         hook.program_id = Some(*hook_program).try_into().unwrap();
+        state.base.is_initialized = true;
+        state.pack_base();
+        state.init_account_type().unwrap();
+        data
+    }
+
+    /// A Token-2022 mint carrying `PausableConfig` with `paused` as given.
+    fn pausable_mint_data(paused: bool) -> Vec<u8> {
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&[
+            ExtensionType::Pausable,
+        ])
+        .unwrap();
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data).unwrap();
+        state.init_extension::<PausableConfig>(true).unwrap().paused = paused.into();
         state.base.is_initialized = true;
         state.pack_base();
         state.init_account_type().unwrap();
@@ -989,6 +1027,42 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(body.to_string())
             .expect(reads)
+            .create_async()
+            .await
+    }
+
+    /// Serves `address` to `getAccountInfo` only for a read bound to
+    /// `min_context_slot`, and expects exactly one such read.
+    async fn mock_account_at_slot(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        data: &[u8],
+        min_context_slot: u64,
+    ) -> mockito::Mock {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context": {"slot": min_context_slot},
+                "value": {
+                    "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                    "lamports": 1_000_000u64,
+                    "data": [STANDARD.encode(data), "base64"],
+                    "executable": false,
+                    "rentEpoch": 0
+                }
+            },
+            "id": 1,
+        });
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(address.to_string()),
+                mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{min_context_slot}\b"#)),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(1)
             .create_async()
             .await
     }
@@ -1042,7 +1116,7 @@ mod tests {
         let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
 
         let resolved = cache
-            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15, 1)
             .await
             .unwrap();
 
@@ -1106,6 +1180,7 @@ mod tests {
                 &Pubkey::new_unique(),
                 1_000,
                 max_extras,
+                1,
             )
             .await
             .unwrap();
@@ -1152,6 +1227,7 @@ mod tests {
                 &Pubkey::new_unique(),
                 1_000,
                 15,
+                1,
             )
             .await
             .unwrap();
@@ -1210,7 +1286,7 @@ mod tests {
         let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
 
         let resolved = cache
-            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15, 1)
             .await
             .unwrap();
 
@@ -1261,6 +1337,7 @@ mod tests {
                 &Pubkey::new_unique(),
                 1_000,
                 15,
+                1,
             )
             .await
             .unwrap_err();
@@ -1271,13 +1348,65 @@ mod tests {
         );
     }
 
+    /// The hook-program lookup reads the mint, so it has to carry the slot it is
+    /// given. The validation account is absent, which stops resolution after that
+    /// one read.
+    #[tokio::test]
+    async fn resolve_hook_extras_sends_the_slot_on_the_hook_lookup() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let gate_slot = 42;
+
+        let mut server = mockito::Server::new_async().await;
+        let bound_read = mock_account_at_slot(
+            &mut server,
+            &mint,
+            &hook_mint_data(&hook_program),
+            gate_slot,
+        )
+        .await;
+        mock_account(&mut server, &validation_pda, None, 1).await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(
+                &mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                15,
+                gate_slot,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationMissing),
+            "expected ValidationMissing, got {resolved:?}"
+        );
+        bound_read.assert_async().await;
+    }
+
     #[tokio::test]
     async fn check_paused_errors_without_rpc() {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let cache = MintCache::new(storage);
 
         let err = cache
-            .check_paused(&create_test_mint())
+            .check_paused(&create_test_mint(), 1)
             .await
             .expect_err("check_paused should require RPC");
         assert!(
@@ -1467,10 +1596,9 @@ mod tests {
     async fn check_paused_absent_past_the_allow_slot_is_target_mint_missing() {
         let mint = create_test_mint();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
-        cache.record_existence_floor(&mint, 42);
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
 
-        let err = cache.check_paused(&mint).await.unwrap_err();
+        let err = cache.check_paused(&mint, 42).await.unwrap_err();
 
         assert!(
             matches!(
@@ -1478,22 +1606,6 @@ mod tests {
                 OperatorError::Account(AccountError::TargetMintMissing { pubkey }) if pubkey == mint
             ),
             "absent mint must be deterministic, got: {err:?}"
-        );
-    }
-
-    /// Without an allow slot nothing proves the mint ever existed, so a null could be
-    /// a lagging node. Staying transient keeps a burned withdrawal out of manual review.
-    #[tokio::test]
-    async fn check_paused_absent_without_an_allow_slot_stays_transient() {
-        let mint = create_test_mint();
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
-
-        let err = cache.check_paused(&mint).await.unwrap_err();
-
-        assert!(
-            matches!(err, OperatorError::RpcError(_)),
-            "an unprovable absence must stay retryable, got: {err:?}"
         );
     }
 
@@ -1546,11 +1658,43 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let cache = MintCache::with_rpc(storage, Arc::new(rpc));
 
-        let err = cache.check_paused(&mint).await.unwrap_err();
+        let err = cache.check_paused(&mint, 1).await.unwrap_err();
 
         assert!(
             matches!(err, OperatorError::RpcError(_)),
             "a reachability failure must stay transient, got: {err:?}"
         );
+    }
+
+    /// The pause read has to carry the slot it is given, or a backend from before an
+    /// unpause could answer it.
+    #[tokio::test]
+    async fn check_paused_sends_the_slot_it_is_given() {
+        let mint = create_test_mint();
+        let gate_slot = 42;
+
+        let mut server = mockito::Server::new_async().await;
+        let bound_read =
+            mock_account_at_slot(&mut server, &mint, &pausable_mint_data(false), gate_slot).await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let paused = cache
+            .check_paused(&mint, gate_slot)
+            .await
+            .expect("the node answers a read bound to the slot");
+
+        assert!(!paused);
+        bound_read.assert_async().await;
     }
 }
