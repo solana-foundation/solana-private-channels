@@ -1335,6 +1335,7 @@ mod tests {
     use spl_token_2022::state::{
         Account as Token2022AccountState, AccountState, Mint as Token2022MintState,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fee the seeded mints rows carry, as their AllowMint would have set it.
     const TEST_WITHDRAW_FEE: u64 = 1_000;
@@ -2421,6 +2422,96 @@ mod tests {
             row_status(&storage, txn_id),
             Some(TransactionStatus::Pending),
             "the row must be requeued for another attempt"
+        );
+    }
+
+    /// A backend a slot or two behind the bar refuses the gate read, and the next one
+    /// answers. That skew has to clear inside the read, not restart the operator and
+    /// spend one of the row's requeue attempts.
+    #[tokio::test]
+    async fn a_gate_read_refused_by_a_lagging_backend_is_retried() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+        let tip_slot = 1_000;
+        let allowed_mint = allowed_mint_bytes(false, false, false);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_tip(&mut server, tip_slot);
+        // The first backend has not reached the tip yet, the next one has.
+        let gate_reads = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(allowed_mint_pda.to_string()),
+            ]))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let reply = if gate_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {
+                            "code": -32016,
+                            "message": "Minimum context slot has not been reached"
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "context": {"slot": tip_slot},
+                            "value": {
+                                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                                "lamports": 1_000_000u64,
+                                "data": [STANDARD.encode(&allowed_mint), "base64"],
+                                "executable": false,
+                                "rentEpoch": 0
+                            }
+                        }
+                    })
+                };
+                reply.to_string().into_bytes()
+            })
+            .create();
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::RetryConfig {
+                        max_attempts: 2,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    solana_commitment_config::CommitmentConfig::confirmed(),
+                )),
+            ),
+        };
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "a refusal the next attempt clears must not restart the task: {outcome:?}"
+        );
+        assert!(
+            update.is_none(),
+            "a refusal the next attempt clears must not park the row: {:?}",
+            update.and_then(|parked| parked.error_message)
+        );
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
         );
     }
 
