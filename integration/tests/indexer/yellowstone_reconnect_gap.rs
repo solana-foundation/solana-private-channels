@@ -888,7 +888,6 @@ async fn slots_without_their_blocks_are_filled_over_rpc() {
 
     const CHECKPOINT: u64 = 100;
     const RESUME: u64 = 101;
-    const LAST_SLOT: u64 = 160;
 
     // Every slot is produced and empty, so any range the fill asks for is answered in full.
     let mut rpc_mock = MockitoServer::new_async().await;
@@ -923,7 +922,7 @@ async fn slots_without_their_blocks_are_filled_over_rpc() {
         .create_async()
         .await;
 
-    let server = MockYellowstoneServer::start().await;
+    let server = Arc::new(MockYellowstoneServer::start().await);
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_mock.url(),
         UiTransactionEncoding::Json,
@@ -949,11 +948,23 @@ async fn slots_without_their_blocks_are_filled_over_rpc() {
         .await
         .expect("yellowstone source start");
 
-    // Only Slot updates arrive: the provider drops every block that has no escrow transaction.
-    server.enqueue_sequence((RESUME..=LAST_SLOT).map(|slot| Update::ok(slot_update(slot))));
+    // Only Slot updates arrive, one per slot like a live chain: the provider drops every block
+    // that has no escrow transaction.
+    let feeder = {
+        let server = server.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut slot = RESUME;
+            while !cancel.is_cancelled() {
+                server.enqueue(UpdateMatcher, Update::ok(slot_update(slot)));
+                slot += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
 
     // Well past the arming gate, so only a re-arm from the lagging slots can complete it.
-    let wanted: HashSet<u64> = (RESUME..=LAST_SLOT - 32).collect();
+    let wanted: HashSet<u64> = (RESUME..=RESUME + 27).collect();
     let mut seen: HashSet<u64> = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while !wanted.is_subset(&seen) {
@@ -971,8 +982,11 @@ async fn slots_without_their_blocks_are_filled_over_rpc() {
     }
 
     cancel.cancel();
+    let _ = feeder.await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    server.shutdown().await;
+    if let Ok(server) = Arc::try_unwrap(server) {
+        server.shutdown().await;
+    }
 }
 
 /// A fill slower than the Slot stream must still finish. Re-arming on every lagging Slot would
