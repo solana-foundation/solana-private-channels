@@ -61,6 +61,7 @@ have prefixes.
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
+| `Max retries exceeded` with no recorded release signature | I - quarantined by a zero retry budget | no | `sender/transaction.rs` |
 
 ## An unresolved row holds the bitmap rotation
 
@@ -630,6 +631,27 @@ coordination:
 ```sql
 UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
+```
+
+## Path I - quarantined by a zero retry budget
+
+`error_message` contains `Max retries exceeded` and `pending_release_signatures`
+has no row for the transaction. The operator now refuses to start with
+`retry_max_attempts = 0`, but rows it quarantined before that check existed
+are not repaired by a restart: with no recorded signature the stalled-release
+reconciliation never picks them up. Nothing was broadcast for these rows.
+
+1. Confirm `operator.retry_max_attempts` (`OPERATOR_RETRY_MAX_ATTEMPTS`) is at
+   least 1 on the running operator.
+2. Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
+   verdict: `NOT_LANDED`. If `LANDED`, switch to Path C.
+3. Re-arm the row so the operator sends it again:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id
+   AND status = 'manual_review';
 ```
 
 ## Path H - rotated past generation

@@ -25,6 +25,25 @@ done
 
 INTERVAL_HOURS="${PG_BACKUP_INTERVAL_HOURS:-6}"
 RETENTION="${PG_BACKUP_RETENTION_COUNT:-3}"
+
+# Canonical positive integer, at most 4 digits so the seconds arithmetic cannot overflow.
+# A zero retention would prune the backup just taken, and a zero interval would loop
+# full backups back to back. A leading zero is refused because sh reads "08" as invalid octal.
+require_positive_int() {
+  case "$2" in
+    ''|*[!0-9]*|0*)
+      echo "FATAL: $1 must be a positive integer without a sign or leading zero (got '$2')" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${#2}" -gt 4 ]; then
+    echo "FATAL: $1 must be at most 4 digits (got '$2')" >&2
+    exit 1
+  fi
+}
+require_positive_int PG_BACKUP_INTERVAL_HOURS "${INTERVAL_HOURS}"
+require_positive_int PG_BACKUP_RETENTION_COUNT "${RETENTION}"
+
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 WAL_ARCHIVE_DIR="${WAL_ARCHIVE_DIR:-/wal_archive}"
 MAX_ATTEMPTS=3
@@ -81,6 +100,15 @@ prune_old_backups() {
   done
 }
 
+# True when at least one complete base backup is left. WAL older than the oldest kept
+# backup is deleted, so pruning it with no backup left would destroy the only recovery path.
+backup_remains() {
+  for d in "${BACKUP_DIR}"/base_*; do
+    [ -f "${d}/base.tar.gz" ] && return 0
+  done
+  return 1
+}
+
 prune_old_wal() {
   if [ ! -d "${WAL_ARCHIVE_DIR}" ]; then
     return
@@ -118,7 +146,13 @@ echo "pg-backup: host=${PGHOST} interval=${INTERVAL_HOURS}h retention=${RETENTIO
 while true; do
   if take_backup; then
     prune_old_backups
-    prune_old_wal
+    # Logged, not fatal: exiting would make the container restart and take another full backup.
+    if backup_remains; then
+      echo "[$(date -Iseconds)] Retention verified: ${BACKUP_DIR} holds a complete base backup"
+      prune_old_wal
+    else
+      echo "[$(date -Iseconds)] ERROR: no complete base backup remains after pruning, skipping WAL pruning" >&2
+    fi
   else
     echo "[$(date -Iseconds)] Skipping pruning due to backup failure"
   fi

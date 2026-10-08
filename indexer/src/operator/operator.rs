@@ -42,27 +42,16 @@ pub async fn run(
     // Config checks first: a misconfigured operator must not take the lock or migrate
     // the schema before refusing.
 
-    // The withdraw operator's compensating remint MintTo must broadcast on the source
-    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
-    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
-    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
-    if common_config.program_type == crate::config::ProgramType::Withdraw
-        && common_config.source_rpc_url.is_none()
-    {
-        return Err(OperatorError::InvalidConfig(
-            "source_rpc_url required for Withdraw operator: remints must target the source \
-             PrivateChannel, not the Solana destination"
-                .to_string(),
-        ));
-    }
-
-    // Both roles are bound to one instance: withdraw derives the bitmap and ReleaseFunds
-    // accounts from it, escrow reconciles its custody. Refuse before the fetcher can claim
-    // a row the pipeline could never finish.
+    // Pure config rules (zeros, source chain, instance, escrow alert sink). The withdraw
+    // remint MintTo must broadcast on the source chain, so a blank source URL fails closed.
+    crate::config::validate_operator_startup(&common_config, &config)
+        .map_err(OperatorError::InvalidConfig)?;
+    // Hand the trimmed value on, since the sender builds its client from the raw string.
+    let mut common_config = common_config;
+    common_config.source_rpc_url = crate::config::normalize_optional(common_config.source_rpc_url);
     let Some(escrow_instance) = common_config.escrow_instance_id else {
         return Err(OperatorError::InvalidConfig(
-            "escrow_instance_id required for every operator: withdraw releases and escrow \
-             reconciliation are bound to the instance"
+            "common.escrow_instance_id (COMMON_ESCROW_INSTANCE_ID) required for every operator"
                 .to_string(),
         ));
     };
@@ -1674,5 +1663,155 @@ mod tests {
             TransactionStatus::Pending,
             "no row may be claimed before the refusal"
         );
+    }
+
+    fn startup_fixture(program_type: ProgramType) -> (PrivateChannelIndexerConfig, OperatorConfig) {
+        let common = PrivateChannelIndexerConfig {
+            program_type,
+            storage_type: StorageType::Postgres,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            postgres: PostgresConfig {
+                database_url: String::new(),
+                max_connections: 1,
+            },
+            escrow_instance_id: Some(Pubkey::new_unique()),
+        };
+        let config = OperatorConfig {
+            db_poll_interval: Duration::from_millis(50),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: Duration::from_millis(100),
+            channel_buffer_size: 100,
+            rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: Duration::from_secs(300),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: Some("http://127.0.0.1:1/hook".to_string()),
+            feepayer_monitor_interval: Duration::from_secs(60),
+            confirmation_poll_interval_ms: 400,
+        };
+        (common, config)
+    }
+
+    /// Runs the operator against a mock and returns the verdict plus every storage call it made.
+    async fn run_against_mock(
+        common: PrivateChannelIndexerConfig,
+        config: OperatorConfig,
+    ) -> (Result<(), OperatorError>, Vec<String>) {
+        let mock = MockStorage::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run(Arc::new(Storage::Mock(mock.clone())), common, config, None),
+        )
+        .await
+        .expect("a bad config must be refused at once, not start workers");
+        let calls = mock.call_order.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    /// A zero here panics a channel, busy-loops, or quarantines rows. It must be refused
+    /// before the lock, the schema or any storage call.
+    #[tokio::test]
+    async fn run_refuses_each_zero_value_before_touching_storage() {
+        type Mutate = fn(&mut OperatorConfig);
+        let cases: [(&str, Mutate); 8] = [
+            ("poll_interval_secs", |c| {
+                c.db_poll_interval = Duration::ZERO
+            }),
+            ("batch_size", |c| c.batch_size = 0),
+            ("retry_max_attempts", |c| c.retry_max_attempts = 0),
+            ("retry_base_delay_secs", |c| {
+                c.retry_base_delay = Duration::ZERO
+            }),
+            ("channel_buffer_size", |c| c.channel_buffer_size = 0),
+            ("reconciliation_interval_secs", |c| {
+                c.reconciliation_interval = Duration::ZERO
+            }),
+            ("feepayer_monitor_interval_secs", |c| {
+                c.feepayer_monitor_interval = Duration::ZERO
+            }),
+            ("confirmation_poll_interval_ms", |c| {
+                c.confirmation_poll_interval_ms = 0
+            }),
+        ];
+        for (name, mutate) in cases {
+            for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+                let (common, mut config) = startup_fixture(role);
+                mutate(&mut config);
+                let (result, calls) = run_against_mock(common, config).await;
+                assert!(
+                    matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains(name)),
+                    "{name} = 0 must be refused for {role:?}: {result:?}"
+                );
+                assert!(calls.is_empty(), "{name}: storage was touched: {calls:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn escrow_without_a_webhook_is_refused_before_touching_storage() {
+        for webhook in [None, Some(" ".to_string())] {
+            let (common, mut config) = startup_fixture(ProgramType::Escrow);
+            config.reconciliation_webhook_url = webhook;
+            let (result, calls) = run_against_mock(common, config).await;
+            assert!(
+                matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("reconciliation_webhook_url")),
+                "escrow without an alert sink must be refused: {result:?}"
+            );
+            assert!(calls.is_empty(), "storage was touched: {calls:?}");
+        }
+    }
+
+    /// The withdraw role never reads the webhook, so omitting it must pass the config
+    /// gate. The run then proceeds to storage (and stalls on the unreachable RPC).
+    #[tokio::test]
+    async fn withdraw_without_a_webhook_passes_the_config_gate() {
+        let (common, mut config) = startup_fixture(ProgramType::Withdraw);
+        config.reconciliation_webhook_url = None;
+        let mock = MockStorage::new();
+        let started = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(Arc::new(Storage::Mock(mock.clone())), common, config, None),
+        )
+        .await;
+        if let Ok(Err(OperatorError::InvalidConfig(msg))) = &started {
+            panic!("withdraw must not be refused for a missing webhook: {msg}");
+        }
+        assert!(
+            !mock.call_order.lock().unwrap().is_empty(),
+            "the withdraw operator must reach storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_or_missing_source_rpc_is_refused_for_both_roles() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            for source in [None, Some("".to_string()), Some("  ".to_string())] {
+                let (mut common, config) = startup_fixture(role);
+                common.source_rpc_url = source;
+                let (result, calls) = run_against_mock(common, config).await;
+                assert!(
+                    matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("source_rpc_url")),
+                    "{role:?} without a usable source rpc must be refused: {result:?}"
+                );
+                assert!(calls.is_empty(), "storage was touched: {calls:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_instance_is_refused_for_both_roles_before_touching_storage() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            let (mut common, config) = startup_fixture(role);
+            common.escrow_instance_id = None;
+            let (result, calls) = run_against_mock(common, config).await;
+            assert!(
+                matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("escrow_instance_id")),
+                "{role:?} without an instance must be refused: {result:?}"
+            );
+            assert!(calls.is_empty(), "storage was touched: {calls:?}");
+        }
     }
 }

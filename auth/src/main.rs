@@ -31,7 +31,7 @@ async fn main() {
     info!("Starting private-channel-auth on port {}", config.port);
 
     let pool = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
+        .max_connections(config.database_max_connections.get())
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
         .connect(&config.database_url)
         .await

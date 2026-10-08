@@ -8,7 +8,7 @@ Authentication service for the Solana Private Channels platform. Handles user re
 |---|---|---|
 | `AUTH_PORT` | `8903` | Port to listen on |
 | `AUTH_DATABASE_URL` | — | Postgres connection URL. Connect as `private_channel_auth_runtime`, which may read and write users, challenges and wallets, and nothing else. Creating the schema is `auth-admin migrate`'s job, as its owner. |
-| `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
+| `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. At least 32 bytes after trimming whitespace, or auth refuses to start. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
 | `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |

@@ -166,14 +166,15 @@ pub struct Args {
     /// that hits a gated method occupies one connection for the ownership
     /// check, so this should be sized to match expected peak concurrency.
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
-    pub auth_database_max_connections: u32,
+    pub auth_database_max_connections: NonZeroU32,
 
     /// Maximum number of concurrent client connections per listener. Connections
     /// beyond this are dropped so a flood cannot exhaust file descriptors or memory.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
     pub max_connections: NonZeroUsize,
 
-    /// Maximum concurrent connections from a single client IP.
+    /// Maximum concurrent connections from a single client IP. Must be below
+    /// max_connections, so one client cannot take every slot.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS_PER_IP", default_value = "64")]
     pub max_connections_per_ip: NonZeroUsize,
 
@@ -281,7 +282,8 @@ pub struct Limits {
     /// accepts up to twice this, though only the public one is floodable.
     pub max_connections: NonZeroUsize,
     /// Max concurrent connections from a single client IP, so one host cannot
-    /// consume the whole global connection budget.
+    /// consume the whole global connection budget. `run` requires it strictly below
+    /// `max_connections`, which reserves one slot; the struct itself does not check.
     pub max_connections_per_ip: NonZeroUsize,
     /// Max public requests in flight to the read node. Reads past it get a 503,
     /// so a stalled read node can't take the slots writes need.
@@ -749,8 +751,16 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeadlineIo<T> {
     }
 }
 
-/// Rejects limits that would let reads take every connection slot.
+/// Rejects limits that would let reads or one client take every connection slot.
 fn check_limits(limits: &Limits) -> Result<(), String> {
+    // Strictly below, so at least one slot is left for other clients.
+    if limits.max_connections_per_ip >= limits.max_connections {
+        return Err(format!(
+            "GATEWAY_MAX_CONNECTIONS_PER_IP ({}) must be below GATEWAY_MAX_CONNECTIONS ({}), \
+             or one client can take the whole budget and the per-IP cap never applies",
+            limits.max_connections_per_ip, limits.max_connections
+        ));
+    }
     if limits.max_forwarded_reads >= limits.max_connections {
         return Err(format!(
             "GATEWAY_MAX_FORWARDED_READS ({}) must be below GATEWAY_MAX_CONNECTIONS ({})",
@@ -760,11 +770,34 @@ fn check_limits(limits: &Limits) -> Result<(), String> {
     Ok(())
 }
 
-/// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
-/// auth service so a whitespace-only secret doesn't enable gateway RBAC while auth refuses
-/// to start.
+/// Lenient trim used by `Gateway::new`, which is not a validated entry point: a library
+/// caller handing it a blank or whitespace-only secret gets RBAC off. `run` applies the
+/// strict rule in `resolve_jwt_secret` before any `Gateway` is built.
 fn configured_secret(secret: Option<&str>) -> Option<&str> {
     secret.filter(|s| !s.trim().is_empty())
+}
+
+/// Shortest accepted JWT signing secret, measured after trimming whitespace.
+const MIN_JWT_SECRET_BYTES: usize = 32;
+
+/// Startup rule for `JWT_SECRET`, identical to the auth service's (auth is only a
+/// dev-dependency here, so the rule is repeated and both sides pin the same vectors).
+/// An absent or empty value means RBAC off. Anything else must be at least 32 bytes after
+/// trimming, so a whitespace-only value cannot silently disable auth while auth signs
+/// with it. The key stays the raw value. The error never includes the secret.
+fn resolve_jwt_secret(secret: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let trimmed_len = secret.trim().len();
+    if trimmed_len < MIN_JWT_SECRET_BYTES {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes after trimming \
+             whitespace (got {trimmed_len}); leave it empty to run without auth, or \
+             generate one with `openssl rand -hex 32`"
+        ));
+    }
+    Ok(Some(secret))
 }
 
 /// A blank `GATEWAY_INTERNAL_PORT` means "no internal listener", the same way a
@@ -2259,54 +2292,13 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
+
+    // Config rules run before anything connects, so a bad value never opens the pool.
+    let auth_enabled = resolve_jwt_secret(args.jwt_secret.as_deref())?.is_some();
     info!(
         "  Auth enforcement: {}",
-        if configured_secret(args.jwt_secret.as_deref()).is_some() {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        if auth_enabled { "enabled" } else { "disabled" }
     );
-
-    // Refuse to start if JWT_SECRET is set without AUTH_DATABASE_URL.
-    //
-    // Auth is intentionally optional: both absent means "run without auth" and
-    // is valid for local dev. But JWT_SECRET present without AUTH_DATABASE_URL
-    // is a misconfiguration — enforce_auth silently falls through to its wildcard
-    // arm and returns None, disabling all enforcement with no indication. An
-    // operator who sets JWT_SECRET believes auth is active; failing here at boot
-    // ensures that belief is correct rather than every request passing through
-    // unguarded at runtime.
-    if configured_secret(args.jwt_secret.as_deref()).is_some() && args.auth_database_url.is_none() {
-        return Err(
-            "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
-             Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
-             or unset JWT_SECRET to run without auth."
-                .into(),
-        );
-    }
-
-    // Connect to the auth DB if a URL was provided.
-    // This pool is used for per-request wallet ownership checks.
-    let auth_db = match args.auth_database_url {
-        Some(ref url) => {
-            let pool = PgPoolOptions::new()
-                .max_connections(args.auth_database_max_connections)
-                .connect(url)
-                .await?;
-            info!(
-                "  Auth DB: connected (max_connections={})",
-                args.auth_database_max_connections
-            );
-            warn_if_owner_change_table_unreadable(&pool).await;
-            Some(pool)
-        }
-        None => {
-            info!("  Auth DB: not configured");
-            None
-        }
-    };
-
     let limits = Limits {
         max_connections: args.max_connections,
         max_connections_per_ip: args.max_connections_per_ip,
@@ -2324,6 +2316,45 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         rate_limit_burst: args.rate_limit_burst,
     };
     check_limits(&limits)?;
+
+    // Refuse to start if JWT_SECRET is set without AUTH_DATABASE_URL.
+    //
+    // Auth is intentionally optional: both absent means "run without auth" and
+    // is valid for local dev. But JWT_SECRET present without AUTH_DATABASE_URL
+    // is a misconfiguration: enforce_auth silently falls through to its wildcard
+    // arm and returns None, disabling all enforcement with no indication. An
+    // operator who sets JWT_SECRET believes auth is active; failing here at boot
+    // ensures that belief is correct rather than every request passing through
+    // unguarded at runtime.
+    if auth_enabled && args.auth_database_url.is_none() {
+        return Err(
+            "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
+             Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
+             or unset JWT_SECRET to run without auth."
+                .into(),
+        );
+    }
+
+    // Connect to the auth DB if a URL was provided.
+    // This pool is used for per-request wallet ownership checks.
+    let auth_db = match args.auth_database_url {
+        Some(ref url) => {
+            let pool = PgPoolOptions::new()
+                .max_connections(args.auth_database_max_connections.get())
+                .connect(url)
+                .await?;
+            info!(
+                "  Auth DB: connected (max_connections={})",
+                args.auth_database_max_connections
+            );
+            warn_if_owner_change_table_unreadable(&pool).await;
+            Some(pool)
+        }
+        None => {
+            info!("  Auth DB: not configured");
+            None
+        }
+    };
 
     let gateway = Arc::new(
         Gateway::new(
@@ -4441,5 +4472,160 @@ mod tests {
             }
         }
         assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    fn parse_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "gateway",
+            "--write-url",
+            "http://w",
+            "--read-url",
+            "http://r",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("test args must parse")
+    }
+
+    /// An address nothing listens on, so a run that gets past validation fails to connect.
+    const UNREACHABLE_AUTH_DB: &str = "postgres://127.0.0.1:1/auth";
+
+    #[test]
+    fn per_ip_cap_must_stay_below_max_connections() {
+        let limits = |per_ip, connections| Limits {
+            max_connections_per_ip: NonZeroUsize::new(per_ip).unwrap(),
+            max_connections: NonZeroUsize::new(connections).unwrap(),
+            max_forwarded_reads: NonZeroUsize::new(1).unwrap(),
+            ..Default::default()
+        };
+        assert!(check_limits(&limits(63, 64)).is_ok());
+        for (per_ip, connections) in [(64, 64), (65, 64)] {
+            let err = check_limits(&limits(per_ip, connections))
+                .expect_err("a per-IP cap that is not below the global cap must be refused");
+            assert!(err.contains("GATEWAY_MAX_CONNECTIONS_PER_IP"), "got: {err}");
+            assert!(err.contains("must be below"), "got: {err}");
+        }
+    }
+
+    /// The same vectors are pinned in the auth service's config tests.
+    #[test]
+    fn jwt_secret_rule_matches_the_auth_service() {
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        for off in [None, Some("")] {
+            assert_eq!(resolve_jwt_secret(off), Ok(None), "blank means RBAC off");
+        }
+        for bad in [
+            "   \t\n".to_string(),
+            "secret".to_string(),
+            thirty_one.clone(),
+            format!("{thirty_one}\n"),
+            format!("  {thirty_one}  "),
+        ] {
+            let err = resolve_jwt_secret(Some(&bad)).expect_err("must be rejected");
+            assert!(err.contains("JWT_SECRET"), "got: {err}");
+        }
+        for good in [thirty_two.clone(), format!(" {thirty_two}\n")] {
+            assert_eq!(resolve_jwt_secret(Some(&good)), Ok(Some(good.as_str())));
+        }
+    }
+
+    #[test]
+    fn a_rejected_jwt_secret_is_never_echoed() {
+        let marker = "LEAKMARKER-xyz";
+        let err = resolve_jwt_secret(Some(marker)).expect_err("short secret");
+        assert!(
+            !err.contains(marker) && !err.contains("LEAK"),
+            "leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_auth_pool_size_is_rejected_by_the_parser() {
+        let parsed = Args::try_parse_from([
+            "gateway",
+            "--write-url",
+            "http://w",
+            "--read-url",
+            "http://r",
+            "--auth-database-max-connections",
+            "0",
+        ]);
+        assert!(parsed.is_err(), "a zero pool panics in sqlx pool creation");
+    }
+
+    /// `run` must refuse a bad secret before it builds the pool, so the error is the
+    /// validation message and not a connection failure to the unreachable database.
+    #[tokio::test]
+    async fn run_refuses_a_weak_or_whitespace_secret_before_connecting() {
+        let marker = "LEAKMARKER-xyz";
+        for secret in [marker, "   ", "short-secret"] {
+            let args = parse_args(&[
+                "--port",
+                "0",
+                "--jwt-secret",
+                secret,
+                "--auth-database-url",
+                UNREACHABLE_AUTH_DB,
+            ]);
+            let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+                .await
+                .expect("a bad secret must be refused, not served")
+                .expect_err("a bad secret must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("JWT_SECRET"), "got: {msg}");
+            assert!(!msg.contains(marker), "secret leaked: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refuses_equal_connection_caps_before_connecting() {
+        let args = parse_args(&[
+            "--port",
+            "0",
+            "--auth-database-url",
+            UNREACHABLE_AUTH_DB,
+            "--max-connections",
+            "100",
+            "--max-connections-per-ip",
+            "100",
+            "--max-forwarded-reads",
+            "50",
+        ]);
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("bad limits must be refused, not served")
+            .expect_err("bad limits must be refused");
+        assert!(
+            err.to_string().contains("GATEWAY_MAX_CONNECTIONS_PER_IP"),
+            "got: {err}"
+        );
+    }
+
+    /// A strong secret passes the strength rule and reaches the next check, which wants
+    /// the auth database next to it.
+    #[tokio::test]
+    async fn run_accepts_a_strong_secret_and_moves_on_to_the_database_check() {
+        let strong = "0123456789abcdef0123456789abcdef01234567";
+        let args = parse_args(&["--port", "0", "--jwt-secret", strong]);
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("a missing auth database must be refused, not served")
+            .expect_err("a secret without an auth database is refused");
+        assert!(
+            err.to_string()
+                .contains("AUTH_DATABASE_URL is not configured"),
+            "got: {err}"
+        );
+    }
+
+    /// Blank means RBAC off, so the gateway keeps serving.
+    #[tokio::test]
+    async fn run_serves_with_a_blank_secret() {
+        let args = parse_args(&["--port", "0", "--jwt-secret", ""]);
+        let outcome = tokio::time::timeout(Duration::from_millis(500), run(args)).await;
+        assert!(
+            outcome.is_err(),
+            "a blank secret must leave the gateway serving"
+        );
     }
 }

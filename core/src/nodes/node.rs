@@ -276,6 +276,13 @@ async fn read_accounts_db(
     Ok(AccountsDB::Redis(redis))
 }
 
+/// Largest accepted `max_connections`. It only guards typos: far above any real file
+/// descriptor limit, and well below the semaphore's own permit ceiling.
+pub const MAX_RPC_CONNECTIONS: usize = 10_000_000;
+
+/// Largest accepted `perf_sample_period_secs`: the settle stage stores it as a u16.
+pub const MAX_PERF_SAMPLE_PERIOD_SECS: u64 = u16::MAX as u64;
+
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
     if config.blocktime_ms == 0 {
@@ -289,19 +296,70 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 .into(),
         );
     }
-    // Zero capacity would panic the bounded-channel constructors below; fail closed instead.
+    // Every mode serves RPC through this cap. Zero binds the port but admits no connection.
+    if config.max_connections == 0 {
+        return Err(
+            "max_connections (PRIVATE_CHANNEL_MAX_CONNECTIONS) must be greater than 0".into(),
+        );
+    }
+    if config.max_connections > MAX_RPC_CONNECTIONS {
+        return Err(format!(
+            "max_connections (PRIVATE_CHANNEL_MAX_CONNECTIONS) must be at most {MAX_RPC_CONNECTIONS}"
+        )
+        .into());
+    }
+    // Zero capacity would panic the bounded-channel constructors below, and zero workers or
+    // sampling period would stop the pipeline; fail closed instead.
     if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-        for (name, cap) in [
-            ("ingress_queue_capacity", config.ingress_queue_capacity),
-            ("sequencer_queue_capacity", config.sequencer_queue_capacity),
+        for (name, env, cap) in [
+            (
+                "ingress_queue_capacity",
+                "PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY",
+                config.ingress_queue_capacity,
+            ),
+            (
+                "sequencer_queue_capacity",
+                "PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY",
+                config.sequencer_queue_capacity,
+            ),
             (
                 "execution_results_capacity",
+                "PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY",
                 config.execution_results_capacity,
+            ),
+            (
+                "sigverify_queue_size",
+                "PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE",
+                config.sigverify_queue_size,
+            ),
+            (
+                "sigverify_workers",
+                "PRIVATE_CHANNEL_SIGVERIFY_WORKERS",
+                config.sigverify_workers,
+            ),
+            (
+                "batch_channel_capacity",
+                "PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY",
+                config.batch_channel_capacity,
             ),
         ] {
             if cap == 0 {
-                return Err(format!("{name} must be greater than 0").into());
+                return Err(format!("{name} ({env}) must be greater than 0").into());
             }
+        }
+        if config.perf_sample_period_secs == 0 {
+            return Err(
+                "perf_sample_period_secs (PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS) must be \
+                 greater than 0"
+                    .into(),
+            );
+        }
+        if config.perf_sample_period_secs > MAX_PERF_SAMPLE_PERIOD_SECS {
+            return Err(format!(
+                "perf_sample_period_secs (PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS) must be at \
+                 most {MAX_PERF_SAMPLE_PERIOD_SECS}"
+            )
+            .into());
         }
     }
 
@@ -1127,7 +1185,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.err().unwrap().to_string(),
-            "sequencer_queue_capacity must be greater than 0"
+            "sequencer_queue_capacity (PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY) must be greater than 0"
         );
     }
 }

@@ -520,11 +520,10 @@
     # Mirror the template's `default(true)` so an unset flag still requires it.
     - name: Assert jwt_secret is set
       ansible.builtin.assert:
-        # `| trim` mirrors the gateway's configured_secret() trim semantics: a
-        # whitespace-only jwt_secret disables gateway auth, so it must fail here too.
-        that: jwt_secret | default('') | trim | length > 0
+        # Auth and the gateway refuse a secret under 32 bytes after trimming, so fail here first.
+        that: jwt_secret | default('') | trim | length >= 32
         fail_msg: |
-          `jwt_secret` empty (or whitespace-only) in secrets.yml. Used by gateway to sign auth tokens.
+          `jwt_secret` missing, whitespace-only or under 32 bytes in secrets.yml. Used by gateway to sign auth tokens.
           Fix: edit secrets.yml and add `jwt_secret: <random-32+-byte-string>`  (e.g. `openssl rand -hex 32`).
       when: gateway_enforce_jwt | default(true) | bool
 

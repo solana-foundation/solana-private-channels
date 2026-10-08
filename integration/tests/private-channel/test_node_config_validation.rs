@@ -81,3 +81,67 @@ async fn zero_max_blockhashes_on_write_mode_fails_validation() {
         "error must name the violated parameter: {msg}"
     );
 }
+
+/// Runs `run_node` and returns the validation error text, failing the test if the node starts.
+async fn refusal(config: NodeConfig) -> String {
+    match run_node(config).await {
+        Err(e) => format!("{e}"),
+        Ok(_) => panic!("an invalid config must be refused"),
+    }
+}
+
+/// Each of these would panic a channel or semaphore constructor, or leave the node
+/// running with nothing behind its port. The write modes must refuse them before the lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_pipeline_sizes_on_write_modes_fail_validation() {
+    type Mutate = fn(&mut NodeConfig);
+    let cases: [(&str, Mutate); 4] = [
+        ("sigverify_workers", |c| c.sigverify_workers = 0),
+        ("sigverify_queue_size", |c| c.sigverify_queue_size = 0),
+        ("batch_channel_capacity", |c| c.batch_channel_capacity = 0),
+        ("perf_sample_period_secs", |c| c.perf_sample_period_secs = 0),
+    ];
+    for (name, mutate) in cases {
+        for mode in [NodeMode::Write, NodeMode::Aio] {
+            let mut config = base_config(mode);
+            mutate(&mut config);
+            let msg = refusal(config).await;
+            assert!(
+                msg.contains(name) && msg.contains("greater than 0"),
+                "{name} = 0 must be refused: {msg}"
+            );
+        }
+    }
+}
+
+/// The settle stage casts the period to u16, so a larger value would wrap silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_perf_sample_period_fails_validation() {
+    let mut config = base_config(NodeMode::Aio);
+    config.perf_sample_period_secs = 65_536;
+    let msg = refusal(config).await;
+    assert!(msg.contains("perf_sample_period_secs"), "got: {msg}");
+}
+
+/// A zero-permit semaphore binds the port and drops every connection. Read nodes use the
+/// cap too, so it is checked in every mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_max_connections_fails_validation_in_every_mode() {
+    for mode in [NodeMode::Write, NodeMode::Aio, NodeMode::Read] {
+        let mut config = base_config(mode);
+        config.max_connections = 0;
+        let msg = refusal(config).await;
+        assert!(
+            msg.contains("max_connections") && msg.contains("greater than 0"),
+            "max_connections = 0 must be refused: {msg}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_max_connections_fails_validation() {
+    let mut config = base_config(NodeMode::Read);
+    config.max_connections = private_channel_core::nodes::node::MAX_RPC_CONNECTIONS + 1;
+    let msg = refusal(config).await;
+    assert!(msg.contains("max_connections"), "got: {msg}");
+}

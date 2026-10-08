@@ -12,7 +12,9 @@ rpc_url = "http://localhost:8899"
 # operator (independent, same-cluster, reachable) or it refuses to start; the escrow operator refuses to start if set. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
 
-# Solana custody RPC. Required for escrow: the reconciliation solvency check reads custody from it.
+# Second-chain RPC. REQUIRED and non-blank for every operator or it refuses to start: the escrow
+# operator reads custody from it and the withdraw operator sends compensating remints to it.
+# Env: COMMON_SOURCE_RPC_URL
 source_rpc_url = "http://localhost:18899"
 
 # Escrow instance ID. REQUIRED for every operator (escrow and withdraw) or it refuses to start.
@@ -23,7 +25,7 @@ source_rpc_url = "http://localhost:18899"
 # Storage type: "postgres"
 type = "postgres"
 
-# Maximum number of database connections
+# Maximum number of database connections. Must be at least 1. Env: STORAGE_MAX_CONNECTIONS
 max_connections = 10
 
 # Database URL must be set via environment variable: DATABASE_URL
@@ -31,6 +33,9 @@ max_connections = 10
 # Example: export DATABASE_URL="postgresql://user:pass@localhost:5434/indexer"
 
 [operator]
+# Every count and interval below must be at least 1 or the operator refuses to start,
+# naming the key and its OPERATOR_* env var. A zero would panic, busy-loop or quarantine rows.
+
 # Database polling interval in seconds
 poll_interval_secs = 5
 
@@ -79,6 +84,7 @@ channel_buffer_size = 100
 
 # Reconciliation settings (part of [operator])
 # How often to run escrow balance reconciliation checks (in seconds)
+# Minimum: 10 seconds, so the halt debounce does not sample one view in a row
 # Default: 300 seconds (5 minutes)
 reconciliation_interval_secs = 300
 
@@ -131,5 +137,6 @@ reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"
 
 # Feepayer balance monitoring interval (seconds)
 # Only applies to escrow operators (ReleaseFunds feepayer on Solana mainnet)
+# Minimum: 5 seconds
 # Default: 60 seconds
 feepayer_monitor_interval_secs = 60

@@ -4,7 +4,8 @@ use figment::{
     Figment,
 };
 use private_channel_indexer::config::{
-    floor_operator_commitment, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    floor_operator_commitment, normalize_optional, validate_operator_startup,
+    validate_rpc_batch_size, validate_rpc_encoding, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
@@ -408,18 +409,48 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
 
-    let postgres_config = PostgresConfig {
+    // Every config rule runs before the pool opens, so a bad value never touches the database.
+    let (common_config, operator_config) = build_operator_config(
+        common,
+        &storage_section,
+        operator,
         database_url,
-        max_connections: storage_section.max_connections,
-    };
+        std::env::var("ALERT_WEBHOOK_URL").ok(),
+    )?;
+
+    // Validate signer configuration early (from environment variables)
+    OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
     // Initialize storage
     let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type
     {
         StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
-            private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
+            private_channel_indexer::storage::PostgresDb::new(&common_config.postgres).await?,
         )),
     };
+
+    private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health))
+        .await?;
+
+    Ok(())
+}
+
+/// Smallest reconciliation interval the binary accepts. A zero or tiny value samples one
+/// finalized view several times in a row, which can trip the durable halt on a transient gap.
+const MIN_RECONCILIATION_INTERVAL_SECS: u64 = 10;
+/// Smallest fee-payer balance poll interval the binary accepts.
+const MIN_FEEPAYER_MONITOR_INTERVAL_SECS: u64 = 5;
+
+/// Turn the parsed sections into the runtime configs and apply every startup rule. It never
+/// touches storage, so the caller can run it before opening the database pool. Interval
+/// floors live here and not in `operator::run`, which library callers drive with short values.
+fn build_operator_config(
+    common: CommonSection,
+    storage: &StorageSection,
+    operator: OperatorSection,
+    database_url: String,
+    alert_webhook_url: Option<String>,
+) -> Result<(PrivateChannelIndexerConfig, OperatorConfig), String> {
     let escrow_instance_id = common
         .escrow_instance_id
         .map(|id_str| {
@@ -427,16 +458,27 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         })
         .transpose()?;
 
+    let postgres_config = PostgresConfig {
+        database_url,
+        max_connections: storage.max_connections,
+    };
+    postgres_config.validate()?;
+
+    // Blank values count as unset and the trimmed value is what the workers use.
     let common_config = PrivateChannelIndexerConfig {
         program_type: common.program_type,
-        storage_type: storage_section.storage_type,
+        storage_type: storage.storage_type,
         postgres: postgres_config,
         rpc_url: common.rpc_url,
         fallback_rpc_url: common.fallback_rpc_url,
-        source_rpc_url: common.source_rpc_url,
+        source_rpc_url: normalize_optional(common.source_rpc_url),
         escrow_instance_id,
     };
 
+    let (reconciliation_secs, feepayer_secs) = (
+        operator.reconciliation_interval_secs,
+        operator.feepayer_monitor_interval_secs,
+    );
     let operator_config = OperatorConfig {
         db_poll_interval: Duration::from_secs(operator.poll_interval_secs),
         batch_size: operator.batch_size,
@@ -448,20 +490,59 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
                 .rpc_commitment
                 .unwrap_or(CommitmentLevel::Confirmed),
         )?,
-        alert_webhook_url: std::env::var("ALERT_WEBHOOK_URL").ok(),
+        alert_webhook_url,
         reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
-        reconciliation_webhook_url: operator.reconciliation_webhook_url,
+        reconciliation_webhook_url: normalize_optional(operator.reconciliation_webhook_url),
         feepayer_monitor_interval: Duration::from_secs(operator.feepayer_monitor_interval_secs),
         confirmation_poll_interval_ms: operator.confirmation_poll_interval_ms,
     };
 
-    // Validate signer configuration early (from environment variables)
-    OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
+    validate_operator_startup(&common_config, &operator_config)?;
+    // Zero is already refused above, so the floors only see non-zero values.
+    for (secs, min, key, env) in [
+        (
+            reconciliation_secs,
+            MIN_RECONCILIATION_INTERVAL_SECS,
+            "operator.reconciliation_interval_secs",
+            "OPERATOR_RECONCILIATION_INTERVAL_SECS",
+        ),
+        (
+            feepayer_secs,
+            MIN_FEEPAYER_MONITOR_INTERVAL_SECS,
+            "operator.feepayer_monitor_interval_secs",
+            "OPERATOR_FEEPAYER_MONITOR_INTERVAL_SECS",
+        ),
+    ] {
+        if secs < min {
+            return Err(format!("{key} ({env}) must be at least {min} seconds"));
+        }
+    }
 
-    private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health))
-        .await?;
+    Ok((common_config, operator_config))
+}
 
+/// Resync skips `IndexerConfig::validate`, so it repeats the rules for what it uses: the
+/// pool, the backfill batch size and the poller encoding. Runs before anything connects.
+fn validate_resync_config(
+    storage: &StorageSection,
+    indexer: &IndexerSection,
+) -> Result<(), String> {
+    if storage.max_connections == 0 {
+        return Err(
+            "storage.max_connections (STORAGE_MAX_CONNECTIONS) must be greater than 0".into(),
+        );
+    }
+    validate_rpc_batch_size(
+        "indexer.backfill.batch_size (INDEXER_BACKFILL_BATCH_SIZE)",
+        indexer.backfill.batch_size,
+    )?;
+    if let Some(encoding) = indexer.rpc_polling.as_ref().and_then(|rpc| rpc.encoding) {
+        validate_rpc_encoding(
+            "indexer.rpc_polling.encoding (INDEXER_RPC_POLLING_ENCODING)",
+            encoding,
+        )?;
+    }
     Ok(())
 }
 
@@ -496,10 +577,7 @@ async fn run_resync(
     let storage: StorageSection = figment.extract_inner("storage")?;
     let indexer: IndexerSection = figment.extract_inner("indexer")?;
     // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
-    private_channel_indexer::config::validate_rpc_batch_size(
-        "indexer.backfill.batch_size",
-        indexer.backfill.batch_size,
-    )?;
+    validate_resync_config(&storage, &indexer)?;
 
     // Get DATABASE_URL from environment
     let database_url =
@@ -596,4 +674,266 @@ async fn run_resync(
     resync_service.run(genesis_slot).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn common_section(program_type: ProgramType) -> CommonSection {
+        CommonSection {
+            program_type,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:8899".to_string()),
+            escrow_instance_id: Some(Pubkey::new_unique().to_string()),
+        }
+    }
+
+    fn storage_section() -> StorageSection {
+        StorageSection {
+            storage_type: StorageType::Postgres,
+            max_connections: 5,
+        }
+    }
+
+    fn operator_section() -> OperatorSection {
+        OperatorSection {
+            poll_interval_secs: 1,
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay_secs: 1,
+            channel_buffer_size: 100,
+            rpc_commitment: None,
+            reconciliation_interval_secs: 300,
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: Some("http://alerts.local/hook".to_string()),
+            feepayer_monitor_interval_secs: 60,
+            confirmation_poll_interval_ms: 250,
+        }
+    }
+
+    fn build(
+        common: CommonSection,
+        storage: StorageSection,
+        operator: OperatorSection,
+    ) -> Result<(PrivateChannelIndexerConfig, OperatorConfig), String> {
+        build_operator_config(common, &storage, operator, "postgres://x".to_string(), None)
+    }
+
+    #[test]
+    fn a_valid_config_builds_for_both_roles() {
+        for role in [ProgramType::Escrow, ProgramType::Withdraw] {
+            build(common_section(role), storage_section(), operator_section())
+                .expect("a valid config must build");
+        }
+    }
+
+    #[test]
+    fn zero_operator_values_are_refused_with_key_and_env_var() {
+        type Mutate = fn(&mut OperatorSection);
+        let cases: [(&str, &str, Mutate); 8] = [
+            ("poll_interval_secs", "OPERATOR_POLL_INTERVAL_SECS", |o| {
+                o.poll_interval_secs = 0
+            }),
+            ("batch_size", "OPERATOR_BATCH_SIZE", |o| o.batch_size = 0),
+            ("retry_max_attempts", "OPERATOR_RETRY_MAX_ATTEMPTS", |o| {
+                o.retry_max_attempts = 0
+            }),
+            (
+                "retry_base_delay_secs",
+                "OPERATOR_RETRY_BASE_DELAY_SECS",
+                |o| o.retry_base_delay_secs = 0,
+            ),
+            ("channel_buffer_size", "OPERATOR_CHANNEL_BUFFER_SIZE", |o| {
+                o.channel_buffer_size = 0
+            }),
+            (
+                "reconciliation_interval_secs",
+                "OPERATOR_RECONCILIATION_INTERVAL_SECS",
+                |o| o.reconciliation_interval_secs = 0,
+            ),
+            (
+                "feepayer_monitor_interval_secs",
+                "OPERATOR_FEEPAYER_MONITOR_INTERVAL_SECS",
+                |o| o.feepayer_monitor_interval_secs = 0,
+            ),
+            (
+                "confirmation_poll_interval_ms",
+                "OPERATOR_CONFIRMATION_POLL_INTERVAL_MS",
+                |o| o.confirmation_poll_interval_ms = 0,
+            ),
+        ];
+        for (key, env, mutate) in cases {
+            let mut operator = operator_section();
+            mutate(&mut operator);
+            let err = build(
+                common_section(ProgramType::Escrow),
+                storage_section(),
+                operator,
+            )
+            .expect_err("a zero value must be refused");
+            assert!(err.contains(key) && err.contains(env), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn interval_floors_apply_in_the_binary() {
+        let mut operator = operator_section();
+        operator.reconciliation_interval_secs = MIN_RECONCILIATION_INTERVAL_SECS - 1;
+        let err = build(
+            common_section(ProgramType::Escrow),
+            storage_section(),
+            operator,
+        )
+        .expect_err("a reconciliation interval under the floor must be refused");
+        assert!(
+            err.contains("OPERATOR_RECONCILIATION_INTERVAL_SECS"),
+            "got: {err}"
+        );
+
+        let mut operator = operator_section();
+        operator.feepayer_monitor_interval_secs = MIN_FEEPAYER_MONITOR_INTERVAL_SECS - 1;
+        let err = build(
+            common_section(ProgramType::Escrow),
+            storage_section(),
+            operator,
+        )
+        .expect_err("a fee-payer interval under the floor must be refused");
+        assert!(
+            err.contains("OPERATOR_FEEPAYER_MONITOR_INTERVAL_SECS"),
+            "got: {err}"
+        );
+
+        let mut operator = operator_section();
+        operator.reconciliation_interval_secs = MIN_RECONCILIATION_INTERVAL_SECS;
+        operator.feepayer_monitor_interval_secs = MIN_FEEPAYER_MONITOR_INTERVAL_SECS;
+        build(
+            common_section(ProgramType::Escrow),
+            storage_section(),
+            operator,
+        )
+        .expect("the floors themselves are accepted");
+    }
+
+    #[test]
+    fn storage_pool_size_zero_is_refused() {
+        let storage = StorageSection {
+            storage_type: StorageType::Postgres,
+            max_connections: 0,
+        };
+        let err = build(
+            common_section(ProgramType::Withdraw),
+            storage,
+            operator_section(),
+        )
+        .expect_err("a zero pool must be refused before it is opened");
+        assert!(err.contains("STORAGE_MAX_CONNECTIONS"), "got: {err}");
+    }
+
+    #[test]
+    fn instance_id_commitment_and_role_rules_are_enforced_before_storage() {
+        let mut common = common_section(ProgramType::Withdraw);
+        common.escrow_instance_id = Some("not-a-pubkey".to_string());
+        assert!(build(common, storage_section(), operator_section()).is_err());
+
+        let mut common = common_section(ProgramType::Withdraw);
+        common.escrow_instance_id = None;
+        assert!(build(common, storage_section(), operator_section()).is_err());
+
+        let mut operator = operator_section();
+        operator.rpc_commitment = Some(CommitmentLevel::Processed);
+        assert!(build(
+            common_section(ProgramType::Escrow),
+            storage_section(),
+            operator
+        )
+        .is_err());
+
+        let mut operator = operator_section();
+        operator.reconciliation_webhook_url = Some("  ".to_string());
+        assert!(build(
+            common_section(ProgramType::Escrow),
+            storage_section(),
+            operator
+        )
+        .is_err());
+
+        let mut operator = operator_section();
+        operator.reconciliation_webhook_url = None;
+        build(
+            common_section(ProgramType::Withdraw),
+            storage_section(),
+            operator,
+        )
+        .expect("the withdraw role never needs the webhook");
+
+        let mut common = common_section(ProgramType::Withdraw);
+        common.source_rpc_url = Some("   ".to_string());
+        assert!(build(common, storage_section(), operator_section()).is_err());
+    }
+
+    #[test]
+    fn blank_padding_is_trimmed_before_the_workers_see_it() {
+        let mut common = common_section(ProgramType::Escrow);
+        common.source_rpc_url = Some("  http://127.0.0.1:8899 \n".to_string());
+        let mut operator = operator_section();
+        operator.reconciliation_webhook_url = Some(" http://alerts.local/hook ".to_string());
+        let (common_config, operator_config) =
+            build(common, storage_section(), operator).expect("padded values are valid");
+        assert_eq!(
+            common_config.source_rpc_url.as_deref(),
+            Some("http://127.0.0.1:8899")
+        );
+        assert_eq!(
+            operator_config.reconciliation_webhook_url.as_deref(),
+            Some("http://alerts.local/hook")
+        );
+    }
+
+    fn indexer_section() -> IndexerSection {
+        IndexerSection {
+            datasource_type: DatasourceType::RpcPolling,
+            rpc_polling: Some(RpcPollingSection {
+                start_slot: None,
+                poll_interval_ms: 1000,
+                error_retry_interval_ms: 1000,
+                batch_size: 10,
+                encoding: None,
+            }),
+            yellowstone: None,
+            backfill: BackfillSection {
+                enabled: true,
+                backfill_only: false,
+                rpc_url: None,
+                batch_size: 10,
+                max_gap_slots: 1000,
+                start_slot: None,
+            },
+            reconciliation: ReconciliationSection::default(),
+        }
+    }
+
+    #[test]
+    fn resync_refuses_a_zero_pool_a_zero_batch_and_a_non_json_encoding() {
+        validate_resync_config(&storage_section(), &indexer_section())
+            .expect("a valid resync config must pass");
+
+        let storage = StorageSection {
+            storage_type: StorageType::Postgres,
+            max_connections: 0,
+        };
+        let err = validate_resync_config(&storage, &indexer_section()).expect_err("zero pool");
+        assert!(err.contains("STORAGE_MAX_CONNECTIONS"), "got: {err}");
+
+        let mut indexer = indexer_section();
+        indexer.backfill.batch_size = 0;
+        let err = validate_resync_config(&storage_section(), &indexer).expect_err("zero batch");
+        assert!(err.contains("INDEXER_BACKFILL_BATCH_SIZE"), "got: {err}");
+
+        let mut indexer = indexer_section();
+        indexer.rpc_polling.as_mut().unwrap().encoding = Some(UiTransactionEncoding::JsonParsed);
+        let err = validate_resync_config(&storage_section(), &indexer).expect_err("encoding");
+        assert!(err.contains("INDEXER_RPC_POLLING_ENCODING"), "got: {err}");
+    }
 }

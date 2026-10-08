@@ -33,7 +33,8 @@ pub struct Limits {
     /// flood cannot exhaust file descriptors or memory.
     pub max_connections: NonZeroUsize,
     /// Max concurrent connections from a single client IP, so one host cannot
-    /// consume the whole global connection budget.
+    /// consume the whole global connection budget. Config requires it strictly
+    /// below the global cap, which reserves one slot; the struct itself does not check.
     pub max_connections_per_ip: NonZeroUsize,
     /// Max time a client may take to send the full request header block.
     /// Slowloris header-trickle connections are closed after this.
