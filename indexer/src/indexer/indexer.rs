@@ -562,6 +562,15 @@ pub async fn run(
     crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
+    // The binary validates too; repeated so embedders get the same refusal before storage opens.
+    common_config
+        .postgres
+        .validate()
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    indexer_config
+        .validate()
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+
     // 1. Initialize storage
     let storage: Arc<Storage> = match common_config.storage_type {
         StorageType::Postgres => Arc::new(Storage::Postgres(
@@ -2369,5 +2378,93 @@ mod tests {
                 "no gap means no slot was processed, so the checkpoint stands still"
             );
         }
+    }
+
+    fn run_configs() -> (crate::PrivateChannelIndexerConfig, crate::IndexerConfig) {
+        use crate::config::{
+            BackfillConfig, DatasourceType, PostgresConfig, RpcPollingConfig, StorageType,
+        };
+        use solana_commitment_config::CommitmentLevel;
+        use solana_transaction_status::UiTransactionEncoding;
+        let common = crate::PrivateChannelIndexerConfig {
+            program_type: ProgramType::Withdraw,
+            storage_type: StorageType::Postgres,
+            rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: None,
+            // Nothing listens here, so a config that gets past validation fails at connect.
+            postgres: PostgresConfig {
+                database_url: "postgres://u:p@127.0.0.1:1/none".to_string(),
+                max_connections: 5,
+            },
+            escrow_instance_id: None,
+        };
+        let indexer = crate::IndexerConfig {
+            datasource_type: DatasourceType::RpcPolling,
+            rpc_polling: Some(RpcPollingConfig {
+                from_slot: Some(0),
+                poll_interval_ms: 1000,
+                error_retry_interval_ms: 1000,
+                batch_size: 10,
+                encoding: UiTransactionEncoding::Json,
+                commitment: CommitmentLevel::Finalized,
+            }),
+            yellowstone: None,
+            backfill: BackfillConfig {
+                enabled: false,
+                batch_size: 10,
+                max_gap_slots: 1000,
+                start_slot: None,
+                exit_after_backfill: false,
+                rpc_url: "http://localhost:8899".to_string(),
+            },
+            reconciliation: ReconciliationConfig::default(),
+        };
+        (common, indexer)
+    }
+
+    /// Library callers reach `run` without the binary, so it must refuse a zero pool
+    /// itself, before sqlx panics on it.
+    #[cfg(feature = "datasource-rpc")]
+    #[tokio::test]
+    async fn run_refuses_a_zero_pool_before_opening_storage() {
+        let (mut common, indexer) = run_configs();
+        common.postgres.max_connections = 0;
+
+        let err = run(common, indexer, None).await.unwrap_err();
+
+        assert!(err.to_string().contains("storage.max_connections"), "{err}");
+    }
+
+    /// A non-json encoding makes the poller retry one block forever, so `run` refuses it.
+    #[cfg(feature = "datasource-rpc")]
+    #[tokio::test]
+    async fn run_refuses_a_non_json_encoding_before_opening_storage() {
+        let (common, mut indexer) = run_configs();
+        indexer.rpc_polling.as_mut().unwrap().encoding =
+            solana_transaction_status::UiTransactionEncoding::JsonParsed;
+
+        let err = run(common, indexer, None).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("indexer.rpc_polling.encoding"),
+            "{err}"
+        );
+    }
+
+    /// A zero backfill batch size loops forever in the range split, so `run` refuses it.
+    #[cfg(feature = "datasource-rpc")]
+    #[tokio::test]
+    async fn run_refuses_a_zero_backfill_batch_before_opening_storage() {
+        let (common, mut indexer) = run_configs();
+        indexer.backfill.enabled = true;
+        indexer.backfill.batch_size = 0;
+
+        let err = run(common, indexer, None).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("indexer.backfill.batch_size"),
+            "{err}"
+        );
     }
 }
