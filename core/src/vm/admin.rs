@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use solana_sdk::{
-    account::{AccountSharedData, ReadableAccount},
+    account::{AccountSharedData, ReadableAccount, WritableAccount},
     instruction::InstructionError,
     pubkey::Pubkey,
     transaction::TransactionError,
@@ -27,6 +27,7 @@ use spl_token::state::Mint;
 use tracing::{debug, warn};
 
 const SPL_TOKEN_ID: Pubkey = spl_token::id();
+const SYSTEM_PROGRAM_ID: Pubkey = solana_sdk_ids::system_program::ID;
 
 // SPL Token instruction types
 const INSTRUCTION_INITIALIZE_MINT: u8 = 0;
@@ -82,7 +83,9 @@ impl AdminVm {
     /// account an admin transaction happens to reference.
     ///
     /// A missing target stays legal: the private channel allocates and
-    /// initializes in one step so mint addresses mirror mainnet.
+    /// initializes in one step so mint addresses mirror mainnet. So does a
+    /// dataless System account, which anyone can leave at the address by
+    /// sending it lamports first.
     ///
     /// Rent exemption is deliberately not checked. Execution is gasless
     /// (the rent rate is zero) and `create_mint_account`
@@ -101,6 +104,9 @@ impl AdminVm {
 
         if existing.executable() {
             return Err(InstructionError::ExecutableDataModified);
+        }
+        if *existing.owner() == SYSTEM_PROGRAM_ID && existing.data().is_empty() {
+            return Ok(());
         }
         if *existing.owner() != SPL_TOKEN_ID {
             return Err(InstructionError::ExternalAccountDataModified);
@@ -159,6 +165,7 @@ impl AdminVm {
     /// - mint read-only in the message          -> ReadonlyDataModified
     /// - existing target executable             -> ExecutableDataModified
     /// - existing target not SPL-Token-owned    -> ExternalAccountDataModified
+    ///   (a dataless System account is accepted)
     /// - existing target not `Mint::LEN` bytes  -> InvalidAccountData
     /// - mint already initialized               -> AccountAlreadyInitialized
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
@@ -369,7 +376,12 @@ impl AdminVm {
 
         let decimals = instruction.data[1];
         let mint_authority = &instruction.data[2..34];
-        let mint_account = Self::create_mint_account(decimals, mint_authority, freeze_authority);
+        let mut mint_account =
+            Self::create_mint_account(decimals, mint_authority, freeze_authority);
+        // InitializeMint keeps the target's balance; only a missing target takes the floor.
+        if let Some(existing) = &existing {
+            mint_account.set_lamports(existing.lamports().max(1));
+        }
         Ok((mint_index, mint_pubkey, mint_account))
     }
 }
@@ -992,6 +1004,41 @@ mod tests {
         assert_eq!(mint_state.mint_authority, COption::Some(admin.pubkey()));
     }
 
+    /// Same flow, but someone sent lamports to the mint address first. The mint
+    /// still lands there and keeps those lamports.
+    #[test]
+    fn test_operator_built_initialize_mint_reclaims_reserved_target() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let decimals = 6;
+        let reserved_lamports = 3;
+        let sanitized = operator_init_mint_tx(
+            &admin,
+            &mint,
+            decimals,
+            spl_token::instruction::initialize_mint,
+        );
+        let cb = StubCbForPubkey {
+            key: mint,
+            account: AccountSharedData::new(reserved_lamports, 0, &SYSTEM_PROGRAM_ID),
+        };
+
+        let executed = assert_executed_with_status(
+            run_admin_vm_with_cb(std::slice::from_ref(&sanitized), &cb),
+            Ok(()),
+        );
+
+        let mint_index = index_of(&sanitized, &mint);
+        let (_, account) = &executed.loaded_transaction.accounts[mint_index];
+        assert_eq!(*account.owner(), spl_token::id());
+        assert_eq!(account.lamports(), reserved_lamports);
+        let mint_state = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint_state.decimals, decimals);
+        assert_eq!(mint_state.mint_authority, COption::Some(admin.pubkey()));
+        let persisted = persisted_by_consumer(&executed, &sanitized);
+        assert!(persisted.iter().any(|(key, _)| *key == mint));
+    }
+
     /// Signature shared by spl-token's `initialize_mint` and `initialize_mint2`.
     type InitMintIx =
         fn(
@@ -1396,6 +1443,28 @@ mod tests {
     fn test_check_target_foreign_owner_rejected() {
         let mut account = mint_allocation();
         account.set_owner(solana_sdk_ids::system_program::id());
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Err(InstructionError::ExternalAccountDataModified)
+        );
+    }
+
+    /// Anyone can send lamports to a mint address before the mint exists,
+    /// which leaves a dataless System account there.
+    #[test]
+    fn test_check_target_system_owned_dataless_is_allowed() {
+        let account = AccountSharedData::new(1, 0, &SYSTEM_PROGRAM_ID);
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Ok(())
+        );
+    }
+
+    /// Only the System program qualifies. A dataless account owned by another
+    /// program, like a DvP nonce tombstone, stays rejected.
+    #[test]
+    fn test_check_target_program_owned_dataless_rejected() {
+        let account = AccountSharedData::new(1, 0, &Pubkey::new_unique());
         assert_eq!(
             AdminVm::check_initialize_mint_target(Some(&account), true),
             Err(InstructionError::ExternalAccountDataModified)

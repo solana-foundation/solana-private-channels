@@ -335,14 +335,6 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get account data with retry
-    pub async fn get_account_data(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Result<Vec<u8>, Box<client_error::Error>> {
-        Ok(self.get_account(pubkey).await?.data)
-    }
-
     /// Get account with retry. An absent account is the client's `AccountNotFound` error.
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<Account, Box<client_error::Error>> {
         self.get_account_with_context(pubkey, self.rpc_client.commitment())
@@ -1056,15 +1048,15 @@ mod tests {
         assert!(err.to_string().contains("does not decode"), "{err}");
 
         let err = client
-            .get_account_data(&Pubkey::default())
+            .get_account(&Pubkey::default())
             .await
-            .expect_err("undecodable data must not read as data");
+            .expect_err("undecodable data must not read as an account");
         assert!(!err.to_string().contains("AccountNotFound"), "{err}");
     }
 
-    /// `get_account_data` keeps the client's contract: absence is `AccountNotFound`.
+    /// `get_account` keeps the client's contract: absence is `AccountNotFound`.
     #[tokio::test]
-    async fn get_account_data_absent_is_account_not_found() {
+    async fn get_account_absent_is_account_not_found() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
@@ -1075,7 +1067,7 @@ mod tests {
             .await;
         let client = make_client_at(&server.url());
         let err = client
-            .get_account_data(&Pubkey::default())
+            .get_account(&Pubkey::default())
             .await
             .expect_err("absent account");
         assert!(is_permanent_rpc_error(&err), "{err}");

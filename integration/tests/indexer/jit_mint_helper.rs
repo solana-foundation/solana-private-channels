@@ -3,7 +3,7 @@
 //! `test_hooks::jit_mint_init` wrapper.
 //!
 //! Drives the production helper against a scripted `MockRpcServer`, so the
-//! full code path — on-chain probe, `decode_and_check_authority` branching,
+//! full code path — on-chain probe, `classify_mint_account` branching,
 //! `InitializeMint` send, confirmation poll, post-init authority recheck,
 //! and backoff fallback — is exercised end-to-end rather than replayed by
 //! hand at the wire layer.
@@ -36,6 +36,7 @@ use {
     serde_json::json,
     solana_keychain::SolanaSigner,
     solana_sdk::pubkey::Pubkey,
+    solana_sdk_ids::system_program,
     spl_token::{
         solana_program::{program_option::COption, program_pack::Pack},
         state::Mint,
@@ -91,16 +92,22 @@ fn corrupt_mint_bytes() -> Vec<u8> {
     data
 }
 
+/// Build a `getAccountInfo` success-shaped reply for an SPL Token-owned
+/// account carrying the given bytes.
+fn account_info_reply(data: &[u8]) -> Reply {
+    account_info_reply_owned_by(data, &spl_token::id())
+}
+
 /// Build a `getAccountInfo` success-shaped reply carrying the given
 /// account bytes in base64 encoding (Solana JSON-RPC wire shape).
-fn account_info_reply(data: &[u8]) -> Reply {
+fn account_info_reply_owned_by(data: &[u8], owner: &Pubkey) -> Reply {
     Reply::result(json!({
         "context": { "slot": 100 },
         "value": {
             "data": [STANDARD.encode(data), "base64"],
             "executable": false,
             "lamports": 1_461_600u64,
-            "owner": spl_token::id().to_string(),
+            "owner": owner.to_string(),
             "rentEpoch": 0u64,
             "space": data.len(),
         }
@@ -648,9 +655,11 @@ async fn jit_returns_manual_review_when_backoff_recovers_with_authority_mismatch
 // Backoff exhausts with uninit reads — Transient.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Wall-clock note: this is the only test that pays the full
-// 4 × BACKOFF_MS = ~750 ms for the backoff loop; do not duplicate this
-// shape elsewhere.
+// Wall-clock note: this and
+// `jit_returns_transient_when_post_confirm_backoff_exhausts_with_reserved`
+// are the only tests that pay the full 4 × BACKOFF_MS = ~750 ms for the
+// backoff loop. They cover the unconfirmed and confirmed branches, which
+// end with different messages. Do not duplicate this shape elsewhere.
 #[tokio::test]
 async fn jit_returns_transient_when_backoff_exhausts_with_uninit() {
     let Fixture {
@@ -718,6 +727,175 @@ async fn jit_returns_transient_when_no_cached_builder() {
         0,
         "early return must skip every RPC call"
     );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Someone sent lamports to the mint address first, leaving a dataless
+// System account there. Each test pins one of the three JIT reads.
+// ─────────────────────────────────────────────────────────────────────
+
+// Pre-check reads the dataless System account, so JIT still sends
+// InitializeMint over it.
+#[tokio::test]
+async fn jit_initializes_over_reserved_account_then_returns_retry() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    mock.enqueue("getSignatureStatuses", confirmed_status_reply());
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_owned_initialized_mint_bytes()),
+    );
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    assert!(
+        matches!(outcome, JitOutcome::Retry(_)),
+        "expected Retry, got {:?}",
+        debug_outcome(&outcome)
+    );
+    assert_eq!(mock.call_count("getAccountInfo"), 2);
+    assert_eq!(mock.call_count("sendTransaction"), 1);
+    mock.shutdown().await;
+}
+
+// Post-confirm re-read still sees the dataless System account because the
+// read RPC lags. It keeps polling, and the next read finds the admin mint.
+#[tokio::test]
+async fn jit_post_confirm_polls_past_reserved_account() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    mock.enqueue("getSignatureStatuses", confirmed_status_reply());
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_owned_initialized_mint_bytes()),
+    );
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    assert!(
+        matches!(outcome, JitOutcome::Retry(_)),
+        "expected Retry, got {:?}",
+        debug_outcome(&outcome)
+    );
+    assert_eq!(
+        mock.call_count("getAccountInfo"),
+        3,
+        "1 pre-check + 2 post-confirm reads"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 1);
+    mock.shutdown().await;
+}
+
+// InitializeMint confirmed, but every backoff read still sees the dataless
+// System account. JIT cannot confirm the mint, so the deposit is re-armed.
+#[tokio::test]
+async fn jit_returns_transient_when_post_confirm_backoff_exhausts_with_reserved() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    mock.enqueue("getSignatureStatuses", confirmed_status_reply());
+    for _ in 0..4 {
+        mock.enqueue(
+            "getAccountInfo",
+            account_info_reply_owned_by(&[], &system_program::ID),
+        );
+    }
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    match outcome {
+        JitOutcome::Transient(reason) => {
+            assert!(reason.contains("reads as uninitialized"), "got {reason:?}");
+        }
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
+    }
+    assert_eq!(
+        mock.call_count("getAccountInfo"),
+        5,
+        "1 pre-check + 4 post-confirm reads"
+    );
+    mock.shutdown().await;
+}
+
+// Backoff re-read sees the dataless System account first, keeps polling,
+// and the next read finds the admin mint.
+#[tokio::test]
+async fn jit_backoff_polls_past_reserved_account() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    for _ in 0..5 {
+        mock.enqueue("getSignatureStatuses", null_status_reply());
+    }
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_owned_by(&[], &system_program::ID),
+    );
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_owned_initialized_mint_bytes()),
+    );
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    assert!(
+        matches!(outcome, JitOutcome::Retry(_)),
+        "expected Retry, got {:?}",
+        debug_outcome(&outcome)
+    );
+    assert_eq!(
+        mock.call_count("getAccountInfo"),
+        3,
+        "1 pre-check + 2 backoff reads"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 1);
     mock.shutdown().await;
 }
 

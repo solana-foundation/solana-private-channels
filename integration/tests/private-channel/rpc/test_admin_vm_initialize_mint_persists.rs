@@ -12,6 +12,9 @@
 //!      exists with the declared decimals/authority, and the spl_token program
 //!      account is not clobbered.
 //!   2. One admin tx with two InitializeMint instructions - both mints persist.
+//!   3. Someone closes an ATA into a future mint address first. The operator's
+//!      deposit mint fails there with IncorrectProgramId, InitializeMint still
+//!      lands over the dataless System account, and the deposit mint then lands.
 
 use {
     super::{
@@ -22,8 +25,16 @@ use {
     solana_sdk::{
         account::ReadableAccount,
         program_pack::Pack,
+        pubkey::Pubkey,
         signature::{Keypair, Signer},
         transaction::Transaction,
+    },
+    solana_sdk_ids::system_program,
+    spl_associated_token_account::{
+        get_associated_token_address,
+        instruction::{
+            create_associated_token_account, create_associated_token_account_idempotent,
+        },
     },
     spl_token::state::Mint,
     std::time::Duration,
@@ -34,6 +45,7 @@ pub async fn run_admin_vm_initialize_mint_persists_test(ctx: &PrivateChannelCont
 
     case_single_mint_persists(ctx).await;
     case_two_mints_persist(ctx).await;
+    case_reserved_target_initializes(ctx).await;
 
     println!("✓ AdminVm mint-persistence tests passed");
 }
@@ -69,11 +81,7 @@ fn assert_balances_aligned(tx_json: &serde_json::Value, label: &str) {
 }
 
 /// Fetch and unpack the on-chain Mint at `pubkey`, asserting its decimals.
-async fn assert_mint_decimals(
-    ctx: &PrivateChannelContext,
-    pubkey: &solana_sdk::pubkey::Pubkey,
-    label: &str,
-) {
+async fn assert_mint_decimals(ctx: &PrivateChannelContext, pubkey: &Pubkey, label: &str) {
     let account = ctx
         .read_client
         .get_account(pubkey)
@@ -203,4 +211,142 @@ async fn case_two_mints_persist(ctx: &PrivateChannelContext) {
     assert_mint_decimals(ctx, &mint_a.pubkey(), "case 2 mint_a").await;
     assert_mint_decimals(ctx, &mint_b.pubkey(), "case 2 mint_b").await;
     println!("  ✓ case 2: two InitializeMint instructions both persist");
+}
+
+/// Someone squats a future mint address by closing an ATA into it. The
+/// operator's deposit mint fails there until the admin initializes the mint,
+/// then lands.
+async fn case_reserved_target_initializes(ctx: &PrivateChannelContext) {
+    let operator = ctx.operator_key.pubkey();
+    let live_mint = Keypair::new();
+    let mint = Keypair::new();
+    let squatter = Keypair::new();
+    let squatter_ata = get_associated_token_address(&squatter.pubkey(), &live_mint.pubkey());
+    let recipient = Pubkey::new_unique();
+    let recipient_ata = get_associated_token_address(&recipient, &mint.pubkey());
+    let amount = 1_000;
+
+    // Squat: open an ATA on a live mint, then close it into the future mint
+    // address. The close destination does not have to sign.
+    let live_mint_tx = setup::create_mint_account_transaction(
+        &ctx.operator_key,
+        &live_mint,
+        &operator,
+        MINT_DECIMALS,
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &live_mint_tx).await;
+    assert!(err.is_null(), "live mint init failed: {err}");
+    let open_tx = Transaction::new_signed_with_payer(
+        &[create_associated_token_account(
+            &squatter.pubkey(),
+            &squatter.pubkey(),
+            &live_mint.pubkey(),
+            &spl_token::id(),
+        )],
+        Some(&squatter.pubkey()),
+        &[&squatter],
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &open_tx).await;
+    assert!(err.is_null(), "squatter ATA create failed: {err}");
+    let close_tx = Transaction::new_signed_with_payer(
+        &[spl_token::instruction::close_account(
+            &spl_token::id(),
+            &squatter_ata,
+            &mint.pubkey(),
+            &squatter.pubkey(),
+            &[],
+        )
+        .unwrap()],
+        Some(&squatter.pubkey()),
+        &[&squatter],
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &close_tx).await;
+    assert!(err.is_null(), "squatter ATA close failed: {err}");
+    let reserved = ctx
+        .read_client
+        .get_account(&mint.pubkey())
+        .await
+        .expect("case 3: the squat must leave an account at the mint address");
+    assert_eq!(*reserved.owner(), system_program::ID);
+    assert!(reserved.data().is_empty());
+
+    // The operator's deposit mint: create the recipient ATA, then MintTo.
+    let deposit_ixs = [
+        create_associated_token_account_idempotent(
+            &operator,
+            &recipient,
+            &mint.pubkey(),
+            &spl_token::id(),
+        ),
+        spl_token::instruction::mint_to(
+            &spl_token::id(),
+            &mint.pubkey(),
+            &recipient_ata,
+            &operator,
+            &[],
+            amount,
+        )
+        .unwrap(),
+    ];
+
+    // Before the init it fails with IncorrectProgramId, the error that sends
+    // the indexer to JIT mint initialization.
+    let deposit_tx = Transaction::new_signed_with_payer(
+        &deposit_ixs,
+        Some(&operator),
+        &[&ctx.operator_key],
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &deposit_tx).await;
+    assert!(
+        err.to_string().contains("IncorrectProgramId"),
+        "deposit before init must fail with IncorrectProgramId, got: {err}"
+    );
+
+    let init_tx = setup::create_mint_account_transaction(
+        &ctx.operator_key,
+        &mint,
+        &operator,
+        MINT_DECIMALS,
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &init_tx).await;
+    assert!(err.is_null(), "InitializeMint over the squat failed: {err}");
+    assert_mint_decimals(ctx, &mint.pubkey(), "case 3").await;
+    let account = ctx.read_client.get_account(&mint.pubkey()).await.unwrap();
+    assert_eq!(*account.owner(), spl_token::id());
+    assert_eq!(account.lamports(), 1, "the squatted lamport is kept");
+
+    // After the init the same deposit mint lands.
+    let deposit_tx = Transaction::new_signed_with_payer(
+        &deposit_ixs,
+        Some(&operator),
+        &[&ctx.operator_key],
+        ctx.get_blockhash().await.unwrap(),
+    );
+    let err = send_and_get_err(ctx, &deposit_tx).await;
+    assert!(err.is_null(), "deposit after init failed: {err}");
+    assert_eq!(ctx.get_token_balance(&recipient_ata).await.unwrap(), amount);
+    println!("  ✓ case 3: a squatted mint address still initializes and mints");
+}
+
+/// Send `tx`, wait for it to land, and return its `meta.err` (null on success).
+async fn send_and_get_err(ctx: &PrivateChannelContext, tx: &Transaction) -> serde_json::Value {
+    let sig = ctx
+        .send_and_check(tx, Duration::from_secs(SEND_AND_CHECK_DURATION_SECONDS))
+        .await
+        .expect("send_and_check should not error")
+        .expect("transaction should land");
+    let response = ctx
+        .get_transaction(&sig)
+        .await
+        .expect("get_transaction should not error")
+        .expect("a landed transaction must be retrievable");
+    response
+        .pointer("/meta/err")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
