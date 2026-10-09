@@ -2981,17 +2981,15 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Drop remint signatures whose parent transaction is no longer
-    /// `pending_remint`. Returns the number of rows removed.
+    /// Drop remint signatures whose parent transaction is terminal. Returns the
+    /// number of rows removed. A `manual_review` row keeps its journal: its
+    /// MintTo may still land, and recovery needs the signature to rule that out.
     pub async fn gc_stale_remint_signatures_internal(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM pending_remint_signatures
-            WHERE transaction_id IN (
-                SELECT id FROM transactions WHERE status <> 'pending_remint'
-            )
-            "#,
-        )
+        let result = sqlx::query(&format!(
+            "DELETE FROM pending_remint_signatures
+             WHERE transaction_id IN (SELECT id FROM transactions
+                                      WHERE status IN {TERMINAL_STATUSES})"
+        ))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())

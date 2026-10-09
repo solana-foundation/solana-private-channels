@@ -398,6 +398,17 @@ async fn test_remint_signatures_round_trip_and_gc() {
         2
     );
 
+    // A ManualReview parent keeps its rows: its MintTo may still land.
+    sqlx::query(
+        "UPDATE transactions SET status = 'manual_review'::transaction_status WHERE id = $1",
+    )
+    .bind(tx_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
+    assert_eq!(removed, 0, "a ManualReview parent must keep its rows");
+
     // Once the parent goes terminal, GC sweeps its write-ahead rows.
     sqlx::query(
         "UPDATE transactions SET status = 'failed_reminted'::transaction_status WHERE id = $1",

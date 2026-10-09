@@ -2013,6 +2013,64 @@ async fn release_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// A non-terminal row can still have a remint in flight, so only a terminal
+/// parent lets the GC reclaim its remint journal.
+#[tokio::test(flavor = "multi_thread")]
+async fn remint_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // (status, must_survive)
+    let cases = [
+        ("pending", true),
+        ("processing", true),
+        ("parked", true),
+        ("pending_remint", true),
+        ("manual_review", true),
+        ("completed", false),
+        ("failed", false),
+        ("failed_reminted", false),
+    ];
+
+    let mut ids = Vec::new();
+    for (status, survive) in cases {
+        let txn = make_db_transaction(&format!("remint_gc_{status}"), TransactionType::Withdrawal);
+        let id = storage.insert_db_transaction(&txn).await?;
+        // The claim only journals against a pending_remint parent.
+        sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        assert_eq!(
+            storage
+                .claim_remint_attempt(id, format!("remint-{status}"), 1, None, &[])
+                .await?,
+            RemintClaim::Claimed
+        );
+        sqlx::query(&format!(
+            "UPDATE transactions SET status = '{status}'::transaction_status WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await?;
+        ids.push((status, id, survive));
+    }
+
+    let removed = storage.gc_stale_remint_signatures().await?;
+    let expected_removed = ids.iter().filter(|(_, _, survive)| !survive).count() as u64;
+    assert_eq!(
+        removed, expected_removed,
+        "GC must drop only the terminal rows' journals"
+    );
+    for (status, id, survive) in ids {
+        let present = !storage.get_remint_signatures(id).await?.is_empty();
+        assert_eq!(
+            present, survive,
+            "status '{status}' journal retention mismatch (survive={survive})"
+        );
+    }
+    Ok(())
+}
+
 // ── type-scoped stale queries ────────────────────────────────────────────────
 
 async fn backdate_updated_at(

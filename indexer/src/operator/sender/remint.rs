@@ -1400,6 +1400,7 @@ mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
         mock_bitmap_account, mock_bitmap_at_commitment, mock_bitmap_read_failure,
+        push_withdrawal_with_nonce,
     };
     use crate::operator::sender::types::{
         PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
@@ -3694,6 +3695,63 @@ mod tests {
         assert!(
             err.contains("release_funds failed"),
             "must preserve the original withdrawal error: {err}"
+        );
+    }
+
+    /// An unclassifiable attempt may still land, so its journal must outlive the
+    /// ManualReview hand-off for the operator to rule it out.
+    #[tokio::test]
+    async fn unclassifiable_remint_keeps_its_journal_through_manual_review() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let transaction_id = 714;
+        let nonce = 75;
+        let journaled = Signature::new_unique().to_string();
+        mock.remint_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: journaled.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        let _statuses = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatusSnapshot",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
+        )
+        .await;
+
+        let entry = make_matured_remint(transaction_id, nonce);
+        execute_deferred_remint(&state, entry, &storage_tx).await;
+        let update = storage_rx
+            .try_recv()
+            .expect("an unclassifiable attempt must escalate");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("classification unavailable"),
+            "must escalate from the Uncertain arm: {err}"
+        );
+        // Apply the update as the async writer would.
+        push_withdrawal_with_nonce(&mock, transaction_id, nonce as i64, update.status);
+
+        state.storage.gc_stale_remint_signatures().await.unwrap();
+
+        let kept: Vec<String> = mock
+            .get_remint_signatures(transaction_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stored| stored.signature)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![journaled],
+            "a ManualReview row must keep its remint journal"
         );
     }
 
