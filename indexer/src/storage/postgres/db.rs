@@ -855,6 +855,26 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // A reminted row must carry the remint that refunded it, whoever writes
+        // it, or a later re-arm cannot tell the row was already refunded.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'failed_reminted_has_landed_signature'
+                      AND conrelid = 'transactions'::regclass
+                ) THEN
+                    ALTER TABLE transactions
+                    ADD CONSTRAINT failed_reminted_has_landed_signature
+                    CHECK (status <> 'failed_reminted' OR landed_remint_signature IS NOT NULL);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add manual_review status for unconfirmed remints requiring investigation
         sqlx::query(
             r#"
@@ -1898,6 +1918,8 @@ impl PostgresDb {
     ) -> Result<bool, sqlx::Error> {
         // Only write non-terminal source states — blocks late writes after recovery.
         // release_signatures is COALESCE-guarded so a None never wipes provenance.
+        // failed_reminted is refused: only record_remint_result may set it, since
+        // only it stores the landed signature with it.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -1908,6 +1930,7 @@ impl PostgresDb {
                 release_signatures = COALESCE($5, release_signatures)
             WHERE id = $1
               AND status IN ('processing', 'pending_remint')
+              AND $2 <> 'failed_reminted'
             "#,
         )
         .bind(transaction_id)
@@ -2569,9 +2592,9 @@ impl PostgresDb {
     }
 
     /// Durably record a confirmed remint: flip status to FailedReminted and
-    /// store the signature in one UPDATE, before the async writer runs. The
-    /// `pending_remint` guard makes it a no-op on an already-terminal row, so
-    /// a replayed call can never resurrect or double-record.
+    /// store the signature in one UPDATE. The `pending_remint` guard makes it a
+    /// no-op on an already-terminal row, so a replayed call can never resurrect
+    /// or double-record.
     pub async fn record_remint_result_internal(
         &self,
         transaction_id: i64,
@@ -2617,7 +2640,7 @@ impl PostgresDb {
             // on-call: a missing row is a bug (the id came from a live
             // PendingRemint row), a non-pending_remint status is expected on an
             // idempotent replay. Both still signal RowNotFound so the caller
-            // falls back to the async writer.
+            // reads the row back to see who owns it.
             match current.as_deref() {
                 None => warn!("record_remint_result: transaction {transaction_id} not found"),
                 Some(status) => info!(
@@ -2690,6 +2713,8 @@ impl PostgresDb {
               AND NOT EXISTS (
                   SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
               )
+              -- A landed remint already refunded the row; releasing it would pay twice.
+              AND landed_remint_signature IS NULL
             RETURNING updated_at
             "#,
         )
@@ -2984,6 +3009,8 @@ impl PostgresDb {
     /// Drop remint signatures whose parent transaction is terminal. Returns the
     /// number of rows removed. A `manual_review` row keeps its journal: its
     /// MintTo may still land, and recovery needs the signature to rule that out.
+    /// A `failed_reminted` parent always carries its landed signature (table
+    /// CHECK), so dropping its journal loses no evidence.
     pub async fn gc_stale_remint_signatures_internal(&self) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(&format!(
             "DELETE FROM pending_remint_signatures

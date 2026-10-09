@@ -24,10 +24,13 @@ Pull the row's DB-side state:
 
 ```sql
 SELECT id, signature, slot, withdrawal_nonce, status, counterpart_signature,
-       remint_signatures, updated_at
+       remint_signatures, landed_remint_signature, updated_at
   FROM transactions
  WHERE id = :transaction_id;
 ```
+
+If `landed_remint_signature` is set, the row was already refunded: handle it as
+the **Landed** case of the remint check below, and never re-arm or refund it.
 
 **Check the remint journal before any path.** A row keeps every remint it
 broadcast until it goes terminal:
@@ -200,6 +203,7 @@ every active withdrawal is collateral.
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
       AND id <> ALL(:excluded_ids)
+      AND landed_remint_signature IS NULL
       AND NOT EXISTS (SELECT 1 FROM pending_remint_signatures r
                        WHERE r.transaction_id = transactions.id);
    ```
@@ -207,7 +211,9 @@ every active withdrawal is collateral.
    held in `manual_review` (each recorded in its own incident record).
    Re-arming a held row releases escrowed funds against a burn nobody
    proved happened. A row with a remint journal is skipped: its remint may
-   still land, so take it through the Triage remint check on its own.
+   still land, so take it through the Triage remint check on its own. A row
+   with a landed remint was already refunded, so no re-arm in this runbook
+   matches it.
    The `transactions` table does not store `error_message` - it lives in the
    alert payload only. Distinguishing trigger from collateral happens in
    triage (Step 2: oldest `updated_at` is the trigger), not in the re-arm
@@ -350,8 +356,12 @@ would reopen the free retry loop it exists to close.
    ```sql
    UPDATE transactions
       SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
-    WHERE id = :transaction_id;
+    WHERE id = :transaction_id
+      AND landed_remint_signature IS NULL;
    ```
+   On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+   refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+   remint check.
 4. **No operator restart is needed.** The processor did not halt; the
    fetcher will pick up the re-armed row on its next tick.
 5. **If the condition is permanent**, mark `failed` and capture the
@@ -581,8 +591,13 @@ The generation is the u64 at offset 2. If it is above
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
- WHERE id = :transaction_id;
+ WHERE id = :transaction_id
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 Otherwise proceed.
 
@@ -680,8 +695,13 @@ stall, since the counter is already at the cap:
 ```sql
 UPDATE transactions
    SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
- WHERE id = :transaction_id;
+ WHERE id = :transaction_id
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 If the release can never land (unrecoverable on-chain rejection), mark the
 row terminal and [escalate](_escalation.md) (Tier 1) for refund
@@ -720,8 +740,13 @@ Nothing was broadcast for these rows.
 UPDATE transactions
    SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id
-   AND status = 'manual_review';
+   AND status = 'manual_review'
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 ## Path H - rotated past generation
 
@@ -784,8 +809,9 @@ keys.
    the alert history for an earlier `failed_reminted` webhook for this
    `transaction_id`, and the user's channel token account history for a remint
    after the burn.
-   - Any remint landed: set the row back to `failed_reminted`, record that
-     signature in the incident record, and skip to Step 6. Do not remint again.
+   - Any remint landed: mark the row reminted with that signature using the
+     Triage SQL, record it in the incident record, and skip to Step 6. Do not
+     remint again.
    - None landed, and every signature is dead by the Triage rule: continue.
    - A signature cannot be confirmed either way: `AMBIGUOUS`.
 4. **Confirm the burn** with both coverage bounds, as in Path C Step 3. If the
@@ -795,8 +821,8 @@ keys.
    the user is owed their channel tokens. [Escalate](_escalation.md) (Tier 1)
    for an out-of-band remint of the burned tokens, as in Path B Step 3. Include
    the evidence from Steps 1 to 3 in the escalation. Once the remint is
-   confirmed, mark the row `failed_reminted` and record the remint signature in
-   the incident record.
+   confirmed, mark the row reminted with its signature using the Triage SQL,
+   and record it in the incident record.
 6. **Attribute the rotation.** If the signer from Step 1 is this operator's key
    and the row was re-armed from a terminal status around then, it is the first
    cause above. Otherwise [escalate](_escalation.md) (Tier 2): the admin can

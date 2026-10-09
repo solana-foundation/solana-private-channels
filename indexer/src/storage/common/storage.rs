@@ -463,8 +463,8 @@ impl Storage {
     }
 
     /// Durably record a confirmed remint (status -> FailedReminted plus the
-    /// signature) in one write, before the async status writer runs. Closes the
-    /// crash window that would otherwise leave a landed remint as PendingRemint.
+    /// signature) in one write. The only operator write that sets FailedReminted,
+    /// so a reminted row always carries its landed signature.
     pub async fn record_remint_result(
         &self,
         transaction_id: i64,
@@ -1775,6 +1775,26 @@ mod tests {
                 if retained { "keep" } else { "lose" }
             );
         }
+    }
+
+    /// Mirrors the Postgres claim: a row with a landed remint was already
+    /// refunded, so its release is never claimed.
+    #[tokio::test]
+    async fn release_claim_refuses_a_reminted_row() {
+        let (storage, mock) = make_mock_storage();
+        let mut row = make_db_transaction();
+        row.id = 1;
+        row.status = TransactionStatus::Processing;
+        row.landed_remint_signature = Some("remint-landed".to_string());
+        let token = row.updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let claimed = storage
+            .claim_and_persist_signature(1, token, "sig-reminted".to_string(), 1, None)
+            .await
+            .unwrap();
+
+        assert!(claimed.is_none(), "a reminted row must not be released");
     }
 
     /// A non-terminal row can still have a remint in flight, so only a

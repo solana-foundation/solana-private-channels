@@ -411,9 +411,11 @@ async fn test_remint_signatures_round_trip_and_gc() {
 
     // Once the parent goes terminal, GC sweeps its write-ahead rows.
     sqlx::query(
-        "UPDATE transactions SET status = 'failed_reminted'::transaction_status WHERE id = $1",
+        "UPDATE transactions SET status = 'failed_reminted'::transaction_status,
+         landed_remint_signature = $2 WHERE id = $1",
     )
     .bind(tx_id)
+    .bind(attempt_b.clone())
     .execute(&pool)
     .await
     .unwrap();

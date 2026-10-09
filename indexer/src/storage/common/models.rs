@@ -100,8 +100,7 @@ pub struct DbTransaction {
     /// identity so a CPI deposit/withdraw never collides with its parent's row.
     pub inner_index: Option<i32>,
     /// Confirmed remint signature, written in the same UPDATE that flips status
-    /// to FailedReminted. A crash before the async writer runs can no longer
-    /// leave a landed remint recorded only as PendingRemint (which would replay).
+    /// to FailedReminted, so a reminted row always carries the remint it landed.
     pub landed_remint_signature: Option<String>,
     /// Set when the program itself refused this row's release, which is direct
     /// proof no payout occurred and the only such proof that outlives a bitmap

@@ -404,6 +404,7 @@ pub fn init_labels(program_type: &str) {
         "confirmation_error",
         "deposit_ownership_lost",
         "release_claim_lost",
+        "remint_record_failed",
         "halted_before_broadcast",
         "halt_read_error",
         "release_missing_claim_lease",

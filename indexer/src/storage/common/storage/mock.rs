@@ -391,13 +391,15 @@ impl MockStorage {
                 .unwrap()
                 .insert(transaction_id, sigs);
         }
-        // Mirror the Postgres status filter (Processing or PendingRemint only).
+        // Mirror the Postgres status filter (Processing or PendingRemint only),
+        // and its refusal to set FailedReminted.
         let mut pending = self.pending_transactions.lock().unwrap();
         let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
             if matches!(
                 txn.status,
                 TransactionStatus::Processing | TransactionStatus::PendingRemint
-            ) {
+            ) && status != TransactionStatus::FailedReminted
+            {
                 txn.status = status;
                 if counterpart_signature.is_some() {
                     txn.counterpart_signature = counterpart_signature.clone();
@@ -1524,6 +1526,7 @@ impl MockStorage {
                 t.id == transaction_id
                     && t.status == TransactionStatus::Processing
                     && t.updated_at == expected_updated_at
+                    && t.landed_remint_signature.is_none()
             });
             // CAS miss: Postgres updates no row and never reaches the insert.
             if !owned {

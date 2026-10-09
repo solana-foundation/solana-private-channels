@@ -934,6 +934,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: remint-record-failing
+        title: "A landed remint cannot be recorded"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) confirmed a remint on the private channel but cannot record it on the withdrawal row, so the row stays pending_remint and the sender retries it every pass. No funds are at risk: the remint is journaled and never resent. The landed signature is in the sender's 'confirmed but durable persist failed' ERROR line. Check the operator's database connection. Until the remint is recorded, the row holds the bitmap rotation."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="remint_record_failed"}[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
       - uid: halt-flag-unreadable
         title: "Operator cannot read the reconciliation halt flag"
         condition: C
