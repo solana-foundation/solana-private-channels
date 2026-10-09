@@ -3039,27 +3039,43 @@ impl PostgresDb {
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
     ///
-    /// Journalled release signatures are copied onto the row in the same
-    /// UPDATE. The journal is GC'd once the row leaves `Processing`, and the
-    /// reconcile sweep only fetches rows carrying those columns.
+    /// Journalled release signatures are copied onto the row, because the
+    /// reconcile sweep only fetches rows carrying those columns. The rows are
+    /// locked first, so a claim in flight commits its journal before the copy
+    /// reads it.
     ///
     /// Scope is intentionally DB-wide over `transaction_type = 'withdrawal'`
     /// to match the fetcher's own scope. The data model assumes a single
     /// withdrawal operator per database; multi-instance isolation would
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
-    // Coverage-ignore rationale (category b, defensive recovery):
-    //   `quarantine_active_withdrawals_internal` is only invoked by
-    //   the poison-pill pipeline in `operator/processor.rs`
-    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded.
-    //   Integration tests do not produce malformed rows that would trip
-    //   it. The SQL itself is trivial; the behavior is covered via the
-    //   `Storage::Mock` variant in in-crate tests and by the runbook drills.
     pub async fn quarantine_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,
         min_nonce: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock first: this waits out a claim in flight, whose journal insert
+        // commits under the same row lock, and rechecks the status after it.
+        let ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM transactions
+            WHERE transaction_type = 'withdrawal'
+              AND status IN ('pending', 'processing', 'parked')
+              AND ($1::BIGINT IS NULL OR id <> $1)
+              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(exclude_id)
+        .bind(min_nonce)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // A new statement reads a new snapshot, so the copy sees every journal
+        // committed before the locks were taken.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -3077,17 +3093,15 @@ impl PostgresDb {
                      WHERE p.transaction_id = transactions.id),
                     remint_last_valid_block_heights
                 )
-            WHERE transaction_type = 'withdrawal'
+            WHERE id = ANY($1)
               AND status IN ('pending', 'processing', 'parked')
-              AND ($1::BIGINT IS NULL OR id <> $1)
-              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
             "#,
         )
-        .bind(exclude_id)
-        .bind(min_nonce)
-        .execute(&self.pool)
+        .bind(&ids)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 

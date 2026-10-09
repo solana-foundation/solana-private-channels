@@ -3004,6 +3004,104 @@ async fn claim_is_refused_for_a_reminted_row() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// The halt sweep must copy a journal that a concurrent claim commits while the
+/// sweep waits on its row lock, or the quarantined row carries no evidence and
+/// can never clear itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_copies_the_journal_of_a_claim_it_waited_on(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let nonce = 100_i64;
+    let signature = "claim-release-signature";
+    let last_valid_block_height = 777_i64;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "quarantine_race",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing', withdrawal_nonce = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(nonce)
+    .execute(&pool)
+    .await?;
+
+    // Mirrors claim_and_persist_signature, held open so the sweep has to wait on it.
+    let mut claim = pool.begin().await?;
+    sqlx::query(
+        "UPDATE transactions SET updated_at = NOW() WHERE id = $1 AND status = 'processing'",
+    )
+    .bind(id)
+    .execute(&mut *claim)
+    .await?;
+
+    let sweep_storage = storage.clone();
+    let sweep = tokio::spawn(async move {
+        sweep_storage
+            .quarantine_active_withdrawals(None, Some(nonce))
+            .await
+    });
+    wait_for_lock_waiter(&pool, &sweep).await;
+
+    sqlx::query(
+        "INSERT INTO pending_release_signatures (transaction_id, signature, last_valid_block_height)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(id)
+    .bind(signature)
+    .bind(last_valid_block_height)
+    .execute(&mut *claim)
+    .await?;
+    claim.commit().await?;
+
+    assert_eq!(sweep.await??, 1);
+    let (status, signatures, heights): (String, Option<Vec<String>>, Option<Vec<i64>>) =
+        sqlx::query_as(
+            "SELECT status::text, remint_signatures, remint_last_valid_block_heights
+             FROM transactions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "manual_review");
+    assert_eq!(signatures, Some(vec![signature.to_string()]));
+    assert_eq!(heights, Some(vec![last_valid_block_height]));
+    let stalled = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
+        .await?;
+    assert_eq!(
+        stalled.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![id],
+        "the copied journal lets the row clear itself"
+    );
+    Ok(())
+}
+
+/// Waits until some backend is blocked on a lock. Panics if none does, so a
+/// regression fails the test instead of hanging it. Returns early if `task`
+/// already finished, so the caller's await surfaces its real error.
+async fn wait_for_lock_waiter<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) {
+    for _ in 0..500 {
+        if task.is_finished() {
+            return;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the quarantine sweep never waited on the claim's row lock");
+}
+
 /// A halt-refused row that never broadcast goes back to Pending without spending a
 /// requeue attempt; a row with a journaled attempt, a stale token or no halt stays put.
 #[tokio::test(flavor = "multi_thread")]
