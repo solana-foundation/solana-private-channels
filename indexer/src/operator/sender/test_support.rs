@@ -82,6 +82,8 @@ pub(super) fn sender_state_with_storage_and_role(
         instance_pda: None,
         in_flight_withdrawals: HashSet::new(),
         cached_generation: None,
+        anchor_high_water: 0,
+        refusal_floor: 0,
         retry_counts: HashMap::new(),
         rotation_retry_attempts: 0,
         rotation_in_flight: None,
@@ -220,14 +222,26 @@ fn withdrawal_row(id: i64, status: TransactionStatus) -> DbTransaction {
     }
 }
 
-/// A `getAccountInfo` JSON-RPC response carrying a withdrawal bitmap account.
-fn bitmap_account_response(generation: u64, consumed: &[u64]) -> String {
+/// The `minContextSlot` a request asked for, or 1. A mock answering there stands in for
+/// a backend that is exactly at the floor the caller proved.
+pub(super) fn requested_min_slot(request: &mockito::Request) -> u64 {
+    let body: serde_json::Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+    body["params"][1]["minContextSlot"].as_u64().unwrap_or(1)
+}
+
+/// A `getAccountInfo` reply carrying a withdrawal bitmap, answered at the requested floor.
+fn bitmap_reply(request: &mockito::Request, generation: u64, consumed: &[u64]) -> Vec<u8> {
+    bitmap_account_response_at(generation, consumed, requested_min_slot(request)).into_bytes()
+}
+
+/// A `getAccountInfo` JSON-RPC response carrying a withdrawal bitmap account at `slot`.
+pub(super) fn bitmap_account_response_at(generation: u64, consumed: &[u64], slot: u64) -> String {
     let bytes = bitmap_account_bytes(generation, consumed, 255);
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "result": {
-            "context": {"slot": 1},
+            "context": {"slot": slot},
             "value": {
                 "owner": Pubkey::new_unique().to_string(),
                 "lamports": 1_000_000u64,
@@ -252,7 +266,10 @@ pub(super) fn mock_bitmap_account(
             r#""method"\s*:\s*"getAccountInfo""#.into(),
         ))
         .with_status(200)
-        .with_body(bitmap_account_response(generation, consumed))
+        .with_body_from_request({
+            let consumed = consumed.to_vec();
+            move |request| bitmap_reply(request, generation, &consumed)
+        })
         .create()
 }
 
@@ -364,7 +381,7 @@ pub(super) fn mock_bitmap_at_slot(
             mockito::Matcher::Regex(r#""commitment"\s*:\s*"finalized""#.into()),
         ]))
         .with_status(200)
-        .with_body(bitmap_account_response(generation, consumed))
+        .with_body(bitmap_account_response_at(generation, consumed, slot))
         .expect(1)
         .create()
 }
@@ -384,7 +401,10 @@ pub(super) fn mock_bitmap_at_commitment(
             mockito::Matcher::Regex(format!(r#""commitment"\s*:\s*"{commitment}""#)),
         ]))
         .with_status(200)
-        .with_body(bitmap_account_response(generation, consumed))
+        .with_body_from_request({
+            let consumed = consumed.to_vec();
+            move |request| bitmap_reply(request, generation, &consumed)
+        })
         .create()
 }
 
@@ -395,16 +415,15 @@ pub(super) fn mock_bitmap_account_counted(
     generation: u64,
     reads: Arc<AtomicUsize>,
 ) -> mockito::Mock {
-    let body = bitmap_account_response(generation, &[]);
     server
         .mock("POST", "/")
         .match_body(mockito::Matcher::Regex(
             r#""method"\s*:\s*"getAccountInfo""#.into(),
         ))
         .with_status(200)
-        .with_body_from_request(move |_| {
+        .with_body_from_request(move |request| {
             reads.fetch_add(1, Ordering::SeqCst);
-            body.clone().into_bytes()
+            bitmap_reply(request, generation, &[])
         })
         .expect_at_least(0)
         .create()
@@ -478,9 +497,9 @@ pub(super) fn mock_bitmap_then_read_failure(
             r#""method"\s*:\s*"getAccountInfo""#.into(),
         ))
         .with_status(200)
-        .with_body_from_request(move |_| {
+        .with_body_from_request(move |request| {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                return bitmap_account_response(generation, &consumed).into_bytes();
+                return bitmap_reply(request, generation, &consumed);
             }
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -512,13 +531,13 @@ pub(super) fn mock_bitmap_sequence(
             r#""method"\s*:\s*"getAccountInfo""#.into(),
         ))
         .with_status(200)
-        .with_body_from_request(move |_| {
+        .with_body_from_request(move |request| {
             let index = counter.fetch_add(1, Ordering::SeqCst);
             let (generation, consumed) = reads
                 .get(index)
                 .or_else(|| reads.last())
                 .expect("mock_bitmap_sequence needs at least one read");
-            bitmap_account_response(*generation, consumed).into_bytes()
+            bitmap_reply(request, *generation, consumed)
         })
         .expect_at_least(1)
         .create();

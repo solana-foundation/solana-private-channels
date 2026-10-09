@@ -147,7 +147,7 @@ In every case the safe posture is the same: only whitelist mints whose close/fre
 - TypeScript: resolve with `@solana-program/token-2022`, then append the metas to the instruction's `accounts`.
 - Rust: `spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute` against a scratch instruction whose first four accounts are source, mint, destination and authority, then take everything past them. This is what the withdrawal operator does.
 
-Every forwarded account keeps its writable flag but loses its signer bit, so a hook can never receive a signature from an account that signed the transaction. Withdrawals of a mint whose validation account is missing park for manual review under the `hook_unresolvable` bail reason, since nothing can resolve them.
+Every forwarded account keeps its writable flag but loses its signer bit, so a hook can never receive a signature from an account that signed the transaction. Withdrawals of a mint whose validation account is missing park for manual review under the `hook_unresolvable` bail reason, since nothing can resolve them. The operator reads the validation account and every resolved extra at or past the slot its allowlist read proved, and never below the slot it last saw that validation account at, and it counts a null as missing only from a node whose newest block is under 120 s old. Anything less is retried as a transient (up to the requeue cap, then parked with a reason naming freshness). One residual remains: the first withdrawal of a mint, on a live node that is behind the validation account's creation, still parks as missing; that floor is in memory, not persisted, since nothing on chain proves the account exists before it is first seen.
 
 ## BlockMint
 

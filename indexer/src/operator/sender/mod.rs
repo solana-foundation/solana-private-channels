@@ -13,7 +13,8 @@ pub use mint::{
 };
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
 pub(crate) use state::{
-    release_seen_at_confirmed, validate_bitmap_consistency, verify_release_landed, ReleaseVerdict,
+    release_seen_at_confirmed, validate_bitmap_consistency, verify_release_landed,
+    verify_release_landed_at, ReleaseVerdict,
 };
 pub(crate) use transaction::fetch_statuses_checked;
 pub use types::TransactionStatusUpdate;
@@ -199,8 +200,8 @@ use tracing::{debug, error, info, warn};
 
 use proof::{originate_rotation_if_needed, take_pending_rotation_if_ready};
 use transaction::{
-    handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
-    send_and_confirm, GenerationWindow,
+    classify_generation, handle_transaction_submission, poll_in_flight, route_poll_results,
+    run_poll_task, send_and_confirm, GenerationWindow,
 };
 use types::{PollTaskResult, SenderState};
 
@@ -448,10 +449,34 @@ pub async fn run_sender(
 /// a CAS before it is broadcast. Only a positive answer authorises the send: an
 /// unparked row belongs to someone else now, and an unreadable one says nothing
 /// about who owns it.
+///
+/// The generation is read once per tick at the sender's floor, which includes every
+/// refusal slot, and never taken from the cache. A read that cannot reach the floor
+/// holds every entry: resending on an older view only pays a fee to be refused again.
 pub(super) async fn drain_rotation_retry_queue(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    if state.rotation_retry_queue.is_empty() {
+        return;
+    }
+    let chain_generation = match state.pending_rotation {
+        Some(_) => None,
+        None => match state.refresh_generation().await {
+            Ok(generation) => Some(generation),
+            Err(e) => {
+                crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[state.program_type.as_label(), "rotation_retry_held"])
+                    .inc();
+                warn!(
+                    queued = state.rotation_retry_queue.len(),
+                    "Holding queued releases: no generation read at or past the floor: {e}"
+                );
+                None
+            }
+        },
+    };
+
     for (ctx, instruction) in std::mem::take(&mut state.rotation_retry_queue) {
         let Some(transaction_id) = ctx.transaction_id else {
             error!("Dropping a queued release that carries no row to unpark");
@@ -467,14 +492,13 @@ pub(super) async fn drain_rotation_retry_queue(
             continue;
         };
 
-        if state.pending_rotation.is_some() {
+        let Some(chain_generation) = chain_generation else {
             hold_queued_release(state, ctx, instruction, transaction_id).await;
             continue;
-        }
+        };
 
         // The rotation this entry waits on can be lost, and a send into a shut window pays a fee to be refused.
-        let (window, chain_generation) = state.release_window(nonce).await;
-        match window {
+        match classify_generation(nonce, chain_generation) {
             GenerationWindow::Open => {}
             GenerationWindow::NotYetOpen => {
                 hold_queued_release(state, ctx, instruction, transaction_id).await;
@@ -1088,12 +1112,148 @@ mod tests {
         );
     }
 
+    /// A `getAccountInfo` bitmap at `generation`, answered at `slot` whatever was asked, counting reads.
+    fn mock_bitmap_answering_at(
+        server: &mut mockito::ServerGuard,
+        generation: u64,
+        slot: u64,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::operator::sender::test_support::bitmap_account_response_at(
+                    generation,
+                    &[],
+                    slot,
+                )
+                .into_bytes()
+            })
+            .create();
+        reads
+    }
+
+    /// The drain reads once per tick at the refusal floor, never from the cache. A cache
+    /// still on the refused generation would call the window open and pay for a refusal.
+    #[tokio::test]
+    async fn drain_reads_once_at_the_refusal_floor_and_classifies_without_release_window() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        let reads = mock_bitmap_answering_at(&mut server, 0, 500);
+
+        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let mut state = sender_state_with_storage(&server.url(), mock_with_parked_row(QUEUED_ROW));
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.refusal_floor = 500;
+        // The cache claims the nonce's window is open, which release_window would trust.
+        state.cached_generation = Some(1);
+        state.rotation_retry_queue.push(queued_release(nonce));
+        state.rotation_retry_queue.push(queued_release(nonce + 1));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one read per tick"
+        );
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            2,
+            "generation 1 has not opened at 500"
+        );
+    }
+
+    /// A backend that can only answer below the refusal slot cannot release anything.
+    #[tokio::test]
+    async fn drain_does_not_resend_below_the_refusal_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        // Below the floor it would show the nonce's window open.
+        let _reads = mock_bitmap_answering_at(&mut server, 1, 400);
+
+        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let mut state = sender_state_with_storage(&server.url(), mock_with_parked_row(QUEUED_ROW));
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.refusal_floor = 500;
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(state.rotation_retry_queue.len(), 1, "held, not resent");
+    }
+
+    /// No read at the floor holds every entry, parks refreshed so recovery leaves them be.
+    #[tokio::test]
+    async fn drain_holds_every_entry_while_the_floor_is_unmet() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        let _down = crate::operator::sender::test_support::mock_bitmap_read_failure(&mut server);
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let before = row_updated_at(&mock, QUEUED_ROW).expect("seeded row");
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(5));
+        state.rotation_retry_queue.push(queued_release(6));
+        let held = crate::metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "rotation_retry_held"]);
+        let held_before = held.get();
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(state.rotation_retry_queue.len(), 2);
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked)
+        );
+        assert!(
+            row_updated_at(&mock, QUEUED_ROW).unwrap() > before,
+            "heartbeat"
+        );
+        assert!(held.get() > held_before, "the hold is visible");
+    }
+
+    /// A pending rotation holds the queue anyway, so there is nothing to read for.
+    #[tokio::test]
+    async fn drain_skips_the_read_while_a_rotation_is_pending() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        let reads = mock_bitmap_answering_at(&mut server, 0, 1);
+
+        let mut state = sender_state_with_storage(&server.url(), mock_with_parked_row(QUEUED_ROW));
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.pending_rotation = Some(Box::default());
+        state.rotation_retry_queue.push(queued_release(5));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+    }
+
     /// `Ok(false)` means the row is no longer parked, so another actor owns it.
     /// Broadcasting anyway would send work this sender has already lost.
     #[tokio::test]
     async fn rotation_retry_drain_drops_an_entry_it_no_longer_owns() {
         let mut server = mockito::Server::new_async().await;
         let send = expect_no_broadcast(&mut server).await;
+        let _bitmap =
+            crate::operator::sender::test_support::mock_bitmap_account(&mut server, 0, &[]);
 
         // A Processing row: recovery or another sender already took it back.
         let mock = mock_with_processing_row(QUEUED_ROW);

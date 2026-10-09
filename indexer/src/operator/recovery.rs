@@ -226,8 +226,8 @@ async fn recover_once(
     }
 
     // Rescue parked withdrawals orphaned by a restart. A live sender unparks
-    // these itself, so anything stale here lost its in-memory driver. Parked
-    // rows were never sent on-chain, so requeue them without verifying finality.
+    // these itself, so anything stale here lost its in-memory driver. A parked row
+    // was never sent, or its send was refused by the program, so nothing can land.
     let stale_parked = storage
         .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT, owned_type)
         .await?;
@@ -2865,7 +2865,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": 900},
                         "value": {
                             "owner": Pubkey::new_unique().to_string(),
                             "lamports": 1_000_000u64,

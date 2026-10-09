@@ -96,6 +96,23 @@ fn bitmap_reply(generation: u64) -> Reply {
     }))
 }
 
+/// Finalized anchors for the generation reads, at a slot the bitmap replies are past.
+fn script_anchor(rpc: &MockRpcServer) {
+    rpc.enqueue_sequence(
+        "getLatestBlockhash",
+        std::iter::repeat_with(|| {
+            Reply::result(json!({
+                "context": { "slot": 100 },
+                "value": {
+                    "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                    "lastValidBlockHeight": 1_000u64
+                }
+            }))
+        })
+        .take(64),
+    );
+}
+
 /// A withdraw-role sender over the given storage, pointed at `rpc_url`.
 fn build_sender(storage: Arc<Storage>, rpc_url: String) -> SenderState {
     ensure_admin_signer_env();
@@ -167,6 +184,7 @@ fn next_generation_nonce(offset: i64) -> i64 {
 async fn rotation_happens_with_no_boundary_row_present() {
     let (storage, pool, _pg) = start_pg("rotation_no_boundary_row").await;
     let rpc = MockRpcServer::start().await;
+    script_anchor(&rpc);
     rpc.enqueue_sequence("getAccountInfo", vec![bitmap_reply(0), bitmap_reply(0)]);
 
     // Both rows sit in the next generation, and the boundary nonce itself is
@@ -191,6 +209,7 @@ async fn rotation_happens_with_no_boundary_row_present() {
 async fn a_manual_review_row_blocks_rotation_until_resolved() {
     let (storage, pool, _pg) = start_pg("rotation_blocked_by_manual_review").await;
     let rpc = MockRpcServer::start().await;
+    script_anchor(&rpc);
     // The withheld pass, the arming pass, and the send gate each read the chain.
     rpc.enqueue_sequence(
         "getAccountInfo",
@@ -244,6 +263,7 @@ async fn a_manual_review_row_blocks_rotation_until_resolved() {
 async fn a_row_re_armed_after_arming_is_seen_before_the_send() {
     let (storage, pool, _pg) = start_pg("rotation_disarmed_by_rearmed_row").await;
     let rpc = MockRpcServer::start().await;
+    script_anchor(&rpc);
     rpc.enqueue_sequence(
         "getAccountInfo",
         std::iter::repeat_with(|| bitmap_reply(0)).take(4),
@@ -312,6 +332,7 @@ async fn a_row_re_armed_after_arming_is_seen_before_the_send() {
 async fn rotation_is_re_derived_after_a_restart_that_dropped_the_arm() {
     let (storage, pool, _pg) = start_pg("rotation_survives_restart").await;
     let rpc = MockRpcServer::start().await;
+    script_anchor(&rpc);
     rpc.enqueue_sequence("getAccountInfo", vec![bitmap_reply(0), bitmap_reply(0)]);
 
     seed_withdrawal(&storage, &pool, "w1", next_generation_nonce(0), "pending").await;
@@ -514,4 +535,96 @@ async fn a_rotation_reported_failed_after_it_landed_is_refused_not_rebound() {
         state.pending_rotation.is_none() && state.rotation_in_flight.is_none(),
         "a rotation refused as a duplicate is settled, not owed"
     );
+}
+
+/// Armed against generation 0, then another rotation lands before the send. Sending the
+/// armed one is a certain refusal, so it is disarmed; the next pass arms against the
+/// generation the chain is on, and the rotation that lands opens the waiting rows' window.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_armed_rotation_the_chain_moved_past_is_disarmed_and_re_armed() {
+    let (storage, pool, _pg) = start_pg("rotation_moved_past_before_send").await;
+    let rpc = MockRpcServer::start().await;
+    let chain = FakeChain::default();
+    script_chain(&rpc, &chain);
+
+    let waiting = 2 * NONCES_PER_GENERATION as i64 + 1;
+    seed_withdrawal(&storage, &pool, "w1", waiting, "pending").await;
+    let mut state = build_sender(storage, rpc.url());
+    let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(16);
+
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    assert_eq!(state.rotation_bound_generation, Some(0));
+
+    // Rotated externally before our send.
+    chain.generation.store(1, Ordering::SeqCst);
+    assert!(
+        test_hooks::take_pending_rotation_if_ready(&mut state)
+            .await
+            .is_none(),
+        "a rotation the chain already moved past must not be sent"
+    );
+    assert!(state.pending_rotation.is_none() && state.rotation_bound_generation.is_none());
+
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    let rotation = test_hooks::take_pending_rotation_if_ready(&mut state)
+        .await
+        .expect("re-armed against the chain's generation");
+    test_hooks::submit_transaction(
+        &mut state,
+        TransactionBuilder::RotateBitmap(rotation),
+        &storage_tx,
+    )
+    .await;
+
+    assert_eq!(
+        *chain.signed.lock().unwrap(),
+        vec![1],
+        "bound to what arming read"
+    );
+    assert_eq!(
+        chain.generation.load(Ordering::SeqCst),
+        2,
+        "the waiting rows' generation opened, none skipped"
+    );
+}
+
+/// The send gate reads a backend behind the generation the rotation was armed against.
+/// That read says nothing about rows owed under the bound, so the rotation waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backend_below_the_bound_holds_the_send() {
+    let (storage, pool, _pg) = start_pg("rotation_gate_backend_below_bound").await;
+    let rpc = MockRpcServer::start().await;
+    script_anchor(&rpc);
+    // Arming reads generation 1, the gate's backend still reports 0.
+    rpc.enqueue_sequence("getAccountInfo", vec![bitmap_reply(1), bitmap_reply(0)]);
+
+    let owed = NONCES_PER_GENERATION as i64 + 3;
+    let settled = seed_withdrawal(&storage, &pool, "settled", owed, "completed").await;
+    seed_withdrawal(
+        &storage,
+        &pool,
+        "waiting",
+        2 * NONCES_PER_GENERATION as i64 + 1,
+        "pending",
+    )
+    .await;
+    let mut state = build_sender(storage.clone(), rpc.url());
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    assert_eq!(state.rotation_bound_generation, Some(1));
+
+    // A row in the bound generation is re-armed before the send tick.
+    sqlx::query("UPDATE transactions SET status = 'pending' WHERE id = $1")
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        test_hooks::take_pending_rotation_if_ready(&mut state)
+            .await
+            .is_none(),
+        "a stale backend must not wave the rotation past the owed row"
+    );
+    assert!(state.pending_rotation.is_some(), "held, not disarmed");
+    assert_eq!(rpc.call_count("sendTransaction"), 0);
 }

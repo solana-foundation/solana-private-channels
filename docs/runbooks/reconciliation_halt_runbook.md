@@ -253,6 +253,24 @@ the halt reason:
    release confirms. A refusal there is a shortfall neither the chain nor the
    operator's own records explain.
 
+   A boot also refuses when it cannot read custody fresh, before any comparison:
+
+   - `CustodyStale` (`custody could not be read at or past slot N`): every custody
+     read must answer at or past the larger of Solana's newest finalized block and the
+     committed escrow checkpoint, and that block must be under 120 s old. A refusal
+     (-32016), an older answer or an old newest block is retried three times, 2 s
+     apart, about 10 s in all, then the indexer exits for the supervisor to restart.
+     Fix the Solana RPC (lag, a backend replaying a snapshot, host clock). A
+     checkpoint above the node's tip (a DB restored from another cluster, or a
+     cluster reset) fails every restart by design: confirm the database belongs to
+     this cluster before anything else.
+   - `CustodyBehindLedger` with backfill off: the checkpoint is read again right
+     after custody, and a ledger that moved past the reading is refused and retried
+     the same way.
+   - `SupplyInvariantUnverified` also covers a channel whose newest block is over
+     120 s old, or whose supply stays behind that block after re-reads: check the
+     channel RPC as well as the gateway.
+
    For a liability halt, custody below `deposits - released` means tokens left
    escrow without a recorded release. Only `ReleaseFunds` is indexed as an
    outflow, so check the escrow token accounts' history for other movements: a

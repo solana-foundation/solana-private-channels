@@ -553,15 +553,32 @@ fn script_channel_caught_up(mock: &MockRpcServer) {
     }
 }
 
-/// Answer the startup supply invariant with "no channel mint exists yet".
-///
-/// An absent mint account reads as zero supply, which can never exceed custody, so the
-/// invariant passes and the custody comparison stays the only thing under test. Startup
-/// now refuses to boot on a supply it could not read, so leaving the read unscripted
-/// would fail the boot rather than be ignored.
+/// Answer the startup supply invariant with "no channel mint exists yet" (zero supply).
+/// Supply only counts at or past the channel's newest recent block, so the mock also
+/// reports a tip at slot 100 stamped a second ago and answers the read at that slot.
 fn script_channel_empty_supply(mock: &MockRpcServer) {
-    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
+    const CHANNEL_TIP: u64 = 100;
+    mock.enqueue_sequence(
+        "getSlot",
+        std::iter::repeat_n(Reply::result(json!(CHANNEL_TIP)), 256),
+    );
+    mock.enqueue_sequence(
+        "getBlocks",
+        std::iter::repeat_n(Reply::result(json!([CHANNEL_TIP])), 256),
+    );
+    let time = Reply::dynamic(|_| json!(chrono::Utc::now().timestamp() - 1));
+    mock.enqueue_sequence("getBlockTime", std::iter::repeat_n(time, 256));
+    let reply = Reply::result(json!({"context": {"slot": CHANNEL_TIP}, "value": null}));
     mock.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 256));
+}
+
+/// Wait until the finalized chain reaches the escrow checkpoint. This harness indexes at
+/// confirmed, while production indexes at finalized, so its checkpoint can sit above the
+/// finalized custody read that startup refuses to compare against an ahead ledger.
+async fn wait_for_finalized_escrow_checkpoint(rpc_url: &str, db_url: &str) {
+    if let Some(checkpoint) = checkpoint_of(db_url, "escrow").await {
+        wait_for_finalized_slot(rpc_url, checkpoint as u64).await;
+    }
 }
 
 /// Place the single serviced mint on page 2: page 1 is a full `CHANNEL_PAGE_LIMIT`
@@ -3730,6 +3747,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
     // channel supply, so the supply invariant reads an empty mock channel, as IT-R12 does.
     let mock = MockRpcServer::start().await;
     script_channel_empty_supply(&mock);
+    wait_for_finalized_escrow_checkpoint(&rpc_url, &db_url).await;
     let recon_storage = new_storage(&db_url).await;
     let recon = run_startup_reconciliation(
         &ReconciliationConfig {
@@ -3774,6 +3792,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         (2 * WITHDRAW_AMOUNT + 1).to_string()
     );
     script_channel_empty_supply(&mock);
+    wait_for_finalized_escrow_checkpoint(&rpc_url, &db_url).await;
     let recon_storage = new_storage(&db_url).await;
     let recon = run_startup_reconciliation(
         &ReconciliationConfig {

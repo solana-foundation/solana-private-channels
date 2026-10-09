@@ -5,7 +5,8 @@ use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::{
     fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
-    find_withdrawal_bitmap_pda, BitmapState, RetryConfig, RpcClientWithRetry,
+    fetch_consumed_nonces_at, find_withdrawal_bitmap_pda, BitmapState, RetryConfig,
+    RpcClientWithRetry,
 };
 use crate::operator::{
     MintCache, SourceEventId, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo,
@@ -77,6 +78,8 @@ impl SenderState {
             instance_pda,
             in_flight_withdrawals: HashSet::new(),
             cached_generation: None,
+            anchor_high_water: 0,
+            refusal_floor: 0,
             retry_counts: HashMap::new(),
             rotation_retry_attempts: 0,
             rotation_in_flight: None,
@@ -133,8 +136,25 @@ pub(crate) async fn verify_release_landed(
     nonce: u64,
     max_lvbh: u64,
 ) -> ReleaseVerdict {
+    verify_release_landed_at(rpc, instance_pda, nonce, max_lvbh)
+        .await
+        .0
+}
+
+/// `verify_release_landed`, plus the bitmap's context slot when the read shows the release
+/// window closed: `NotLanded` (tip past every lvbh) or the nonce's generation rotated away.
+/// Every release of the nonce happened at or below that slot, so it bounds the window.
+pub(crate) async fn verify_release_landed_at(
+    rpc: &RpcClientWithRetry,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> (ReleaseVerdict, Option<u64>) {
     let Some(instance_pda) = instance_pda else {
-        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+        return (
+            ReleaseVerdict::Uncertain("no instance pda configured".to_string()),
+            None,
+        );
     };
 
     let (ref_slot, lvbh) = match rpc
@@ -143,25 +163,32 @@ pub(crate) async fn verify_release_landed(
     {
         Ok(v) => v,
         Err(e) => {
-            return ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}"))
+            return (
+                ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}")),
+                None,
+            )
         }
     };
     // A blockhash stays valid for MAX_PROCESSING_AGE blocks past the tip it was
     // taken at, so its lvbh minus that window is the tip height at `ref_slot`.
     let Some(tip_height) = lvbh.checked_sub(MAX_PROCESSING_AGE as u64) else {
-        return ReleaseVerdict::Uncertain(format!(
-            "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
-             cannot derive a tip height"
-        ));
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
+                 cannot derive a tip height"
+            )),
+            None,
+        );
     };
-    if tip_height <= max_lvbh {
-        return ReleaseVerdict::Pending(format!(
+    let pending = (tip_height <= max_lvbh).then(|| {
+        ReleaseVerdict::Pending(format!(
             "finalized tip height {tip_height} is not past the attempt's last valid block \
              height {max_lvbh}, so the bits are too stale to prove non-release"
-        ));
-    }
+        ))
+    });
 
-    let bitmap = match fetch_consumed_nonces(
+    // Read even while pending: a rotation is final whatever the lvbh, and its slot bounds the window.
+    let (bitmap, slot) = match fetch_consumed_nonces_at(
         rpc,
         &find_withdrawal_bitmap_pda(&instance_pda),
         Some(ref_slot),
@@ -169,25 +196,47 @@ pub(crate) async fn verify_release_landed(
     )
     .await
     {
-        Ok(bitmap) => bitmap,
-        Err(e) => return ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")),
+        Ok(read) => read,
+        Err(e) => {
+            let verdict = pending
+                .unwrap_or_else(|| ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")));
+            return (verdict, None);
+        }
     };
 
     // Rotation clears every bit, so outside the current window a clear bit is
     // indistinguishable from a release that happened and was then wiped.
+    if nonce / NONCES_PER_GENERATION < bitmap.generation {
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "the bitmap rotated to generation {} and its bits say nothing about nonce {nonce}",
+                bitmap.generation
+            )),
+            Some(slot),
+        );
+    }
+    if let Some(pending) = pending {
+        return (pending, None);
+    }
     if !bitmap.covers(nonce) {
-        return ReleaseVerdict::Uncertain(format!(
-            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
-            bitmap.generation
-        ));
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+                bitmap.generation
+            )),
+            None,
+        );
     }
 
     if bitmap.is_consumed(nonce) {
-        ReleaseVerdict::Landed {
-            generation: bitmap.generation,
-        }
+        (
+            ReleaseVerdict::Landed {
+                generation: bitmap.generation,
+            },
+            None,
+        )
     } else {
-        ReleaseVerdict::NotLanded
+        (ReleaseVerdict::NotLanded, Some(slot))
     }
 }
 
@@ -628,11 +677,42 @@ impl SenderState {
     /// state. Callers that want it remembered go through `refresh_generation`
     /// instead, which is the only way a generation reaches the cache and is
     /// what keeps the cache from ever holding a number nobody read.
-    pub(super) async fn fetch_current_generation(&self) -> Result<u64, OperatorError> {
+    pub(super) async fn fetch_current_generation(&mut self) -> Result<u64, OperatorError> {
         let instance_pda = self.instance_pda.ok_or(AccountError::InstanceNotFound {
             instance: Pubkey::default(),
         })?;
-        fetch_bitmap_generation(&self.rpc_client, &find_withdrawal_bitmap_pda(&instance_pda)).await
+        let read = match self.generation_floor().await {
+            Ok(floor) => {
+                fetch_bitmap_generation(
+                    &self.rpc_client,
+                    &find_withdrawal_bitmap_pda(&instance_pda),
+                    floor,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok((generation, slot)) => {
+                self.anchor_high_water = self.anchor_high_water.max(slot);
+                Ok(generation)
+            }
+            Err(e) => {
+                crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[self.program_type.as_label(), "generation_floor_unmet"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// The slot a generation read must answer at or past: the endpoint's finalized tip, never
+    /// below an earlier anchor, answer or refusal this sender saw. A node lagging evenly can still
+    /// answer at its own old tip; that costs at most one refused send, never a wrong payout.
+    pub(super) async fn generation_floor(&mut self) -> Result<u64, OperatorError> {
+        let anchor = finalized_anchor(&self.rpc_client).await?;
+        self.anchor_high_water = self.anchor_high_water.max(anchor);
+        Ok(self.anchor_high_water.max(self.refusal_floor))
     }
 
     /// Read the current generation and remember it.
@@ -2385,6 +2465,130 @@ mod tests {
             matches!(verdict, ReleaseVerdict::NotLanded),
             "a fork-only bit must not read as a landed release"
         );
+    }
+
+    fn generation_reader(url: &str) -> SenderState {
+        let mut state = sender_state_with_storage(url, MockStorage::new());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state
+    }
+
+    /// The floor is the latest of the finalized anchor, any earlier anchor and any refusal.
+    #[tokio::test]
+    async fn generation_floor_is_max_of_anchor_high_water_and_refusal_floor() {
+        for (refusal_floor, expected) in [(0u64, 300u64), (500, 500)] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![300]);
+            let mut state = generation_reader(&server.url());
+            state.refusal_floor = refusal_floor;
+
+            assert_eq!(state.generation_floor().await.unwrap(), expected);
+        }
+    }
+
+    /// A later anchor from a lagging backend cannot pull the floor back.
+    #[tokio::test]
+    async fn anchor_high_water_only_rises() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500, 400]);
+        let mut state = generation_reader(&server.url());
+
+        assert_eq!(state.generation_floor().await.unwrap(), 500);
+        assert_eq!(state.generation_floor().await.unwrap(), 500);
+        assert_eq!(state.anchor_high_water, 500);
+    }
+
+    /// A read answered past the anchor raises the floor to its slot, so a later read on an
+    /// older backend cannot roll the cached generation back.
+    #[tokio::test]
+    async fn generation_read_raises_the_floor_to_its_answer_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![100, 110]);
+        let _bitmap = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(1, &[], 200),
+            )
+            .create();
+        let mut state = generation_reader(&server.url());
+
+        assert_eq!(state.refresh_generation().await.unwrap(), 1);
+        assert_eq!(state.generation_floor().await.unwrap(), 200);
+    }
+
+    /// An answer behind the floor is a bitmap failure, and what the cache knew stays.
+    #[tokio::test]
+    async fn fetch_current_generation_leaves_the_cache_when_behind_the_floor() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _behind = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(2, &[], 400),
+            )
+            .create();
+        let mut state = generation_reader(&server.url());
+        state.cached_generation = Some(3);
+
+        let err = state.refresh_generation().await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(crate::error::ProgramError::BitmapUnavailable { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(state.cached_generation, Some(3));
+    }
+
+    /// A clear bit read at the anchored finalized slot reports that slot, the bound of
+    /// every slot a release could sit in.
+    #[tokio::test]
+    async fn verify_release_landed_at_carries_the_bitmap_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _finalized = mock_bitmap_at_slot(&mut server, 500, 0, &[]);
+        let state = generation_reader(&server.url());
+
+        let (verdict, slot) =
+            super::verify_release_landed_at(&state.rpc_client, state.instance_pda, 4, 10).await;
+
+        assert!(matches!(verdict, ReleaseVerdict::NotLanded));
+        assert_eq!(slot, Some(500));
+    }
+
+    /// A rotation is final whatever the attempt's lvbh, so a rotated-past nonce is
+    /// reported, with its slot, even while the tip has not passed the lvbh.
+    #[tokio::test]
+    async fn rotated_past_is_reported_even_before_the_tip_passes_lvbh() {
+        // The anchor's tip height is 850, below the attempt's lvbh of 900.
+        for (generation, rotated) in [(1u64, true), (0, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+            let _finalized = mock_bitmap_at_slot(&mut server, 500, generation, &[]);
+            let state = generation_reader(&server.url());
+
+            let (verdict, slot) =
+                super::verify_release_landed_at(&state.rpc_client, state.instance_pda, 4, 900)
+                    .await;
+
+            if rotated {
+                assert!(matches!(verdict, ReleaseVerdict::Uncertain(_)));
+                assert_eq!(slot, Some(500));
+            } else {
+                assert!(matches!(verdict, ReleaseVerdict::Pending(_)));
+                assert_eq!(slot, None);
+            }
+        }
     }
 
     /// Releases now stay processing until finality, so a restart in that window sees a bit
