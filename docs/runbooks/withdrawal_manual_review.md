@@ -52,6 +52,7 @@ have prefixes.
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
+| `Max retries exceeded` together with `no signatures to verify` | I - retry budget spent with nothing broadcast (use this, not C) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
@@ -61,7 +62,6 @@ have prefixes.
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
-| `Max retries exceeded` with no recorded release signature | I - quarantined by a zero retry budget | no | `sender/transaction.rs` |
 
 ## An unresolved row holds the bitmap rotation
 
@@ -633,19 +633,31 @@ UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
-## Path I - quarantined by a zero retry budget
+## Path I - retry budget spent with nothing broadcast
 
-`error_message` contains `Max retries exceeded` and `pending_release_signatures`
-has no row for the transaction. The operator now refuses to start with
-`retry_max_attempts = 0`, but rows it quarantined before that check existed
-are not repaired by a restart: with no recorded signature the stalled-release
-reconciliation never picks them up. Nothing was broadcast for these rows.
+`error_message` contains `Max retries exceeded` and `no signatures to verify`,
+and `pending_release_signatures` has no row for the transaction. The sender's
+per-nonce attempt counter reached `operator.retry_max_attempts`
+(`OPERATOR_RETRY_MAX_ATTEMPTS`) before any release was broadcast. There are two
+causes:
 
-1. Confirm `operator.retry_max_attempts` (`OPERATOR_RETRY_MAX_ATTEMPTS`) is at
-   least 1 on the running operator.
+- A zero budget. The operator now refuses to start with `retry_max_attempts = 0`,
+  but rows quarantined before that check existed are not repaired by a restart:
+  with no recorded signature the stalled-release reconciliation never picks them up.
+- Repeated build or sign failures, for example the blockhash RPC being down.
+  The counter survives a pre-broadcast requeue, so a small budget runs out.
+
+Nothing was broadcast for these rows.
+
+1. Find out why the attempts failed. Read the operator logs for the nonce
+   (`Transaction attempt n/m` and the build or sign error before each) and fix that
+   cause first. For a zero budget, confirm the running operator has
+   `retry_max_attempts` of at least 1.
 2. Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
    verdict: `NOT_LANDED`. If `LANDED`, switch to Path C.
-3. Re-arm the row so the operator sends it again:
+3. Restart the operator. The attempt counter lives in memory, so a re-armed row
+   would otherwise be quarantined again at once.
+4. Re-arm the row so the operator sends it again:
 
 ```sql
 UPDATE transactions

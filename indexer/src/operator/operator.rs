@@ -293,8 +293,8 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
-        // escrow_instance_id is enforced above; source_rpc_url is only checked at startup
-        // for withdraw. Fail loud rather than silently skip reconciliation.
+        // Both are enforced above for every role. Fail loud rather than silently
+        // skip reconciliation if that ever regresses.
         match (common_config.escrow_instance_id, source_rpc_client.clone()) {
             (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
                 let reconciliation_storage = storage.clone();

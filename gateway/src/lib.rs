@@ -4582,6 +4582,8 @@ mod tests {
         let args = parse_args(&[
             "--port",
             "0",
+            "--jwt-secret",
+            "",
             "--auth-database-url",
             UNREACHABLE_AUTH_DB,
             "--max-connections",
@@ -4606,7 +4608,9 @@ mod tests {
     #[tokio::test]
     async fn run_accepts_a_strong_secret_and_moves_on_to_the_database_check() {
         let strong = "0123456789abcdef0123456789abcdef01234567";
-        let args = parse_args(&["--port", "0", "--jwt-secret", strong]);
+        let mut args = parse_args(&["--port", "0", "--jwt-secret", strong]);
+        // The flag also reads AUTH_DATABASE_URL from the environment.
+        args.auth_database_url = None;
         let err = tokio::time::timeout(Duration::from_secs(5), run(args))
             .await
             .expect("a missing auth database must be refused, not served")
@@ -4621,7 +4625,8 @@ mod tests {
     /// Blank means RBAC off, so the gateway keeps serving.
     #[tokio::test]
     async fn run_serves_with_a_blank_secret() {
-        let args = parse_args(&["--port", "0", "--jwt-secret", ""]);
+        let mut args = parse_args(&["--port", "0", "--jwt-secret", ""]);
+        args.auth_database_url = None;
         let outcome = tokio::time::timeout(Duration::from_millis(500), run(args)).await;
         assert!(
             outcome.is_err(),
