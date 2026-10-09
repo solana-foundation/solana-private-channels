@@ -692,16 +692,22 @@ impl SenderState {
             }
             Err(e) => Err(e),
         };
-        if read.is_err() {
-            crate::metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[self.program_type.as_label(), "generation_floor_unmet"])
-                .inc();
+        match read {
+            Ok((generation, slot)) => {
+                self.anchor_high_water = self.anchor_high_water.max(slot);
+                Ok(generation)
+            }
+            Err(e) => {
+                crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[self.program_type.as_label(), "generation_floor_unmet"])
+                    .inc();
+                Err(e)
+            }
         }
-        read
     }
 
     /// The slot a generation read must answer at or past: the endpoint's finalized tip, never
-    /// below an earlier anchor or a refusal this sender saw. A node lagging evenly can still
+    /// below an earlier anchor, answer or refusal this sender saw. A node lagging evenly can still
     /// answer at its own old tip; that costs at most one refused send, never a wrong payout.
     pub(super) async fn generation_floor(&mut self) -> Result<u64, OperatorError> {
         let anchor = finalized_anchor(&self.rpc_client).await?;
@@ -2490,6 +2496,28 @@ mod tests {
         assert_eq!(state.generation_floor().await.unwrap(), 500);
         assert_eq!(state.generation_floor().await.unwrap(), 500);
         assert_eq!(state.anchor_high_water, 500);
+    }
+
+    /// A read answered past the anchor raises the floor to its slot, so a later read on an
+    /// older backend cannot roll the cached generation back.
+    #[tokio::test]
+    async fn generation_read_raises_the_floor_to_its_answer_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![100, 110]);
+        let _bitmap = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(1, &[], 200),
+            )
+            .create();
+        let mut state = generation_reader(&server.url());
+
+        assert_eq!(state.refresh_generation().await.unwrap(), 1);
+        assert_eq!(state.generation_floor().await.unwrap(), 200);
     }
 
     /// An answer behind the floor is a bitmap failure, and what the cache knew stays.

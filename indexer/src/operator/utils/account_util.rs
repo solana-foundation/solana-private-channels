@@ -136,21 +136,21 @@ pub fn parse_withdrawal_bitmap(data: &[u8]) -> Result<BitmapState, AccountError>
     })
 }
 
-/// Read only the generation, answered at or past `min_slot`. Used at the rotation boundary
-/// and when routing a generation rejection, where the bits are irrelevant.
+/// Read only the generation and the slot it answered at, at or past `min_slot`. Used at the
+/// rotation boundary and when routing a generation rejection, where the bits are irrelevant.
 pub async fn fetch_bitmap_generation(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
     min_slot: u64,
-) -> Result<u64, OperatorError> {
-    Ok(fetch_consumed_nonces(
+) -> Result<(u64, u64), OperatorError> {
+    fetch_consumed_nonces_at(
         rpc_client,
         bitmap_pda,
         Some(min_slot),
         rpc_client.rpc_client.commitment(),
     )
-    .await?
-    .generation)
+    .await
+    .map(|(bitmap, slot)| (bitmap.generation, slot))
 }
 
 /// Read the authoritative consumed-nonce set for the current generation.

@@ -315,6 +315,12 @@ impl MintCache {
             };
         };
         let validation_data = validation_account.data;
+        // Present is remembered before any verdict, so a refused list also blocks a lagging null.
+        let seen = self
+            .validation_seen_floor
+            .entry((*mint, hook_program))
+            .or_default();
+        *seen = (*seen).max(validation_slot);
 
         // The resolver reads every declared entry, so an oversized list is
         // rejected before it runs. Extras are the entries plus the hook program
@@ -398,12 +404,6 @@ impl MintCache {
                 ..meta
             })
             .collect();
-
-        let seen = self
-            .validation_seen_floor
-            .entry((*mint, hook_program))
-            .or_default();
-        *seen = (*seen).max(validation_slot);
         Ok(HookExtras::Resolved(extras))
     }
 
@@ -1394,6 +1394,37 @@ mod tests {
         let floors = mock_absent_at(&mut server, &validation_pda, 70).await;
         mock_block_age(&mut server, 1).await;
         let _ = resolve_with(&mut cache, &mint, &accounts, 1).await;
+
+        assert_eq!(*floors.lock().unwrap(), vec![serde_json::json!(70)]);
+    }
+
+    /// A present validation account is remembered even when its list is refused, so a later
+    /// resolve cannot take a lagging null as missing.
+    #[tokio::test]
+    async fn refused_validation_list_still_records_a_seen_floor() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        mock_account_recording(
+            &mut server,
+            &mint,
+            Some(hook_mint_data(&hook_program)),
+            None,
+        )
+        .await;
+        mock_account_recording(&mut server, &validation_pda, Some(vec![7; 64]), Some(70)).await;
+        let mut cache = fast_cache(server.url());
+
+        let first = resolve_at(&mut cache, &mint, 1).await.unwrap();
+        assert!(
+            matches!(first, HookExtras::ValidationInvalid(_)),
+            "{first:?}"
+        );
+
+        let floors = mock_absent_at(&mut server, &validation_pda, 70).await;
+        mock_block_age(&mut server, 1).await;
+        let _ = resolve_at(&mut cache, &mint, 1).await;
 
         assert_eq!(*floors.lock().unwrap(), vec![serde_json::json!(70)]);
     }

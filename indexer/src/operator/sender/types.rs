@@ -186,7 +186,7 @@ pub struct SenderState {
     /// every refusal is taken against a fresh read instead, which is what keeps
     /// a stale entry from stranding a releasable withdrawal.
     pub cached_generation: Option<u64>,
-    /// Highest finalized anchor any generation read was bound to. Never lowered, so no
+    /// Highest finalized anchor or answer slot of any generation read. Never lowered, so no
     /// later read can come from an older snapshot than an earlier one did.
     pub anchor_high_water: u64,
     /// Highest slot at which the program refused a release for its generation. A read
