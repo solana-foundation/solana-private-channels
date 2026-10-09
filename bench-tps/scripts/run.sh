@@ -290,6 +290,14 @@ for secret_key in POSTGRES_PASSWORD POSTGRES_REPLICATION_PASSWORD \
     fi
 done
 
+# Compose takes the signer backend from env with no default; bench signs with the
+# in-memory admin key, so fill memory into an older .env that predates the keys.
+for signer_key in ADMIN_SIGNER OPERATOR_SIGNER; do
+    if [ -z "${!signer_key:-}" ]; then
+        patch_env "${signer_key}" memory
+    fi
+done
+
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
 # --env-file in docker compose, so without this re-source the operator
@@ -709,7 +717,7 @@ cleanup() {
     if [ "${TEARDOWN}" -eq 0 ]; then
         echo "Skipping teardown (--no-teardown). Containers are still running."
         echo "  Inspect logs:  docker logs <container>"
-        echo "  Stop later:    docker compose -f ${REPO_ROOT}/docker-compose.yml down"
+        echo "  Stop later:    docker compose -f ${REPO_ROOT}/docker-compose.yml --env-file ${REPO_ROOT}/versions.env --env-file ${BENCH_ENV} down"
         return
     fi
     echo "Tearing down all services..."

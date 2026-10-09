@@ -31,7 +31,7 @@ use tokio::sync::Semaphore;
 /// Anything that builds a real instruction reaches `SignerUtil`, which panics
 /// when no signer is configured. The key itself is never checked, so a fresh
 /// throwaway keypair is enough to let those paths run.
-pub(super) fn ensure_test_signer() {
+pub(crate) fn ensure_test_signer() {
     static INIT_TEST_SIGNER: Once = Once::new();
     INIT_TEST_SIGNER.call_once(|| {
         let keypair = solana_sdk::signer::keypair::Keypair::new();

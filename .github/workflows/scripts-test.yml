@@ -11,6 +11,9 @@ on:
     paths:
       - "scripts/**"
       - "versions.env"
+      - "docker-compose*.yml"
+      - ".env.*"
+      - "private-channel-deploy/**"
       - "Makefile"
       - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
@@ -19,6 +22,9 @@ on:
     paths:
       - "scripts/**"
       - "versions.env"
+      - "docker-compose*.yml"
+      - ".env.*"
+      - "private-channel-deploy/**"
       - "Makefile"
       - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"

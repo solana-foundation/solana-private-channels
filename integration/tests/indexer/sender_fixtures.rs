@@ -51,9 +51,8 @@ use {
 };
 
 /// Set `ADMIN_SIGNER` / `OPERATOR_SIGNER` env vars exactly once per
-/// test process. `SignerUtil::admin_signer()` is a `Lazy<Signer>` that
-/// reads the env on first access — every test binary that touches
-/// `make_instruction` must call this first.
+/// test process. `SignerUtil::admin_signer()` loads the signers from env on
+/// first access and keeps them, so call this before `make_instruction`.
 pub fn ensure_admin_signer_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {

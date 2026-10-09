@@ -56,6 +56,11 @@ pub async fn run(
         ));
     };
 
+    // Library callers skip the binary, so load signers here too; a second call is a no-op.
+    crate::operator::init_signers()
+        .await
+        .map_err(OperatorError::InvalidConfig)?;
+
     // Empty means unset (env renders "") and maps to None.
     let normalized_fallback_url = common_config
         .fallback_rpc_url
@@ -1571,6 +1576,60 @@ mod tests {
         );
     }
 
+    /// The all-ones placeholder instance is refused like a missing one, before the schema.
+    #[tokio::test]
+    async fn operator_startup_refuses_the_placeholder_instance() {
+        for program_type in [ProgramType::Escrow, ProgramType::Withdraw] {
+            let mock = MockStorage::new();
+            let common_config = PrivateChannelIndexerConfig {
+                program_type,
+                storage_type: StorageType::Postgres,
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                fallback_rpc_url: None,
+                source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+                postgres: PostgresConfig {
+                    database_url: String::new(),
+                    max_connections: 1,
+                },
+                escrow_instance_id: Some(Pubkey::default()),
+            };
+            let config = OperatorConfig {
+                db_poll_interval: Duration::from_millis(50),
+                batch_size: 10,
+                retry_max_attempts: 3,
+                retry_base_delay: Duration::from_millis(100),
+                channel_buffer_size: 100,
+                rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+                alert_webhook_url: None,
+                reconciliation_interval: Duration::from_secs(300),
+                reconciliation_tolerance_bps: 10,
+                reconciliation_webhook_url: None,
+                feepayer_monitor_interval: Duration::from_secs(60),
+                confirmation_poll_interval_ms: 400,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                run(
+                    Arc::new(Storage::Mock(mock.clone())),
+                    common_config,
+                    config,
+                    None,
+                ),
+            )
+            .await
+            .expect("a placeholder instance must refuse, not start");
+            assert!(
+                matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("placeholder")),
+                "{program_type:?}: {result:?}"
+            );
+            assert!(!mock
+                .call_order
+                .lock()
+                .unwrap()
+                .contains(&"init_schema".to_string()));
+        }
+    }
+
     /// Without the escrow instance no ReleaseFunds can be built, so the withdraw operator
     /// must refuse before it takes the lock, migrates the schema or claims a burned row.
     #[tokio::test]
@@ -1647,7 +1706,8 @@ mod tests {
         .expect("a withdraw operator without an instance must refuse, not start");
 
         assert!(
-            matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("escrow_instance_id")),
+            matches!(&result, Err(OperatorError::InvalidConfig(msg))
+                if msg.contains("escrow_instance_id") && msg.contains("COMMON_ESCROW_INSTANCE_ID")),
             "missing instance must refuse to start: {result:?}"
         );
         assert!(
@@ -1768,6 +1828,8 @@ mod tests {
     /// gate. The run then proceeds to storage (and stalls on the unreachable RPC).
     #[tokio::test]
     async fn withdraw_without_a_webhook_passes_the_config_gate() {
+        // Past the config gate `run` loads the signers, so give it one.
+        crate::operator::sender::test_support::ensure_test_signer();
         let (common, mut config) = startup_fixture(ProgramType::Withdraw);
         config.reconciliation_webhook_url = None;
         let mock = MockStorage::new();

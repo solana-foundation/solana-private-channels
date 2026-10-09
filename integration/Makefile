@@ -71,6 +71,7 @@ integration-test:
 	@cargo test --test rpc_polling_fail_closed -- --nocapture
 	@cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cargo test --test harness_sanity -- --nocapture
+	@cargo test --test test_operator_signer_refusal -- --nocapture
 	@cargo test --test sender_poll_rpc_error -- --nocapture
 	@cargo test --test sender_sign_and_send_error -- --nocapture
 	@cargo test --test sender_max_retries -- --nocapture
@@ -300,6 +301,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_inner_and_unknown -- --nocapture
 	@echo "Running OperatorMockHarness sanity test with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test harness_sanity -- --nocapture
+	@echo "Running operator signer refusal test with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test test_operator_signer_refusal -- --nocapture
 	@echo "Running sender poll-RPC-error tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_poll_rpc_error -- --nocapture
 	@echo "Running sender sign-and-send error tests with coverage instrumentation..."
