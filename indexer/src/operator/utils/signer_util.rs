@@ -619,6 +619,23 @@ mod tests {
         assert!(err.contains("ADMIN_PRIVY_APP_ID not set"), "got: {err}");
     }
 
+    /// Complete credentials reach the awaited Privy constructor. A nested `block_on` would
+    /// panic on the first poll; the fake wallet only ever yields an error or the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn privy_init_awaits_the_constructor_inside_a_runtime() {
+        let env = env_of(&[
+            (ADMIN_SIGNER, "privy"),
+            (ADMIN_PRIVY_APP_ID, "app"),
+            (ADMIN_PRIVY_APP_SECRET, "secret"),
+            (ADMIN_PRIVY_WALLET_ID, "wallet"),
+        ]);
+        if let Ok(result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), load_signers(&env)).await
+        {
+            assert!(result.is_err(), "a fake privy wallet must not load");
+        }
+    }
+
     #[tokio::test]
     async fn install_is_idempotent_and_first_wins() {
         let cell = OnceLock::new();

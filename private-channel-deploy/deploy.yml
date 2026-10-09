@@ -642,9 +642,9 @@
   - name: Resolve the escrow instance
     tags: [ always ]
     block:
-    # Preserve the escrow instance PDA across redeploys. A redeploy with
-    # `reset_state=false` and no escrow_instance_id var keeps the instance a
-    # previous render wrote, instead of starting the workers without one.
+    # Preserve the escrow instance PDA across redeploys. A redeploy with no
+    # escrow_instance_id var keeps the instance a previous render wrote, instead
+    # of starting the workers without one.
     - name: Read existing .env (if any) to preserve previously-written instance ID
       ansible.builtin.shell: |
         if [ -f "{{ host_data_dir }}/config/.env" ]; then
@@ -655,10 +655,11 @@
       changed_when: false
       check_mode: false
 
-    # A localnet reset wipes the validator, so a kept PDA would name an account that is gone.
+    # A validator that boots with --reset wipes the ledger on every start, even when Postgres
+    # is kept, so a kept PDA would name an account that is gone.
     - name: Set escrow_instance_id_pda from existing .env if present and non-placeholder
       when:
-      - not (network == 'localnet' and reset_state | default(false) | bool and validator_reset | default(true) | bool)
+      - not (network == 'localnet' and validator_reset | default(true) | bool)
       - _existing_instance_id.stdout | default('') | trim | length > 0
       - _existing_instance_id.stdout | trim != '11111111111111111111111111111111'
       - escrow_instance_id_pda is not defined
@@ -679,7 +680,7 @@
           scripts/devnet) and set escrow_instance_id to its address.
 
     - name: Refuse a named instance that a localnet reset is about to wipe
-      when: network == 'localnet' and reset_state | default(false) | bool and validator_reset | default(true) | bool
+      when: network == 'localnet' and validator_reset | default(true) | bool
       ansible.builtin.assert:
         that: escrow_instance_id | default('', true) | length == 0
         fail_msg: |

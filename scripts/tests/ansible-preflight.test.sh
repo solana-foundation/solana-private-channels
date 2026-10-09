@@ -135,13 +135,17 @@ test_preflight_cases() {
   # A redeploy keeps the PDA a previous render left in .env, with no var set (SOLA13-67).
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
   expect_services devnet_preserved_instance yes "${devnet[@]}"
-  # A localnet reset wipes the validator, so the PDA a previous render kept is gone too.
+  # A validator that boots with --reset wipes the PDA a previous render kept, even when
+  # Postgres is kept.
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
   expect_services localnet_reset_drops_preserved_instance no "${common[@]}"
-  expect_services localnet_kept_ledger_keeps_instance yes "${common[@]}" -e reset_state=false
+  expect_services localnet_validator_reset_drops_preserved_instance no "${common[@]}" -e reset_state=false
+  expect_services localnet_kept_ledger_keeps_instance yes "${common[@]}" "${kept[@]}"
   rm "$data/config/.env"
   # The reset wipes an explicitly named instance too; a create_instance seed is random.
   expect_refused localnet_reset_with_named_instance "a localnet reset wipes" "${common[@]}" -e escrow_instance_id=$INSTANCE
+  expect_refused localnet_validator_reset_with_named_instance "a localnet reset wipes" "${common[@]}" \
+    -e escrow_instance_id=$INSTANCE -e reset_state=false
   expect_services localnet_named_instance_kept_ledger yes "${common[@]}" -e escrow_instance_id=$INSTANCE \
     -e reset_state=false -e validator_reset=false
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$PLACEHOLDER" >"$data/config/.env"
