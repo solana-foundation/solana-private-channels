@@ -1,6 +1,6 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
+    ChannelFence, DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
     MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
     StoredSig, TransactionStatus, TransactionType,
 };
@@ -28,6 +28,8 @@ type EnvelopeBounds = (Option<u64>, Option<u64>);
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
+    /// Mirrors the fence columns on the `indexer_state` rows, keyed by program.
+    pub channel_fences: std::sync::Arc<Mutex<HashMap<String, ChannelFence>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
@@ -136,6 +138,17 @@ impl MockStorage {
             .lock()
             .unwrap()
             .insert(program_type.to_string(), slot);
+    }
+
+    /// Seed the channel fence the withdraw checkpoint row carries.
+    pub fn set_channel_fence(&self, slot: u64, blockhash: &str) {
+        self.channel_fences.lock().unwrap().insert(
+            "withdraw".to_string(),
+            ChannelFence {
+                slot,
+                blockhash: blockhash.to_string(),
+            },
+        );
     }
 
     pub fn set_should_fail(&self, program_type: &str, should_fail: bool) {
@@ -361,7 +374,26 @@ impl MockStorage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
+        self.update_committed_checkpoint_with_fence(program_type, slot, None)
+            .await
+    }
+
+    pub async fn update_committed_checkpoint_with_fence(
+        &self,
+        program_type: &str,
+        slot: u64,
+        fence: Option<&ChannelFence>,
+    ) -> Result<(), StorageError> {
         self.check_should_fail(program_type)?;
+        if let Some(fence) = fence {
+            let mut fences = self.channel_fences.lock().unwrap();
+            let newer = fences
+                .get(program_type)
+                .is_none_or(|stored| fence.slot > stored.slot);
+            if newer {
+                fences.insert(program_type.to_string(), fence.clone());
+            }
+        }
         // Mirrors postgres GREATEST(): monotonic, lower writes are ignored.
         // Use `set_checkpoint` to seed arbitrary values in tests.
         let mut map = self.committed_checkpoints.lock().unwrap();
@@ -846,6 +878,73 @@ impl MockStorage {
             .filter(|n| n >= &min_nonce && n < &max_nonce)
             .collect();
         Ok(nonces)
+    }
+
+    pub async fn get_channel_fence(&self) -> Result<Option<ChannelFence>, StorageError> {
+        self.check_should_fail("get_channel_fence")?;
+        Ok(self.channel_fences.lock().unwrap().get("withdraw").cloned())
+    }
+
+    pub async fn get_newest_known_mint_signatures(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_newest_known_mint_signatures")?;
+        let rows = self.pending_transactions.lock().unwrap();
+        let status = match kind {
+            TransactionType::Deposit => TransactionStatus::Completed,
+            TransactionType::Withdrawal => TransactionStatus::FailedReminted,
+        };
+        Ok(rows
+            .iter()
+            .filter(|t| t.mint == mint && t.transaction_type == kind && t.status == status)
+            .filter_map(|t| match kind {
+                TransactionType::Deposit => t.counterpart_signature.clone(),
+                TransactionType::Withdrawal => t.landed_remint_signature.clone(),
+            })
+            .next_back()
+            .into_iter()
+            .collect())
+    }
+
+    pub async fn get_max_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("get_max_withdrawal_nonce")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal)
+            .filter_map(|t| t.withdrawal_nonce)
+            .max()
+            .map(|nonce| nonce as u64))
+    }
+
+    pub async fn try_mark_reminted(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        remint_signature: String,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_mark_reminted")?;
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let Some(txn) = rows.iter_mut().find(|t| {
+            t.id == transaction_id
+                && matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::PendingRemint
+                )
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        let now = Utc::now();
+        txn.status = TransactionStatus::FailedReminted;
+        txn.landed_remint_signature = Some(remint_signature);
+        txn.processed_at = Some(now);
+        txn.updated_at = now;
+        Ok(true)
     }
 
     pub async fn get_withdrawal_by_nonce(

@@ -29,6 +29,8 @@ pub struct PrivateChannelNode {
     pub url: String,
     handles: Option<NodeHandles>,
     _db: ContainerAsync<Postgres>,
+    admin_pubkey: Pubkey,
+    accountsdb_connection_url: String,
 }
 
 impl PrivateChannelNode {
@@ -37,6 +39,98 @@ impl PrivateChannelNode {
             handles.shutdown().await;
         }
     }
+
+    /// Dump the node's accountsdb, as a backup of the channel primary.
+    pub fn dump(&self) -> Vec<u8> {
+        container_pg_dump(&self._db, "private_channel_node")
+    }
+
+    /// Stop the node, restore `dump` over its accountsdb and start it again on a new
+    /// port, as a point-in-time restore of the channel primary.
+    pub async fn restore_and_restart(
+        &mut self,
+        dump: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(handles) = self.handles.take() {
+            handles.shutdown().await;
+        }
+        container_pg_restore(&self._db, "private_channel_node", dump);
+        let (url, handles) =
+            run_on(self.admin_pubkey, self.accountsdb_connection_url.clone()).await?;
+        self.url = url;
+        self.handles = Some(handles);
+        Ok(())
+    }
+}
+
+/// `pg_dump -Fc` of `db`, run inside its test container so the host needs no client tools.
+pub fn container_pg_dump(container: &ContainerAsync<Postgres>, db: &str) -> Vec<u8> {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            container.id(),
+            "pg_dump",
+            "-U",
+            "postgres",
+            "-Fc",
+            db,
+        ])
+        .output()
+        .expect("docker runs pg_dump");
+    assert!(
+        out.status.success(),
+        "pg_dump failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Replace `db` with `dump`. Other sessions are ended first, as a restore requires.
+pub fn container_pg_restore(container: &ContainerAsync<Postgres>, db: &str, dump: &[u8]) {
+    use std::io::Write;
+    let terminate = format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = '{db}' AND pid <> pg_backend_pid()"
+    );
+    let status = std::process::Command::new("docker")
+        .args([
+            "exec",
+            container.id(),
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            db,
+            "-c",
+            &terminate,
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("docker runs psql");
+    assert!(status.success(), "terminating sessions failed");
+    let mut child = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            container.id(),
+            "pg_restore",
+            "-U",
+            "postgres",
+            "--clean",
+            "--if-exists",
+            "-d",
+            db,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker runs pg_restore");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(dump)
+        .expect("feed pg_restore");
+    assert!(child.wait().unwrap().success(), "pg_restore failed");
 }
 
 fn get_free_port() -> u16 {
@@ -69,6 +163,23 @@ pub async fn start_private_channel_node(
         host, port
     );
 
+    let (url, handles) = run_on(admin_pubkey, accountsdb_connection_url.clone()).await?;
+    println!("=== PrivateChannel node started at {} ===", url);
+
+    Ok(PrivateChannelNode {
+        url,
+        handles: Some(handles),
+        _db: db_container,
+        admin_pubkey,
+        accountsdb_connection_url,
+    })
+}
+
+/// Run a node on `accountsdb_connection_url` and wait for its first block.
+async fn run_on(
+    admin_pubkey: Pubkey,
+    accountsdb_connection_url: String,
+) -> Result<(String, NodeHandles), Box<dyn std::error::Error>> {
     let node_port = get_free_port();
     let node_config = NodeConfig {
         mode: NodeMode::Aio,
@@ -111,11 +222,5 @@ pub async fn start_private_channel_node(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    println!("=== PrivateChannel node started at {} ===", url);
-
-    Ok(PrivateChannelNode {
-        url,
-        handles: Some(handles),
-        _db: db_container,
-    })
+    Ok((url, handles))
 }

@@ -1,3 +1,4 @@
+use crate::channel_fence::{verify_channel_fence, FenceVerdict, FenceWait};
 use crate::config::OperatorConfig;
 use crate::error::{OperatorError, StorageError};
 use crate::metrics;
@@ -153,6 +154,38 @@ pub async fn run(
         ))
     });
 
+    // The chain the receipt mints live on: the escrow role mints there, the withdraw role
+    // burns there. The fence and the consumed set are both read from it.
+    let channel_rpc = match program_type_channel_rpc(
+        common_config.program_type,
+        &rpc_client,
+        source_rpc_client.as_ref(),
+    ) {
+        Some(rpc) => rpc,
+        None => {
+            return Err(OperatorError::InvalidConfig(
+                "source_rpc_url required for Withdraw operator".to_string(),
+            ))
+        }
+    };
+
+    // Refuse a channel restored behind the indexer DB before any row is touched. Every
+    // channel-behind skew is stopped here: stale pending rows, lost credits, re-withdrawals.
+    under_live_lock(
+        &live_lock_lost,
+        verify_fence_for_operator(&storage, &channel_rpc, common_config.program_type),
+    )
+    .await?;
+    let fence_broken = CancellationToken::new();
+
+    // Rows an indexer restore re-created are checked against this before anything is sent.
+    let consumed = under_live_lock(
+        &live_lock_lost,
+        build_consumed_claims(&storage, &channel_rpc, common_config.program_type),
+    )
+    .await
+    .inspect_err(|e| error!("Operator refusing to start: {e}"))?;
+
     let (processor_tx, processor_rx) = mpsc::channel(config.channel_buffer_size);
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
@@ -179,7 +212,8 @@ pub async fn run(
     // locked, or processed.
     //
     // A database that claims a release the chain never made, or a check that could not
-    // run, refuses to start. A release the database never recorded is repaired in place.
+    // run, refuses to start. A release the database never recorded is repaired in place
+    // when its row's journal proves it, and refuses to start otherwise.
     if program_type == crate::config::ProgramType::Withdraw {
         // The main rpc_client is the chain where the instance and releases live.
         let preflight = under_live_lock(
@@ -248,6 +282,7 @@ pub async fn run(
     let processor_fallback_rpc = fallback_rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
     let processor_storage_tx = storage_tx.clone();
+    let processor_consumed = consumed.clone();
     let processor_handle = tokio::spawn(async move {
         processor::run_processor(
             processor_rx,
@@ -259,6 +294,7 @@ pub async fn run(
             processor_rpc,
             processor_fallback_rpc,
             processor_source_rpc,
+            Some(processor_consumed),
         )
         .await;
     });
@@ -282,6 +318,7 @@ pub async fn run(
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
             sender_lock,
+            Some(consumed),
         )
         .await
         {
@@ -335,8 +372,13 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
-    // Recovery worker: resolves rows stuck in Processing after a crash.
+    // Recovery worker: resolves rows stuck in Processing after a crash, and re-checks
+    // the channel fence every tick.
     let recovery_handle = {
+        let fence_watch = recovery::ChannelFenceWatch {
+            rpc: channel_rpc.clone(),
+            broken: fence_broken.clone(),
+        };
         let recovery_storage = storage.clone();
         let recovery_rpc = rpc_client.clone();
         let recovery_fallback = fallback_rpc_client.clone();
@@ -352,6 +394,7 @@ pub async fn run(
                 recovery_instance,
                 recovery_storage_tx,
                 recovery_token,
+                Some(fence_watch),
             )
             .await
             {
@@ -546,8 +589,102 @@ pub async fn run(
         }
     }
 
+    if fence_broken.is_cancelled() {
+        return Err(OperatorError::ChannelFence {
+            reason: "the channel was restored while the operator was running".to_string(),
+        });
+    }
+
     info!("Operator shutdown complete");
     Ok(())
+}
+
+/// The channel endpoint for `program_type`: `rpc_url` for escrow, `source_rpc_url` for withdraw.
+fn program_type_channel_rpc(
+    program_type: crate::config::ProgramType,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    source_rpc_client: Option<&Arc<RpcClientWithRetry>>,
+) -> Option<Arc<RpcClientWithRetry>> {
+    match program_type {
+        crate::config::ProgramType::Escrow => Some(rpc_client.clone()),
+        crate::config::ProgramType::Withdraw => source_rpc_client.cloned(),
+    }
+}
+
+/// Build the claim-time consumed set from each receipt mint's channel history. The index
+/// must cover the newest block first, or a mint landed just before boot could be missing.
+async fn build_consumed_claims(
+    storage: &Arc<Storage>,
+    channel_rpc: &Arc<RpcClientWithRetry>,
+    program_type: crate::config::ProgramType,
+) -> Result<sender::ConsumedClaims, OperatorError> {
+    let role = match program_type {
+        crate::config::ProgramType::Escrow => crate::storage::TransactionType::Deposit,
+        crate::config::ProgramType::Withdraw => crate::storage::TransactionType::Withdrawal,
+    };
+    if !storage.get_mint_addresses().await?.is_empty() {
+        match channel_rpc.get_address_index_slot().await {
+            // Only core indexes addresses after the block lands; a node without the
+            // method writes its index with the block, so its history is complete.
+            Err(e) if crate::operator::utils::rpc_util::is_method_not_found(&e) => {
+                warn!("Channel RPC has no getAddressIndexSlot; its address index is synchronous");
+            }
+            _ => sender::wait_for_address_index(
+                channel_rpc,
+                sender::INDEX_CATCH_UP_BUDGET,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .map_err(|reason| OperatorError::ConsumedSet { reason })?,
+        }
+    }
+    let cache = sender::ConsumedSetCache::build_at_boot(
+        channel_rpc,
+        storage,
+        crate::operator::CONSUMED_SET_PAGE_SIZE,
+        role,
+    )
+    .await
+    .map_err(|reason| OperatorError::ConsumedSet { reason })?;
+    Ok(sender::ConsumedClaims::new(cache, channel_rpc.clone()))
+}
+
+/// How long boot waits for a lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: std::time::Duration::from_secs(1),
+    budget: std::time::Duration::from_secs(600),
+};
+
+/// Both roles read the fence from the withdraw indexer's checkpoint row: only that
+/// indexer sees channel blocks with their hashes.
+async fn verify_fence_for_operator(
+    storage: &Storage,
+    channel_rpc: &RpcClientWithRetry,
+    program_type: crate::config::ProgramType,
+) -> Result<(), OperatorError> {
+    let fence = storage.get_channel_fence().await?;
+    match verify_channel_fence(channel_rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok if fence.is_none() => {
+            // Expected once after an upgrade or a withdraw resync; persistent means no withdraw indexer.
+            warn!("No channel fence yet; a restored channel cannot be detected until the withdraw indexer writes one");
+            Ok(())
+        }
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(())
+        }
+        FenceVerdict::Mismatch(reason) => {
+            metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[program_type.as_label()])
+                .inc();
+            error!("Operator refusing to start: {reason}");
+            Err(OperatorError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Operator refusing to start, channel fence unchecked: {reason}");
+            Err(OperatorError::ChannelFenceUnchecked { reason })
+        }
+    }
 }
 
 /// Reconcile in-flight releases, then diff the on-chain bitmap against the
@@ -616,7 +753,6 @@ async fn run_withdraw_preflight(
         rpc_client,
         fallback_rpc_client,
         Some(instance_pda),
-        storage_tx,
     )
     .await;
     match verdict {
@@ -768,6 +904,60 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The escrow operator has no checkpoint of its own with block hashes, so it reads the
+    /// withdraw row's fence: a mismatch there refuses its boot (Apex SOLA13-164).
+    #[tokio::test]
+    async fn escrow_boot_reads_withdraw_fence_row() {
+        use crate::operator::RetryConfig;
+        use crate::storage::common::storage::mock::MockStorage;
+        use mockito::{Matcher, Server};
+        use serde_json::json;
+
+        let mut server = Server::new_async().await;
+        let _slot = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(json!({ "method": "getSlot" })))
+            .with_body(json!({ "jsonrpc": "2.0", "id": 1, "result": 500 }).to_string())
+            .create();
+        let _block = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({ "method": "getBlock", "params": [300] }),
+            ))
+            .with_body(
+                json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                    "blockhash": "Reproduced300", "previousBlockhash": "p"
+                }})
+                .to_string(),
+            )
+            .create();
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+
+        let mock = MockStorage::new();
+        // An escrow checkpoint far ahead must not matter: only the withdraw fence does.
+        mock.set_checkpoint("escrow", 900);
+        mock.set_channel_fence(300, "Original300");
+        let storage = Storage::Mock(mock.clone());
+        let err = verify_fence_for_operator(&storage, &rpc, crate::config::ProgramType::Escrow)
+            .await
+            .expect_err("a re-produced fence block must refuse the escrow operator");
+        assert!(matches!(err, OperatorError::ChannelFence { .. }), "{err}");
+
+        // No fence yet (first boot after the upgrade) starts without a check.
+        let fresh = Storage::Mock(MockStorage::new());
+        verify_fence_for_operator(&fresh, &rpc, crate::config::ProgramType::Escrow)
+            .await
+            .expect("a null fence skips the check");
+    }
 
     /// Every worker must be stopped outright, not asked to finish, and be stopped by the
     /// time this returns: returning is what releases the lock, and a drain or a straggler
@@ -1090,17 +1280,22 @@ mod tests {
         );
     }
 
-    /// Chain ahead of the database: the release landed and only the bookkeeping
-    /// is missing, so the operator repairs what it can and starts.
+    /// Chain ahead of the database with no row to explain the bit: after an indexer
+    /// restore the re-indexed burns are renumbered, so starting could pay one twice.
     #[tokio::test]
-    async fn preflight_starts_when_chain_is_ahead() {
+    async fn preflight_refuses_when_chain_is_ahead_unexplained() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
-            result.is_ok(),
-            "a landed-but-unrecorded release must not halt boot: {result:?}"
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
+                ))
+            ),
+            "an unexplained consumed nonce must refuse boot: {result:?}"
         );
     }
 
@@ -1367,13 +1562,11 @@ mod tests {
         );
     }
 
-    /// The unprovable case. Under the SMT this was a refuse-to-start, because
-    /// any root mismatch was. The bitmap narrows the halt to db-ahead only: a
-    /// consumed nonce the reconcile cannot attribute is a payout that really
-    /// happened, so boot continues and the row is escalated to manual_review
-    /// instead of being completed on a guess.
+    /// The unprovable case: a consumed nonce the reconcile cannot attribute. Boot
+    /// refuses and leaves the row alone, so a later boot can still prove it once the
+    /// status read works, instead of parking it in manual_review over an RPC blip.
     #[tokio::test]
-    async fn preflight_escalates_when_chain_ahead_survives_reconcile() {
+    async fn preflight_refuses_when_chain_ahead_survives_reconcile() {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
         let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
@@ -1389,14 +1582,19 @@ mod tests {
         .await;
 
         assert!(
-            result.is_ok(),
-            "an unattributable payout must not halt boot: {result:?}"
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
+                ))
+            ),
+            "an unattributable payout must refuse boot: {result:?}"
         );
         assert!(
-            updates
+            !updates
                 .iter()
                 .any(|u| u.status == TransactionStatus::ManualReview),
-            "the row must be escalated for a human, not left silent: {updates:?}"
+            "the gate itself writes no row status: {updates:?}"
         );
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,

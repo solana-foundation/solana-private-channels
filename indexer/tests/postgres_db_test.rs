@@ -14,7 +14,9 @@ use private_channel_indexer::{
     operator::sender_lock_key,
     storage::{
         common::amount::TokenAmount,
-        common::models::{DbMint, DbMintStatus, DbObservedRelease, MintStatusAtSlot, StoredSig},
+        common::models::{
+            ChannelFence, DbMint, DbMintStatus, DbObservedRelease, MintStatusAtSlot, StoredSig,
+        },
         common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
         common::storage::resync_state::resync_halt_reason,
         common::storage::sender_lock::SenderLockGuard,
@@ -5025,6 +5027,277 @@ async fn the_lock_session_bounds_its_lock_waits() -> Result<(), Box<dyn std::err
     assert_eq!(
         lock_timeout, "10s",
         "the lock session must bound how long it waits for another session's lock"
+    );
+    Ok(())
+}
+
+// ── Channel fence, consumed-set bound and nonce gate reads ───────────────────
+
+fn fence(slot: u64, blockhash: &str) -> ChannelFence {
+    ChannelFence {
+        slot,
+        blockhash: blockhash.to_string(),
+    }
+}
+
+/// The fence rides the checkpoint upsert and only ever moves forward, so it can never
+/// name a block above the checkpoint or step back onto an older one.
+#[tokio::test(flavor = "multi_thread")]
+async fn fence_written_with_checkpoint_and_monotonic() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    assert_eq!(storage.get_channel_fence().await?, None);
+
+    storage
+        .update_committed_checkpoint_with_fence("withdraw", 100, Some(&fence(98, "H98")))
+        .await?;
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        Some(100)
+    );
+    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+
+    // A lower fence leaves both columns alone even when the checkpoint rises.
+    storage
+        .update_committed_checkpoint_with_fence("withdraw", 120, Some(&fence(90, "H90")))
+        .await?;
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        Some(120)
+    );
+    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+
+    // No block in the batch keeps the fence where it was.
+    storage
+        .update_committed_checkpoint_with_fence("withdraw", 130, None)
+        .await?;
+    storage.update_committed_checkpoint("withdraw", 140).await?;
+    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+
+    storage
+        .update_committed_checkpoint_with_fence("withdraw", 150, Some(&fence(149, "H149")))
+        .await?;
+    assert_eq!(storage.get_channel_fence().await?, Some(fence(149, "H149")));
+
+    // Only the withdraw row carries the fence both operators read.
+    storage
+        .update_committed_checkpoint_with_fence("escrow", 500, Some(&fence(500, "E500")))
+        .await?;
+    assert_eq!(storage.get_channel_fence().await?, Some(fence(149, "H149")));
+    Ok(())
+}
+
+/// The nonce gate relies on this: the trigger numbers a withdrawal before the conflict
+/// check, so an insert that loses a race or rolls back still burns a nonce and the next
+/// row is numbered past the gap. A restored sequence then renumbers re-indexed burns.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_insert_consumes_a_nonce() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_db_transaction(&make_db_transaction("burn_a", TransactionType::Withdrawal))
+        .await?;
+
+    // Two writers that both passed the existence pre-check: the loser hits the conflict.
+    let raced = sqlx::query(
+        "INSERT INTO transactions (signature, instruction_index, slot, initiator, recipient, \
+         mint, amount, transaction_type, status, trace_id) \
+         VALUES ('burn_a', 0, 100, 'i', 'r', 'm', 1, 'withdrawal', 'pending', 't') \
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(&pool)
+    .await?;
+    assert_eq!(raced.rows_affected(), 0);
+
+    // A slot write that rolls back keeps the nonce it drew.
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO transactions (signature, instruction_index, slot, initiator, recipient, \
+         mint, amount, transaction_type, status, trace_id) \
+         VALUES ('burn_rolled_back', 0, 100, 'i', 'r', 'm', 1, 'withdrawal', 'pending', 't')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+
+    storage
+        .insert_db_transaction(&make_db_transaction("burn_b", TransactionType::Withdrawal))
+        .await?;
+
+    let nonces: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT signature, withdrawal_nonce FROM transactions ORDER BY withdrawal_nonce",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        nonces,
+        vec![("burn_a".to_string(), 0), ("burn_b".to_string(), 3)],
+        "the raced and the rolled-back inserts must each have consumed a nonce"
+    );
+    assert_eq!(storage.get_max_withdrawal_nonce().await?, Some(3));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_withdrawal_nonce_is_none_without_withdrawals() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_db_transaction(&make_db_transaction("dep", TransactionType::Deposit))
+        .await?;
+    assert_eq!(storage.get_max_withdrawal_nonce().await?, None);
+    Ok(())
+}
+
+/// Seed one row of `kind` on `mint` in `status` carrying `sig` in the column that
+/// records its channel mint.
+async fn seed_minted_row(
+    pool: &PgPool,
+    storage: &Storage,
+    tag: &str,
+    mint: &str,
+    kind: TransactionType,
+    status: &str,
+    sig: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut row = make_db_transaction(tag, kind);
+    row.mint = mint.to_string();
+    let id = storage.insert_db_transaction(&row).await?;
+    let column = match kind {
+        TransactionType::Deposit => "counterpart_signature",
+        TransactionType::Withdrawal => "landed_remint_signature",
+    };
+    sqlx::query(&format!(
+        "UPDATE transactions SET status = $2::transaction_status, {column} = $3 WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(status)
+    .bind(sig)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// The consumed-set walk stops at the newest mint the DB already knows for each kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn newest_known_mint_signature_per_mint() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    use TransactionType::{Deposit, Withdrawal};
+
+    seed_minted_row(&pool, &storage, "d1", "M1", Deposit, "completed", "dep_old").await?;
+    seed_minted_row(&pool, &storage, "d2", "M1", Deposit, "completed", "dep_new").await?;
+    // Not completed, so its signature proves nothing about the channel.
+    seed_minted_row(
+        &pool,
+        &storage,
+        "d3",
+        "M1",
+        Deposit,
+        "processing",
+        "dep_live",
+    )
+    .await?;
+    seed_minted_row(
+        &pool,
+        &storage,
+        "w1",
+        "M1",
+        Withdrawal,
+        "failed_reminted",
+        "rem_old",
+    )
+    .await?;
+    seed_minted_row(
+        &pool,
+        &storage,
+        "w2",
+        "M1",
+        Withdrawal,
+        "failed_reminted",
+        "rem_new",
+    )
+    .await?;
+    seed_minted_row(&pool, &storage, "d4", "M2", Deposit, "completed", "dep_m2").await?;
+
+    // Each operator reads only the kind it writes itself.
+    assert_eq!(
+        storage
+            .get_newest_known_mint_signatures("M1", Deposit)
+            .await?,
+        vec!["dep_new".to_string()]
+    );
+    assert_eq!(
+        storage
+            .get_newest_known_mint_signatures("M1", Withdrawal)
+            .await?,
+        vec!["rem_new".to_string()]
+    );
+    assert_eq!(
+        storage
+            .get_newest_known_mint_signatures("M2", Deposit)
+            .await?,
+        vec!["dep_m2".to_string()]
+    );
+    assert!(storage
+        .get_newest_known_mint_signatures("M2", Withdrawal)
+        .await?
+        .is_empty());
+    assert!(storage
+        .get_newest_known_mint_signatures("unknown", Deposit)
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+/// The release path completes a withdrawal whose remint already landed, as a CAS.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_mark_reminted_cas() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    for (tag, status) in [("p", "processing"), ("r", "pending_remint")] {
+        let id = storage
+            .insert_db_transaction(&make_db_transaction(tag, TransactionType::Withdrawal))
+            .await?;
+        sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        let updated_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await?;
+
+        let stale = updated_at - chrono::Duration::seconds(1);
+        assert!(!storage.try_mark_reminted(id, stale, "sig".into()).await?);
+        assert!(
+            storage
+                .try_mark_reminted(id, updated_at, "sig".into())
+                .await?
+        );
+
+        let (status, landed): (String, Option<String>) = sqlx::query_as(
+            "SELECT status::text, landed_remint_signature FROM transactions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(status, "failed_reminted");
+        assert_eq!(landed.as_deref(), Some("sig"));
+    }
+
+    // A pending row was never claimed, so it is not this writer's to finish.
+    let id = storage
+        .insert_db_transaction(&make_db_transaction("q", TransactionType::Withdrawal))
+        .await?;
+    let updated_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        !storage
+            .try_mark_reminted(id, updated_at, "sig".into())
+            .await?
     );
     Ok(())
 }

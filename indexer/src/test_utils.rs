@@ -34,6 +34,7 @@ pub mod rpc_blocks {
     pub fn create_test_block() -> RpcBlock {
         RpcBlock {
             blockhash: "TestBlockHash11111111111111111111111111111".to_string(),
+            previous_blockhash: "TestBlockHash11111111111111111111111111111".to_string(),
             parent_slot: 0,
             transactions: vec![],
         }
@@ -312,6 +313,7 @@ pub mod rpc_mocks {
                     "result": {
                         "blockhash": format!("TestBlockHash{slot}"),
                         "parentSlot": parent_slot,
+                        "previousBlockhash": format!("TestBlockHash{parent_slot}"),
                         "transactions": []
                     },
                     "id": 1
@@ -395,6 +397,7 @@ pub mod rpc_mocks {
                     "result": {
                         "blockhash": format!("TestBlockHash{slot}"),
                         "parentSlot": parent_slot,
+                        "previousBlockhash": format!("TestBlockHash{parent_slot}"),
                         "transactions": [{
                             "transaction": {
                                 "signatures": [crate::test_utils::pubkey::test_sig(&format!("sig_deposit_slot_{slot}"))],

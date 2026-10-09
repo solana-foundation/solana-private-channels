@@ -21,6 +21,14 @@ pub struct IndexerState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Newest channel block at or below the withdraw checkpoint. A restored channel
+/// re-produces the same slots with different hashes, so a mismatch proves a rewind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelFence {
+    pub slot: u64,
+    pub blockhash: String,
+}
+
 /// Status of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "transaction_status", rename_all = "lowercase")]

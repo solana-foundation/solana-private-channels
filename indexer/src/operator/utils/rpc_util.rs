@@ -72,6 +72,25 @@ pub struct SignatureStatusSnapshot {
     pub value: Vec<Option<solana_transaction_status::TransactionStatus>>,
 }
 
+/// The endpoint does not implement the method (-32601).
+pub(crate) fn is_method_not_found(e: &client_error::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
+    )
+}
+
+/// The node's "skipped or missing" answers to `getBlock`, which name no block at all.
+fn is_missing_block(e: &client_error::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError {
+            code: -32004 | -32007 | -32009,
+            ..
+        })
+    )
+}
+
 pub struct RpcClientWithRetry {
     pub rpc_client: Arc<RpcClient>,
     pub retry_config: RetryConfig,
@@ -303,6 +322,44 @@ impl RpcClientWithRetry {
         }
     }
 
+    /// Read `(blockhash, previousBlockhash)` of the block at `slot`, or `None` when the
+    /// node reports it skipped or missing (-32004, -32007, -32009, or a null result).
+    pub async fn get_block_hashes(
+        &self,
+        slot: u64,
+    ) -> Result<Option<(String, String)>, Box<client_error::Error>> {
+        let params = serde_json::json!([slot, {
+            "transactionDetails": "none",
+            "rewards": false,
+            "maxSupportedTransactionVersion": 1,
+            "commitment": self.rpc_client.commitment().commitment.to_string(),
+        }]);
+        let block = self
+            .with_retry("get_block_hashes", RetryPolicy::Idempotent, || async {
+                match self
+                    .rpc_client
+                    .send::<Option<serde_json::Value>>(RpcRequest::GetBlock, params.clone())
+                    .await
+                {
+                    Err(e) if is_missing_block(&e) => Ok(None),
+                    other => other,
+                }
+            })
+            .await?;
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        match (
+            block["blockhash"].as_str(),
+            block["previousBlockhash"].as_str(),
+        ) {
+            (Some(hash), Some(prev)) => Ok(Some((hash.to_string(), prev.to_string()))),
+            _ => Err(Box::new(client_error::Error::from(ErrorKind::Custom(
+                format!("getBlock({slot}) reply lacks blockhash or previousBlockhash"),
+            )))),
+        }
+    }
+
     /// Get the cluster genesis hash with retry. Used once at withdraw startup to
     /// prove the fallback endpoint is on the same cluster as the primary.
     pub async fn get_genesis_hash(&self) -> Result<Hash, Box<client_error::Error>> {
@@ -522,15 +579,23 @@ impl RpcClientWithRetry {
     /// enumeration cannot miss a mint that sits beyond the first window. Any page error
     /// propagates as `Err` so the caller can fail closed rather than treat a partial
     /// history as complete. Only entries `keep` accepts are retained, page by page.
+    ///
+    /// The walk ends early at the first page holding any `stop_at` signature, keeping only
+    /// the entries newer than it, and reports whether it met one. `until` is not used
+    /// because the RPC leaves that signature out, so meeting it could not be told apart.
     pub async fn get_signatures_for_address_paginated(
         &self,
         address: &Pubkey,
         page_limit: usize,
+        stop_at: &std::collections::HashSet<Signature>,
         keep: impl Fn(
             &solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
         ) -> bool,
     ) -> Result<
-        Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+        (
+            Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+            bool,
+        ),
         Box<client_error::Error>,
     > {
         let mut all = Vec::new();
@@ -557,8 +622,15 @@ impl RpcClientWithRetry {
             let page_len = page.len();
             // Capture the oldest signature on this page; it becomes the next page's cursor.
             let last_signature = page.last().map(|s| s.signature.clone());
+            let stop = page.iter().position(|status| {
+                Signature::from_str(&status.signature).is_ok_and(|sig| stop_at.contains(&sig))
+            });
             // Filter per page so a busy address's full history is never held in memory.
-            all.extend(page.into_iter().filter(|status| keep(status)));
+            let newer = page.into_iter().take(stop.unwrap_or(usize::MAX));
+            all.extend(newer.filter(|status| keep(status)));
+            if stop.is_some() {
+                return Ok((all, true));
+            }
 
             // A short page is the only legitimate end of history.
             if page_len < page_limit {
@@ -583,7 +655,7 @@ impl RpcClientWithRetry {
                 }
             }
         }
-        Ok(all)
+        Ok((all, false))
     }
 
     /// Get a confirmed transaction in JSON-parsed encoding (read-only, safe to retry)
@@ -614,6 +686,88 @@ impl RpcClientWithRetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve `entries` as the page of `address` history after `before`.
+    async fn page(
+        server: &mut mockito::ServerGuard,
+        before: Option<&str>,
+        entries: &[&str],
+    ) -> mockito::Mock {
+        let before = match before {
+            Some(sig) => format!(r#""before"\s*:\s*"{sig}""#),
+            None => r#""before"\s*:\s*null"#.to_string(),
+        };
+        let body: Vec<String> = entries
+            .iter()
+            .map(|sig| {
+                format!(
+                    r#"{{"signature":"{sig}","slot":1,"err":null,"memo":null,"blockTime":null,"confirmationStatus":"confirmed"}}"#
+                )
+            })
+            .collect();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(before),
+            ]))
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                body.join(",")
+            ))
+            .create_async()
+            .await
+    }
+
+    /// The bounded consumed-set walk stops at the newest signature the DB knows and says
+    /// whether it met it, so a stop the history never reaches can refuse boot.
+    #[tokio::test]
+    async fn paginated_stop_at_reports_membership() {
+        let sigs: Vec<String> = (0..5)
+            .map(|_| Signature::new_unique().to_string())
+            .collect();
+        let [s5, s4, s3, s2, s1] = [&sigs[0], &sigs[1], &sigs[2], &sigs[3], &sigs[4]];
+        let mut server = mockito::Server::new_async().await;
+        let _p1 = page(&mut server, None, &[s5, s4]).await;
+        let p2 = page(&mut server, Some(s4), &[s3, s2]).await;
+        let p3 = page(&mut server, Some(s2), &[s1]).await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let address = Pubkey::new_unique();
+        let names = |found: &[solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature]| {
+            found.iter().map(|s| s.signature.clone()).collect::<Vec<_>>()
+        };
+
+        // Met mid-page: only the newer entries come back and the walk stops there.
+        let stop = std::collections::HashSet::from([Signature::from_str(s2).unwrap()]);
+        let (found, met) = rpc
+            .get_signatures_for_address_paginated(&address, 2, &stop, |_| true)
+            .await
+            .unwrap();
+        assert!(met);
+        assert_eq!(names(&found), vec![s5.clone(), s4.clone(), s3.clone()]);
+        p2.assert_async().await;
+        assert!(
+            !p3.matched_async().await,
+            "the walk must stop at the page holding the stop"
+        );
+
+        // Never met: the whole history is walked and the caller is told so.
+        let stop = std::collections::HashSet::from([Signature::new_unique()]);
+        let (found, met) = rpc
+            .get_signatures_for_address_paginated(&address, 2, &stop, |_| true)
+            .await
+            .unwrap();
+        assert!(!met);
+        assert_eq!(found.len(), 5);
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[tokio::test]

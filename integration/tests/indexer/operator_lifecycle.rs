@@ -1309,15 +1309,13 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     Ok(())
 }
 
-/// The mirror image, and the direction that must NOT halt. A release lands
-/// on-chain and its `completed` write is lost, so a bit is set with no matching
-/// row. The money already moved correctly; halting the whole pipeline over a
-/// bookkeeping gap would be the wrong trade. The operator starts, reports the
-/// orphan nonce, and keeps processing new withdrawals.
+/// An indexer restore past a release (Apex SOLA13-68): a bit is set with no row to explain
+/// it and the restored sequence renumbers the next burn, so serving any withdrawal could
+/// pay twice. The operator refuses to start and the pending withdrawal is not touched.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn std::error::Error>>
+async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn std::error::Error>>
 {
-    println!("=== Operator Lifecycle: Boot Continues When The Chain Is Ahead ===");
+    println!("=== Operator Lifecycle: Boot Refuses When The Chain Is Ahead ===");
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -1376,6 +1374,16 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
     .await?;
     let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
 
+    // The boot gate reads the bitmap at finalized, so the consumed bit must be final first.
+    let released_at = client.get_slot().await?;
+    while client
+        .get_slot_with_commitment(CommitmentConfig::finalized())
+        .await?
+        < released_at
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // Advance the sequence past the nonce the chain already consumed.
     sqlx::query("SELECT setval('withdrawal_nonce_seq', 0, true)")
         .execute(&pool)
@@ -1402,17 +1410,25 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &next_sig).await?;
-
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !operator_handle._handle.is_finished() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     assert!(
-        !operator_handle._handle.is_finished(),
-        "a chain-ahead divergence must not halt the operator"
+        operator_handle._handle.is_finished(),
+        "an unexplained consumed nonce must refuse boot"
+    );
+    let next = db::get_transaction(&pool, &next_sig)
+        .await?
+        .expect("the post-restore withdrawal row must exist");
+    assert_eq!(
+        next.status, "pending",
+        "nothing may be served after a refusal"
     );
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
-        balance_after,
-        balance_after_orphan + 25_000,
-        "the post-boot withdrawal must release exactly once"
+        balance_after, balance_after_orphan,
+        "no further release may land"
     );
 
     operator_handle.shutdown().await;

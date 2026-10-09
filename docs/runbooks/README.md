@@ -29,10 +29,11 @@ dispatch table below routes by webhook + `transaction_type`.
 > resync did not finish, and a resync refusing while work is still in flight; see
 > [`live_state_lock_runbook.md`](live_state_lock_runbook.md).
 >
-> **Two halts have no dedicated alert.** The **withdrawal bitmap boot
+> **Three halts have no dedicated alert.** The **withdrawal bitmap boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
-> A chain-ahead divergence is repaired at boot and the operator starts; a
-> database-ahead divergence, or a check that cannot run at all, makes it
+> A chain-ahead nonce with a landed journaled release is repaired at boot and
+> the operator starts; any other chain-ahead nonce, a database-ahead
+> divergence, or a check that cannot run at all, makes it
 > **refuse to start**, surfacing as a boot-time crash-loop with
 > `Withdraw boot pre-flight failed, refusing to start` in the operator logs.
 > Recognize it by that pattern, not a single alert, and not via this
@@ -43,6 +44,10 @@ dispatch table below routes by webhook + `transaction_type`.
 > skip slots nothing would ever go back for. It also shows as a boot-time
 > crash-loop, recognized by that marker in the indexer logs; see
 > [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
+> The **channel fence** refusal is the third: the channel primary was restored
+> behind the indexer DB, so the withdraw indexer and both operators exit at
+> boot (or stop while running) with `channel fence check failed`; see
+> [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md#channel-fence-refused).
 >
 > A **startup backfill** that cannot fetch or decode a slot also exits and is
 > restarted in a loop, usually too fast for `indexer-block-unavailable` to fire.

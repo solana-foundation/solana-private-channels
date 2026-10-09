@@ -5,6 +5,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcBlock {
     pub blockhash: String,
+    /// Required: the withdraw indexer checks every block links to the one before it.
+    #[serde(rename = "previousBlockhash")]
+    pub previous_blockhash: String,
     #[serde(rename = "parentSlot")]
     pub parent_slot: u64,
     pub transactions: Vec<RpcTransactionWithMeta>,

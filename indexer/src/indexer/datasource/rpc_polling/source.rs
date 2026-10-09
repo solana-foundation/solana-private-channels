@@ -1,3 +1,4 @@
+use super::chain_link::ChainLink;
 use super::rpc::RpcPoller;
 use super::types::BlockFetch;
 use crate::channel_utils::send_guaranteed;
@@ -31,6 +32,7 @@ pub struct RpcPollingSource {
     // a no-op.
     fallback_rpc_url: Option<String>,
     health: Option<Arc<HealthState>>,
+    chain_link: Option<Arc<ChainLink>>,
 }
 
 impl RpcPollingSource {
@@ -59,7 +61,14 @@ impl RpcPollingSource {
             escrow_instance_id,
             fallback_rpc_url,
             health: None,
+            chain_link: None,
         }
+    }
+
+    /// Check every block against the channel chain link the startup fill shares.
+    pub fn with_chain_link(mut self, chain_link: Option<Arc<ChainLink>>) -> Self {
+        self.chain_link = chain_link;
+        self
     }
 
     pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
@@ -181,6 +190,7 @@ impl DataSource for RpcPollingSource {
         let program_type = self.program_type;
         let escrow_instance_id = self.escrow_instance_id;
         let health = self.health.clone();
+        let chain_link = self.chain_link.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -235,6 +245,7 @@ impl DataSource for RpcPollingSource {
 
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
+                    let mut blockhash = None;
                     match block_result {
                         Ok(BlockFetch::Present(block)) => {
                             // A block with incomplete meta, or holding a supported instruction
@@ -298,7 +309,25 @@ impl DataSource for RpcPollingSource {
                                 }
                             };
 
+                            // Checked before any row is sent, so a rewound channel writes nothing.
+                            // A broken link is final: the indexer stops on the cancelled token.
+                            if let Some(chain) = &chain_link {
+                                if let Err(reason) = chain.record(
+                                    slot,
+                                    block.parent_slot,
+                                    &block.blockhash,
+                                    &block.previous_blockhash,
+                                ) {
+                                    error!(
+                                        "Slot {} does not extend the channel history the indexer read: {}; stopping",
+                                        slot, reason
+                                    );
+                                    return;
+                                }
+                            }
+
                             last_block = Some(slot);
+                            blockhash = Some(block.blockhash.clone());
                             if !instructions_with_meta.is_empty() {
                                 info!(
                                     "Slot {}: found {} {:?} instructions",
@@ -367,7 +396,11 @@ impl DataSource for RpcPollingSource {
                     // Send SlotComplete marker for this slot
                     let send_res = send_guaranteed(
                         &tx,
-                        ProcessorMessage::SlotComplete { slot, program_type },
+                        ProcessorMessage::SlotComplete {
+                            slot,
+                            program_type,
+                            blockhash,
+                        },
                         "SlotComplete marker",
                     )
                     .await;
@@ -441,6 +474,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [],
                         // Also answers the signatures view, so an escrow consumer can confirm it empty.
                         "signatures": []
@@ -469,6 +503,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": parent_slot,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [],
                         // Also answers the signatures view, so an escrow consumer can confirm it empty.
                         "signatures": []
@@ -581,6 +616,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [withdraw_block_transaction(serde_json::Value::Null)]
                     },
                     "id": 1
@@ -633,6 +669,7 @@ mod tests {
                     "result": {
                         "blockhash": blockhash,
                         "parentSlot": slot - 1,
+                        "previousBlockhash": blockhash,
                         "transactions": [withdraw_block_transaction(meta)]
                     },
                     "id": 1
@@ -1005,6 +1042,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [withdraw_block_transaction(meta_without_err)]
                     },
                     "id": 1
@@ -1075,6 +1113,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [transaction]
                     },
                     "id": 1
@@ -1133,6 +1172,7 @@ mod tests {
                     "result": {
                         "blockhash": format!("TestBlockHash{slot}"),
                         "parentSlot": slot - 1,
+                        "previousBlockhash": format!("TestBlockHash{}", slot - 1),
                         "transactions": []
                     },
                     "id": 1
@@ -1707,7 +1747,10 @@ mod tests {
         let _full = closing_mock(
             &mut primary,
             json!({ "method": "getBlock", "params": [100, { "transactionDetails": "full" }] }),
-            json!({ "blockhash": "TestBlockHash100", "parentSlot": 99, "transactions": [] }),
+            json!({
+                "blockhash": "TestBlockHash100", "previousBlockhash": "TestBlockHash99",
+                "parentSlot": 99, "transactions": []
+            }),
         );
         // Everything up to the full block passes; the signatures-view confirm stalls.
         let (url, accepted) =

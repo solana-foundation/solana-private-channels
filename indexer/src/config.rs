@@ -342,6 +342,24 @@ impl PrivateChannelIndexerConfig {
     }
 }
 
+/// The withdraw indexer must poll RPC: only that datasource writes the channel fence the
+/// indexer and both operators check against a restored channel.
+pub fn validate_withdraw_datasource(
+    common: &PrivateChannelIndexerConfig,
+    indexer: &IndexerConfig,
+) -> Result<(), String> {
+    if common.program_type == ProgramType::Withdraw
+        && indexer.datasource_type != DatasourceType::RpcPolling
+    {
+        return Err(format!(
+            "the withdraw indexer requires the rpc_polling datasource, got {:?}: only it records \
+             the channel fence that detects a restored channel",
+            indexer.datasource_type
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a fallback that is spelled the same as the node serving blocks: failing over to it
 /// re-fetches from the endpoint that just served the slot unusably, so it can never help
 /// while still making the deploy look like it has a failover.
@@ -763,6 +781,26 @@ mod tests {
     // ============================================================================
     // Common Config Validation Tests
     // ============================================================================
+
+    /// Only the RPC poller writes the channel fence, so a withdraw indexer on any other
+    /// datasource would run unprotected against a restored channel.
+    #[test]
+    fn withdraw_indexer_requires_rpc_polling() {
+        let withdraw = PrivateChannelIndexerConfig {
+            program_type: ProgramType::Withdraw,
+            escrow_instance_id: None,
+            ..create_common_config()
+        };
+        let yellowstone = IndexerConfig {
+            datasource_type: DatasourceType::Yellowstone,
+            ..create_indexer_config()
+        };
+        let err = validate_withdraw_datasource(&withdraw, &yellowstone).unwrap_err();
+        assert!(err.contains("rpc_polling"), "{err}");
+
+        assert!(validate_withdraw_datasource(&withdraw, &create_indexer_config()).is_ok());
+        assert!(validate_withdraw_datasource(&create_common_config(), &yellowstone).is_ok());
+    }
 
     #[test]
     fn test_validate_common_config_escrow_missing_instance_id() {

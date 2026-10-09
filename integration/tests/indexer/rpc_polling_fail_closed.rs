@@ -71,6 +71,7 @@ fn mock_get_block_success(server: &mut Server, slot: u64, expect_at_least: usize
                 "result": {
                     "blockhash": BLOCKHASH,
                     "parentSlot": slot - 1,
+                    "previousBlockhash": BLOCKHASH,
                     "transactions": []
                 },
                 "id": 1
@@ -169,6 +170,7 @@ fn mock_get_block_withdraw(
                 "result": {
                     "blockhash": blockhash,
                     "parentSlot": slot - 1,
+                    "previousBlockhash": blockhash,
                     "transactions": [withdraw_block_transaction(successful_meta(), data)]
                 },
                 "id": 1

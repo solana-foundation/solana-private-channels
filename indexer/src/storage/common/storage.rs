@@ -15,13 +15,16 @@ pub mod gc_stale_release_signatures;
 pub mod gc_stale_remint_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
+pub mod get_channel_fence;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
 pub mod get_in_flight_amounts_by_mint;
+pub mod get_max_withdrawal_nonce;
 pub mod get_mint;
 pub mod get_mint_addresses;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
+pub mod get_newest_known_mint_signatures;
 pub mod get_observed_release;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
@@ -54,6 +57,7 @@ pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_complete_stalled_withdrawal;
 pub mod try_fail_processing;
+pub mod try_mark_reminted;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -192,7 +196,56 @@ impl Storage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
-        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, None)
+            .await
+    }
+
+    /// Update a checkpoint and, when `fence` is newer than the stored one, the channel
+    /// fence with it, in one statement.
+    pub async fn update_committed_checkpoint_with_fence(
+        &self,
+        program_type: &str,
+        slot: u64,
+        fence: Option<&ChannelFence>,
+    ) -> Result<(), StorageError> {
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, fence)
+            .await
+    }
+
+    /// The channel fence on the withdraw checkpoint row, or `None` when never written.
+    pub async fn get_channel_fence(&self) -> Result<Option<ChannelFence>, StorageError> {
+        get_channel_fence::get_channel_fence(self).await
+    }
+
+    /// The channel mint signature of the newest `completed` deposit (`Deposit`) or the newest
+    /// `failed_reminted` withdrawal (`Withdrawal`) on `mint`, if any.
+    pub async fn get_newest_known_mint_signatures(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, StorageError> {
+        get_newest_known_mint_signatures::get_newest_known_mint_signatures(self, mint, kind).await
+    }
+
+    /// Highest withdrawal nonce any row holds, or `None` with no withdrawal.
+    pub async fn get_max_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        get_max_withdrawal_nonce::get_max_withdrawal_nonce(self).await
+    }
+
+    /// CAS a claimed withdrawal to `FailedReminted` with its landed remint signature.
+    pub async fn try_mark_reminted(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signature: String,
+    ) -> Result<bool, StorageError> {
+        try_mark_reminted::try_mark_reminted(
+            self,
+            transaction_id,
+            expected_updated_at,
+            remint_signature,
+        )
+        .await
     }
 
     /// Terminal status write; `Ok(false)` if row already off Processing.

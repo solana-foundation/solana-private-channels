@@ -249,6 +249,13 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     operator_keypair: Keypair,
 ) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
     let rpc = MockRpcServer::start().await;
+    // Boot waits for the channel's address index before reading mint history; report it caught up.
+    for _ in 0..4 {
+        rpc.enqueue(
+            "getAddressIndexSlot",
+            crate::mock_rpc::Reply::result(serde_json::json!({"watermark": 1, "latestBlock": 1})),
+        );
+    }
     let mock_storage = MockStorage::new();
     let storage = Arc::new(Storage::Mock(mock_storage.clone()));
 

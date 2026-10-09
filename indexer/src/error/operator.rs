@@ -36,6 +36,23 @@ pub enum OperatorError {
     #[error("RPC error: {0}")]
     RpcError(String),
 
+    /// The channel no longer holds the block the withdraw indexer's checkpoint was built
+    /// on, so it was restored behind the indexer DB. See docs/PITR.md.
+    #[error(
+        "channel fence check failed: {reason}. The channel database was restored behind the \
+         indexer database; restore the indexer to a point before the channel's restore target \
+         (docs/PITR.md)"
+    )]
+    ChannelFence { reason: String },
+
+    #[error("channel fence could not be checked: {reason}")]
+    ChannelFenceUnchecked { reason: String },
+
+    /// The channel mint history could not be read completely, so a row it may already
+    /// have paid cannot be told apart from a new one.
+    #[error("consumed set unavailable: {reason}")]
+    ConsumedSet { reason: String },
+
     #[error("Invalid config: {0}")]
     InvalidConfig(String),
 

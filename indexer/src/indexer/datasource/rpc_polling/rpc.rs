@@ -1140,7 +1140,7 @@ mod tests {
             })))
             .with_status(200)
             .with_body(
-                r#"{"jsonrpc":"2.0","result":{"blockhash":"B100","parentSlot":99,"transactions":[]},"id":1}"#,
+                r#"{"jsonrpc":"2.0","result":{"blockhash":"B100","previousBlockhash":"B99","parentSlot":99,"transactions":[]},"id":1}"#,
             )
             .expect(1)
             .create();

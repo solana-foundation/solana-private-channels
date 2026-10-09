@@ -3,6 +3,7 @@ use crate::error::{
     CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
 };
 use crate::{
+    channel_fence::{verify_channel_fence, FenceVerdict, FenceWait},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
         datasource::common::{datasource::DataSource, types::ProcessorMessage},
@@ -11,13 +12,17 @@ use crate::{
         },
         transaction_processor::TransactionProcessor,
     },
+    operator::{RetryConfig, RpcClientWithRetry},
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
     storage::common::storage::live_lock::{
         under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
     },
-    storage::{PostgresDb, Storage},
+    storage::{common::models::ChannelFence, PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
+use private_channel_metrics::MetricLabel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use std::time::Duration;
 
 #[cfg(feature = "datasource-rpc")]
 use crate::{
@@ -32,16 +37,14 @@ use crate::{
     },
     operator::escrow_sweep::CustodySnapshot,
 };
-#[cfg(feature = "datasource-rpc")]
-use private_channel_metrics::MetricLabel;
-#[cfg(feature = "datasource-rpc")]
-use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
 
 #[cfg(feature = "datasource-rpc")]
-use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
+use crate::indexer::datasource::rpc_polling::{
+    chain_link::ChainLink, rpc::RpcPoller, RpcPollingSource,
+};
 
 #[cfg(feature = "datasource-yellowstone")]
 use crate::indexer::datasource::yellowstone::YellowstoneSource;
@@ -67,6 +70,52 @@ enum Supervision {
     ShutdownSignalled(std::io::Result<StopReason>),
     /// The startup fill failed, so its range stays unfilled until a restart refills it.
     BackfillFailed(IndexerError),
+    /// A channel block did not link to the history this DB holds, so the channel was
+    /// restored under the running indexer.
+    ChannelFenceBroken,
+}
+
+/// How long boot waits for a restored or lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: Duration::from_secs(1),
+    budget: Duration::from_secs(600),
+};
+
+/// Withdraw role: refuse to start on a channel that no longer holds the block this DB's
+/// checkpoint was built on. Returns the fence the chain link is seeded with.
+async fn verify_fence_at_boot(
+    storage: &Storage,
+    common_config: &PrivateChannelIndexerConfig,
+    indexer_config: &IndexerConfig,
+) -> Result<Option<ChannelFence>, IndexerError> {
+    let fence = storage.get_channel_fence().await?;
+    let commitment = indexer_config
+        .rpc_polling
+        .as_ref()
+        .map(|c| c.commitment)
+        .unwrap_or(CommitmentLevel::Confirmed);
+    let rpc = RpcClientWithRetry::with_retry_config(
+        common_config.rpc_url.clone(),
+        RetryConfig::default(),
+        CommitmentConfig { commitment },
+    );
+    match verify_channel_fence(&rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(fence)
+        }
+        FenceVerdict::Mismatch(reason) => {
+            crate::metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[ProgramType::Withdraw.as_label()])
+                .inc();
+            error!("Indexer refusing to start: {reason}");
+            Err(IndexerError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Indexer refusing to start, channel fence unchecked: {reason}");
+            Err(IndexerError::ChannelFenceUnchecked { reason })
+        }
+    }
 }
 
 /// Wind the checkpoint writer down once the processor has ended.
@@ -178,10 +227,12 @@ async fn supervise(
     processor_handle: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
     shutdown: impl std::future::Future<Output = std::io::Result<StopReason>>,
     backfill: impl std::future::Future<Output = IndexerError>,
+    fence_broken: &CancellationToken,
 ) -> Supervision {
     tokio::select! {
         biased;
         res = &mut *processor_handle => Supervision::ProcessorEnded(res),
+        _ = fence_broken.cancelled() => Supervision::ChannelFenceBroken,
         sig = shutdown => Supervision::ShutdownSignalled(sig),
         err = backfill => Supervision::BackfillFailed(err),
     }
@@ -345,6 +396,7 @@ fn build_backfill_service(
     storage: Arc<Storage>,
     common_config: &PrivateChannelIndexerConfig,
     indexer_config: &IndexerConfig,
+    chain_link: Option<Arc<ChainLink>>,
 ) -> Result<BackfillService, IndexerError> {
     let rpc_polling_config =
         indexer_config
@@ -384,7 +436,8 @@ fn build_backfill_service(
         indexer_config.backfill.clone(),
         common_config.escrow_instance_id,
     )
-    .with_fallback_poller(fallback_poller))
+    .with_fallback_poller(fallback_poller)
+    .with_chain_link(chain_link))
 }
 
 /// Spawn the processor that turns decoded instructions into rows and checkpoint updates.
@@ -610,6 +663,35 @@ pub async fn run(
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
 
+    // The withdraw indexer DB must never be ahead of the channel. Checked before any block
+    // is read; the chain link then keeps every later block tied to the same history.
+    let fence_broken = CancellationToken::new();
+    #[cfg(feature = "datasource-rpc")]
+    let mut chain_link: Option<Arc<ChainLink>> = None;
+    if common_config.program_type == ProgramType::Withdraw {
+        let fence = under_live_lock(
+            &live_lock_lost,
+            verify_fence_at_boot(&storage, &common_config, &indexer_config),
+        )
+        .await?;
+        #[cfg(feature = "datasource-rpc")]
+        {
+            let floor = get_last_checkpoint(&storage, ProgramType::Withdraw)
+                .await?
+                .unwrap_or(0);
+            let link = Arc::new(ChainLink::new(fence, floor));
+            let broken = link.broken();
+            let forward = fence_broken.clone();
+            tokio::spawn(async move {
+                broken.cancelled().await;
+                forward.cancel();
+            });
+            chain_link = Some(link);
+        }
+        #[cfg(not(feature = "datasource-rpc"))]
+        let _ = fence;
+    }
+
     // 2. Validate the escrow reconciliation wiring before doing any work.
     //
     // Only the config check runs here. The reconciliation itself compares on-chain
@@ -658,8 +740,12 @@ pub async fn run(
 
         #[cfg(feature = "datasource-rpc")]
         {
-            let backfill_service =
-                build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
+            let backfill_service = build_backfill_service(
+                storage.clone(),
+                &common_config,
+                &indexer_config,
+                chain_link.clone(),
+            )?;
 
             return run_backfill_only(
                 backfill_service,
@@ -736,8 +822,12 @@ pub async fn run(
         #[cfg(feature = "datasource-rpc")]
         {
             let startup_fill = async {
-                let backfill_service =
-                    build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
+                let backfill_service = build_backfill_service(
+                    storage.clone(),
+                    &common_config,
+                    &indexer_config,
+                    chain_link.clone(),
+                )?;
 
                 // Settle the configured floor before any network call. It reads one config
                 // field and one row, so surfacing it first keeps a misconfiguration from
@@ -976,6 +1066,7 @@ pub async fn run(
                 common_config.escrow_instance_id,
                 common_config.fallback_rpc_url.clone(),
             );
+            source = source.with_chain_link(chain_link.clone());
             if let Some(h) = health.clone() {
                 source = source.with_health(h);
             }
@@ -1110,6 +1201,7 @@ pub async fn run(
         &mut processor_handle,
         stop_signal(signal::ctrl_c(), live_lock_lost),
         backfill_failure(backfill_task.as_mut()),
+        &fence_broken,
     )
     .await;
     // A running fill holds an instruction sender, so stop it before any drain waits on the channel.
@@ -1136,6 +1228,22 @@ pub async fn run(
         other => other,
     };
     match outcome {
+        Supervision::ChannelFenceBroken => {
+            // Slots before the broken block are on the history this DB holds, so the
+            // checkpoint writer may still flush them.
+            crate::metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[ProgramType::Withdraw.as_label()])
+                .inc();
+            cancellation_token.cancel();
+            drop(instruction_tx);
+            finish_checkpoint_writer(&processor_end_lock_lost, checkpoint_tx, checkpoint_handle)
+                .await;
+            processor_handle.abort();
+            return Err(IndexerError::ChannelFence {
+                reason: "a channel block does not link to the history this indexer read"
+                    .to_string(),
+            });
+        }
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
             // from the latest durable point, unless the lock is gone and the flush would
@@ -1355,6 +1463,7 @@ mod tests {
             &mut handle,
             std::future::ready(Ok(StopReason::Interrupted)),
             std::future::pending(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1380,6 +1489,7 @@ mod tests {
             &mut handle,
             stop_signal(std::future::pending(), token),
             std::future::pending(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1422,6 +1532,7 @@ mod tests {
             &mut handle,
             std::future::ready(Ok(StopReason::Interrupted)),
             std::future::pending(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1444,6 +1555,7 @@ mod tests {
             &mut handle,
             std::future::pending::<std::io::Result<StopReason>>(),
             std::future::pending(),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1531,6 +1643,7 @@ mod tests {
             &mut processor,
             std::future::pending::<std::io::Result<StopReason>>(),
             std::future::ready(unavailable_slot()),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1557,6 +1670,7 @@ mod tests {
             &mut processor,
             stop_signal(std::future::pending(), token),
             std::future::ready(unavailable_slot()),
+            &CancellationToken::new(),
         )
         .await;
 
@@ -1580,6 +1694,7 @@ mod tests {
             &mut processor,
             std::future::pending::<std::io::Result<StopReason>>(),
             std::future::ready(unavailable_slot()),
+            &CancellationToken::new(),
         )
         .await;
 

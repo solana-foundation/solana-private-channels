@@ -544,14 +544,46 @@ for a burn that did land. Same two bounds as Path C Step 3.
 
 #### Burn landed
 
-The user already burned. Escalate (Tier 1) for refund coordination —
-either a manual `release_funds` to the depositor or a manual remint of
-the burned tokens. Then mark the row terminal:
+The user already burned. Escalate (Tier 1) for refund coordination, either a
+manual `release_funds` or a manual remint of the burned tokens. Either one must
+leave the row provable from the chain, because after any later indexer restore
+the operators trust only what they can tie back to a row: a release recorded
+under a different nonce, or a remint without its memo, would be paid again or
+refuse boot.
 
-```sql
-UPDATE transactions SET status = 'failed', updated_at = NOW()
- WHERE id = :transaction_id;
-```
+- **Manual release.** A release needs a nonce and this row has none, so prefer
+  the remint below. If a release is required, first give the row a nonce from
+  the sequence (`UPDATE transactions SET withdrawal_nonce =
+  nextval('withdrawal_nonce_seq') WHERE id = :transaction_id`), then release with
+  that `withdrawal_nonce` and the row's `amount` and `recipient`. Once it is
+  finalized, mark the row `completed` with it:
+
+  ```sql
+  UPDATE transactions
+     SET status = 'completed', counterpart_signature = :release_signature,
+         processed_at = NOW(), updated_at = NOW()
+   WHERE id = :transaction_id;
+  ```
+
+- **Manual remint.** Send the `MintTo` to the burner's token account, signed by
+  the mint authority, in one transaction with exactly one memo instruction
+  carrying the standard remint memo `private_channel:remint:<source_event_id>`.
+  `<source_event_id>` is base58 of SHA256 over the UTF-8 text of the row's `signature`
+  column as stored (the base58 string, not its decoded 64 bytes), then `instruction_index`
+  and `inner_index` (or -1 when null) as 4-byte little-endian signed integers. Have Tier 2
+  check the memo against the operator's own encoding before sending: a memo built any other
+  way still parses, but names a different event, and a later restore would remint the row.
+  Once it lands, mark the row `failed_reminted` with it:
+
+  ```sql
+  UPDATE transactions
+     SET status = 'failed_reminted', landed_remint_signature = :remint_signature,
+         processed_at = NOW(), updated_at = NOW()
+   WHERE id = :transaction_id;
+  ```
+
+Do not mark the row `failed` after either one: the withdraw operator refuses to
+start on a released nonce that no completed row explains.
 
 #### Burn did not land
 
@@ -735,9 +767,10 @@ keys.
 5. **Burned, no release, no earlier refund.** The release can never happen, so
    the user is owed their channel tokens. [Escalate](_escalation.md) (Tier 1)
    for an out-of-band remint of the burned tokens, as in Path B Step 3. Include
-   the evidence from Steps 1 to 3 in the escalation. Once the remint is
-   confirmed, mark the row `failed_reminted` and record the remint signature in
-   the incident record.
+   the evidence from Steps 1 to 3 in the escalation. The remint must carry the
+   standard remint memo, as in Path F Step 3 `Burn landed`. Once it is
+   confirmed, mark the row `failed_reminted` with `landed_remint_signature` set
+   to the remint signature, and record it in the incident record.
 6. **Attribute the rotation.** If the signer from Step 1 is this operator's key
    and the row was re-armed from a terminal status around then, it is the first
    cause above. Otherwise [escalate](_escalation.md) (Tier 2): the admin can
