@@ -171,6 +171,12 @@ path = "tests/indexer/yellowstone_inner_and_unknown.rs"
 name = "harness_sanity"
 path = "tests/indexer/harness_sanity.rs"
 
+# Operator refuses to start when a configured operator signer will not load. Own binary:
+# the installed signers are process-global and first-wins.
+[[test]]
+name = "test_operator_signer_refusal"
+path = "tests/indexer/test_operator_signer_refusal.rs"
+
 # RPC-error + storage-failure fault-injection tests.
 [[test]]
 name = "sender_poll_rpc_error"

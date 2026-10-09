@@ -47,7 +47,8 @@ pub fn default_operator_config() -> OperatorConfig {
     }
 }
 
-fn set_operator_env_vars(keypair: &Keypair) {
+/// Memory signer env for both roles; `operator::run` loads signers from env before anything else.
+pub fn set_operator_env_vars(keypair: &Keypair) {
     let private_key_base58 = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &private_key_base58);

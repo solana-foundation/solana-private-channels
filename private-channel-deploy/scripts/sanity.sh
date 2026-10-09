@@ -86,10 +86,15 @@ probe_http "write-node" "${WRITE_URL}/health"
 probe_http "read-node"  "${READ_URL}/health"
 
 # Indexers default to :9100; operators are given an explicit METRICS_PORT in
-# docker-compose.yml so bench-tps can scrape them on distinct host ports
-# (operator-solana=9102, operator-private-channel=9103). Read it from the container
-# env so this stays correct if compose changes.
+# docker-compose.yml (operator-solana=9102, operator-private-channel=9103, host
+# loopback only). Read it from the container env so this stays correct if compose changes.
 for svc in indexer-solana indexer-private-channel operator-solana operator-private-channel; do
+  # A localnet first boot without an escrow instance does not deploy these three.
+  if [[ "${SANITY_WORKERS_EXPECTED:-true}" == false && "$svc" != indexer-private-channel ]] \
+    && ! docker inspect "private-channel-$svc" >/dev/null 2>&1; then
+    sk "$svc not deployed (no escrow instance yet)"
+    continue
+  fi
   port=$(docker exec "private-channel-$svc" sh -c 'echo "${METRICS_PORT:-9100}"' 2>/dev/null || echo 9100)
   if docker exec "private-channel-$svc" curl -fsS -m 3 "http://localhost:${port}/health" >/dev/null 2>&1; then
     ok "$svc → 200 (in-container :${port}/health)"

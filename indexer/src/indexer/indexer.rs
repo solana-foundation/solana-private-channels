@@ -561,6 +561,8 @@ pub async fn run(
     // `common`, the block source it must differ from depends on the datasource.
     crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::reject_placeholder_instance(common_config.escrow_instance_id)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // The binary validates too; repeated so embedders get the same refusal before storage opens.
     common_config
@@ -1278,6 +1280,45 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Embedders that call run() directly get the same placeholder refusal as the binary.
+    #[tokio::test]
+    async fn run_refuses_the_placeholder_instance() {
+        let common = PrivateChannelIndexerConfig {
+            program_type: crate::config::ProgramType::Escrow,
+            storage_type: crate::config::StorageType::Postgres,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            postgres: crate::config::PostgresConfig {
+                database_url: "postgres://127.0.0.1:1/none".to_string(),
+                max_connections: 1,
+            },
+            escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::default()),
+        };
+        let indexer = IndexerConfig {
+            datasource_type: crate::config::DatasourceType::RpcPolling,
+            rpc_polling: None,
+            yellowstone: None,
+            backfill: crate::config::BackfillConfig {
+                enabled: false,
+                batch_size: 10,
+                max_gap_slots: 10,
+                start_slot: None,
+                exit_after_backfill: false,
+                rpc_url: "http://127.0.0.2:1".to_string(),
+            },
+            reconciliation: crate::config::ReconciliationConfig::default(),
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(common, indexer, None),
+        )
+        .await
+        .expect("must refuse before connecting")
+        .unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "got: {err}");
+    }
 
     /// Only a balance mismatch earns another fill. Retrying the rest would repeat the
     /// whole range resolution and fill twice over before failing with the same error,

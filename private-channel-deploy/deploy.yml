@@ -148,16 +148,16 @@
           _admin_kp_present: true
 
     # Without the keypair we'd silently fall through to env.j2's placeholder
-    # ADMIN_PRIVATE_KEY/PRIVATE_CHANNEL_ADMIN_KEYS, the operators would start, then
-    # panic at signer_util.rs:79 on `InvalidPrivateKey`. Surface the missing
-    # file in preflight, with the exact command to fix it.
+    # ADMIN_PRIVATE_KEY/PRIVATE_CHANNEL_ADMIN_KEYS and the operators would refuse
+    # to start on the unloadable admin signer. Surface the missing file in
+    # preflight, with the exact command to fix it.
     - name: Assert admin keypair exists
       ansible.builtin.assert:
         that: _admin_kp_present
         fail_msg: |
           Admin keypair not found at {{ admin_keypair_path }}.
           Operator services need this to derive ADMIN_PRIVATE_KEY; without it
-          they panic on startup with `InvalidPrivateKey`. The keypairs/ dir is
+          they refuse to start with a signer configuration error. The keypairs/ dir is
           gitignored so each operator generates their own.
 
           Auto-generation only runs for network=localnet with reset_state=true
@@ -611,6 +611,112 @@
           RBAC and no error redaction.
       when: gateway_enforce_jwt | default(true) | bool
 
+  # Config the binaries would refuse or ignore. Tagged always and not `preflight`, so
+  # neither `--tags render` nor `--skip-tags preflight` can skip them; no host probes.
+  - name: Deployment config asserts
+    tags: [ always, config_asserts ]
+    block:
+    - name: Allow the memory signer on localnet and devnet only
+      ansible.builtin.assert:
+        that: network in ['localnet', 'devnet']
+        fail_msg: |
+          network={{ network }} refused: this playbook renders an in-memory hot key for both
+          signer roles (ADMIN_SIGNER=OPERATOR_SIGNER=memory), allowed on localnet and devnet
+          only. Mainnet needs a non-memory backend (vault, turnkey or privy), which this
+          playbook does not render yet.
+
+    - name: Assert program IDs equal the compiled ones
+      ansible.builtin.assert:
+        that:
+        - escrow_program_id | default(compiled_escrow_program_id) == compiled_escrow_program_id
+        - withdraw_program_id | default(compiled_withdraw_program_id) == compiled_withdraw_program_id
+        fail_msg: |
+          escrow_program_id / withdraw_program_id must equal the compiled program IDs
+          ({{ compiled_escrow_program_id }} / {{ compiled_withdraw_program_id }}). They
+          are fixed by declare_id! and compiled into the indexer and clients, so a
+          different value here would be ignored. A custom ID needs rebuilt programs,
+          images and clients. Fix: remove the override from vars/<env>.yml.
+
+  # Tagged always: render needs the preserved PDA and deploy needs `_workers_enabled`,
+  # whichever phases run.
+  - name: Resolve the escrow instance
+    tags: [ always ]
+    block:
+    # Preserve the escrow instance PDA across redeploys. A redeploy with no
+    # escrow_instance_id var keeps the instance a previous render wrote, instead
+    # of starting the workers without one.
+    - name: Read existing .env (if any) to preserve previously-written instance ID
+      ansible.builtin.shell: |
+        if [ -f "{{ host_data_dir }}/config/.env" ]; then
+          grep -m1 '^COMMON_ESCROW_INSTANCE_ID=' "{{ host_data_dir }}/config/.env" \
+            | cut -d= -f2- || true
+        fi
+      register: _existing_instance_id
+      changed_when: false
+      check_mode: false
+
+    # A validator that boots with --reset wipes the ledger on every start, even when Postgres
+    # is kept, so a kept PDA would name an account that is gone.
+    - name: Set escrow_instance_id_pda from existing .env if present and non-placeholder
+      when:
+      - not (network == 'localnet' and validator_reset | default(true) | bool)
+      - _existing_instance_id.stdout | default('') | trim | length > 0
+      - _existing_instance_id.stdout | trim != '11111111111111111111111111111111'
+      - escrow_instance_id_pda is not defined
+      ansible.builtin.set_fact:
+        escrow_instance_id_pda: "{{ _existing_instance_id.stdout | trim }}"
+
+    # Same precedence as env.j2: the explicit var wins over the preserved PDA.
+    - name: Resolve the instance the workers will run against
+      ansible.builtin.set_fact:
+        _escrow_instance: "{{ (escrow_instance_id | default('', true) or escrow_instance_id_pda | default('')) | trim }}"
+
+    - name: Refuse the all-ones placeholder instance
+      ansible.builtin.assert:
+        that: _escrow_instance != '11111111111111111111111111111111'
+        fail_msg: |
+          escrow_instance_id is the all-ones placeholder (the system program). The
+          indexer and operators refuse it. Create the instance (create_instance in
+          scripts/devnet) and set escrow_instance_id to its address.
+
+    - name: Refuse a named instance that a localnet reset is about to wipe
+      when: network == 'localnet' and validator_reset | default(true) | bool
+      ansible.builtin.assert:
+        that: escrow_instance_id | default('', true) | length == 0
+        fail_msg: |
+          escrow_instance_id={{ escrow_instance_id | default('') }} but a localnet reset wipes the
+          validator, and with it that instance. Either unset escrow_instance_id (the stack
+          comes up without the workers) or pass -e reset_state=false -e validator_reset=false.
+
+    - name: Require an escrow instance off localnet
+      ansible.builtin.assert:
+        that: network == 'localnet' or _escrow_instance | length > 0
+        fail_msg: |
+          No escrow instance for network={{ network }}: escrow_instance_id is unset and
+          no previous .env holds a COMMON_ESCROW_INSTANCE_ID. The indexer and operators
+          refuse to start without it. Fix: create the instance first (create_instance in
+          scripts/devnet), then set escrow_instance_id in vars/<env>.yml. An .env from an
+          older render keeps it on an ESCROW_INSTANCE_ID line, which is no longer read.
+
+    # A localnet first boot has no instance (the validator starts empty), so the
+    # workers would only crash-loop and abort `up --wait`.
+    - name: Deploy the workers only when there is an instance
+      ansible.builtin.set_fact:
+        _workers_enabled: "{{ _escrow_instance | length > 0 }}"
+
+    - name: Report the services to deploy
+      ansible.builtin.debug:
+        msg: "compose_services: {{ compose_services }}"
+
+    - name: Explain the localnet first boot
+      when: not (_workers_enabled | bool)
+      ansible.builtin.debug:
+        msg: >-
+          No escrow instance yet, so indexer-solana, operator-solana and
+          operator-private-channel are not deployed. Create the instance on the
+          validator, set escrow_instance_id, and redeploy with
+          -e reset_state=false -e validator_reset=false.
+
   # =========================================================================
   # PHASE 2: BOOTSTRAP — one-time host prep. Skipped via marker on subsequent runs.
   # =========================================================================
@@ -829,32 +935,7 @@
         mode: "0644"
       tags: [ render, deploy ]
 
-    # If a prior run wrote a real escrow instance ID into the .env file,
-    # preserve it across re-renders. Otherwise the next deploy overwrites it
-    # with the all-1s placeholder, which leaves the indexer's already-
-    # populated DB pointing at a non-existent instance and reconciliation
-    # crashes. With `reset_state=true` the DB has been wiped so this doesn't
-    # matter; with `reset_state=false` it absolutely does. We read the
-    # existing file (best-effort), grep out the COMMON_ESCROW_INSTANCE_ID
-    # line, and pass it as a fact for env.j2.
-    - name: Read existing .env (if any) to preserve previously-written instance ID
-      ansible.builtin.shell: |
-        if [ -f "{{ host_data_dir }}/config/.env" ]; then
-          grep -m1 '^COMMON_ESCROW_INSTANCE_ID=' "{{ host_data_dir }}/config/.env" \
-            | cut -d= -f2- || true
-        fi
-      register: _existing_instance_id
-      changed_when: false
-      no_log: true
-
-    - name: Set escrow_instance_id_pda from existing .env if present and non-placeholder
-      when:
-      - _existing_instance_id.stdout | default('') | length > 0
-      - _existing_instance_id.stdout | trim != '11111111111111111111111111111111'
-      - escrow_instance_id_pda is not defined
-      ansible.builtin.set_fact:
-        escrow_instance_id_pda: "{{ _existing_instance_id.stdout | trim }}"
-
+    # COMMON_ESCROW_INSTANCE_ID comes from the instance PHASE 1 resolved.
     - name: Render .env
       ansible.builtin.template:
         src: templates/env.j2
@@ -1547,6 +1628,7 @@
       READ_URL: "http://127.0.0.1:{{ read_port }}"
       POSTGRES_USER: "{{ postgres_user }}"
       PROMETHEUS_URL: "http://127.0.0.1:{{ monitoring_prometheus_port }}"
+      SANITY_WORKERS_EXPECTED: "{{ _workers_enabled | default(true) | bool | lower }}"
     register: _sanity
     changed_when: false
     failed_when: _sanity.rc != 0

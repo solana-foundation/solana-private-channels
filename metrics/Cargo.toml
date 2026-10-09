@@ -5,9 +5,12 @@ edition.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 prometheus = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

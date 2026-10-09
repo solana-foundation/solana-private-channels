@@ -116,6 +116,13 @@ Images published by [`.github/workflows/publish-image.yml`](../.github/workflows
 
 Cluster-agnostic by design, the commands don't change between localnet, devnet/mainnet. The deploy target is set once in [`vars/dev.yml`](./vars/dev.yml) (`network` + `rpc_url`); the playbook auto-selects the matching compose file ([`docker-compose.yml`](../docker-compose.yml) for localnet, [`docker-compose.devnet.yml`](../docker-compose.devnet.yml) for devnet/mainnet) and renders a per-env `.env` from `vars/dev.yml` + `secrets.yml`.
 
+PHASE 1 refuses a config the binaries would refuse or ignore:
+
+- `network: mainnet` is refused. The playbook renders one in-memory hot key for both signer roles (`ADMIN_SIGNER=OPERATOR_SIGNER=memory`), and mainnet needs a non-memory backend this playbook does not render yet.
+- Off localnet, an escrow instance is required: set `escrow_instance_id` (created with `create_instance` in `scripts/devnet`), or keep the one a previous render left in `.env`. The all-ones placeholder is refused everywhere.
+- On a localnet first boot there is no instance yet, so the stack comes up without `indexer-solana`, `operator-solana` and `operator-private-channel`. Create the instance on the validator, set `escrow_instance_id`, and redeploy with `-e reset_state=false -e validator_reset=false`.
+- `escrow_program_id` / `withdraw_program_id` overrides must equal the compiled IDs. They are fixed by `declare_id!`; a custom ID needs rebuilt programs, images and clients.
+
 **Routine operations**
 
 | What you want                                           | Command&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Detail                                                                                                                                                                                                                                                                                                                           |

@@ -1,5 +1,5 @@
 [profile.default]
 # Integration tests can take up to 5 minutes
 slow-timeout = { period = "60s", terminate-after = 20 }
-# Each test runs in its own process — required for Lazy<Signer> singleton isolation
+# Each test runs in its own process: required for the process-global signer isolation
 # and for unique_port_range_for_tests to assign non-overlapping validator port ranges
