@@ -13,12 +13,14 @@
 
 use {
     private_channel_indexer::{
-        config::{BackfillConfig, ReconciliationConfig},
+        config::{BackfillConfig, ReconciliationConfig, RpcPollingConfig},
         error::{IndexerError, ReconciliationError},
         indexer::run,
         DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
         StorageType,
     },
+    solana_commitment_config::CommitmentLevel,
+    solana_transaction_status::UiTransactionEncoding,
     testcontainers::runners::AsyncRunner,
     testcontainers_modules::postgres::Postgres,
 };
@@ -55,7 +57,14 @@ async fn run_rejects_escrow_without_instance_id() {
 
     let indexer_config = IndexerConfig {
         datasource_type: DatasourceType::RpcPolling,
-        rpc_polling: None,
+        rpc_polling: Some(RpcPollingConfig {
+            poll_interval_ms: 1_000,
+            error_retry_interval_ms: 1_000,
+            batch_size: 10,
+            from_slot: None,
+            encoding: UiTransactionEncoding::Json,
+            commitment: CommitmentLevel::Finalized,
+        }),
         yellowstone: None,
         backfill: BackfillConfig {
             enabled: false,
@@ -124,7 +133,14 @@ async fn run_rejects_escrow_without_instance_id_in_backfill_only() {
 
     let indexer_config = IndexerConfig {
         datasource_type: DatasourceType::RpcPolling,
-        rpc_polling: None,
+        rpc_polling: Some(RpcPollingConfig {
+            poll_interval_ms: 1_000,
+            error_retry_interval_ms: 1_000,
+            batch_size: 10,
+            from_slot: None,
+            encoding: UiTransactionEncoding::Json,
+            commitment: CommitmentLevel::Finalized,
+        }),
         yellowstone: None,
         backfill: BackfillConfig {
             enabled: true,
