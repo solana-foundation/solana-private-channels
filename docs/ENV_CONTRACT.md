@@ -65,7 +65,7 @@ so a blank secret is caught identically on both surfaces. Currently required:
 - `GF_ADMIN_PASSWORD` — Grafana's admin login; the literal `admin` is rejected
 
 No working defaults ship for these. Generate each with `openssl rand -hex 32`.
-`JWT_SECRET` is required only when auth/RBAC is enabled (see `.env.example`).
+`JWT_SECRET` is required only when auth/RBAC is enabled (see `.env.example`). When set it must be at least 32 bytes after trimming; the gateway treats an empty value as auth off and refuses a whitespace-only one, and auth refuses an empty one.
 
 The nine `POSTGRES_*` values must also be **distinct from one another**, which the
 same script enforces. Each names a login with different rights, so reusing one

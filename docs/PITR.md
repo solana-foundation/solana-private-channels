@@ -42,6 +42,15 @@ This document describes how WAL archiving, base backups, and point-in-time recov
 | `PG_BACKUP_INTERVAL_HOURS` | 6 | Hours between base backups |
 | `PG_BACKUP_RETENTION_COUNT` | 3 | Number of base backups to retain |
 
+Both must be positive integers of at most 4 digits, with no sign and no leading zero. The
+sidecar exits at startup, before waiting for Postgres, on any other value. A retention of 0
+is refused because it would delete the backup just taken.
+
+After each backup and prune, the sidecar checks that a complete base backup is still on
+disk and logs `Retention verified`. If none is left it logs an `ERROR` and skips WAL
+pruning, so the archive is not trimmed with no base backup to restore from. It does not
+exit, since a restart would only take another full backup. Alert on that `ERROR` line.
+
 ## Restore Procedure
 
 ### Prerequisites

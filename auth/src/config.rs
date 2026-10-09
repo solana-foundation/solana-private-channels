@@ -2,6 +2,9 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
+/// Shortest accepted JWT signing secret, measured after trimming whitespace.
+pub const MIN_JWT_SECRET_BYTES: usize = 32;
+
 /// How long a handler waits for a pool connection.
 ///
 /// Must stay below the request timeout. sqlx defaults this to 30s, so a request
@@ -33,7 +36,7 @@ pub struct Config {
 
     /// Maximum number of connections in the database pool.
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
-    pub database_max_connections: u32,
+    pub database_max_connections: NonZeroU32,
 
     /// Maximum number of Argon2 hashes running at once. Hashing is CPU-bound,
     /// so raising this past the core count costs memory without adding throughput.
@@ -106,8 +109,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// Rejects combinations that parse fine but leave a control inert. Both of
-    /// these fail silently at runtime, which is worse than not starting.
+    /// Rejects values that parse fine but leave a control inert or a key weak. These fail
+    /// silently at runtime, which is worse than not starting. Auth has no disabled mode,
+    /// so an empty secret is rejected here (the gateway alone treats empty as "off").
     pub fn validate(&self) -> Result<(), String> {
         if Duration::from_secs(self.request_timeout_secs) <= POOL_ACQUIRE_TIMEOUT {
             return Err(format!(
@@ -119,11 +123,22 @@ impl Config {
             ));
         }
 
-        if self.max_connections_per_ip > self.max_connections {
+        if self.max_connections_per_ip >= self.max_connections {
             return Err(format!(
-                "AUTH_MAX_CONNECTIONS_PER_IP ({}) must not exceed AUTH_MAX_CONNECTIONS ({}), \
+                "AUTH_MAX_CONNECTIONS_PER_IP ({}) must be below AUTH_MAX_CONNECTIONS ({}), \
                  or one client can take the whole budget and the per-IP cap never applies",
                 self.max_connections_per_ip, self.max_connections,
+            ));
+        }
+
+        // Only the variable name and lengths may appear here: the value is a signing key
+        // and `Config` derives Debug, so it must never be formatted into an error.
+        let trimmed_len = self.jwt_secret.trim().len();
+        if trimmed_len < MIN_JWT_SECRET_BYTES {
+            return Err(format!(
+                "JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes after trimming \
+                 whitespace (got {trimmed_len}); the key used for signing is the exact value, \
+                 so generate one with `openssl rand -hex 32`",
             ));
         }
 
@@ -142,8 +157,17 @@ mod tests {
             "--database-url",
             "postgres://localhost/auth",
             "--jwt-secret",
-            "secret",
+            STRONG_SECRET,
         ])
+    }
+
+    /// 40 characters, comfortably over the 32 byte floor.
+    const STRONG_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn with_secret(secret: &str) -> Config {
+        let mut config = valid_config();
+        config.jwt_secret = secret.to_string();
+        config
     }
 
     #[test]
@@ -161,5 +185,69 @@ mod tests {
         config.max_connections = NonZeroUsize::new(8).unwrap();
         config.max_connections_per_ip = NonZeroUsize::new(9).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_per_ip_cap_equal_to_the_global_cap_is_rejected() {
+        let mut config = valid_config();
+        config.max_connections = NonZeroUsize::new(8).unwrap();
+        config.max_connections_per_ip = NonZeroUsize::new(8).unwrap();
+        let err = config.validate().expect_err("equal caps leave no reserve");
+        assert!(err.contains("must be below"), "got: {err}");
+
+        config.max_connections_per_ip = NonZeroUsize::new(7).unwrap();
+        config.validate().expect("strictly less is valid");
+    }
+
+    #[test]
+    fn a_zero_database_pool_size_is_rejected_by_the_parser() {
+        let parsed = Config::try_parse_from([
+            "auth",
+            "--database-url",
+            "postgres://localhost/auth",
+            "--jwt-secret",
+            STRONG_SECRET,
+            "--database-max-connections",
+            "0",
+        ]);
+        assert!(parsed.is_err(), "a zero pool panics in sqlx pool creation");
+    }
+
+    /// The check is on the trimmed length, so padding cannot satisfy it. The key itself
+    /// stays the raw string, so a valid secret with surrounding whitespace is accepted.
+    #[test]
+    fn the_jwt_secret_must_be_32_bytes_after_trimming() {
+        let thirty_one = "a".repeat(31);
+        let thirty_two = "a".repeat(32);
+        let rejected = [
+            "".to_string(),
+            "   \t\n".to_string(),
+            "secret".to_string(),
+            thirty_one.clone(),
+            format!("{thirty_one}\n"),
+            format!("  {thirty_one}  "),
+        ];
+        for secret in rejected {
+            let err = with_secret(&secret)
+                .validate()
+                .expect_err("a weak or blank secret must be rejected");
+            assert!(err.contains("JWT_SECRET"), "must name the variable: {err}");
+        }
+        for secret in [thirty_two.clone(), format!(" {thirty_two}\n")] {
+            with_secret(&secret)
+                .validate()
+                .expect("32 trimmed bytes is enough");
+        }
+    }
+
+    /// The rejection text may name the variable and lengths, never the value or a prefix.
+    #[test]
+    fn a_rejected_jwt_secret_is_never_echoed() {
+        let marker = "LEAKMARKER-xyz";
+        let err = with_secret(marker)
+            .validate()
+            .expect_err("a short secret must be rejected");
+        assert!(!err.contains(marker), "secret leaked: {err}");
+        assert!(!err.contains("LEAK"), "secret prefix leaked: {err}");
     }
 }

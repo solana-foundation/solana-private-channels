@@ -52,6 +52,8 @@ pub fn validate_gap(
 }
 
 fn calculate_batches(from_slot: u64, to_slot: u64, batch_size: usize) -> Vec<Vec<u64>> {
+    // A zero size would never advance and grow the list without bound.
+    let batch_size = batch_size.max(1);
     let mut batches = vec![];
     let mut next_slot = from_slot + 1;
 
@@ -984,6 +986,15 @@ mod tests {
         // from_slot == to_slot: next_slot = from_slot+1 > to_slot, so no iterations
         let batches = calculate_batches(100, 100, 10);
         assert!(batches.is_empty());
+    }
+
+    /// A zero batch size must still advance. Config validation rejects it, this is the
+    /// backstop for library callers that build the config directly.
+    #[test]
+    fn test_calculate_batches_zero_size_still_advances() {
+        let batches = calculate_batches(100, 103, 0);
+
+        assert_eq!(batches, vec![vec![101], vec![102], vec![103]]);
     }
 
     #[cfg(feature = "datasource-rpc")]
