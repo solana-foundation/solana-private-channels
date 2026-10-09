@@ -24,9 +24,68 @@ Pull the row's DB-side state:
 
 ```sql
 SELECT id, signature, slot, withdrawal_nonce, status, counterpart_signature,
-       remint_signatures, updated_at
+       remint_signatures, landed_remint_signature, updated_at
   FROM transactions
  WHERE id = :transaction_id;
+```
+
+If `landed_remint_signature` is set, the row was already refunded: handle it as
+the **Landed** case of the remint check below, and never re-arm or refund it.
+
+**Check the remint journal before any path.** A row keeps every remint it
+broadcast until it goes terminal:
+
+```sql
+SELECT signature, last_valid_block_height, blockhash_slot
+  FROM pending_remint_signatures
+ WHERE transaction_id = :transaction_id
+ ORDER BY id;
+```
+
+Classify them with one snapshot from the private channel read node, at the
+withdraw operator's `COMMON_SOURCE_RPC_URL`. The public gateway refuses this
+method without an operator JWT. It returns the statuses, block height and
+ledger floor from a single read, so a `null` is never older than the height
+it is judged against. Separate `solana` calls can mix states; do not use them
+here.
+
+```bash
+curl -s "$COMMON_SOURCE_RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSignatureStatusSnapshot","params":[["<sig1>","<sig2>"]]}'
+```
+
+`value` is in signature order. Judge each entry against the `blockHeight`
+and `firstAvailableBlock` of that same response:
+
+- **Landed:** an entry with `err: null`. The user was refunded. If the
+  release also landed (Path B Step 1, or the nonce's bitmap bit is set), the
+  user was credited twice: [escalate](_escalation.md) (Tier 1) and leave the
+  row as is. Otherwise mark it reminted, and never re-arm or restore it:
+  ```sql
+  UPDATE transactions
+     SET status = 'failed_reminted',
+         landed_remint_signature = :signature,
+         processed_at = NOW(),
+         updated_at = NOW()
+   WHERE id = :transaction_id
+     AND status = 'manual_review';
+  ```
+- **Dead:** an entry with a non-null `err`, or `null` with `blockHeight`
+  above its `last_valid_block_height` and `firstAvailableBlock` at or below
+  its `blockhash_slot`. A NULL `blockhash_slot` cannot meet the last bound.
+- **Anything else:** the remint may still land. Do not re-arm, restore or
+  mark the row terminal. Re-run the snapshot once `blockHeight` passes
+  `last_valid_block_height`, and [escalate](_escalation.md) (Tier 2) if it is
+  still unproven.
+
+Continue only if the journal is empty or every signature is dead. If they
+are all dead, record them in the incident record, then clear the journal so
+a re-arm starts clean:
+
+```sql
+DELETE FROM pending_remint_signatures
+ WHERE transaction_id IN (SELECT id FROM transactions
+                           WHERE id = :transaction_id
+                             AND status = 'manual_review');
 ```
 
 Match the webhook's `error_message` against the table below to pick the
@@ -143,12 +202,18 @@ every active withdrawal is collateral.
       SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
-      AND id <> ALL(:excluded_ids);
+      AND id <> ALL(:excluded_ids)
+      AND landed_remint_signature IS NULL
+      AND NOT EXISTS (SELECT 1 FROM pending_remint_signatures r
+                       WHERE r.transaction_id = transactions.id);
    ```
    `:excluded_ids` is `:poison_id` plus every row a prior escalation left
    held in `manual_review` (each recorded in its own incident record).
    Re-arming a held row releases escrowed funds against a burn nobody
-   proved happened.
+   proved happened. A row with a remint journal is skipped: its remint may
+   still land, so take it through the Triage remint check on its own. A row
+   with a landed remint was already refunded, so no re-arm in this runbook
+   matches it.
    The `transactions` table does not store `error_message` - it lives in the
    alert payload only. Distinguishing trigger from collateral happens in
    triage (Step 2: oldest `updated_at` is the trigger), not in the re-arm
@@ -291,8 +356,12 @@ would reopen the free retry loop it exists to close.
    ```sql
    UPDATE transactions
       SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
-    WHERE id = :transaction_id;
+    WHERE id = :transaction_id
+      AND landed_remint_signature IS NULL;
    ```
+   On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+   refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+   remint check.
 4. **No operator restart is needed.** The processor did not halt; the
    fetcher will pick up the re-armed row on its next tick.
 5. **If the condition is permanent**, mark `failed` and capture the
@@ -343,11 +412,9 @@ release and the channel-side remint may have left partial state.
      Done. No further action.
    - If `NOT_LANDED` → continue.
    - If `AMBIGUOUS` → [escalate](_escalation.md) (Tier 2).
-2. **Verify the remint signature on the channel side.** The remint targets
-   the private channel side, not Solana mainnet. Check the private channel read node for the
-   user's ATA balance before/after `processed_at`. If the balance moved, the
-   remint actually succeeded and the failure was a confirmation glitch - mark
-   `failed_reminted` and capture the remint signature manually.
+2. **Verify the remint on the channel side.** The remint journal check in
+   Triage decides this. Do not infer it from the user's balance: a remint
+   still in flight has not moved it yet and can land later.
 3. **If both confirmed not-landed,** the user's funds are stuck:
    - Their private channel side tokens were burned for the withdrawal.
    - Solana-side release did not happen.
@@ -415,6 +482,8 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > the release failed, so once the RPC catches up that row promotes itself to
 > `completed` with the landed signature. A row quarantined with `no broadcast
 > signatures recorded ...` has nothing to re-check and will never self-clear.
+> Neither will a row with a remint journal: the sweep skips it until Triage
+> clears the journal.
 > Re-read the row's status before starting the steps below: if it is already
 > `completed`, the sweep resolved the bookkeeping and the alert can be closed
 > against that signature. The promotion is bookkeeping only and needs no
@@ -522,8 +591,13 @@ The generation is the u64 at offset 2. If it is above
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
- WHERE id = :transaction_id;
+ WHERE id = :transaction_id
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 Otherwise proceed.
 
@@ -621,8 +695,13 @@ stall, since the counter is already at the cap:
 ```sql
 UPDATE transactions
    SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
- WHERE id = :transaction_id;
+ WHERE id = :transaction_id
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 If the release can never land (unrecoverable on-chain rejection), mark the
 row terminal and [escalate](_escalation.md) (Tier 1) for refund
@@ -661,8 +740,13 @@ Nothing was broadcast for these rows.
 UPDATE transactions
    SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id
-   AND status = 'manual_review';
+   AND status = 'manual_review'
+   AND landed_remint_signature IS NULL;
 ```
+
+On `UPDATE 0`, check `landed_remint_signature`: if set, the row was already
+refunded. Do not re-arm it; handle it as the **Landed** case of the Triage
+remint check.
 
 ## Path H - rotated past generation
 
@@ -718,16 +802,17 @@ keys.
    already compensated, and "burned, no release" is still true for it.
    ```sql
    SELECT landed_remint_signature FROM transactions WHERE id = :transaction_id;
-   SELECT signature FROM pending_remint_signatures WHERE transaction_id = :transaction_id;
    ```
-   Confirm each signature against the private channel read node. Also search
+   Triage has already cleared the remint journal, so also take the remint
+   signatures it recorded in the incident record. Classify each signature with
+   the snapshot from the Triage remint check, not `solana confirm`. Also search
    the alert history for an earlier `failed_reminted` webhook for this
    `transaction_id`, and the user's channel token account history for a remint
    after the burn.
-   - Any remint landed: set the row back to `failed_reminted`, record that
-     signature in the incident record, and skip to Step 6. Do not remint again.
-   - None landed, and every signature was confirmed failed or not found:
-     continue.
+   - Any remint landed: mark the row reminted with that signature using the
+     Triage SQL, record it in the incident record, and skip to Step 6. Do not
+     remint again.
+   - None landed, and every signature is dead by the Triage rule: continue.
    - A signature cannot be confirmed either way: `AMBIGUOUS`.
 4. **Confirm the burn** with both coverage bounds, as in Path C Step 3. If the
    burn is unproven, stop and [escalate](_escalation.md) (Tier 2). If it is
@@ -736,8 +821,8 @@ keys.
    the user is owed their channel tokens. [Escalate](_escalation.md) (Tier 1)
    for an out-of-band remint of the burned tokens, as in Path B Step 3. Include
    the evidence from Steps 1 to 3 in the escalation. Once the remint is
-   confirmed, mark the row `failed_reminted` and record the remint signature in
-   the incident record.
+   confirmed, mark the row reminted with its signature using the Triage SQL,
+   and record it in the incident record.
 6. **Attribute the rotation.** If the signer from Step 1 is this operator's key
    and the row was re-armed from a terminal status around then, it is the first
    cause above. Otherwise [escalate](_escalation.md) (Tier 2): the admin can

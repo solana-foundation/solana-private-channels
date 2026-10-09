@@ -186,8 +186,8 @@ async fn recover_once(
     threshold: Duration,
     reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
-    // Best-effort GC of release and remint signatures whose parent left its
-    // live status; a failure here must not block recovery.
+    // Best-effort GC of release and remint signatures whose parent is
+    // terminal; a failure here must not block recovery.
     match storage.gc_stale_release_signatures().await {
         Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
