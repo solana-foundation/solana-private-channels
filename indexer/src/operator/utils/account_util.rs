@@ -136,16 +136,17 @@ pub fn parse_withdrawal_bitmap(data: &[u8]) -> Result<BitmapState, AccountError>
     })
 }
 
-/// Read only the generation. Used at the rotation boundary and when routing a
-/// generation rejection, where the bits are irrelevant.
+/// Read only the generation, answered at or past `min_slot`. Used at the rotation boundary
+/// and when routing a generation rejection, where the bits are irrelevant.
 pub async fn fetch_bitmap_generation(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
+    min_slot: u64,
 ) -> Result<u64, OperatorError> {
     Ok(fetch_consumed_nonces(
         rpc_client,
         bitmap_pda,
-        None,
+        Some(min_slot),
         rpc_client.rpc_client.commitment(),
     )
     .await?
@@ -170,14 +171,23 @@ pub async fn fetch_consumed_nonces(
     min_context_slot: Option<u64>,
     commitment: CommitmentConfig,
 ) -> Result<BitmapState, OperatorError> {
-    fetch_bitmap_if_present(rpc_client, bitmap_pda, min_context_slot, commitment)
-        .await?
-        .ok_or_else(|| {
-            ProgramError::BitmapUnavailable {
-                reason: format!("bitmap {bitmap_pda} not found"),
-            }
-            .into()
-        })
+    fetch_consumed_nonces_at(rpc_client, bitmap_pda, min_context_slot, commitment)
+        .await
+        .map(|(bitmap, _)| bitmap)
+}
+
+/// `fetch_consumed_nonces`, plus the context slot the bitmap was read at.
+pub async fn fetch_consumed_nonces_at(
+    rpc_client: &RpcClientWithRetry,
+    bitmap_pda: &Pubkey,
+    min_context_slot: Option<u64>,
+    commitment: CommitmentConfig,
+) -> Result<(BitmapState, u64), OperatorError> {
+    let (bitmap, slot) = read_bitmap(rpc_client, bitmap_pda, min_context_slot, commitment).await?;
+    let bitmap = bitmap.ok_or_else(|| ProgramError::BitmapUnavailable {
+        reason: format!("bitmap {bitmap_pda} not found"),
+    })?;
+    Ok((bitmap, slot))
 }
 
 /// Same read as `fetch_consumed_nonces`, but a bitmap that was never created is `None`.
@@ -190,6 +200,18 @@ pub async fn fetch_bitmap_if_present(
     min_context_slot: Option<u64>,
     commitment: CommitmentConfig,
 ) -> Result<Option<BitmapState>, OperatorError> {
+    read_bitmap(rpc_client, bitmap_pda, min_context_slot, commitment)
+        .await
+        .map(|(bitmap, _)| bitmap)
+}
+
+/// The bitmap, or `None` if never created, and the context slot of the read.
+async fn read_bitmap(
+    rpc_client: &RpcClientWithRetry,
+    bitmap_pda: &Pubkey,
+    min_context_slot: Option<u64>,
+    commitment: CommitmentConfig,
+) -> Result<(Option<BitmapState>, u64), OperatorError> {
     // Named as a bitmap failure rather than a generic transport one because
     // callers branch on it. An unreadable bitmap leaves a withdrawal row alone
     // for the recovery worker, where an error they do not recognise marks the
@@ -201,15 +223,16 @@ pub async fn fetch_bitmap_if_present(
             reason: format!("get_account_info({bitmap_pda}): {e}"),
         })?;
 
+    let slot = response.context.slot;
     let Some(account) = response.value else {
-        return Ok(None);
+        return Ok((None, slot));
     };
     if account.owner == SYSTEM_PROGRAM_ID && account.data.is_empty() {
-        return Ok(None);
+        return Ok((None, slot));
     }
 
     parse_withdrawal_bitmap(&account.data)
-        .map(Some)
+        .map(|bitmap| (Some(bitmap), slot))
         .map_err(|e| match e {
             AccountError::AccountDeserializationFailed { reason, .. } => {
                 AccountError::AccountDeserializationFailed {
@@ -581,5 +604,53 @@ mod tests {
             assert_eq!(bitmap.generation, 3);
             read.assert_async().await;
         }
+    }
+
+    /// The context slot comes back with the bitmap, so a caller can bound later work by it.
+    #[tokio::test]
+    async fn fetch_consumed_nonces_at_returns_the_context_slot() {
+        use crate::operator::utils::rpc_util::RetryConfig;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use solana_commitment_config::CommitmentConfig;
+
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": {"slot": 777},
+                "value": {
+                    "owner": pk(1).to_string(),
+                    "lamports": 1u64,
+                    "data": [STANDARD.encode(bitmap_account_bytes(2, &[2 * NONCES_PER_GENERATION], 255)), "base64"],
+                    "executable": false,
+                    "rentEpoch": 0
+                }
+            }
+        });
+        let _read = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+
+        let (bitmap, slot) =
+            fetch_consumed_nonces_at(&rpc, &pk(9), Some(700), CommitmentConfig::finalized())
+                .await
+                .unwrap();
+
+        assert_eq!(slot, 777);
+        assert_eq!(bitmap.generation, 2);
+        assert!(bitmap.is_consumed(2 * NONCES_PER_GENERATION));
     }
 }

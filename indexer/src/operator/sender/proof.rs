@@ -129,6 +129,9 @@ impl SenderState {
             // choice that cannot strand a releasable withdrawal is to broadcast
             // it and let the program judge.
             Err(e) => {
+                crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[self.program_type.as_label(), "release_sent_unchecked"])
+                    .inc();
                 warn!(nonce, "Sending without a generation check: {e}");
                 (GenerationWindow::Open, nonce_generation)
             }
@@ -167,8 +170,8 @@ const ROTATION_HELD_ALERT_PASSES: u32 =
 ///
 /// The only thing that starts a rotation. Driven by state, not by a particular
 /// row reaching the processor, so it still fires when that row was quarantined,
-/// swept aside, or never existed. Arming is all it does: the in-flight barrier
-/// decides when the rotation is sent, and binds the generation then.
+/// swept aside, or never existed. The in-flight barrier decides when the rotation
+/// is sent, with the generation bound here from the anchored read that armed it.
 pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     // Only the withdraw role has an escrow instance whose bitmap can rotate.
     let Some(instance_pda) = state.instance_pda else {
@@ -242,6 +245,9 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
             lowest_generation, "Chain is behind the waiting withdrawals, arming a rotation"
         );
         state.pending_rotation = Some(build_rotation(instance_pda));
+        // Bound now, to the generation this decision was made against, so nothing later
+        // can swap in a generation the sender never decided to rotate.
+        state.rotation_bound_generation = Some(chain_generation);
         state.rotation_blocked_passes = 0;
         return;
     }
@@ -354,9 +360,8 @@ fn report_read_failure(state: &SenderState) {
 }
 
 /// A rotation for `instance_pda`, with every account derived rather than carried
-/// over from whatever built it. `expected_generation` is deliberately left unset:
-/// the submit path binds it from a fresh read, which is the only moment the value
-/// is still current.
+/// over from whatever built it. `expected_generation` is left unset: the submit
+/// path sets it from the generation bound when the rotation was armed.
 fn build_rotation(instance_pda: Pubkey) -> Box<RotateBitmapBuilder> {
     let operator_pubkey = SignerUtil::get_operator_pubkey();
     let mut builder = RotateBitmapBuilder::new();
@@ -421,11 +426,20 @@ async fn owed_nonce_gate_allows_send(state: &mut SenderState) -> bool {
         }
     };
 
-    if state
-        .rotation_bound_generation
-        .is_some_and(|bound| bound != chain_generation)
-    {
-        return true;
+    match state.rotation_bound_generation {
+        // The chain moved past the bound. Never sent: disarm, the arming pass re-decides.
+        // Sent before: let it go, the program refuses it and that settles the rotation.
+        Some(bound) if chain_generation > bound => {
+            if state.rotation_in_flight.is_some() {
+                return true;
+            }
+            state.pending_rotation = None;
+            state.rotation_bound_generation = None;
+            return false;
+        }
+        // A backend behind the bound proves nothing about the rows owed under it.
+        Some(bound) if chain_generation < bound => return false,
+        _ => {}
     }
 
     let window_floor = chain_generation.saturating_mul(NONCES_PER_GENERATION);
@@ -450,6 +464,7 @@ async fn owed_nonce_gate_allows_send(state: &mut SenderState) -> bool {
         );
     } else {
         state.pending_rotation = None;
+        state.rotation_bound_generation = None;
     }
 
     false
@@ -462,7 +477,7 @@ async fn owed_nonce_gate_allows_send(state: &mut SenderState) -> bool {
 /// A failed read leaves us unable to say which nonces the rotation would erase,
 /// so it holds the rotation: the next tick tries again, whereas a bit cleared
 /// out from under a maturing remint never comes back.
-async fn pending_remints_have_settled(state: &SenderState) -> bool {
+async fn pending_remints_have_settled(state: &mut SenderState) -> bool {
     let pending_nonces: Vec<u64> = state
         .pending_remints
         .iter()
@@ -519,9 +534,9 @@ mod tests {
     use crate::error::ProgramError;
     use crate::operator::sender::test_support::{
         ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
-        mock_bitmap_read_failure, mock_bitmap_sequence, mock_with_processing_row,
-        push_processing_row, push_withdrawal_with_nonce, row_status, sender_state,
-        sender_state_with_storage,
+        mock_bitmap_read_failure, mock_bitmap_sequence, mock_finalized_anchor,
+        mock_with_processing_row, push_processing_row, push_withdrawal_with_nonce, row_status,
+        sender_state, sender_state_with_storage,
     };
     use crate::operator::sender::transaction::handle_nonce_outside_generation;
     use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
@@ -648,6 +663,7 @@ mod tests {
     #[tokio::test]
     async fn send_gate_disarms_when_a_nonce_owes_a_release_in_the_current_generation() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = send_gate_state(
@@ -669,6 +685,7 @@ mod tests {
     #[tokio::test]
     async fn send_gate_sends_when_only_later_generations_owe_a_release() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = send_gate_state(
@@ -731,6 +748,7 @@ mod tests {
     #[tokio::test]
     async fn send_gate_ignores_a_nonce_stranded_below_the_current_generation() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = send_gate_state(
@@ -790,6 +808,7 @@ mod tests {
     #[tokio::test]
     async fn send_gate_releases_a_rearmed_rotation_whose_bound_is_stale() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
 
         let mut state = send_gate_state(
@@ -805,6 +824,52 @@ mod tests {
 
         assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
         assert!(state.pending_rotation.is_none());
+    }
+
+    /// The chain moved past the generation this rotation was armed against before it was
+    /// ever sent. Sending it is a certain refusal, so it is disarmed for arming to re-decide.
+    #[tokio::test]
+    async fn gate_disarms_a_never_sent_rotation_the_chain_moved_past() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
+        // Owed only in a later generation, so the owed check alone would send it.
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(
+                1,
+                3 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+        state.rotation_bound_generation = Some(1);
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(state.pending_rotation.is_none(), "disarmed");
+        assert_eq!(state.rotation_bound_generation, None, "arming binds afresh");
+    }
+
+    /// A read below the bound is a backend behind the read that armed the rotation. It
+    /// says nothing about the rows owed in the bound generation, so the rotation waits.
+    #[tokio::test]
+    async fn gate_holds_when_chain_reads_below_bound() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let mut state = send_gate_state(
+            &server.url(),
+            // Owed in the bound generation: a send at that bound would close it.
+            &[(
+                1,
+                2 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+        state.rotation_bound_generation = Some(2);
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(state.pending_rotation.is_some(), "held, not disarmed");
+        assert_eq!(state.rotation_bound_generation, Some(2));
     }
 
     /// A deferred remint has left the in-flight set but its outcome still turns
@@ -834,6 +899,7 @@ mod tests {
         use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = sender_state(&server.url());
@@ -919,6 +985,7 @@ mod tests {
     #[serial_test::serial]
     async fn originates_when_lowest_unreleased_is_in_a_later_generation() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = originator_state(
@@ -932,6 +999,28 @@ mod tests {
             state.pending_rotation.is_some(),
             "a generation the chain has not opened yet must arm a rotation"
         );
+    }
+
+    /// Arming binds the generation it read, so the send path carries exactly what the
+    /// decision to rotate was made against.
+    #[tokio::test]
+    async fn arming_stores_the_generation_it_read() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 3, &[]);
+        let mut state = originator_state(
+            &server.url(),
+            &[(
+                1,
+                4 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(state.pending_rotation.is_some());
+        assert_eq!(state.rotation_bound_generation, Some(3));
     }
 
     /// The current window still owes a release, so rotating would close the only
@@ -1024,6 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn send_gate_hold_reports_on_the_shared_threshold() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = send_gate_state(
@@ -1093,6 +1183,7 @@ mod tests {
     #[serial_test::serial]
     async fn originates_again_after_a_rotation_when_the_gap_spans_generations() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = originator_state(
@@ -1109,7 +1200,9 @@ mod tests {
 
         // Stand in for that rotation landing: the arm clears and the chain moves on.
         state.pending_rotation = None;
+        state.rotation_bound_generation = None;
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
         state.rpc_client = std::sync::Arc::new(
             crate::operator::utils::rpc_util::RpcClientWithRetry::with_retry_config(
@@ -1173,6 +1266,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_that_persists_is_reported() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = originator_state(
@@ -1207,6 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn a_block_that_outlasts_the_first_report_keeps_reporting() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = originator_state(
@@ -1277,6 +1372,7 @@ mod tests {
     #[serial_test::serial]
     async fn reads_fresh_when_the_cached_generation_is_none() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let reads = Arc::new(AtomicUsize::new(0));
         let _bitmap = mock_bitmap_account_counted(&mut server, 0, reads.clone());
 
@@ -1432,6 +1528,7 @@ mod tests {
     #[serial_test::serial]
     async fn originates_despite_a_nonce_stranded_below_the_current_generation() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = originator_state(
@@ -1459,6 +1556,7 @@ mod tests {
     #[tokio::test]
     async fn arming_does_not_submit_while_the_barrier_is_closed() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = originator_state(
@@ -1550,6 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn stale_cache_does_not_withhold_a_nonce_the_chain_has_rotated_into() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(1, Vec::new())]);
 
         let mut state = sender_state(&server.url());
@@ -1576,6 +1675,7 @@ mod tests {
     #[tokio::test]
     async fn stale_cache_that_permits_a_send_degrades_to_the_rejection_path() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(1, Vec::new())]);
 
         // The deferral is a compare-and-set against a Processing row, so the row
@@ -1618,6 +1718,7 @@ mod tests {
             &mut state,
             &ctx,
             Signature::new_unique(),
+            1,
             instruction,
             &tx,
         )
@@ -1644,6 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_cache_verifies_against_the_chain_before_refusing() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(2, Vec::new())]);
 
         let mut state = sender_state(&server.url());
@@ -1686,6 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn nonce_ahead_of_the_window_is_queued_for_the_rotation() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mock = mock_with_processing_row(RELEASE_TXID);
@@ -1767,6 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn every_queued_release_has_a_parked_row_behind_it() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         // One row for the pre-send hold, one for the on-chain refusal, and one
@@ -1801,6 +1905,7 @@ mod tests {
                 &mut state,
                 &ctx,
                 Signature::new_unique(),
+                1,
                 instruction.clone(),
                 &tx,
             )
@@ -1826,6 +1931,7 @@ mod tests {
     #[tokio::test]
     async fn nonce_behind_the_window_is_refused_and_not_queued() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
 
         let mut state = sender_state(&server.url());
@@ -1849,6 +1955,7 @@ mod tests {
     #[tokio::test]
     async fn cache_never_advances_past_what_the_chain_reported() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mut state = sender_state(&server.url());

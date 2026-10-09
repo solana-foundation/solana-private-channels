@@ -186,14 +186,20 @@ pub struct SenderState {
     /// every refusal is taken against a fresh read instead, which is what keeps
     /// a stale entry from stranding a releasable withdrawal.
     pub cached_generation: Option<u64>,
+    /// Highest finalized anchor any generation read was bound to. Never lowered, so no
+    /// later read can come from an older snapshot than an earlier one did.
+    pub anchor_high_water: u64,
+    /// Highest slot at which the program refused a release for its generation. A read
+    /// below it could still show a generation that refusal already ruled out.
+    pub refusal_floor: u64,
     pub retry_counts: HashMap<u64, u32>,
     /// Attempts spent on the rotation in hand; one counter suffices because at most one is ever in flight.
     pub rotation_retry_attempts: u32,
     /// The rotation last dispatched, kept because nothing else can re-dispatch one that failed.
     pub rotation_in_flight: Option<Box<RotateBitmapBuilder>>,
-    /// The generation that rotation was bound to. It survives a re-arm on
-    /// purpose: rebinding a rotation that already landed would make the replay
-    /// look legitimate and close a generation nobody ever opened.
+    /// The generation the armed rotation was bound to, from the anchored read that armed
+    /// it. It survives a re-arm on purpose: rebinding a rotation that already landed would
+    /// make the replay look legitimate and close a generation nobody ever opened.
     pub rotation_bound_generation: Option<u64>,
     /// Times that rotation has been put back on the tick, so a hopeless one stops being retried.
     pub rotation_rearm_attempts: u32,
@@ -293,13 +299,9 @@ pub struct PendingRemint {
     /// with it, so a restart inside the finality window still lets the refund
     /// go through instead of falling back to manual review.
     pub release_refused_on_chain: bool,
-    /// The last slot a release for this nonce could have landed in, read once.
-    ///
-    /// The indexer's checkpoint has to reach this before an absent release
-    /// record proves anything. Re-reading it each tick would move the target
-    /// the checkpoint is chasing, so it is captured on the first check and
-    /// kept. A restart re-captures a later slot, which only asks for more
-    /// coverage than before, never less.
+    /// Last slot a release could have landed in: the first anchored bitmap read that proved
+    /// the window closed. The checkpoint must reach it before an absent release proves
+    /// anything; never raised, since a bound chasing the tip would never be covered.
     pub coverage_slot: Option<u64>,
     /// Escrow checkpoint at the last coverage read; tells a catching-up indexer from a stuck one.
     pub coverage_checkpoint: Option<u64>,

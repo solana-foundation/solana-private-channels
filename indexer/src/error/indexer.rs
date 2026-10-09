@@ -108,6 +108,12 @@ pub enum ReconciliationError {
     #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
     CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
 
+    /// The Solana node could not answer custody at or past `floor` (its newest recent block,
+    /// or the committed checkpoint), or its newest block is too old. A node catching up
+    /// clears this, so startup re-reads a few times before giving up.
+    #[error("custody could not be read at or past slot {floor} (node answered at {slot:?}); the Solana RPC is behind or not at a recent block")]
+    CustodyStale { slot: Option<u64>, floor: u64 },
+
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 

@@ -70,6 +70,15 @@ async fn read_target_mint_account(
     }
 }
 
+/// A hook read that could not be proven fresh: transient, and counted so lag is visible
+/// apart from a genuinely missing validation account.
+fn hook_freshness_miss(reason: String) -> OperatorError {
+    crate::metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&["withdraw", "hook_freshness_unproven"])
+        .inc();
+    OperatorError::RpcError(reason)
+}
+
 /// Mint reads and per-mint existence floors. Nothing a recreated mint can change
 /// is cached: decimals come from the DB, the rest from `AllowedMint`.
 pub struct MintCache {
@@ -81,6 +90,9 @@ pub struct MintCache {
     /// Highest slot a withdrawal gate read has answered at. Slots are chain-wide,
     /// so no later gate read may answer below it, for any mint.
     slot_high_water: u64,
+    /// Per (mint, hook program), the slot a validation account was last seen at. Hook
+    /// reads never go below it, so a lagging node cannot answer from before it existed.
+    validation_seen_floor: HashMap<(Pubkey, Pubkey), u64>,
 }
 
 /// Outcome of resolving a mint's transfer-hook accounts.
@@ -103,6 +115,7 @@ impl MintCache {
             rpc_client: None,
             existence_floor: HashMap::new(),
             slot_high_water: 0,
+            validation_seen_floor: HashMap::new(),
         }
     }
 
@@ -112,6 +125,7 @@ impl MintCache {
             rpc_client: Some(rpc_client),
             existence_floor: HashMap::new(),
             slot_high_water: 0,
+            validation_seen_floor: HashMap::new(),
         }
     }
 
@@ -241,7 +255,8 @@ impl MintCache {
     /// `ExtraAccountMetaList` resolves to. Empty for a mint with no hook.
     ///
     /// Any variant other than `Resolved` means no transfer of this mint can
-    /// resolve; the caller parks instead of retrying.
+    /// resolve; the caller parks instead of retrying. Each is read at or past
+    /// `min_slot` and the slot this validation account was last seen at.
     ///
     /// Resolved per withdrawal rather than cached, since an
     /// `ExtraAccountMetaList` can derive accounts from the amount and
@@ -265,16 +280,39 @@ impl MintCache {
             OperatorError::RpcError("hook resolution requires an RPC client".to_string())
         })?;
         let commitment = rpc.rpc_client.commitment();
+        // Every hook read answers at or past the gate slot and the last slot this
+        // validation account was seen at, so the verdicts below are not lag.
+        let floor = self
+            .validation_seen_floor
+            .get(&(*mint, hook_program))
+            .map_or(min_slot, |&seen| seen.max(min_slot));
 
         // Read the validation account first so an absent one is told apart from
         // an unreachable node: absent is permanent, a failed read is not.
         let validation_pda = get_extra_account_metas_address(mint, &hook_program);
         let response = rpc
-            .get_account_with_context(&validation_pda, commitment)
+            .get_account_with_context_min_slot(&validation_pda, commitment, Some(floor))
             .await
-            .map_err(|e| OperatorError::RpcError(format!("get_account({validation_pda}): {e}")))?;
+            .map_err(|e| {
+                hook_freshness_miss(format!(
+                    "get_account({validation_pda}) at or past slot {floor} (freshness): {e}"
+                ))
+            })?;
+        let validation_slot = response.context.slot;
         let Some(validation_account) = response.value else {
-            return Ok(HookExtras::ValidationMissing);
+            // Null at the floor is still only as current as the node: one replaying an
+            // old chain sees no account either, so absence counts only from a fresh tip.
+            return match rpc.tip_is_fresh(validation_slot).await {
+                Ok(true) => Ok(HookExtras::ValidationMissing),
+                Ok(false) => Err(hook_freshness_miss(format!(
+                    "validation account {validation_pda} absent at slot {validation_slot}, but \
+                     that node's tip is not recent (freshness unproven)"
+                ))),
+                Err(e) => Err(hook_freshness_miss(format!(
+                    "validation account {validation_pda} absent at slot {validation_slot}, and \
+                     the node's tip time could not be read (freshness unproven): {e}"
+                ))),
+            };
         };
         let validation_data = validation_account.data;
 
@@ -327,7 +365,9 @@ impl MintCache {
                     if kept.is_some() {
                         return Ok(kept);
                     }
-                    let account = rpc.get_account_with_context(&address, commitment).await?;
+                    let account = rpc
+                        .get_account_with_context_min_slot(&address, commitment, Some(floor))
+                        .await?;
                     Ok(account.value.map(|account| account.data))
                 }
             },
@@ -341,8 +381,8 @@ impl MintCache {
                 Some(list_error) if *list_error != fetch_failed => {
                     Ok(HookExtras::ValidationInvalid(list_error.to_string()))
                 }
-                _ => Err(OperatorError::RpcError(format!(
-                    "hook resolution for mint {mint}: {error}"
+                _ => Err(hook_freshness_miss(format!(
+                    "hook resolution for mint {mint} at or past slot {floor} (freshness): {error}"
                 ))),
             };
         }
@@ -359,6 +399,11 @@ impl MintCache {
             })
             .collect();
 
+        let seen = self
+            .validation_seen_floor
+            .entry((*mint, hook_program))
+            .or_default();
+        *seen = (*seen).max(validation_slot);
         Ok(HookExtras::Resolved(extras))
     }
 
@@ -1067,6 +1112,313 @@ mod tests {
             .await
     }
 
+    /// Serves `address` as absent at `slot`, whatever floor was asked, recording each
+    /// request's `minContextSlot`.
+    async fn mock_absent_at(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        slot: u64,
+    ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+        let floors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = floors.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(address.to_string()))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push(body["params"][1]["minContextSlot"].clone());
+                serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                    "result": {"context": {"slot": slot}, "value": null}})
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        floors
+    }
+
+    /// Answers `getBlockTime` with a block `age_secs` old.
+    async fn mock_block_age(server: &mut mockito::ServerGuard, age_secs: i64) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockTime""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                    "result": chrono::Utc::now().timestamp() - age_secs})
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    fn fast_cache(url: String) -> MintCache {
+        let rpc = RpcClientWithRetry::with_retry_config(
+            url,
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        MintCache::with_rpc(Arc::new(Storage::Mock(MockStorage::new())), Arc::new(rpc))
+    }
+
+    async fn resolve_at(
+        cache: &mut MintCache,
+        mint: &Pubkey,
+        gate_slot: u64,
+    ) -> Result<HookExtras, OperatorError> {
+        cache
+            .resolve_hook_extras(
+                mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                15,
+                gate_slot,
+            )
+            .await
+    }
+
+    /// The validation read carries the gate slot, so a lagging node refuses or is refused.
+    #[tokio::test]
+    async fn validation_read_sends_the_floor() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        let _mint =
+            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
+        let floors = mock_absent_at(&mut server, &validation_pda, 50).await;
+        mock_block_age(&mut server, 1).await;
+
+        let _ = resolve_at(&mut fast_cache(server.url()), &mint, 50).await;
+
+        assert_eq!(*floors.lock().unwrap(), vec![serde_json::json!(50)]);
+    }
+
+    /// A null from a node below the floor is lag, never a missing account.
+    #[tokio::test]
+    async fn null_validation_below_the_floor_is_an_rpc_error() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        let _mint =
+            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
+        mock_absent_at(&mut server, &validation_pda, 40).await;
+        mock_block_age(&mut server, 1).await;
+
+        let err = resolve_at(&mut fast_cache(server.url()), &mint, 50)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, OperatorError::RpcError(m) if m.contains("freshness")),
+            "{err:?}"
+        );
+    }
+
+    /// A null at the floor from a node whose tip is old proves nothing about today.
+    #[tokio::test]
+    async fn null_validation_at_a_stale_tip_is_an_rpc_error() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        let _mint =
+            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
+        mock_absent_at(&mut server, &validation_pda, 60).await;
+        mock_block_age(&mut server, 600).await;
+
+        let err = resolve_at(&mut fast_cache(server.url()), &mint, 50)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, OperatorError::RpcError(m) if m.contains("freshness")),
+            "{err:?}"
+        );
+    }
+
+    /// At the floor, from a live node, an absent validation account is missing.
+    #[tokio::test]
+    async fn null_validation_at_a_fresh_tip_is_missing() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        let _mint =
+            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
+        mock_absent_at(&mut server, &validation_pda, 60).await;
+        mock_block_age(&mut server, 1).await;
+
+        let resolved = resolve_at(&mut fast_cache(server.url()), &mint, 50)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationMissing),
+            "{resolved:?}"
+        );
+    }
+
+    /// The residual: a live node behind the account's creation, on the mint's first ever
+    /// resolve, has nothing to compare against and still reports the account missing.
+    #[tokio::test]
+    async fn first_resolve_on_a_live_lagging_node_still_parks() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let mut server = mockito::Server::new_async().await;
+        let _mint =
+            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
+        // Created at slot 55 on the canonical chain; this node is live but at 52.
+        mock_absent_at(&mut server, &validation_pda, 52).await;
+        mock_block_age(&mut server, 1).await;
+
+        let resolved = resolve_at(&mut fast_cache(server.url()), &mint, 50)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationMissing),
+            "{resolved:?}"
+        );
+    }
+
+    /// Serves `address`, absent when `data` is `None`, at `slot` or else at the floor the
+    /// request asked for. Records each request's `minContextSlot`.
+    async fn mock_account_recording(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        data: Option<Vec<u8>>,
+        slot: Option<u64>,
+    ) -> Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+        let floors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = floors.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(address.to_string()))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                let floor = body["params"][1]["minContextSlot"].clone();
+                seen.lock().unwrap().push(floor.clone());
+                let at = slot.unwrap_or_else(|| floor.as_u64().unwrap_or(1));
+                let value = data.as_ref().map(|bytes| {
+                    serde_json::json!({
+                        "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                        "lamports": 1_000_000u64,
+                        "data": [STANDARD.encode(bytes), "base64"],
+                        "executable": false,
+                        "rentEpoch": 0
+                    })
+                });
+                serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                    "result": {"context": {"slot": at}, "value": value}})
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        floors
+    }
+
+    /// A hook mint with an `entries` list and the transfer's own accounts, every read
+    /// answered at its floor except the validation account, answered at `validation_slot`.
+    async fn hook_server(
+        entries: &[ExtraAccountMeta],
+        validation_slot: Option<u64>,
+    ) -> (mockito::ServerGuard, Pubkey, Pubkey, [Pubkey; 3]) {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let accounts = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let mut server = mockito::Server::new_async().await;
+        mock_account_recording(
+            &mut server,
+            &mint,
+            Some(hook_mint_data(&hook_program)),
+            None,
+        )
+        .await;
+        mock_account_recording(
+            &mut server,
+            &validation_pda,
+            Some(validation_data(entries)),
+            validation_slot,
+        )
+        .await;
+        for address in &accounts {
+            mock_account_recording(&mut server, address, None, None).await;
+        }
+        (server, mint, validation_pda, accounts)
+    }
+
+    async fn resolve_with(
+        cache: &mut MintCache,
+        mint: &Pubkey,
+        [source, destination, authority]: &[Pubkey; 3],
+        gate_slot: u64,
+    ) -> Result<HookExtras, OperatorError> {
+        cache
+            .resolve_hook_extras(mint, source, destination, authority, 1_000, 15, gate_slot)
+            .await
+    }
+
+    /// Once a validation account has been seen at a slot, no later resolve of that mint and
+    /// hook reads below it, whatever gate slot it brings.
+    #[tokio::test]
+    async fn successful_resolve_records_a_seen_floor_and_raises_the_next_read() {
+        let (mut server, mint, validation_pda, accounts) = hook_server(&[], Some(70)).await;
+        let mut cache = fast_cache(server.url());
+
+        let first = resolve_with(&mut cache, &mint, &accounts, 1).await.unwrap();
+        assert!(matches!(first, HookExtras::Resolved(_)), "{first:?}");
+
+        // Later the node lags: it answers the validation read as absent, at whatever floor.
+        let floors = mock_absent_at(&mut server, &validation_pda, 70).await;
+        mock_block_age(&mut server, 1).await;
+        let _ = resolve_with(&mut cache, &mint, &accounts, 1).await;
+
+        assert_eq!(*floors.lock().unwrap(), vec![serde_json::json!(70)]);
+    }
+
+    /// The accounts the list resolves to are read at the same floor as the list itself.
+    #[tokio::test]
+    async fn extras_reads_send_the_floor() {
+        let extra = Pubkey::new_unique();
+        let entries = vec![ExtraAccountMeta::new_with_pubkey(&extra, false, false).unwrap()];
+        let (mut server, mint, _validation_pda, accounts) = hook_server(&entries, None).await;
+        let floors = mock_account_recording(&mut server, &extra, None, None).await;
+
+        let resolved = resolve_with(&mut fast_cache(server.url()), &mint, &accounts, 50).await;
+
+        assert!(
+            matches!(resolved, Ok(HookExtras::Resolved(_))),
+            "{resolved:?}"
+        );
+        let floors = floors.lock().unwrap();
+        assert!(
+            !floors.is_empty() && floors.iter().all(|f| *f == 50),
+            "{floors:?}"
+        );
+    }
+
     /// Every account is read once, the mint twice (hook lookup, then the
     /// resolver), so a list at the cap costs a fixed number of reads.
     #[tokio::test]
@@ -1366,7 +1718,8 @@ mod tests {
             gate_slot,
         )
         .await;
-        mock_account(&mut server, &validation_pda, None, 1).await;
+        mock_absent_at(&mut server, &validation_pda, gate_slot).await;
+        mock_block_age(&mut server, 1).await;
 
         let rpc = RpcClientWithRetry::with_retry_config(
             server.url(),
@@ -1536,7 +1889,8 @@ mod tests {
         let mut mocks = std::collections::HashMap::new();
         mocks.insert(
             RpcRequest::GetAccountInfo,
-            serde_json::json!({"context": {"slot": 1}, "value": null}),
+            // At a slot past every floor these tests use, so the absence is current.
+            serde_json::json!({"context": {"slot": 1_000}, "value": null}),
         );
         RpcClientWithRetry::new_mocked(mocks)
     }
@@ -1615,11 +1969,12 @@ mod tests {
     async fn target_mint_read_sends_the_existence_floor_to_the_node() {
         let mint = create_test_mint();
         let mut server = mockito::Server::new_async().await;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "jsonrpc": "2.0",
             "result": create_mock_account_response(&TOKEN_PROGRAM_ID, 9),
             "id": 1,
         });
+        body["result"]["context"]["slot"] = 42.into();
         let endpoint = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex("\"minContextSlot\":42".to_string()))

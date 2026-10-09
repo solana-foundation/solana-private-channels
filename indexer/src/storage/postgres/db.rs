@@ -2875,6 +2875,9 @@ impl PostgresDb {
     /// sides could read `pending_remint` and commit. The write takes the row lock
     /// and its trigger bumps `updated_at`, so a completion pinned on the old
     /// version no longer matches once a claim commits.
+    ///
+    /// The parent write is also refused when a release for the row's nonce is on
+    /// record, so one indexed after the caller's own lookup still blocks the refund.
     pub async fn claim_remint_attempt_internal(
         &self,
         transaction_id: i64,
@@ -2896,14 +2899,35 @@ impl PostgresDb {
                     WHERE id = $1
                       AND status = 'pending_remint'
                       AND transaction_type = 'withdrawal'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM observed_releases o
+                          WHERE o.withdrawal_nonce = transactions.withdrawal_nonce
+                      )
                     "#,
                 )
                 .bind(transaction_id)
                 .execute(&mut *tx)
                 .await?;
                 if parent.rows_affected() == 0 {
+                    // Zero rows is a moved row, or a recorded release on a row still ours; only the latter escalates.
+                    let observed: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM transactions t
+                            JOIN observed_releases o ON o.withdrawal_nonce = t.withdrawal_nonce
+                            WHERE t.id = $1 AND t.status = 'pending_remint'
+                        )
+                        "#,
+                    )
+                    .bind(transaction_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
                     tx.rollback().await?;
-                    return Ok(RemintClaim::RowMoved);
+                    return Ok(if observed {
+                        RemintClaim::ReleaseObserved
+                    } else {
+                        RemintClaim::RowMoved
+                    });
                 }
 
                 sqlx::query(

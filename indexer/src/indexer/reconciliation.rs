@@ -14,7 +14,8 @@
 //!
 //! Flow:
 //! 1. Sweep the escrow instance's on-chain ATA of each allowed mint, noting the slot the
-//!    reading is valid as of.
+//!    reading is valid as of. Every read must answer at or past the chain's newest recent
+//!    block and the committed checkpoint, so a lagging node cannot pass off old custody.
 //! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
@@ -35,7 +36,8 @@ use crate::{
     indexer::checkpoint::program_key,
     operator::{
         escrow_sweep::{
-            fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
+            channel_anchor, fetch_escrow_balances_by_mint, fetch_fresh_channel_supply,
+            CustodySnapshot, SweepFailure, SUPPLY_REREAD_BUDGET,
         },
         reconciliation::insolvency_tolerance_raw,
         rpc_util::RpcClientWithRetry,
@@ -104,6 +106,9 @@ impl MintReconciliation {
 ///
 /// Does nothing when `program_type` is not `Escrow` (only the escrow program
 /// has ATAs to check).
+///
+/// The no-backfill path. A custody read from a node that is behind is retried a few
+/// times, then stops the boot for the supervisor to restart.
 pub async fn run_startup_reconciliation(
     config: &ReconciliationConfig,
     program_type: ProgramType,
@@ -117,7 +122,89 @@ pub async fn run_startup_reconciliation(
         return Ok(());
     }
 
-    let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
+    let mut attempt = 1;
+    loop {
+        let result = reconcile_once(
+            config,
+            program_type,
+            storage,
+            rpc_url,
+            channel_rpc_url,
+            instance_pda,
+        )
+        .await;
+        match result {
+            Err(e) if attempt < CUSTODY_READ_ATTEMPTS && custody_read_may_clear(&e) => {
+                warn!(
+                    "Startup reconciliation attempt {}/{}: {}, re-reading custody",
+                    attempt, CUSTODY_READ_ATTEMPTS, e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    CUSTODY_READ_RETRY_DELAY_MS,
+                ))
+                .await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Custody reads per no-backfill boot before a lagging node stops it.
+const CUSTODY_READ_ATTEMPTS: u32 = 3;
+
+/// Pause between those reads, so a node a few seconds behind can catch up.
+#[cfg(not(test))]
+const CUSTODY_READ_RETRY_DELAY_MS: u64 = 2_000;
+#[cfg(test)]
+const CUSTODY_READ_RETRY_DELAY_MS: u64 = 10;
+
+/// Whether a custody reading failed only because the node is behind, which it outgrows.
+/// A mismatch is not retried here: with no backfill the ledger cannot change between reads.
+pub(crate) fn custody_read_may_clear(error: &IndexerError) -> bool {
+    matches!(
+        error,
+        IndexerError::Reconciliation(
+            ReconciliationError::CustodyStale { .. }
+                | ReconciliationError::CustodyBehindLedger { .. }
+                | ReconciliationError::CustodySlotUnsettled { .. }
+        )
+    )
+}
+
+/// One no-backfill reconciliation: custody read at or past the committed checkpoint, the
+/// ledger order checked again after the read, then the comparison.
+async fn reconcile_once(
+    config: &ReconciliationConfig,
+    program_type: ProgramType,
+    storage: &Storage,
+    rpc_url: &str,
+    channel_rpc_url: Option<&str>,
+    instance_pda: &Pubkey,
+) -> Result<(), IndexerError> {
+    let key = program_key(program_type);
+    let floor = storage
+        .get_committed_checkpoint(&key)
+        .await
+        .map_err(ReconciliationError::Storage)?
+        .unwrap_or(0);
+    let snapshot = capture_custody_snapshot(rpc_url, instance_pda, floor).await?;
+
+    // The indexer keeps committing while custody is read, so the checkpoint is read again:
+    // a ledger already past the reading holds liabilities the custody side never saw.
+    let committed = storage
+        .get_committed_checkpoint(&key)
+        .await
+        .map_err(ReconciliationError::Storage)?
+        .unwrap_or(0);
+    if committed > snapshot.slot {
+        return Err(ReconciliationError::CustodyBehindLedger {
+            snapshot_slot: snapshot.slot,
+            committed,
+        }
+        .into());
+    }
+
     reconcile_against_snapshot(
         config,
         program_type,
@@ -135,9 +222,13 @@ pub async fn run_startup_reconciliation(
 /// Callers that can catch their ledger up take this first and compare against it after,
 /// so the two sides of the comparison describe the same slot. Reading custody afterwards
 /// instead would measure a chain that has moved on from the ledger it is judged against.
+///
+/// Every read must answer at or past the Solana chain's newest recent block and
+/// `ledger_floor`, so a lagging node cannot hand back custody from before a drain.
 pub async fn capture_custody_snapshot(
     rpc_url: &str,
     instance_pda: &Pubkey,
+    ledger_floor: u64,
 ) -> Result<CustodySnapshot, IndexerError> {
     let rpc_client = RpcClientWithRetry::with_retry_config(
         rpc_url.to_string(),
@@ -145,7 +236,7 @@ pub async fn capture_custody_snapshot(
         CommitmentConfig::finalized(),
     );
 
-    let snapshot = fetch_escrow_balances_by_mint(&rpc_client, *instance_pda)
+    let snapshot = fetch_escrow_balances_by_mint(&rpc_client, *instance_pda, ledger_floor)
         .await
         .map_err(|e| match e {
             // Kept distinct so the caller's retry can take another sweep: this one says the
@@ -159,6 +250,9 @@ pub async fn capture_custody_snapshot(
                 low,
                 high,
             },
+            SweepFailure::Stale { slot, floor } => {
+                ReconciliationError::CustodyStale { slot, floor }
+            }
             SweepFailure::Read(e) => ReconciliationError::Rpc {
                 mint: instance_pda.to_string(),
                 reason: e.reason,
@@ -234,8 +328,15 @@ pub async fn reconcile_against_snapshot(
     // means the same thing however far behind the ledger is. Reporting the ledger
     // mismatch ahead of it would hide the graver finding whenever both are true, and
     // would send startup back for another catch-up that cannot change this answer.
-    check_channel_supply_invariant(channel_rpc_url, rpc_url, instance_pda, config, &results)
-        .await?;
+    check_channel_supply_invariant(
+        channel_rpc_url,
+        rpc_url,
+        instance_pda,
+        config,
+        &results,
+        snapshot.slot,
+    )
+    .await?;
 
     // A ledger checkpointed below the snapshot is missing releases that already left custody,
     // and reading those as a shortfall would fail an otherwise healthy boot. Re-read it with
@@ -314,6 +415,10 @@ struct SupplyReading {
 /// holds. A release landing between the two reads can still make one round look short, and
 /// the repeated readings above are what settle that. `only` restricts the reading to mints
 /// an earlier round already suspected.
+///
+/// Each supply must answer at or past the channel's newest recent block, taken once per
+/// round, or it counts as unread: a lagging replica's old supply can look solvent.
+/// The custody re-read must answer at or past `custody_floor`.
 async fn measure_supply_breaches(
     channel_rpc: &RpcClientWithRetry,
     escrow_rpc_url: &str,
@@ -321,7 +426,20 @@ async fn measure_supply_breaches(
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
     only: Option<&HashSet<Pubkey>>,
+    custody_floor: u64,
 ) -> Result<SupplyReading, IndexerError> {
+    let anchor = match channel_anchor(channel_rpc).await {
+        Ok(anchor) => Some(anchor),
+        Err(e) => {
+            warn!(
+                reason = %e.reason,
+                "Startup supply invariant: channel freshness unknown, counting every mint unread"
+            );
+            None
+        }
+    };
+    let mut rereads = SUPPLY_REREAD_BUDGET;
+
     // Same mint universe as the ledger comparison, so a mint is never dropped from the
     // invariant just because it holds nothing on chain.
     let mut supplies: Vec<(&MintReconciliation, Pubkey, u64)> = Vec::new();
@@ -337,8 +455,21 @@ async fn measure_supply_breaches(
         if only.is_some_and(|s| !s.contains(&mint)) {
             continue;
         }
-        match fetch_channel_supply(channel_rpc, &mint).await {
-            Ok(supply) => supplies.push((r, mint, supply)),
+        let Some(anchor) = anchor else {
+            unread.insert(mint);
+            continue;
+        };
+        match fetch_fresh_channel_supply(channel_rpc, &mint, anchor, &mut rereads).await {
+            Ok((supply, slot)) if slot >= anchor => supplies.push((r, mint, supply)),
+            Ok((_, slot)) => {
+                unread.insert(mint);
+                warn!(
+                    mint = %r.mint,
+                    slot,
+                    anchor,
+                    "Startup supply invariant: channel supply still behind the channel's newest block"
+                );
+            }
             Err(e) => {
                 unread.insert(mint);
                 warn!(
@@ -357,7 +488,7 @@ async fn measure_supply_breaches(
         });
     }
 
-    let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda).await?;
+    let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda, custody_floor).await?;
 
     let mut breaches = Vec::new();
     for (r, mint, supply) in supplies {
@@ -386,7 +517,8 @@ async fn measure_supply_breaches(
 /// same persistence rule the runtime invariant uses. A real insolvency does not heal
 /// between reads, so this costs nothing on a healthy boot and nothing in detection.
 ///
-/// A supply read that errors buys another round rather than being written off. The rounds
+/// A supply read that errors, or stays behind the channel's newest block, buys another round
+/// rather than being written off. The rounds
 /// give a gateway that is still coming up time to answer, but a mint that stays unreadable
 /// to the end stops the boot: an unreadable channel hides an existing breach exactly as
 /// well as a healthy one does, and nothing here can tell the two apart.
@@ -396,6 +528,7 @@ async fn check_channel_supply_invariant(
     instance_pda: &Pubkey,
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
+    custody_floor: u64,
 ) -> Result<(), IndexerError> {
     let channel_rpc = RpcClientWithRetry::with_retry_config(
         channel_rpc_url.to_string(),
@@ -419,6 +552,7 @@ async fn check_channel_supply_invariant(
             config,
             results,
             suspects.as_ref(),
+            custody_floor,
         )
         .await?;
 
@@ -682,9 +816,27 @@ fn classify_and_report(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_no_backfill_boot_retries_every_custody_read_a_lagging_node_can_outgrow() {
+        let unsettled = ReconciliationError::CustodySlotUnsettled {
+            attempts: 3,
+            low: 1,
+            high: 2,
+        };
+        let stale = ReconciliationError::CustodyStale {
+            slot: None,
+            floor: 5,
+        };
+        let mismatch = ReconciliationError::SupplyInvariantUnverified { count: 1 };
+        assert!(custody_read_may_clear(&unsettled.into()));
+        assert!(custody_read_may_clear(&stale.into()));
+        assert!(!custody_read_may_clear(&mismatch.into()));
+    }
+
     use super::*;
     use crate::operator::escrow_sweep::tests::{
-        allowed_mint_account, mock_all_mints_allowed, mock_multiple_accounts,
+        allowed_mint_account, mock_all_mints_allowed, mock_anchor, mock_multiple_accounts,
     };
     use crate::operator::utils::account_util::find_allowed_mint_pda;
     use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -1084,6 +1236,9 @@ mod tests {
         let empty_body =
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":[]},"id":1}"#.to_string();
 
+        // Both chains share this server, so one fresh clock anchors custody and supply alike.
+        mock_anchor(server, 100).await;
+
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
@@ -1288,6 +1443,7 @@ mod tests {
 
         // The escrow owns a token account for each mint. The attacker opened the unapproved one.
         // Mocked here, not via mock_escrow_sweep, which treats every mint as allowed.
+        mock_anchor(&mut server, 100).await;
         let sweep_body = format!(
             r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{},{}]}},"id":1}}"#,
             token_account_entry(&instance, &allowed.to_string(), 1_000),
@@ -2243,5 +2399,426 @@ mod tests {
             "supply over custody must still halt: {:?}",
             breach
         );
+    }
+
+    // =========================================================================
+    // startup freshness: custody (50, 292) and supply (25)
+    // =========================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Answer every owner-list call at `slot(call)`: `instance`'s ATAs for `entries` on SPL
+    /// Token, nothing on Token-2022. Each call's config is recorded.
+    async fn mock_scripted_sweep(
+        server: &mut mockito::Server,
+        instance: &Pubkey,
+        entries: &[(String, u64)],
+        configs: Arc<Mutex<Vec<serde_json::Value>>>,
+        slot: impl Fn(usize) -> u64 + Send + Sync + 'static,
+    ) {
+        let accounts: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(mint, amount)| {
+                serde_json::from_str(&token_account_entry(instance, mint, *amount)).unwrap()
+            })
+            .collect();
+        let calls = AtomicUsize::new(0);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getTokenAccountsByOwner"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                configs.lock().unwrap().push(body["params"][2].clone());
+                let spl = body["params"][1]["programId"] == spl_token::id().to_string();
+                let value = if spl { accounts.clone() } else { vec![] };
+                let slot = slot(calls.fetch_add(1, Ordering::SeqCst));
+                serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                    "result": {"context": {"slot": slot}, "value": value}})
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    async fn run_no_backfill(
+        server_url: &str,
+        channel_url: &str,
+        storage: &Storage,
+        seed: &Pubkey,
+    ) -> Result<(), IndexerError> {
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        };
+        run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            storage,
+            server_url,
+            Some(channel_url),
+            seed,
+        )
+        .await
+    }
+
+    /// A node that stays behind the anchor is re-read with a fresh anchor each time, then
+    /// stops the boot. Three custody reads, never a fourth.
+    #[tokio::test]
+    async fn startup_custody_stale_retries_then_fails_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let anchor_reads = mock_anchor(&mut server, 100).await;
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        mock_scripted_sweep(
+            &mut server,
+            &seed,
+            &[(mint.to_string(), 1_000)],
+            configs.clone(),
+            |_| 90,
+        )
+        .await;
+        mock_all_mints_allowed(&mut server).await;
+        let supply = mock_supply_for_mint(&mut server, &mint, 1_000, Some(0)).await;
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let url = server.url();
+
+        let result = run_no_backfill(&url, &url, &storage, &seed).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::CustodyStale { floor: 100, .. }
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            anchor_reads.load(Ordering::SeqCst),
+            3,
+            "one anchor per attempt"
+        );
+        assert_eq!(
+            configs.lock().unwrap().len(),
+            3 * 5,
+            "five inner tries per attempt, no fourth attempt"
+        );
+        supply.assert_async().await;
+    }
+
+    /// One lagging answer costs one attempt; the next fresh read lets a healthy boot through.
+    #[tokio::test]
+    async fn startup_custody_fresh_after_one_stale_answer_passes() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_anchor(&mut server, 100).await;
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        mock_scripted_sweep(
+            &mut server,
+            &seed,
+            &[(mint.to_string(), 1_000)],
+            configs.clone(),
+            |call| if call < 5 { 90 } else { 100 },
+        )
+        .await;
+        mock_all_mints_allowed(&mut server).await;
+        mock_channel_supply(&mut server, 1_000).await;
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let url = server.url();
+
+        let result = run_no_backfill(&url, &url, &storage, &seed).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            configs.lock().unwrap().len() > 5,
+            "the boot re-read custody"
+        );
+    }
+
+    /// Custody may answer no older than the newest recent block or the committed ledger,
+    /// whichever is later.
+    #[tokio::test]
+    async fn startup_floor_is_the_larger_of_anchor_and_checkpoint() {
+        for (checkpoint, expected) in [(150u64, 150u64), (50, 100)] {
+            let mut server = mockito::Server::new_async().await;
+            let seed = Pubkey::new_unique();
+            mock_anchor(&mut server, 100).await;
+            let configs = Arc::new(Mutex::new(Vec::new()));
+            mock_scripted_sweep(&mut server, &seed, &[], configs.clone(), move |_| expected).await;
+            let mock_storage = MockStorage::new();
+            mock_storage.set_checkpoint("escrow", checkpoint);
+            let storage = Storage::Mock(mock_storage);
+            let url = server.url();
+
+            let result = run_no_backfill(&url, &url, &storage, &seed).await;
+
+            assert!(result.is_ok(), "checkpoint {checkpoint}: {result:?}");
+            let configs = configs.lock().unwrap();
+            assert!(
+                configs.iter().all(|c| c["minContextSlot"] == expected),
+                "checkpoint {checkpoint}: {configs:?}"
+            );
+        }
+    }
+
+    /// With no backfill the ledger cannot change between reads, so a mismatch stops the boot
+    /// on the first reading.
+    #[tokio::test]
+    async fn no_backfill_does_not_retry_a_mismatch() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+        let anchor_reads = mock_anchor(&mut server, 100).await;
+        mock_channel_supply(&mut server, 0).await;
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let url = server.url();
+
+        let result = run_no_backfill(&url, &url, &storage, &seed).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "{result:?}"
+        );
+        let checkpoint_reads = match &storage {
+            Storage::Mock(mock) => mock.call_counts.lock().unwrap()["get_committed_checkpoint"],
+            _ => unreachable!(),
+        };
+        // Before and after the custody read, plus the comparison's own: one attempt only.
+        assert_eq!(checkpoint_reads, 3);
+        let _ = anchor_reads;
+    }
+
+    /// The ledger advanced while custody was read, so it already holds liabilities the
+    /// reading never saw. Refused with `CustodyBehindLedger`, before any supply read.
+    #[tokio::test]
+    async fn no_backfill_refuses_a_checkpoint_that_advanced_past_the_snapshot() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_anchor(&mut server, 100).await;
+        mock_scripted_sweep(
+            &mut server,
+            &seed,
+            &[(mint.to_string(), 1_000)],
+            Arc::default(),
+            |_| 150,
+        )
+        .await;
+        mock_all_mints_allowed(&mut server).await;
+        let supply = mock_supply_for_mint(&mut server, &mint, 1_000, Some(0)).await;
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        // Each attempt reads 100 before custody and 200 after it.
+        mock_storage.script_checkpoints([100, 200].repeat(3));
+        let storage = Storage::Mock(mock_storage);
+        let url = server.url();
+
+        let result = run_no_backfill(&url, &url, &storage, &seed).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::CustodyBehindLedger {
+                        snapshot_slot: 150,
+                        committed: 200
+                    }
+                ))
+            ),
+            "{result:?}"
+        );
+        supply.assert_async().await;
+    }
+
+    /// A channel-supply read for `mint` answered at `slot(call)` with `supply(call)`. Counts reads.
+    async fn mock_supply_script(
+        server: &mut mockito::Server,
+        mint: &Pubkey,
+        script: impl Fn(usize) -> (u64, u64) + Send + Sync + 'static,
+    ) -> Arc<AtomicUsize> {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        use spl_token::state::Mint;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("getAccountInfo".to_string()),
+                mockito::Matcher::Regex(mint.to_string()),
+            ]))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let (supply, slot) = script(counter.fetch_add(1, Ordering::SeqCst));
+                let mint_state = Mint {
+                    mint_authority: COption::Some(Pubkey::default()),
+                    supply,
+                    decimals: 6,
+                    is_initialized: true,
+                    freeze_authority: COption::None,
+                };
+                let mut buf = vec![0u8; Mint::LEN];
+                mint_state.pack_into_slice(&mut buf);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{slot}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                    prog = spl_token::id(),
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        reads
+    }
+
+    /// Custody 100, real channel supply 200, and a lagging replica still answering a clean
+    /// 100. The stale answer can never pass: it stays unread, or the fresh one is a breach.
+    #[tokio::test]
+    async fn stale_clean_supply_read_cannot_pass_the_invariant() {
+        for catches_up in [false, true] {
+            let mut escrow = mockito::Server::new_async().await;
+            let mut channel = mockito::Server::new_async().await;
+            let seed = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            mock_escrow_sweep(&mut escrow, &seed, &[(mint.to_string(), 100)]).await;
+            mock_anchor(&mut channel, 300).await;
+            mock_supply_script(&mut channel, &mint, move |call| {
+                if catches_up && call > 0 {
+                    (200, 300)
+                } else {
+                    (100, 290)
+                }
+            })
+            .await;
+            let mock_storage = MockStorage::new();
+            mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 100, 0)]);
+            let storage = Storage::Mock(mock_storage);
+
+            let result = run_no_backfill(&escrow.url(), &channel.url(), &storage, &seed).await;
+
+            let expected_breach = matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { count: 1, .. }
+                ))
+            );
+            let expected_unverified = matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyInvariantUnverified { count: 1 }
+                ))
+            );
+            if catches_up {
+                assert!(expected_breach, "{result:?}");
+            } else {
+                assert!(expected_unverified, "{result:?}");
+            }
+        }
+    }
+
+    /// Without a fresh channel block nothing read from the channel proves anything.
+    #[tokio::test]
+    async fn channel_anchor_unavailable_counts_every_mint_unread() {
+        let mut escrow = mockito::Server::new_async().await;
+        let mut channel = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut escrow, &seed, &[(mint.to_string(), 100)]).await;
+        crate::operator::escrow_sweep::tests::mock_channel_clock(
+            &mut channel,
+            300,
+            vec![300],
+            Some(crate::operator::escrow_sweep::CHANNEL_MAX_AGE_SECS + 1),
+        )
+        .await;
+        let supply = mock_supply_for_mint(&mut channel, &mint, 100, Some(0)).await;
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 100, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let result = run_no_backfill(&escrow.url(), &channel.url(), &storage, &seed).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyInvariantUnverified { count: 1 }
+                ))
+            ),
+            "{result:?}"
+        );
+        supply.assert_async().await;
+    }
+
+    /// Re-reads are budgeted per round, so a round late in the confirmation run still gets
+    /// to wait out a lagging replica instead of writing every mint off as unread.
+    #[tokio::test]
+    async fn each_round_gets_a_fresh_reread_budget() {
+        let mut escrow = mockito::Server::new_async().await;
+        let mut channel = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mints: Vec<Pubkey> = (0..3).map(|_| Pubkey::new_unique()).collect();
+        let entries: Vec<(String, u64)> = mints.iter().map(|m| (m.to_string(), 100)).collect();
+        mock_escrow_sweep(&mut escrow, &seed, &entries).await;
+        mock_anchor(&mut channel, 300).await;
+        let mut reads = Vec::new();
+        for mint in &mints {
+            // Two stale answers, then a fresh breach, in every round.
+            reads.push(
+                mock_supply_script(&mut channel, mint, |call| {
+                    if call % 3 == 2 {
+                        (200, 300)
+                    } else {
+                        (200, 290)
+                    }
+                })
+                .await,
+            );
+        }
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(
+            mints
+                .iter()
+                .map(|m| make_mint_balance(&m.to_string(), 100, 0))
+                .collect(),
+        );
+        let storage = Storage::Mock(mock_storage);
+
+        let result = run_no_backfill(&escrow.url(), &channel.url(), &storage, &seed).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { count: 3, .. }
+                ))
+            ),
+            "{result:?}"
+        );
+        // Three rounds of three reads per mint: the breach is confirmed with nothing written off.
+        for r in reads {
+            assert_eq!(r.load(Ordering::SeqCst), 9);
+        }
     }
 }

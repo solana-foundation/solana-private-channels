@@ -44,6 +44,7 @@ have prefixes.
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved | no | processor requeue cap |
 | `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
@@ -53,6 +54,7 @@ have prefixes.
 | `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
 | `Max retries exceeded` together with `no signatures to verify` | I - retry budget spent with nothing broadcast (use this, not C) | no | `sender/transaction.rs` |
+| `was recorded before the refund could be claimed` | K - release observed at the refund claim | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
@@ -242,7 +244,11 @@ would reopen the free retry loop it exists to close.
      creates that account: only the hook program can, so contact the mint issuer.
      Its address is the `["extra-account-metas", mint]` PDA of the hook program the
      mint names; re-arm the row once `solana account <that address>` shows it
-     exists. Expect every withdrawal of that mint to park here. Deposits of it fail
+     exists. The operator reports it missing only when a node answered at or past
+     the gate's slot and that node's newest block is under 120 s old. One residual
+     remains: the first withdrawal of a mint can still park here if a live node is
+     behind the account's creation, so check the account before contacting anyone.
+     Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account invalid for mint` - the mint's
@@ -742,6 +748,32 @@ keys.
    and the row was re-armed from a terminal status around then, it is the first
    cause above. Otherwise [escalate](_escalation.md) (Tier 2): the admin can
    revoke an unaccounted operator key with `RemoveOperator`.
+
+## Path J - RPC behind the gate's slot (hook resolution)
+
+`error_message` names `(freshness)` or `freshness unproven`. The hook validation
+account, or an account its list resolves to, could not be read at or past the slot
+the allowlist gate proved, or it read as absent from a node whose newest block is
+older than 120 s. The row was requeued without a verdict up to the requeue cap
+(each try restarts the processor task), then parked. Nothing was broadcast.
+
+1. Check the operator's Solana RPC: its finalized slot against a reference node,
+   and whether it is load balanced across lagging backends.
+2. Confirm the validation account exists: `solana account <["extra-account-metas", mint] PDA>`.
+3. Once the RPC is current, re-arm the row to `pending` (Path A.non-halting re-arm).
+   If the account is genuinely absent, follow the `validation account missing` entry.
+
+## Path K - release observed at the refund claim
+
+`error_message` contains `was recorded before the refund could be claimed`. Every
+signature of ours looked dead and the refund was about to be claimed, but the indexer
+had recorded a release for this nonce, so the claim refused. Nothing was reminted.
+
+1. Look up the release: `SELECT * FROM observed_releases WHERE withdrawal_nonce = :nonce;`
+   and verify it on-chain ([_verify_onchain_release.md](_verify_onchain_release.md)).
+2. If it landed for this withdrawal, the user was paid: mark the row `completed` with that
+   signature. Do not remint.
+3. If the record does not match this withdrawal, [escalate](_escalation.md) (Tier 2).
 
 ## Post-incident artifacts (required)
 

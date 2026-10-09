@@ -3403,6 +3403,107 @@ async fn remint_claim_on_a_completed_row_is_refused_and_writes_nothing(
     Ok(())
 }
 
+/// A release recorded for the row's nonce means it paid out. The claim must refuse, write
+/// nothing, and say why, so the sender escalates instead of treating it as a moved row.
+#[tokio::test]
+async fn remint_claim_refused_when_a_release_was_observed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim-after-observed-release",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'pending_remint', withdrawal_nonce = 77 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    let dead_attempt = "remint-dead".to_string();
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, dead_attempt.clone(), 100, None, &[])
+            .await?,
+        RemintClaim::Claimed
+    );
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: 77,
+            signature: "release-landed".to_string(),
+            slot: 500,
+            amount: None,
+        }])
+        .await?;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(
+                id,
+                "remint-after-release".to_string(),
+                200,
+                None,
+                std::slice::from_ref(&dead_attempt),
+            )
+            .await?,
+        RemintClaim::ReleaseObserved,
+        "a paid-out nonce must not be refunded, and must not look like a moved row"
+    );
+    let journal: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT signature, superseded FROM pending_remint_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        journal,
+        vec![(dead_attempt, false)],
+        "a refused claim must neither journal its attempt nor retire the old one"
+    );
+    assert_eq!(status_of(&pool, id).await, "pending_remint");
+    Ok(())
+}
+
+/// A row another owner has moved off `pending_remint` is a moved row even when a release is
+/// on record, so the sender leaves it alone instead of writing ManualReview over it.
+#[tokio::test]
+async fn remint_claim_on_a_moved_row_with_a_release_reports_row_moved(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim-moved-with-release",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing', withdrawal_nonce = 78 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: 78,
+            signature: "release-landed".to_string(),
+            slot: 500,
+            amount: None,
+        }])
+        .await?;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, "remint".to_string(), 200, None, &[])
+            .await?,
+        RemintClaim::RowMoved
+    );
+    assert_eq!(status_of(&pool, id).await, "processing");
+    Ok(())
+}
+
 /// Claim first: a completion that read the row before the claim must not land after
 /// it, because the claimed MintTo is about to broadcast. The claim bumps the row's
 /// version, so the completion's pinned `updated_at` no longer matches.

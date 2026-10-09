@@ -218,12 +218,9 @@ const RECONCILE_RETRY_DELAY_MS: u64 = 2_000;
 #[cfg(all(feature = "datasource-rpc", test))]
 const RECONCILE_RETRY_DELAY_MS: u64 = 10;
 
-/// Whether another attempt could plausibly clear this failure.
-///
-/// Two can. A custody-versus-ledger mismatch may be explained by rows the next fill pulls
-/// in. A custody reading from behind our own ledger is a node that has not caught up, and
-/// a fresh read usually lands ahead of it. Everything else, a supply breach included,
-/// compares the same numbers however many times it runs, so it stops the boot on the spot.
+/// Whether another attempt could clear this: a mismatch the next fill may explain, or a
+/// custody read from a node not yet caught up (behind the ledger, stale or unsettled).
+/// Anything else, a supply breach included, compares the same numbers every time.
 #[cfg(feature = "datasource-rpc")]
 fn reconcile_error_may_clear(error: &IndexerError) -> bool {
     matches!(
@@ -232,6 +229,7 @@ fn reconcile_error_may_clear(error: &IndexerError) -> bool {
             ReconciliationError::MismatchExceedsThreshold { .. }
                 | ReconciliationError::CustodyBehindLedger { .. }
                 | ReconciliationError::CustodySlotUnsettled { .. }
+                | ReconciliationError::CustodyStale { .. }
         )
     )
 }
@@ -757,9 +755,15 @@ pub async fn run(
                             // A sweep that never settled on one slot gets the same second
                             // chance a mismatch does: the node was moving under it, and the
                             // next sweep may catch it still. Anything else is fatal here.
+                            // Custody may not be older than what the ledger already holds.
+                            let ledger_floor =
+                                get_last_checkpoint(&storage, common_config.program_type)
+                                    .await?
+                                    .unwrap_or(0);
                             let snapshot = match capture_custody_snapshot(
                                 &common_config.rpc_url,
                                 &instance_id,
+                                ledger_floor,
                             )
                             .await
                             {
@@ -1312,6 +1316,14 @@ mod tests {
                 ReconciliationError::CustodyBehindLedger {
                     snapshot_slot: 90,
                     committed: 100,
+                },
+                true,
+            ),
+            // So is a custody read the node could not give at a fresh enough slot.
+            (
+                ReconciliationError::CustodyStale {
+                    slot: None,
+                    floor: 100,
                 },
                 true,
             ),

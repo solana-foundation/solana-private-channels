@@ -2599,6 +2599,31 @@ mod tests {
         );
     }
 
+    /// Mirror of the Postgres guard: a release recorded for the row's nonce refuses the
+    /// claim and journals nothing.
+    #[tokio::test]
+    async fn mock_remint_claim_refused_when_a_release_was_observed() {
+        use crate::storage::common::models::DbObservedRelease;
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 9, Some(77), TransactionStatus::PendingRemint);
+        mock.insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: 77,
+            signature: "release-landed".to_string(),
+            slot: 500,
+            amount: None,
+        }])
+        .await
+        .unwrap();
+
+        let claim = mock
+            .claim_remint_attempt(9, "sig-claim".to_string(), 0, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(claim, RemintClaim::ReleaseObserved);
+        assert!(mock.get_remint_signatures(9).await.unwrap().is_empty());
+    }
+
     // ── unreleased withdrawal nonce bounds ───────────────────────────
 
     /// Seed a withdrawal at `nonce` in `status` into the mock's row table.

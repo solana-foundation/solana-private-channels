@@ -995,7 +995,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": 900},
                         "value": {
                             "owner": Pubkey::new_unique().to_string(),
                             "lamports": 1_000_000u64,
@@ -1018,7 +1018,7 @@ mod tests {
                 r#""method"\s*:\s*"getAccountInfo""#.into(),
             ))
             .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":900},"value":null}}"#)
             .create()
     }
 
@@ -1074,6 +1074,42 @@ mod tests {
         let _account = mock_bitmap_account(&mut server, 0, &[]);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(result.is_ok(), "agreeing state must start: {result:?}");
+    }
+
+    /// A backend that ignores `minContextSlot` and answers from before the anchor is
+    /// refused, so the boot check never diffs the database against an old bitmap.
+    #[tokio::test]
+    async fn bitmap_read_on_a_backend_ignoring_min_context_slot_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let bytes = bitmap_account_bytes(0, &[], 255);
+        let _stale = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 1},
+                    "value": {"owner": Pubkey::new_unique().to_string(), "lamports": 1u64,
+                        "data": [STANDARD.encode(&bytes), "base64"],
+                        "executable": false, "rentEpoch": 0}}})
+                .to_string(),
+            )
+            .create();
+
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::BitmapUnavailable { .. }
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     /// A bitmap not yet on-chain with an empty database must start, or a fresh deployment

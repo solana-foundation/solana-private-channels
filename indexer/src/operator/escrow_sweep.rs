@@ -12,12 +12,15 @@
 
 use crate::operator::utils::account_util::find_allowed_mint_pda;
 use crate::operator::utils::instruction_util::RetryPolicy;
-use crate::operator::utils::rpc_util::RpcClientWithRetry;
+use crate::operator::utils::rpc_util::{
+    below_min_context_slot, is_min_context_slot_error, RpcClientWithRetry,
+};
 use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use solana_account_decoder_client_types::{UiAccount, UiAccountData};
-use solana_client::rpc_request::{RpcRequest, TokenAccountsFilter};
-use solana_client::rpc_response::Response;
+use solana_client::rpc_request::RpcRequest;
+use solana_client::rpc_response::{Response, RpcKeyedAccount};
 use solana_commitment_config::CommitmentConfig;
+use solana_rpc_client_api::client_error;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::solana_program::program_pack::Pack;
@@ -56,6 +59,15 @@ pub enum SweepFailure {
     /// The two token-program calls never answered at the same slot, so no single slot
     /// describes the merged balances.
     SlotUnsettled { attempts: u32, low: u64, high: u64 },
+    /// The node could not answer at or past `floor`, or its newest block is too old. A
+    /// lagging node catches up, so this is worth another sweep. `slot` is where it answered, if known.
+    Stale { slot: Option<u64>, floor: u64 },
+}
+
+impl From<EscrowSweepError> for SweepFailure {
+    fn from(e: EscrowSweepError) -> Self {
+        SweepFailure::Read(e)
+    }
 }
 
 impl std::fmt::Display for SweepFailure {
@@ -69,6 +81,10 @@ impl std::fmt::Display for SweepFailure {
             } => write!(
                 f,
                 "token program sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high})"
+            ),
+            SweepFailure::Stale { slot, floor } => write!(
+                f,
+                "custody could not be read at or past slot {floor} (answered at {slot:?}); the node is behind"
             ),
         }
     }
@@ -116,15 +132,23 @@ const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 5;
 /// match: a caller that bounds its ledger read by that slot would compare two different
 /// moments and call an ordinary channel broken. The failure is reported as its own kind so
 /// a caller can sweep again, since the skew belongs to the attempt rather than the chain.
+///
+/// Two equally stale answers also agree, so every call must answer at or past the larger
+/// of the chain's newest recent block and `ledger_floor` (a slot the ledger already covers).
+/// Anything older is `Stale`.
 pub async fn fetch_escrow_balances_by_mint(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
+    ledger_floor: u64,
 ) -> Result<CustodySnapshot, SweepFailure> {
+    let anchor = newest_block_anchor(rpc_client, "Solana")
+        .await
+        .map_err(|e| e.into_sweep_failure(ledger_floor))?;
+    let floor = anchor.max(ledger_floor);
     let mut attempt = 1;
     loop {
-        let (mut balances, strays, low, high) = sweep_once(rpc_client, escrow_instance_id)
-            .await
-            .map_err(SweepFailure::Read)?;
+        let (mut balances, strays, low, high) =
+            sweep_once(rpc_client, escrow_instance_id, floor).await?;
         if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
             attempt += 1;
             continue;
@@ -151,9 +175,8 @@ pub async fn fetch_escrow_balances_by_mint(
             );
         }
 
-        let dropped = retain_allowed_mints(rpc_client, escrow_instance_id, &mut balances, low)
-            .await
-            .map_err(SweepFailure::Read)?;
+        let dropped =
+            retain_allowed_mints(rpc_client, escrow_instance_id, &mut balances, low).await?;
         if !dropped.is_empty() {
             warn!(
                 count = dropped.len(),
@@ -180,7 +203,7 @@ async fn retain_allowed_mints(
     escrow_instance_id: Pubkey,
     balances: &mut HashMap<Pubkey, u64>,
     min_slot: u64,
-) -> Result<Vec<Pubkey>, EscrowSweepError> {
+) -> Result<Vec<Pubkey>, SweepFailure> {
     let mints: Vec<Pubkey> = balances.keys().copied().collect();
     let pdas: Vec<Pubkey> = mints
         .iter()
@@ -234,10 +257,9 @@ pub async fn fetch_escrow_custody(
     // but each must be at or past a recent block so a lagging backend cannot hide a drain.
     let anchor = newest_block_anchor(rpc_client, "Solana")
         .await
-        .map_err(SweepFailure::Read)?;
-    let (balances, slots) = read_custody_once(rpc_client, escrow_instance_id, mints, anchor)
-        .await
-        .map_err(SweepFailure::Read)?;
+        .map_err(|e| e.into_sweep_failure(0))?;
+    let (balances, slots) =
+        read_custody_once(rpc_client, escrow_instance_id, mints, anchor).await?;
     let slot = slots.values().copied().max().unwrap_or_default();
     Ok(EscrowCustody {
         balances,
@@ -250,6 +272,15 @@ fn read_failure(reason: String) -> SweepFailure {
     SweepFailure::Read(EscrowSweepError { reason })
 }
 
+/// A failed read at `floor`: `Stale` when the node was behind it, `Read` otherwise.
+fn sweep_rpc_failure(e: &client_error::Error, floor: u64, reason: String) -> SweepFailure {
+    if is_min_context_slot_error(e) {
+        SweepFailure::Stale { slot: None, floor }
+    } else {
+        read_failure(reason)
+    }
+}
+
 /// One pass over every ATA. Returns the balances plus the slot each mint was read at, refusing
 /// any chunk answered below `anchor`.
 async fn read_custody_once(
@@ -257,7 +288,7 @@ async fn read_custody_once(
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
     anchor: u64,
-) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), EscrowSweepError> {
+) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), SweepFailure> {
     let keys: Vec<Pubkey> = mints
         .iter()
         .map(|(mint, token_program)| {
@@ -272,7 +303,8 @@ async fn read_custody_once(
         slots.insert(*mint, slot);
         // No account at the ATA means the escrow holds none of this mint.
         let Some(account) = account else { continue };
-        let amount = decode_ata_amount(&account, mint, token_program)?;
+        let amount =
+            decode_ata_amount(&account, mint, token_program).map_err(SweepFailure::Read)?;
         balances.insert(*mint, amount);
     }
 
@@ -280,23 +312,24 @@ async fn read_custody_once(
 }
 
 /// Read `keys` in chunks of `MAX_ACCOUNTS_PER_CALL`. Returns each key's account (None when
-/// absent) and the slot its chunk answered at, in key order. A chunk below `min_slot` fails.
+/// absent) and the slot its chunk answered at, in key order. A chunk below `min_slot` is `Stale`.
 async fn read_accounts_chunked(
     rpc_client: &RpcClientWithRetry,
     keys: &[Pubkey],
     min_slot: u64,
     what: &str,
-) -> Result<Vec<(Option<UiAccount>, u64)>, EscrowSweepError> {
+) -> Result<Vec<(Option<UiAccount>, u64)>, SweepFailure> {
     let mut accounts = Vec::with_capacity(keys.len());
 
     for chunk in keys.chunks(MAX_ACCOUNTS_PER_CALL) {
         let chunk_keys: Vec<String> = chunk.iter().map(Pubkey::to_string).collect();
         // Sent raw because the client's get_multiple_accounts turns an account it cannot decode
         // into None, which would read as "no account". Here None only ever means absent.
-        // A node behind `min_slot` refuses with -32016, which with_retry retries.
+        // A node behind `min_slot` refuses with -32016, or answers older and is refused here;
+        // with_retry retries both.
         let response = rpc_client
             .with_retry("get_multiple_accounts", RetryPolicy::Idempotent, || async {
-                rpc_client
+                let response = rpc_client
                     .rpc_client
                     .send::<Response<Vec<Option<UiAccount>>>>(
                         RpcRequest::GetMultipleAccounts,
@@ -305,28 +338,23 @@ async fn read_accounts_chunked(
                             {"encoding": "base64", "commitment": "finalized", "minContextSlot": min_slot}
                         ]),
                     )
-                    .await
+                    .await?;
+                if response.context.slot < min_slot {
+                    return Err(below_min_context_slot(response.context.slot, min_slot));
+                }
+                Ok(response)
             })
             .await
-            .map_err(|e| EscrowSweepError {
-                reason: format!("Failed to read {what}: {e}"),
-            })?;
+            .map_err(|e| sweep_rpc_failure(&e, min_slot, format!("Failed to read {what}: {e}")))?;
 
         if response.value.len() != chunk.len() {
-            return Err(EscrowSweepError {
-                reason: format!(
-                    "{what} read returned {} accounts for {} keys",
-                    response.value.len(),
-                    chunk.len()
-                ),
-            });
+            return Err(read_failure(format!(
+                "{what} read returned {} accounts for {} keys",
+                response.value.len(),
+                chunk.len()
+            )));
         }
         let slot = response.context.slot;
-        if slot < min_slot {
-            return Err(EscrowSweepError {
-                reason: format!("{what} read answered at slot {slot}, behind slot {min_slot}"),
-            });
-        }
 
         for account in response.value {
             accounts.push((account, slot));
@@ -370,13 +398,14 @@ fn decode_ata_amount(
     Ok(amount)
 }
 
-/// One pass over both token programs. Returns each mint's ATA balance, the addresses of the
-/// other token accounts the instance owns, and the lowest and highest slot the two responses
-/// reported, which agree when the pass saw one instant.
+/// One pass over both token programs, each answered at or past `floor`. Returns each mint's
+/// ATA balance, the addresses of the other token accounts the instance owns, and the lowest
+/// and highest slot the two responses reported, which agree when the pass saw one instant.
 async fn sweep_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
-) -> Result<(HashMap<Pubkey, u64>, Vec<String>, u64, u64), EscrowSweepError> {
+    floor: u64,
+) -> Result<(HashMap<Pubkey, u64>, Vec<String>, u64, u64), SweepFailure> {
     let mut balances = HashMap::new();
     let mut strays = Vec::new();
     let token_programs = [spl_token::id(), spl_token_2022::id()];
@@ -384,26 +413,37 @@ async fn sweep_once(
     let mut highest_slot = 0u64;
 
     for token_program_id in token_programs {
+        // Sent raw because the client's helper has no `minContextSlot`; same filter and
+        // encoding as that helper.
         let response = rpc_client
             .with_retry(
                 "get_token_accounts_by_owner",
                 RetryPolicy::Idempotent,
                 || async {
-                    rpc_client
+                    let response = rpc_client
                         .rpc_client
-                        .get_token_accounts_by_owner_with_commitment(
-                            &escrow_instance_id,
-                            TokenAccountsFilter::ProgramId(token_program_id),
-                            CommitmentConfig::finalized(),
+                        .send::<Response<Vec<RpcKeyedAccount>>>(
+                            RpcRequest::GetTokenAccountsByOwner,
+                            serde_json::json!([
+                                escrow_instance_id.to_string(),
+                                {"programId": token_program_id.to_string()},
+                                {"encoding": "jsonParsed", "commitment": "finalized", "minContextSlot": floor}
+                            ]),
                         )
-                        .await
+                        .await?;
+                    if response.context.slot < floor {
+                        return Err(below_min_context_slot(response.context.slot, floor));
+                    }
+                    Ok(response)
                 },
             )
             .await
-            .map_err(|e| EscrowSweepError {
-                reason: format!(
-                    "Failed to fetch token accounts for program {token_program_id}: {e}"
-                ),
+            .map_err(|e| {
+                sweep_rpc_failure(
+                    &e,
+                    floor,
+                    format!("Failed to fetch token accounts for program {token_program_id}: {e}"),
+                )
             })?;
 
         lowest_slot = lowest_slot.min(response.context.slot);
@@ -479,21 +519,9 @@ async fn sweep_once(
     Ok((balances, strays, lowest_slot, highest_slot))
 }
 
-/// Read the channel-token supply for `mint` on the PrivateChannel chain. An
-/// absent mint account (nothing minted yet), or one SPL Token does not own, reads as
-/// supply 0; any other RPC or decode failure is surfaced so a bad read never silently
-/// looks like 0 supply.
-pub async fn fetch_channel_supply(
-    channel_rpc: &RpcClientWithRetry,
-    mint: &Pubkey,
-) -> Result<u64, EscrowSweepError> {
-    fetch_channel_supply_at(channel_rpc, mint)
-        .await
-        .map(|(supply, _)| supply)
-}
-
 /// Channel supply for `mint` and the context slot the node answered at. The node reads
-/// its slot before the account, so the supply is at least as new as that slot.
+/// its slot before the account, so the supply is at least as new as that slot. An absent
+/// mint account (nothing minted yet), or one SPL Token does not own, reads as supply 0.
 pub async fn fetch_channel_supply_at(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
@@ -567,15 +595,49 @@ const ANCHOR_WINDOWS: [u64; 3] = [64, 4_096, 262_144];
 /// `minContextSlot`, so a supply read answered at or after this slot is what proves freshness;
 /// a frozen node, a lagging replica or an older load-balanced backend all fail it.
 pub async fn channel_anchor(channel_rpc: &RpcClientWithRetry) -> Result<u64, EscrowSweepError> {
-    newest_block_anchor(channel_rpc, "channel").await
+    newest_block_anchor(channel_rpc, "channel")
+        .await
+        .map_err(|e| EscrowSweepError {
+            reason: e.to_string(),
+        })
+}
+
+/// Why no anchor could be established. `Stale` is a node whose newest block is too old,
+/// usually one still catching up, which a later attempt can clear.
+#[derive(Debug, Clone)]
+pub(crate) enum AnchorError {
+    Stale { chain: String, block: u64, age: i64 },
+    Read(EscrowSweepError),
+}
+
+impl std::fmt::Display for AnchorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnchorError::Stale { chain, block, age } => write!(
+                f,
+                "{chain}'s newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
+            ),
+            AnchorError::Read(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl AnchorError {
+    /// A stale anchor is a lagging node, so a sweep that needed it is `Stale` against `floor`.
+    fn into_sweep_failure(self, floor: u64) -> SweepFailure {
+        match self {
+            AnchorError::Stale { .. } => SweepFailure::Stale { slot: None, floor },
+            AnchorError::Read(e) => SweepFailure::Read(e),
+        }
+    }
 }
 
 /// `chain`'s newest finalized block slot, proven younger than `CHANNEL_MAX_AGE_SECS`.
-async fn newest_block_anchor(
+pub(crate) async fn newest_block_anchor(
     rpc: &RpcClientWithRetry,
     chain: &str,
-) -> Result<u64, EscrowSweepError> {
-    let fail = |reason: String| EscrowSweepError { reason };
+) -> Result<u64, AnchorError> {
+    let fail = |reason: String| AnchorError::Read(EscrowSweepError { reason });
     // Finalized like the reads it anchors, so a node that honors commitment compares like with like.
     let finalized = CommitmentConfig::finalized();
     let tip = rpc
@@ -611,9 +673,11 @@ async fn newest_block_anchor(
         .map_err(|e| fail(format!("{chain} block {block} has no time: {e}")))?;
     let age = chrono::Utc::now().timestamp().saturating_sub(block_time);
     if age > CHANNEL_MAX_AGE_SECS {
-        return Err(fail(format!(
-            "{chain}'s newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
-        )));
+        return Err(AnchorError::Stale {
+            chain: chain.to_string(),
+            block,
+            age,
+        });
     }
     // A clock far ahead of ours would hide a frozen node for as long as it is ahead.
     if age < -CHANNEL_MAX_AGE_SECS {
@@ -737,6 +801,7 @@ pub(crate) mod tests {
         token_2022_slot: u64,
         times: Option<usize>,
     ) {
+        mock_anchor(server, 1).await;
         let spl = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
@@ -783,7 +848,7 @@ pub(crate) mod tests {
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -799,7 +864,7 @@ pub(crate) mod tests {
         mock_sweep(&mut server, &[base64_account(instance, mint, 1_234)]).await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -824,7 +889,7 @@ pub(crate) mod tests {
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -849,7 +914,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        let result = fetch_escrow_balances_by_mint(&client(&server.url()), instance).await;
+        let result = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0).await;
 
         let err = result.expect_err("a snapshot with no coherent slot must not be returned");
         assert!(
@@ -874,7 +939,7 @@ pub(crate) mod tests {
         )
         .await;
 
-        let err = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let err = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .expect_err("a snapshot with no coherent slot must not be returned");
 
@@ -917,7 +982,7 @@ pub(crate) mod tests {
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap();
 
@@ -933,10 +998,11 @@ pub(crate) mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_sweep(&mut server, &[]).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
-            .await
-            .unwrap()
-            .balances;
+        let balances =
+            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique(), 0)
+                .await
+                .unwrap()
+                .balances;
 
         assert!(balances.is_empty());
     }
@@ -1010,7 +1076,7 @@ pub(crate) mod tests {
         )]);
         mock_multiple_accounts(&mut server, pdas, vec![1], Arc::default()).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -1048,7 +1114,7 @@ pub(crate) mod tests {
         ]);
         mock_multiple_accounts(&mut server, pdas, vec![1], Arc::default()).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -1084,8 +1150,9 @@ pub(crate) mod tests {
             .create_async()
             .await;
 
-        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+        let supply = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
             .await
+            .map(|(supply, _)| supply)
             .unwrap();
         assert_eq!(supply, 1_234_567);
     }
@@ -1101,8 +1168,9 @@ pub(crate) mod tests {
             .create_async()
             .await;
 
-        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+        let supply = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
             .await
+            .map(|(supply, _)| supply)
             .unwrap();
         assert_eq!(supply, 0, "absent mint account must read as zero supply");
     }
@@ -1119,8 +1187,9 @@ pub(crate) mod tests {
             .create_async()
             .await;
 
-        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+        let supply = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
             .await
+            .map(|(supply, _)| supply)
             .unwrap();
         assert_eq!(supply, 0);
     }
@@ -1147,7 +1216,9 @@ pub(crate) mod tests {
             },
             CommitmentConfig::finalized(),
         );
-        let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
+        let result = fetch_channel_supply_at(&fast, &Pubkey::new_unique())
+            .await
+            .map(|(supply, _)| supply);
         assert!(result.is_err(), "an RPC outage must be Err, not Ok(0)");
     }
 
@@ -1177,7 +1248,9 @@ pub(crate) mod tests {
             },
             CommitmentConfig::finalized(),
         );
-        let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
+        let result = fetch_channel_supply_at(&fast, &Pubkey::new_unique())
+            .await
+            .map(|(supply, _)| supply);
         assert!(
             result.is_err(),
             "undecodable mint must be Err, got {result:?}"
@@ -1198,7 +1271,7 @@ pub(crate) mod tests {
         mock_sweep(&mut server, &[malformed]).await;
 
         let result =
-            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique()).await;
+            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique(), 0).await;
 
         let err = result.expect_err("malformed account must error");
         let SweepFailure::Read(read) = &err else {
@@ -1284,6 +1357,7 @@ pub(crate) mod tests {
     /// extension layout actually reaches the unpacker. Both calls answer at the same
     /// slot to satisfy the sweep's slot-agreement check.
     async fn mock_sweep_token_2022(server: &mut mockito::Server, token_2022_accounts: &[String]) {
+        mock_anchor(server, 1).await;
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
@@ -1312,7 +1386,7 @@ pub(crate) mod tests {
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -1339,7 +1413,7 @@ pub(crate) mod tests {
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
             .await
             .unwrap()
             .balances;
@@ -1616,7 +1690,7 @@ pub(crate) mod tests {
             let result = fetch_escrow_custody(&fast_client(&server.url()), instance, mints).await;
 
             assert!(
-                matches!(result, Err(SweepFailure::Read(_))),
+                matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
                 "{label}: {result:?}"
             );
         }
@@ -1707,7 +1781,10 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(SweepFailure::Read(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
+            "{result:?}"
+        );
     }
 
     /// Custody is only as fresh as the chain it is read from: an old newest block fails the read.
@@ -1730,7 +1807,10 @@ pub(crate) mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(SweepFailure::Read(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(SweepFailure::Stale { .. })),
+            "{result:?}"
+        );
     }
 
     /// With no mints there is nothing to read, but the snapshot still needs a slot to pin the ledger.
@@ -1757,22 +1837,27 @@ pub(crate) mod tests {
 
     // ── channel freshness ─────────────────────────────────────────────
 
-    /// Mock the channel clock: `getSlot` answers `tip`, `getBlocks` answers the slots of
+    /// Mock a chain clock: `getSlot` answers `tip`, `getBlocks` answers the slots of
     /// `blocks` inside the requested range, and `getBlockTime` answers `age_secs` before
-    /// the moment of the request (null when `age_secs` is None).
+    /// the moment of the request (null when `age_secs` is None). Returns the `getSlot` count.
     pub(crate) async fn mock_channel_clock(
         server: &mut mockito::Server,
         tip: u64,
         blocks: Vec<u64>,
         age_secs: Option<i64>,
-    ) {
+    ) -> Arc<AtomicUsize> {
+        let tip_reads = Arc::new(AtomicUsize::new(0));
+        let counter = tip_reads.clone();
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(
                 serde_json::json!({"method": "getSlot"}),
             ))
             .with_status(200)
-            .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{tip}}}"#))
+            .with_body_from_request(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":{tip}}}"#).into_bytes()
+            })
             .create_async()
             .await;
         server
@@ -1810,6 +1895,7 @@ pub(crate) mod tests {
             })
             .create_async()
             .await;
+        tip_reads
     }
 
     /// A single-attempt client so an error case fails fast.
@@ -1985,6 +2071,177 @@ pub(crate) mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4 + SUPPLY_REREAD_BUDGET as usize
+        );
+    }
+
+    // ── startup sweep freshness ───────────────────────────────────────
+
+    /// A fresh chain clock whose newest block is `tip`. Returns the anchor read count.
+    pub(crate) async fn mock_anchor(server: &mut mockito::Server, tip: u64) -> Arc<AtomicUsize> {
+        mock_channel_clock(server, tip, vec![tip], Some(1)).await
+    }
+
+    /// Answer `getTokenAccountsByOwner` with `reply(call)` for each call, recording each request's params.
+    async fn mock_owner_lists(
+        server: &mut mockito::Server,
+        params: Arc<Mutex<Vec<serde_json::Value>>>,
+        reply: impl Fn(usize) -> serde_json::Value + Send + Sync + 'static,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getTokenAccountsByOwner"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                params.lock().unwrap().push(body["params"].clone());
+                let mut answer = reply(calls.fetch_add(1, Ordering::SeqCst));
+                answer["jsonrpc"] = "2.0".into();
+                answer["id"] = body["id"].clone();
+                answer.to_string().into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    fn owner_list_at(slot: u64) -> serde_json::Value {
+        serde_json::json!({"result": {"context": {"slot": slot}, "value": []}})
+    }
+
+    fn min_context_refusal() -> serde_json::Value {
+        serde_json::json!({"error": {"code": -32016, "message": "Minimum context slot has not been reached"}})
+    }
+
+    /// Both owner-list calls carry the chain's newest recent block as their minimum slot.
+    #[tokio::test]
+    async fn sweep_sends_min_context_slot_on_both_programs() {
+        let mut server = mockito::Server::new_async().await;
+        mock_anchor(&mut server, 50).await;
+        let params = Arc::new(Mutex::new(Vec::new()));
+        mock_owner_lists(&mut server, params.clone(), |_| owner_list_at(60)).await;
+
+        let snapshot =
+            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique(), 0)
+                .await
+                .unwrap();
+
+        assert_eq!(snapshot.slot, 60);
+        let params = params.lock().unwrap();
+        let programs: Vec<_> = params.iter().map(|p| p[1]["programId"].clone()).collect();
+        assert_eq!(
+            programs,
+            vec![
+                serde_json::json!(spl_token::id().to_string()),
+                serde_json::json!(spl_token_2022::id().to_string())
+            ]
+        );
+        for p in params.iter() {
+            assert_eq!(p[2]["minContextSlot"], 50, "{p}");
+            assert_eq!(p[2]["encoding"], "jsonParsed", "{p}");
+            assert_eq!(p[2]["commitment"], "finalized", "{p}");
+        }
+    }
+
+    /// Two answers below the floor agree with each other, but agreement is not freshness.
+    #[tokio::test]
+    async fn sweep_below_floor_context_is_stale() {
+        let mut server = mockito::Server::new_async().await;
+        mock_anchor(&mut server, 50).await;
+        mock_owner_lists(&mut server, Arc::default(), |_| owner_list_at(40)).await;
+
+        let result = fetch_escrow_balances_by_mint(
+            &retrying_client(&server.url(), 3),
+            Pubkey::new_unique(),
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A node refusing the floor every time is lag, reported as `Stale` after the inner tries.
+    #[tokio::test]
+    async fn sweep_min_context_refusal_is_stale() {
+        let mut server = mockito::Server::new_async().await;
+        mock_anchor(&mut server, 50).await;
+        let params = Arc::new(Mutex::new(Vec::new()));
+        mock_owner_lists(&mut server, params.clone(), |_| min_context_refusal()).await;
+
+        let result = fetch_escrow_balances_by_mint(
+            &retrying_client(&server.url(), 5),
+            Pubkey::new_unique(),
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            params.lock().unwrap().len(),
+            5,
+            "the inner tries are spent first"
+        );
+    }
+
+    /// The AllowedMint read is held to the same floor, and its refusal is lag too.
+    #[tokio::test]
+    async fn allowed_mint_chunk_refusal_is_stale() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        mock_anchor(&mut server, 50).await;
+        let entry: serde_json::Value =
+            serde_json::from_str(&json_parsed_account(instance, Pubkey::new_unique(), 7)).unwrap();
+        mock_owner_lists(&mut server, Arc::default(), move |call| {
+            let value = if call == 0 {
+                vec![entry.clone()]
+            } else {
+                vec![]
+            };
+            serde_json::json!({"result": {"context": {"slot": 50}, "value": value}})
+        })
+        .await;
+        mock_multiple_accounts_min_slot(&mut server, usize::MAX, 50, Arc::default()).await;
+
+        let result =
+            fetch_escrow_balances_by_mint(&retrying_client(&server.url(), 3), instance, 0).await;
+
+        assert!(
+            matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A node whose newest block is old is a typed stale anchor, which the sweep reports as `Stale`.
+    #[tokio::test]
+    async fn stale_anchor_is_typed_and_maps_to_stale() {
+        let mut server = mockito::Server::new_async().await;
+        mock_channel_clock(&mut server, 50, vec![50], Some(CHANNEL_MAX_AGE_SECS + 1)).await;
+
+        let anchor = newest_block_anchor(&fast_client(&server.url()), "Solana").await;
+        assert!(
+            matches!(anchor, Err(AnchorError::Stale { block: 50, .. })),
+            "{anchor:?}"
+        );
+
+        let result =
+            fetch_escrow_balances_by_mint(&fast_client(&server.url()), Pubkey::new_unique(), 7)
+                .await;
+        assert!(
+            matches!(
+                result,
+                Err(SweepFailure::Stale {
+                    slot: None,
+                    floor: 7
+                })
+            ),
+            "{result:?}"
         );
     }
 }
