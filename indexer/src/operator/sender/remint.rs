@@ -3,8 +3,10 @@ use super::types::InFlightQueue;
 use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
-    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+    CONSUMED_SET_HITS, OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY,
+    OPERATOR_REMINT_CLAIM_LOST,
 };
+use crate::operator::sender::ConsumedMintKind;
 use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
     channel_utils::send_guaranteed,
@@ -66,6 +68,49 @@ enum RemintAttempt {
 /// double-mint. Everything runs on the source chain (PrivateChannel), not rpc_client
 /// (Solana, the ReleaseFunds destination). No sender-level retry.
 async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> RemintAttempt {
+    // After an indexer restore the journal is gone but the channel still lists the
+    // remint, so its own mint history is checked before any new one is signed.
+    if let Some(claims) = &state.consumed {
+        match claims
+            .lookup_event(&state.storage, &info.mint, &info.source_event_id)
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(consumed))
+                if consumed.kind == ConsumedMintKind::Remint
+                    && consumed.mint == info.mint
+                    && consumed.recipient_ata == info.user_ata
+                    && consumed.amount == info.amount =>
+            {
+                CONSUMED_SET_HITS
+                    .with_label_values(&[state.program_type.as_label(), "remint", "settled"])
+                    .inc();
+                warn!(
+                    "Remint for transaction {} already landed on the channel as {}; recording it",
+                    info.transaction_id, consumed.signature
+                );
+                return RemintAttempt::Confirmed(consumed.signature);
+            }
+            Ok(Some(consumed)) => {
+                CONSUMED_SET_HITS
+                    .with_label_values(&[state.program_type.as_label(), "remint", "mismatch"])
+                    .inc();
+                return RemintAttempt::Failed(format!(
+                    "channel mint {} carries transaction {}'s remint marker but does not pay \
+                     it; refusing to remint",
+                    consumed.signature, info.transaction_id
+                ));
+            }
+            // Nothing was sent, but a remint may exist that could not be read.
+            Err(reason) => {
+                return RemintAttempt::DeferInFlight(format!(
+                    "channel mint history unreadable for transaction {}: {reason}",
+                    info.transaction_id
+                ));
+            }
+        }
+    }
+
     let stored = match state
         .storage
         .get_remint_signatures(info.transaction_id)
@@ -1466,6 +1511,7 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            consumed: None,
         };
         (state, mock)
     }
@@ -1547,6 +1593,52 @@ mod tests {
             });
     }
 
+    /// A remint that already landed before an indexer restore is found in the channel's
+    /// mint history and recorded, not sent again (SOLA13-269).
+    #[tokio::test]
+    async fn remint_claim_consumed_hit_marks_reminted() {
+        use crate::operator::sender::{ConsumedClaims, ConsumedSetCache};
+        use crate::operator::{ConsumedMint, ConsumedMintKind};
+
+        // No RPC is mocked, so any send attempt would fail the test.
+        let server = mockito::Server::new_async().await;
+        let (mut state, _mock) = make_sender_state_with_rpc(&server.url());
+        let info = make_remint_info(9);
+        let landed = Signature::new_unique();
+        let consumed = |amount| ConsumedMint {
+            signature: landed,
+            kind: ConsumedMintKind::Remint,
+            mint: info.mint,
+            recipient_ata: info.user_ata,
+            token_program: info.token_program,
+            amount,
+        };
+        state.consumed = Some(ConsumedClaims::new(
+            ConsumedSetCache::with_entries(
+                &[info.mint],
+                vec![(info.source_event_id.clone(), consumed(info.amount))],
+            ),
+            state.source_rpc_client.clone(),
+        ));
+        match attempt_remint(&state, &info).await {
+            RemintAttempt::Confirmed(signature) => assert_eq!(signature, landed),
+            _ => panic!("a consumed remint must be recorded, not resent"),
+        }
+
+        // A channel mint for this event that pays something else is escalated.
+        state.consumed = Some(ConsumedClaims::new(
+            ConsumedSetCache::with_entries(
+                &[info.mint],
+                vec![(info.source_event_id.clone(), consumed(1))],
+            ),
+            state.source_rpc_client.clone(),
+        ));
+        assert!(matches!(
+            attempt_remint(&state, &info).await,
+            RemintAttempt::Failed(_)
+        ));
+    }
+
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
@@ -1606,6 +1698,7 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            consumed: None,
         };
         (state, mock)
     }
@@ -1673,6 +1766,7 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            consumed: None,
         };
         (state, mock)
     }

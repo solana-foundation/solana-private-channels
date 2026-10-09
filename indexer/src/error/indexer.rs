@@ -21,6 +21,18 @@ pub enum IndexerError {
 
     #[error("Startup backfill task panicked")]
     BackfillPanicked,
+    /// The channel no longer holds the history the indexer DB was built from, so the
+    /// channel was restored behind it. See docs/runbooks/withdrawal_pipeline_halt_runbook.md.
+    #[error(
+        "channel fence check failed: {reason}. The channel database was restored behind the \
+         indexer database; restore the indexer to a point before the channel's restore target \
+         (docs/PITR.md)"
+    )]
+    ChannelFence { reason: String },
+
+    /// The fence check could not reach a verdict, so the indexer refuses rather than guess.
+    #[error("channel fence could not be checked: {reason}")]
+    ChannelFenceUnchecked { reason: String },
 
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
@@ -231,6 +243,9 @@ pub enum DataSourceError {
 pub enum BackfillError {
     #[error("Gap too large: {gap} slots (max: {max_gap})")]
     GapTooLarge { gap: u64, max_gap: u64 },
+
+    #[error("Block {slot} does not extend the channel history the indexer read: {reason}")]
+    ChainLinkBroken { slot: u64, reason: String },
 
     #[error("Failed to fetch slot {slot}: {source}")]
     SlotFetchFailed {

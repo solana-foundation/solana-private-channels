@@ -1204,6 +1204,7 @@ mod tests {
         let complete_block = json!({
             "blockhash": "TestBlockHash11111111111111111111111111111",
             "parentSlot": slot - 1,
+            "previousBlockhash": "TestBlockHash11111111111111111111111111111",
             "transactions": [{
                 "transaction": {
                     "signatures": [signature],
@@ -1272,6 +1273,7 @@ mod tests {
         let loaded_block = json!({
             "blockhash": "TestBlockHash11111111111111111111111111111",
             "parentSlot": slot - 1,
+            "previousBlockhash": "TestBlockHash11111111111111111111111111111",
             "transactions": [{
                 "transaction": {
                     "signatures": [signature],
@@ -1912,6 +1914,7 @@ mod tests {
         let response = json!({
             "blockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
             "parentSlot": 495_752_743u64,
+            "previousBlockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
             "transactions": [{
                 "version": 1,
                 "transaction": {
@@ -1999,6 +2002,7 @@ mod tests {
 
         let response = json!({
             "blockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
+            "previousBlockhash": "11111111111111111111111111111111",
             "parentSlot": 99u64,
             "transactions": [{
                 "transaction": {

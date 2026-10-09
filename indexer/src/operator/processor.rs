@@ -6,7 +6,9 @@ use crate::operator::instruction_util::{
     WithdrawalRemintInfo,
 };
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
-use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
+use crate::operator::sender::{
+    ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
+};
 use crate::operator::utils::mint_util::{HookExtras, MintCache};
 use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
@@ -36,6 +38,8 @@ pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
     pub release_funds_state: Option<ReleaseFundsState>,
     pub mint_cache: MintCache,
+    /// Channel mints the DB may have forgotten, checked before every mint and release.
+    pub(crate) consumed: Option<ConsumedClaims>,
 }
 
 pub struct ReleaseFundsState {
@@ -67,6 +71,7 @@ impl ProcessorState {
                 event_authority_pda,
             }),
             mint_cache: MintCache::with_rpc(storage, rpc_client),
+            consumed: None,
         }
     }
 
@@ -78,6 +83,7 @@ impl ProcessorState {
             admin_pubkey: SignerUtil::get_admin_pubkey(),
             release_funds_state: None,
             mint_cache: MintCache::with_rpc(storage, mint_rpc_client),
+            consumed: None,
         }
     }
 }
@@ -127,6 +133,7 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         OperatorError::MissingBuilder
         | OperatorError::SenderAlreadyRunning { .. }
         | OperatorError::SenderLockLostAtBoot { .. }
+        | OperatorError::ChannelFence { .. }
         | OperatorError::InvalidConfig(_) => ErrorDisposition::Fatal,
         // A dead downstream channel means the sender or storage writer died; the
         // supervisor handles this by aborting the whole operator.
@@ -136,6 +143,8 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         // DB + RPC + webhook errors are treated as infrastructure — retry on restart.
         OperatorError::Storage(_)
         | OperatorError::RpcError(_)
+        | OperatorError::ChannelFenceUnchecked { .. }
+        | OperatorError::ConsumedSet { .. }
         | OperatorError::WebhookError(_)
         | OperatorError::Account(_)
         | OperatorError::Transaction(_) => ErrorDisposition::Transient,
@@ -221,6 +230,104 @@ async fn park_row(
             .with_label_values(&[pt_label, bail.label])
             .inc();
     }
+}
+
+/// Close a claimed row the channel already paid, before anything is built for it. Returns
+/// `true` when the row is settled here. Run after the reopened-row gates, so a journaled
+/// in-flight mint is still classified by its own signatures first.
+async fn settle_if_consumed(
+    consumed: Option<&ConsumedClaims>,
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+) -> Result<bool, OperatorError> {
+    let Some(claims) = consumed else {
+        return Ok(false);
+    };
+    let kind = match transaction.transaction_type {
+        crate::storage::TransactionType::Deposit => "deposit",
+        crate::storage::TransactionType::Withdrawal => "remint",
+    };
+    let lookup = claims
+        .lookup(storage, transaction)
+        .await
+        .map_err(|reason| OperatorError::ConsumedSet { reason })?;
+    let consumed = match lookup {
+        ConsumedLookup::Miss => return Ok(false),
+        ConsumedLookup::Mismatch(reason) => {
+            metrics::CONSUMED_SET_HITS
+                .with_label_values(&[pt_label, kind, "mismatch"])
+                .inc();
+            park_row(
+                storage,
+                storage_tx,
+                pt_label,
+                transaction,
+                BailReason::new("consumed_mint_mismatch", reason),
+            )
+            .await;
+            return Ok(true);
+        }
+        ConsumedLookup::Hit(consumed) => consumed,
+    };
+
+    let signature = consumed.signature.to_string();
+    let (status, op_name) = match transaction.transaction_type {
+        crate::storage::TransactionType::Deposit => {
+            (TransactionStatus::Completed, "consumed-set complete")
+        }
+        crate::storage::TransactionType::Withdrawal => {
+            (TransactionStatus::FailedReminted, "consumed-set remint")
+        }
+    };
+    let written = fenced_terminal_write(
+        storage,
+        pt_label,
+        op_name,
+        transaction.id,
+        status,
+        "the channel already paid this row",
+        || {
+            let signature = signature.clone();
+            async move {
+                match transaction.transaction_type {
+                    crate::storage::TransactionType::Deposit => {
+                        storage
+                            .try_complete_processing(
+                                transaction.id,
+                                transaction.updated_at,
+                                Some(signature),
+                                None,
+                            )
+                            .await
+                    }
+                    crate::storage::TransactionType::Withdrawal => {
+                        storage
+                            .try_mark_reminted(transaction.id, transaction.updated_at, signature)
+                            .await
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    // Nothing is sent for the row in any case; an unverified write leaves it for recovery.
+    let outcome = match written {
+        FencedWrite::Applied => {
+            warn!(
+                signature,
+                "Claimed row was already paid on the channel; settled from its mint history"
+            );
+            "settled"
+        }
+        FencedWrite::Stale => "raced",
+        FencedWrite::Unverified => "write_failed",
+    };
+    metrics::CONSUMED_SET_HITS
+        .with_label_values(&[pt_label, kind, outcome])
+        .inc();
+    Ok(true)
 }
 
 /// Halt the withdrawal pipeline after a poison-pill is detected.
@@ -407,6 +514,7 @@ pub async fn run_processor(
     rpc_client: Arc<crate::operator::RpcClientWithRetry>,
     fallback_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
     source_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
+    consumed: Option<ConsumedClaims>,
 ) {
     info!("Starting processor");
 
@@ -417,6 +525,7 @@ pub async fn run_processor(
                 storage.clone(),
                 rpc_client,
             );
+            processor_state.consumed = consumed;
 
             if let Err(e) = process_release_funds(
                 &mut processor_state,
@@ -436,6 +545,7 @@ pub async fn run_processor(
             let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
             let gate_storage = storage.clone();
             let mut processor_state = ProcessorState::new_with_storage(storage, mint_rpc_client);
+            processor_state.consumed = consumed;
 
             if let Err(e) = process_deposit_funds(
                 &mut processor_state,
@@ -969,6 +1079,19 @@ pub async fn process_release_funds(
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
         let outcome: Result<(), OperatorError> = async {
+            // A withdrawal whose remint already landed must not also be released.
+            if settle_if_consumed(
+                processor_state.consumed.as_ref(),
+                &storage,
+                &storage_tx,
+                pt_label,
+                &transaction,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+
             // Settle whether the escrow will accept a release for this mint before
             // building one, so a mint it would reject costs no further work and no
             // target-chain lookup that would read as an infrastructure failure.
@@ -1200,6 +1323,17 @@ pub async fn process_deposit_funds(
             // signature may already have minted. A first-time row has no journal
             // and falls straight through with no RPC.
             if gate_reopened_deposit(&storage, &gate_finality, pt_label, &transaction).await {
+                return Ok(());
+            }
+            if settle_if_consumed(
+                processor_state.consumed.as_ref(),
+                &storage,
+                &storage_tx,
+                pt_label,
+                &transaction,
+            )
+            .await?
+            {
                 return Ok(());
             }
 
@@ -1653,6 +1787,7 @@ mod tests {
                     solana_commitment_config::CommitmentConfig::confirmed(),
                 )),
             ),
+            consumed: None,
         };
         (processor_state, server)
     }
@@ -1785,6 +1920,200 @@ mod tests {
             .create()
     }
 
+    /// A claim cache that already walked `mint` and holds one channel mint for `txn`'s
+    /// source event, paying `owner` exactly unless `amount` differs.
+    fn consumed_claims_for(
+        txn: &DbTransaction,
+        owner: &str,
+        kind: crate::operator::ConsumedMintKind,
+        amount: u64,
+    ) -> (
+        crate::operator::sender::ConsumedClaims,
+        solana_sdk::signature::Signature,
+    ) {
+        let mint = Pubkey::from_str(&txn.mint).unwrap();
+        let owner = Pubkey::from_str(owner).unwrap();
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let token_program = spl_token::id();
+        let consumed = crate::operator::ConsumedMint {
+            signature,
+            kind,
+            mint,
+            recipient_ata: get_associated_token_address_with_program_id(
+                &owner,
+                &mint,
+                &token_program,
+            ),
+            token_program,
+            amount,
+        };
+        let cache = crate::operator::sender::ConsumedSetCache::with_entries(
+            &[mint],
+            vec![(SourceEventId::from_row(txn), consumed)],
+        );
+        (
+            crate::operator::sender::ConsumedClaims::new(cache, Arc::new(unreachable_rpc())),
+            signature,
+        )
+    }
+
+    /// Run one deposit through `process_deposit_funds` with `consumed` armed.
+    async fn run_one_deposit(
+        consumed: Option<crate::operator::sender::ConsumedClaims>,
+        txn: DbTransaction,
+    ) -> (
+        Arc<Storage>,
+        MockStorage,
+        Option<TransactionStatusUpdate>,
+        Option<TransactionBuilder>,
+    ) {
+        let mock = MockStorage::new();
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        insert_mint_row(&storage, &Pubkey::from_str(&txn.mint).unwrap());
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed,
+        };
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            Arc::new(unreachable_rpc()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .expect("deposit loop");
+        (
+            storage,
+            mock,
+            storage_rx.try_recv().ok(),
+            sender_rx.try_recv().ok(),
+        )
+    }
+
+    /// After an indexer restore a deposit the channel already minted comes back
+    /// pending. The channel's own mint history completes it, no second mint (SOLA13-33).
+    #[tokio::test]
+    async fn deposit_claim_consumed_hit_completes() {
+        let recipient = Pubkey::new_unique().to_string();
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &recipient,
+            None,
+            TransactionType::Deposit,
+        );
+        let (claims, signature) = consumed_claims_for(
+            &txn,
+            &recipient,
+            crate::operator::ConsumedMintKind::Deposit,
+            1000,
+        );
+        let (_storage, mock, update, sent) = run_one_deposit(Some(claims), txn).await;
+        assert!(
+            sent.is_none(),
+            "a consumed deposit must not be minted again"
+        );
+        assert!(update.is_none());
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::Completed);
+        assert_eq!(rows[0].counterpart_signature, Some(signature.to_string()));
+    }
+
+    #[tokio::test]
+    async fn deposit_claim_consumed_mismatch_parks() {
+        let recipient = Pubkey::new_unique().to_string();
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &recipient,
+            None,
+            TransactionType::Deposit,
+        );
+        let (claims, _) = consumed_claims_for(
+            &txn,
+            &recipient,
+            crate::operator::ConsumedMintKind::Deposit,
+            999,
+        );
+        let (_storage, _mock, update, sent) = run_one_deposit(Some(claims), txn).await;
+        assert!(
+            sent.is_none(),
+            "a mismatched channel mint must not be followed by another"
+        );
+        assert_eq!(
+            update.map(|u| u.status),
+            Some(TransactionStatus::ManualReview)
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_claim_consumed_miss_mints() {
+        let recipient = Pubkey::new_unique().to_string();
+        let txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &recipient,
+            None,
+            TransactionType::Deposit,
+        );
+        let (claims, _) = consumed_claims_for(
+            &txn,
+            &recipient,
+            crate::operator::ConsumedMintKind::Deposit,
+            1000,
+        );
+        let mut other = txn.clone();
+        other.signature = "a-different-event".to_string();
+        let (_storage, _mock, update, sent) = run_one_deposit(Some(claims), other).await;
+        assert!(update.is_none());
+        assert!(matches!(sent, Some(TransactionBuilder::Mint(_))));
+    }
+
+    /// A withdrawal whose remint already landed comes back pending after an indexer
+    /// restore. Releasing it would pay the user twice (SOLA13-269), so it is closed.
+    #[tokio::test]
+    async fn release_claim_consumed_remint_hit_marks_reminted() {
+        let mock = MockStorage::new();
+        let txn = make_db_transaction(
+            7,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(3),
+            TransactionType::Withdrawal,
+        );
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let initiator = txn.initiator.clone();
+        let (claims, signature) = consumed_claims_for(
+            &txn,
+            &initiator,
+            crate::operator::ConsumedMintKind::Remint,
+            1000,
+        );
+        let mut ps = processor_state_answering(&storage, serde_json::Value::Null);
+        ps.consumed = Some(claims);
+
+        let (outcome, update, sent) = run_one_withdrawal(&mut ps, storage, txn).await;
+        outcome.expect("withdrawal loop");
+        assert!(sent.is_none(), "a reminted withdrawal must not be released");
+        assert!(update.is_none());
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::FailedReminted);
+        assert_eq!(rows[0].landed_remint_signature, Some(signature.to_string()));
+    }
+
     /// A withdrawal processor whose target chain answers every account read with
     /// `response`, which for these tests is the allowlist account the gate reads.
     fn processor_state_answering(
@@ -1800,6 +2129,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(RpcClientWithRetry::new_mocked(mocks)),
             ),
+            consumed: None,
         }
     }
 
@@ -2133,6 +2463,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
         // Recorded when this process last served the mint, before the block.
         ps.mint_cache.record_existence_floor(&mint, floor_slot);
@@ -2196,6 +2527,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
 
         let (outcome, update, builder) =
@@ -2245,6 +2577,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
 
         let (_, first_update, _) =
@@ -2342,6 +2675,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
         // Recorded when this process last served the mint, before the pause.
         ps.mint_cache.record_existence_floor(&mint, floor_slot);
@@ -2408,6 +2742,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
 
         let (outcome, update, builder) =
@@ -2468,6 +2803,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(rpc_at(&server.url())),
             ),
+            consumed: None,
         };
 
         let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage.clone(), txn).await;
@@ -2555,6 +2891,7 @@ mod tests {
                     solana_commitment_config::CommitmentConfig::confirmed(),
                 )),
             ),
+            consumed: None,
         };
 
         let (outcome, update, builder) =
@@ -2627,6 +2964,7 @@ mod tests {
                     solana_commitment_config::CommitmentConfig::confirmed(),
                 )),
             ),
+            consumed: None,
         };
         ps.mint_cache.record_existence_floor(&mint, 1);
 
@@ -2983,6 +3321,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
+            consumed: None,
         };
 
         let mut txn = make_db_transaction(
@@ -3031,6 +3370,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
+            consumed: None,
         };
 
         let mut txn = make_db_transaction(
@@ -3066,6 +3406,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
         let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(1);
@@ -3100,6 +3441,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(allowlist_only_rpc()),
             ),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -3348,6 +3690,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -3411,6 +3754,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
+            consumed: None,
         };
         let txn = make_db_transaction(
             1,
@@ -3514,6 +3858,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(2);
@@ -3570,6 +3915,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -3619,6 +3965,7 @@ mod tests {
             admin_pubkey: admin,
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -3702,6 +4049,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -3796,6 +4144,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
         let mint_pubkey = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
@@ -3855,6 +4204,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
         let mint_pubkey = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
@@ -3920,6 +4270,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -3970,6 +4321,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4008,6 +4360,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4060,6 +4413,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(allowlist_only_rpc()),
             ),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4137,6 +4491,7 @@ mod tests {
                 storage.clone(),
                 Arc::new(allowlist_only_rpc()),
             ),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4795,6 +5150,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4845,6 +5201,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4923,6 +5280,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -4980,6 +5338,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -5112,6 +5471,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         // fetcher_rx capacity 4 so we can buffer three rows: the poison,
@@ -5420,6 +5780,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         // Mint pubkey is valid base58 but is NOT inserted into `mints`.
@@ -5492,6 +5853,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            consumed: None,
         };
 
         let unknown_fee_mint = Pubkey::new_unique();

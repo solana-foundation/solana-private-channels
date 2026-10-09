@@ -102,6 +102,7 @@ async fn run_sender_exits_on_cancellation_with_empty_channel() {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             /* source_rpc_client */ None,
             SenderLockGuard::Noop,
+            None,
         ),
     )
     .await

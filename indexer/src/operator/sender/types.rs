@@ -233,6 +233,8 @@ pub struct SenderState {
     /// (confirmed, permanent failure, or transfer to a retry), so
     /// `available_permits()` accurately reflects remaining capacity at all times.
     pub semaphore: Arc<Semaphore>,
+    /// Channel mints the DB may have forgotten, checked before every remint.
+    pub(crate) consumed: Option<super::ConsumedClaims>,
 }
 
 impl SenderState {

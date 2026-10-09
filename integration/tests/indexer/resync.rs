@@ -3644,6 +3644,182 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
     Ok(())
 }
 
+/// The withdraw indexer's checkpoint and fence, once it has written a fence.
+async fn withdraw_checkpoint_with_fence(db_url: &str) -> (i64, i64, String) {
+    let pool = fresh_pool(db_url).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(*WAIT_TIMEOUT_SECS);
+    loop {
+        let row: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT last_committed_slot, fence_slot, fence_blockhash FROM indexer_state
+              WHERE program_type = 'withdraw'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("checkpoint read");
+        if let Some((Some(checkpoint), Some(slot), Some(hash))) = row {
+            return (checkpoint, slot, hash);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the withdraw indexer never wrote a fence"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Put the withdraw checkpoint and fence back to `backup`, as the restored snapshot holds them.
+async fn restore_withdraw_checkpoint(db_url: &str, backup: (i64, i64, String)) {
+    sqlx::query(
+        "UPDATE indexer_state SET last_committed_slot = $1, fence_slot = $2, fence_blockhash = $3
+          WHERE program_type = 'withdraw'",
+    )
+    .bind(backup.0)
+    .bind(backup.1)
+    .bind(backup.2)
+    .execute(&fresh_pool(db_url).await)
+    .await
+    .expect("restore the withdraw checkpoint");
+}
+
+/// Stand in for an indexer-only restore to before `signatures` were serviced: the rows come
+/// back `pending` with no journal and no recorded channel mint, the way the older backup had them.
+async fn rewind_rows_to_pending(db_url: &str, signatures: &[&str]) {
+    let pool = fresh_pool(db_url).await;
+    for signature in signatures {
+        let id: i64 = sqlx::query_scalar("SELECT id FROM transactions WHERE signature = $1")
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("row to rewind");
+        for table in ["pending_release_signatures", "pending_remint_signatures"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE transaction_id = $1"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("drop the journal");
+        }
+        sqlx::query(
+            "UPDATE transactions SET status = 'pending'::transaction_status,
+                counterpart_signature = NULL, landed_remint_signature = NULL,
+                remint_signatures = NULL, remint_last_valid_block_heights = NULL,
+                processed_at = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("rewind the row");
+    }
+}
+
+/// Apex SOLA13-33 and SOLA13-269: after an indexer restore a minted deposit and a reminted
+/// withdrawal come back `pending`. The operators must find both in the channel's own mint
+/// history and close them with the original signatures: no second mint, no remint, no release.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_indexer_rewind_completes_from_history() -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_indexer_rewind").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    // The backup this restore goes back to: the withdraw checkpoint and fence from before
+    // either row was serviced, since a real restore takes them from the same snapshot.
+    let backup = withdraw_checkpoint_with_fence(&db_url).await;
+    let deposit = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+
+    // The release fails because the destination has no token account, so the burn is reminted.
+    let destination = Keypair::new().pubkey();
+    let withdrawal =
+        helpers::execute_user_withdrawal_to(&client, user, env.mint, WITHDRAW_AMOUNT, destination)
+            .await?;
+    let settled = wait_for_any_status(
+        &db_url,
+        &withdrawal.signature,
+        &["pending_remint", "manual_review", "failed_reminted"],
+    )
+    .await;
+    stack.stop().await;
+    if settled != "failed_reminted" {
+        remint_as_operator(
+            &client,
+            &db_url,
+            &withdrawal.signature,
+            user.pubkey(),
+            env.mint,
+        )
+        .await;
+    }
+    let minted = row_of(&db_url, &deposit.to_string()).await.2;
+    let pool = fresh_pool(&db_url).await;
+    let reminted: Option<String> =
+        sqlx::query_scalar("SELECT landed_remint_signature FROM transactions WHERE signature = $1")
+            .bind(&withdrawal.signature)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        minted.is_some() && reminted.is_some(),
+        "both rows must be serviced first"
+    );
+
+    // A release to the destination would now land, so a second payout would be visible.
+    let ata_ix =
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &user.pubkey(),
+            &destination,
+            &env.mint,
+            &TOKEN_PROGRAM_ID,
+        );
+    helpers::send_and_confirm_instructions(&client, &[ata_ix], user, &[user], "ATA").await?;
+
+    rewind_rows_to_pending(&db_url, &[&deposit.to_string(), &withdrawal.signature]).await;
+    restore_withdraw_checkpoint(&db_url, backup).await;
+    // The restarted escrow indexer reconciles against finalized custody, which must have
+    // reached its checkpoint or its boot gives up re-reading.
+    let committed = checkpoint_of(&db_url, "escrow").await.unwrap_or(0) as u64;
+    wait_for_finalized_slot(&rpc_url, committed).await;
+    let supply_before = supply(&client, env.mint).await;
+    let custody_before = custody(&client, env.instance, env.mint).await;
+    let user_before = token_balance(&client, user.pubkey(), env.mint).await;
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+    wait_for_status(&db_url, &withdrawal.signature, "failed_reminted").await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+
+    assert_eq!(
+        row_of(&db_url, &deposit.to_string()).await.2,
+        minted,
+        "the original mint closes it"
+    );
+    let reminted_after: Option<String> =
+        sqlx::query_scalar("SELECT landed_remint_signature FROM transactions WHERE signature = $1")
+            .bind(&withdrawal.signature)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(reminted_after, reminted, "the original remint closes it");
+    assert_eq!(
+        supply(&client, env.mint).await,
+        supply_before,
+        "nothing may be minted again"
+    );
+    assert_eq!(
+        custody(&client, env.instance, env.mint).await,
+        custody_before,
+        "nothing may be released"
+    );
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before
+    );
+    assert_eq!(token_balance(&client, destination, env.mint).await, 0);
+    Ok(())
+}
+
 /// E2E-2 (26): an escrow resync on a busy system keeps every withdrawal and nonce, the withdraw
 /// indexer resumes from its kept checkpoint, and nothing is minted or released twice.
 #[tokio::test(flavor = "multi_thread")]

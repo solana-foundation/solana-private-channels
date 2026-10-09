@@ -406,6 +406,7 @@ fn deposit_block_json(slot: u64, instance: Pubkey, mint: Pubkey, amount: u64) ->
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
         "parentSlot": slot - 1,
+        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
         "transactions": [{
             "transaction": {
                 "signatures": [bs58::encode(signature).into_string()],
@@ -488,6 +489,7 @@ async fn mock_fill_range_carrying(
             _ => json!({
                 "blockhash": "TestBlockHash11111111111111111111111111111",
                 "parentSlot": slot - 1,
+                "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                 "transactions": [],
                 "signatures": []
             }),

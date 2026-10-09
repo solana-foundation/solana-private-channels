@@ -8,8 +8,9 @@ use crate::{
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
             rpc_polling::{
-                decode_fetched_block, decoder::SlotRejection, refetch_slot_via_fallback,
-                rpc::RpcPoller, rpc::MAX_LOOKAHEAD_SLOTS, types::BlockFetch,
+                chain_link::ChainLink, decode_fetched_block, decoder::SlotRejection,
+                refetch_slot_via_fallback, rpc::RpcPoller, rpc::MAX_LOOKAHEAD_SLOTS,
+                types::BlockFetch,
             },
         },
     },
@@ -199,6 +200,34 @@ pub async fn fill_slot_range(
     escrow_instance_id: Option<Pubkey>,
     instruction_tx: &InstructionSender,
 ) -> Result<u64, IndexerError> {
+    fill_linked_slot_range(
+        rpc_poller,
+        fallback_poller,
+        from_slot,
+        to_slot,
+        batch_size,
+        program_type,
+        escrow_instance_id,
+        instruction_tx,
+        None,
+    )
+    .await
+}
+
+/// `fill_slot_range` that also checks each block against `chain_link`, so a rewound
+/// channel stops the fill before any of its rows are written.
+#[allow(clippy::too_many_arguments)]
+async fn fill_linked_slot_range(
+    rpc_poller: &RpcPoller,
+    fallback_poller: Option<&RpcPoller>,
+    from_slot: u64,
+    to_slot: u64,
+    batch_size: usize,
+    program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
+    instruction_tx: &InstructionSender,
+    chain_link: Option<&ChainLink>,
+) -> Result<u64, IndexerError> {
     let mut processed_count: u64 = 0;
     let gap = to_slot - from_slot;
 
@@ -235,8 +264,19 @@ pub async fn fill_slot_range(
         };
 
         for (slot, block_fetch) in blocks {
+            let mut blockhash = None;
             match block_fetch {
                 BlockFetch::Present(block) => {
+                    if let Some(chain) = chain_link {
+                        chain
+                            .record(
+                                slot,
+                                block.parent_slot,
+                                &block.blockhash,
+                                &block.previous_blockhash,
+                            )
+                            .map_err(|reason| BackfillError::ChainLinkBroken { slot, reason })?;
+                    }
                     // A block with incomplete meta, or holding a supported instruction that
                     // will not decode, leaves the slot's contents unknown. Try one fallback
                     // re-fetch, then abort before the SlotComplete send so the checkpoint
@@ -301,6 +341,7 @@ pub async fn fill_slot_range(
                         .map_err(BackfillError::ChannelSend)?;
                     }
                     last_block = Some(slot);
+                    blockhash = Some(block.blockhash);
                     processed_count += 1;
                 }
                 BlockFetch::Skipped => {
@@ -320,7 +361,11 @@ pub async fn fill_slot_range(
 
             send_guaranteed(
                 instruction_tx,
-                ProcessorMessage::SlotComplete { slot, program_type },
+                ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type,
+                    blockhash,
+                },
                 "SlotComplete marker (backfill)",
             )
             .await
@@ -461,6 +506,7 @@ pub struct BackfillService {
     program_type: ProgramType,
     config: BackfillConfig,
     escrow_instance_id: Option<Pubkey>,
+    chain_link: Option<Arc<ChainLink>>,
 }
 
 impl BackfillService {
@@ -478,7 +524,14 @@ impl BackfillService {
             program_type,
             config,
             escrow_instance_id,
+            chain_link: None,
         }
+    }
+
+    /// Check every filled block against the shared channel chain link.
+    pub fn with_chain_link(mut self, chain_link: Option<Arc<ChainLink>>) -> Self {
+        self.chain_link = chain_link;
+        self
     }
 
     /// Arms the archival re-fetch for slots the primary serves in an unusable state.
@@ -587,7 +640,7 @@ impl BackfillService {
         to_slot: u64,
         instruction_tx: InstructionSender,
     ) -> Result<(), IndexerError> {
-        fill_slot_range(
+        fill_linked_slot_range(
             &self.rpc_poller,
             self.fallback_poller.as_deref(),
             from_slot,
@@ -596,6 +649,7 @@ impl BackfillService {
             self.program_type,
             self.escrow_instance_id,
             &instruction_tx,
+            self.chain_link.as_deref(),
         )
         .await?;
 
@@ -1056,6 +1110,7 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash11111111111111111111111111111",
                             "parentSlot": slot - 1,
+                            "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                             "transactions": [{
                                 "transaction": {
                                     "signatures": [crate::test_utils::pubkey::test_sig("sig_missing_meta")],
@@ -1089,6 +1144,7 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash11111111111111111111111111111",
                             "parentSlot": slot - 1,
+                            "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                             "transactions": [{
                                 "transaction": {
                                     "signatures": [crate::test_utils::pubkey::test_sig("sig_undecodable")],
@@ -1138,6 +1194,7 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash11111111111111111111111111111",
                             "parentSlot": slot - 1,
+                            "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                             "transactions": [{
                                 "transaction": {
                                     "signatures": [crate::test_utils::pubkey::test_sig("sig_decodable")],
@@ -1249,6 +1306,7 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash101",
                             "parentSlot": 100,
+                            "previousBlockhash": "TestBlockHash101",
                             "transactions": [{
                                 "transaction": {
                                     "signatures": [],
@@ -1737,6 +1795,7 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash111111111111111111111111111",
                             "parentSlot": slot - 1,
+                            "previousBlockhash": "TestBlockHash111111111111111111111111111",
                             "transactions": [],
                             // Also answers the signatures view, so an escrow consumer can confirm it empty.
                             "signatures": []

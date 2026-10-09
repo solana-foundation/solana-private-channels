@@ -30,6 +30,7 @@ fn empty_block_json(slot: u64) -> serde_json::Value {
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
         "parentSlot": slot - 1,
+        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
         "transactions": [],
         "signatures": []
     })

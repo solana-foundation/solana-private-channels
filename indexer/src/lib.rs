@@ -1,3 +1,4 @@
+pub mod channel_fence;
 pub mod channel_utils;
 pub mod config;
 pub mod error;

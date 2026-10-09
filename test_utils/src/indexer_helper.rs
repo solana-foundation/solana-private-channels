@@ -63,7 +63,8 @@ pub async fn start_private_channel_indexer(
     let backfill_config = BackfillConfig {
         enabled: true,
         batch_size: 100,
-        max_gap_slots: 100,
+        // Room for a restart from a checkpoint a test rolled back, as the Solana helper allows.
+        max_gap_slots: 1_000,
         exit_after_backfill: false,
         rpc_url: rpc_url.clone(),
         start_slot: None,

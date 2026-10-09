@@ -9,9 +9,9 @@ use crate::{
     error::StorageError,
     indexer::checkpoint::program_key,
     storage::common::models::{
-        DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
-        StoredSig, TransactionStatus, TransactionType,
+        ChannelFence, DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo,
+        MintDbBalance, MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers,
+        ServicedRow, StoredSig, TransactionStatus, TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::resync_state::resync_halt_reason,
@@ -750,6 +750,15 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_indexer_state_program ON indexer_state (program_type)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // The channel fence. Additive and nullable so older binaries ignore it.
+        sqlx::query(
+            "ALTER TABLE indexer_state
+                ADD COLUMN IF NOT EXISTS fence_slot BIGINT,
+                ADD COLUMN IF NOT EXISTS fence_blockhash TEXT",
         )
         .execute(&self.pool)
         .await?;
@@ -1763,25 +1772,114 @@ impl PostgresDb {
         &self,
         program_type: &str,
         slot: u64,
+        fence: Option<&ChannelFence>,
     ) -> Result<(), sqlx::Error> {
         // Monotonic guard: GREATEST() prevents a lower slot (e.g. backfill
         // replay after a flushed Yellowstone update) from regressing the cursor.
+        // The fence moves only forward too, both columns together.
         sqlx::query(
             r#"
-            INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
-            VALUES ($1, $2, NOW())
+            INSERT INTO indexer_state (program_type, last_committed_slot, fence_slot, fence_blockhash, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (program_type)
             DO UPDATE SET
                 last_committed_slot = GREATEST(indexer_state.last_committed_slot, EXCLUDED.last_committed_slot),
+                fence_slot = CASE
+                    WHEN EXCLUDED.fence_slot > COALESCE(indexer_state.fence_slot, -1)
+                    THEN EXCLUDED.fence_slot ELSE indexer_state.fence_slot END,
+                fence_blockhash = CASE
+                    WHEN EXCLUDED.fence_slot > COALESCE(indexer_state.fence_slot, -1)
+                    THEN EXCLUDED.fence_blockhash ELSE indexer_state.fence_blockhash END,
                 updated_at = NOW()
             "#,
         )
         .bind(program_type)
         .bind(slot as i64)
+        .bind(fence.map(|f| f.slot as i64))
+        .bind(fence.map(|f| f.blockhash.clone()))
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    pub async fn get_channel_fence_internal(&self) -> Result<Option<ChannelFence>, sqlx::Error> {
+        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT fence_slot, fence_blockhash FROM indexer_state WHERE program_type = $1",
+        )
+        .bind(program_key(ProgramType::Withdraw))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((Some(slot), Some(blockhash))) => Some(ChannelFence {
+                slot: slot as u64,
+                blockhash,
+            }),
+            _ => None,
+        })
+    }
+
+    pub async fn get_newest_known_mint_signatures_internal(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let query = match kind {
+            TransactionType::Deposit => {
+                r#"
+                SELECT counterpart_signature FROM transactions
+                 WHERE mint = $1 AND transaction_type = 'deposit' AND status = 'completed'
+                   AND counterpart_signature IS NOT NULL
+                 ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 1
+                "#
+            }
+            TransactionType::Withdrawal => {
+                r#"
+                SELECT landed_remint_signature FROM transactions
+                 WHERE mint = $1 AND transaction_type = 'withdrawal' AND status = 'failed_reminted'
+                   AND landed_remint_signature IS NOT NULL
+                 ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 1
+                "#
+            }
+        };
+        sqlx::query_scalar(query)
+            .bind(mint)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn get_max_withdrawal_nonce_internal(&self) -> Result<Option<u64>, sqlx::Error> {
+        let max: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(withdrawal_nonce) FROM transactions WHERE transaction_type = 'withdrawal'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(max.map(|nonce| nonce as u64))
+    }
+
+    pub async fn try_mark_reminted_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signature: String,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'failed_reminted',
+                landed_remint_signature = $3,
+                processed_at = NOW()
+            WHERE id = $1
+              AND status IN ('processing', 'pending_remint')
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(remint_signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn get_and_lock_pending_transactions_internal(

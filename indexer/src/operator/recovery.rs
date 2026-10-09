@@ -1,5 +1,6 @@
 //! Recovers rows stuck in `Processing` after an operator crash.
 
+use crate::channel_fence::fence_broken_on_tick;
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::OperatorError;
@@ -14,6 +15,7 @@ use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
 use crate::storage::common::storage::Storage;
 use chrono::{DateTime, Utc};
+use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
@@ -131,7 +133,15 @@ enum RecoveryAction {
     },
 }
 
+/// The channel endpoint the recovery tick re-checks the fence on, and the token it
+/// cancels when the channel was restored under the running operator.
+pub struct ChannelFenceWatch {
+    pub rpc: Arc<RpcClientWithRetry>,
+    pub broken: CancellationToken,
+}
+
 /// Recovery loop. First tick runs on boot (the prime crash-recovery moment).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_recovery_worker(
     storage: Arc<Storage>,
     rpc_client: Arc<RpcClientWithRetry>,
@@ -140,6 +150,7 @@ pub async fn run_recovery_worker(
     instance_pda: Option<Pubkey>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: CancellationToken,
+    fence_watch: Option<ChannelFenceWatch>,
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
     let finality = RecoveryFinality::new(&rpc_client, fallback_rpc_client.as_deref());
@@ -154,6 +165,15 @@ pub async fn run_recovery_worker(
                 break;
             }
             _ = interval.tick() => {
+                // Without this a primary restore done with the withdraw operator running
+                // would pay stale pending rows. Cancelling drains journaled sends as usual.
+                if let Some(watch) = &fence_watch {
+                    if fence_broken_on_tick(&storage, &watch.rpc, program_type.as_label()).await {
+                        watch.broken.cancel();
+                        cancellation_token.cancel();
+                        break;
+                    }
+                }
                 if let Err(e) = recover_once(
                     &storage,
                     &finality,
@@ -1123,6 +1143,79 @@ mod tests {
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::{mock::MockStorage, RemintClaim};
     use solana_commitment_config::CommitmentConfig;
+
+    /// A channel restored under a running operator stops it on the next recovery tick; a
+    /// check that cannot run only logs, so a flaky RPC never stops withdrawals.
+    #[tokio::test]
+    async fn recovery_tick_fence_mismatch_cancels() {
+        use mockito::{Matcher, Server};
+        use serde_json::json;
+
+        for (answer, want_cancel) in [
+            (
+                json!({ "result": { "blockhash": "Other", "previousBlockhash": "p" } }),
+                true,
+            ),
+            (
+                json!({ "error": { "code": -32000, "message": "busy" } }),
+                false,
+            ),
+        ] {
+            let mut server = Server::new_async().await;
+            let _slot = server
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({ "method": "getSlot" })))
+                .with_body(json!({ "jsonrpc": "2.0", "id": 1, "result": 200 }).to_string())
+                .create();
+            let mut block = answer.clone();
+            block["jsonrpc"] = json!("2.0");
+            block["id"] = json!(1);
+            let _block = server
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(json!({ "method": "getBlock" })))
+                .with_body(block.to_string())
+                .create();
+
+            let mock = MockStorage::new();
+            mock.set_channel_fence(150, "H150");
+            let storage = Arc::new(Storage::Mock(mock));
+            let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                RetryConfig {
+                    max_attempts: 1,
+                    base_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            ));
+            let (storage_tx, _storage_rx) = mpsc::channel(8);
+            let token = CancellationToken::new();
+            let broken = CancellationToken::new();
+            let worker = tokio::spawn(run_recovery_worker(
+                storage,
+                rpc.clone(),
+                None,
+                ProgramType::Escrow,
+                None,
+                storage_tx,
+                token.clone(),
+                Some(ChannelFenceWatch {
+                    rpc,
+                    broken: broken.clone(),
+                }),
+            ));
+
+            let finished = tokio::time::timeout(Duration::from_millis(500), async {
+                token.cancelled().await;
+            })
+            .await
+            .is_ok();
+            assert_eq!(finished, want_cancel, "answer {answer}");
+            assert_eq!(broken.is_cancelled(), want_cancel, "answer {answer}");
+            token.cancel();
+            worker.await.unwrap().unwrap();
+        }
+    }
 
     fn make_deposit_row(id: i64) -> DbTransaction {
         let now = Utc::now();
@@ -2963,14 +3056,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -3016,14 +3103,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             matches!(
                 validated,

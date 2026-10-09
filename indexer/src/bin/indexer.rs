@@ -373,6 +373,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
 
     common_config.validate()?;
     indexer_config.validate()?;
+    private_channel_indexer::config::validate_withdraw_datasource(&common_config, &indexer_config)?;
 
     private_channel_indexer::run(common_config, indexer_config, Some(health)).await?;
 

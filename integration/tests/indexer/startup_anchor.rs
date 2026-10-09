@@ -153,6 +153,7 @@ fn empty_block_json(slot: u64) -> serde_json::Value {
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
         "parentSlot": slot - 1,
+        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
         "transactions": [],
         "signatures": []
     })
@@ -332,6 +333,7 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
+                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": []
                     },
                     "id": 1
