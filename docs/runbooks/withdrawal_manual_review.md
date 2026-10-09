@@ -655,9 +655,7 @@ Nothing was broadcast for these rows.
    `retry_max_attempts` of at least 1.
 2. Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
    verdict: `NOT_LANDED`. If `LANDED`, switch to Path C.
-3. Restart the operator. The attempt counter lives in memory, so a re-armed row
-   would otherwise be quarantined again at once.
-4. Re-arm the row so the operator sends it again:
+3. Re-arm the row so the operator sends it again:
 
 ```sql
 UPDATE transactions

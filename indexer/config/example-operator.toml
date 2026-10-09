@@ -19,7 +19,7 @@ source_rpc_url = "http://localhost:18899"
 
 # Escrow instance ID. REQUIRED for every operator (escrow and withdraw) or it refuses to start.
 # Env: COMMON_ESCROW_INSTANCE_ID
-escrow_instance_id = "11111111111111111111111111111111"
+# escrow_instance_id = "YourPubkeyHere..."
 
 [storage]
 # Storage type: "postgres"
