@@ -263,7 +263,8 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-private-channel"} / 1e9
+              # Withdraw operator under its prod (Ansible) and dev/devnet compose job names.
+              expr: private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -297,7 +298,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-private-channel"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -337,7 +338,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: (max_over_time(private_channel_feepayer_balance_lamports{job="private-channel-operator-private-channel"}[1h]) - private_channel_feepayer_balance_lamports{job="private-channel-operator-private-channel"}) / 1e9
+              expr: (max_over_time(private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"}[1h]) - private_channel_feepayer_balance_lamports{job=~"private-channel-operator-private-channel|operator-private-channel"}) / 1e9
               instant: true
               refId: A
           - refId: C

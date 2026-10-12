@@ -73,7 +73,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "private_channel_feepayer_balance_lamports{job=\"private-channel-operator-private-channel\"} / 1e9",
+          "expr": "private_channel_feepayer_balance_lamports{job=~\"private-channel-operator-private-channel|operator-private-channel\"} / 1e9",
           "legendFormat": "{{program_type}}",
           "instant": true
         }
