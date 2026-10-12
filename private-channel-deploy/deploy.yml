@@ -616,6 +616,13 @@
   - name: Deployment config asserts
     tags: [ always, config_asserts ]
     block:
+    # compose_file treats anything but devnet/mainnet as localnet, so a typo would
+    # deploy the localnet stack without its validator assets.
+    - name: Assert network is a known cluster
+      ansible.builtin.assert:
+        that: network in ['localnet', 'devnet', 'mainnet']
+        fail_msg: "network={{ network }} must be localnet, devnet or mainnet."
+
     - name: Assert program IDs equal the compiled ones
       ansible.builtin.assert:
         that:

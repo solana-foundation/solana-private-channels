@@ -113,6 +113,9 @@ test_preflight_cases() {
   local common=(-e env=dev -e "admin_keypair_path=$TMP/admin.json" -e "host_data_dir=$data")
   local devnet=("${common[@]}" -e network=devnet -e fallback_rpc_url=https://fallback.invalid)
 
+  # An unknown name would pick the localnet compose file without its validator assets.
+  expect_refused unknown_network "localnet, devnet or mainnet" "${devnet[@]}" -e network=mainnet-beta \
+    -e escrow_instance_id=$INSTANCE
   # Tagged always: a single-phase rerun must not skip the config asserts.
   expect_refused custom_id_partial_run "must equal the compiled" "${devnet[@]}" -e escrow_instance_id=$INSTANCE \
     -e escrow_program_id=$INSTANCE --tags __no_such_phase__
