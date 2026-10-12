@@ -155,6 +155,7 @@ impl AdminVm {
     /// - InitializeMint data < 35 bytes         -> InvalidAccountData
     /// - InitializeMint empty accounts          -> InvalidAccountData
     /// - freeze authority tag=1, <32 trailing   -> InvalidAccountData
+    /// - freeze authority tag not 0 or 1        -> InvalidInstructionData
     /// - mint index out of `account_keys`       -> NotEnoughAccountKeys
     /// - mint read-only in the message          -> ReadonlyDataModified
     /// - existing target executable             -> ExecutableDataModified
@@ -320,16 +321,22 @@ impl AdminVm {
             return Err(InstructionError::InvalidAccountData);
         }
 
-        // Freeze-authority COption: byte 34 is the tag (0 = None, 1 = Some).
-        // When Some, bytes 35..67 carry the 32-byte pubkey; reject if truncated.
-        let freeze_authority = if instruction.data[34] == 1 {
-            if instruction.data.len() < 67 {
-                debug!("[admin-vm] InitializeMint: truncated freeze authority");
-                return Err(InstructionError::InvalidAccountData);
+        // Freeze-authority COption: byte 34 is the tag (0 = None, 1 = Some), and SPL
+        // Token rejects any other. When Some, bytes 35..67 carry the 32-byte pubkey;
+        // reject if truncated.
+        let freeze_authority = match instruction.data[34] {
+            0 => None,
+            1 => {
+                if instruction.data.len() < 67 {
+                    debug!("[admin-vm] InitializeMint: truncated freeze authority");
+                    return Err(InstructionError::InvalidAccountData);
+                }
+                Some(&instruction.data[35..67])
             }
-            Some(&instruction.data[35..67])
-        } else {
-            None
+            _ => {
+                debug!("[admin-vm] InitializeMint: invalid freeze authority tag");
+                return Err(InstructionError::InvalidInstructionData);
+            }
         };
 
         // Resolve the mint pubkey: InitializeMint places the mint at
@@ -990,6 +997,7 @@ mod tests {
         let mint_state = Mint::unpack(account.data()).unwrap();
         assert_eq!(mint_state.decimals, decimals);
         assert_eq!(mint_state.mint_authority, COption::Some(admin.pubkey()));
+        assert_eq!(mint_state.freeze_authority, COption::Some(admin.pubkey()));
     }
 
     /// Signature shared by spl-token's `initialize_mint` and `initialize_mint2`.
@@ -1262,6 +1270,24 @@ mod tests {
             Err(TransactionError::InstructionError(
                 0,
                 InstructionError::InvalidAccountData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// SPL Token accepts only 0 and 1 as the freeze-authority tag. Any other
+    /// value must be rejected, not read as None and the mint created.
+    #[test]
+    fn test_invalid_freeze_authority_tag_returns_invalid_instruction_data() {
+        let mut data = valid_init_mint_data(6, Pubkey::new_unique());
+        data[34] = 2;
+
+        let tx = make_spl_tx(spl_token::id(), &[1], data);
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidInstructionData,
             )),
         );
         assert!(executed.loaded_transaction.accounts.is_empty());
