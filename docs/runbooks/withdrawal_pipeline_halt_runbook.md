@@ -403,18 +403,29 @@ second time for a burn the user repeats on the restored channel.
    each of those releases so the gate can tie its nonce to a row. Use the values from
    step 2 and the release's `_verify_onchain_release.md` verdict (`LANDED` only):
 
+   A surviving burn may have been renumbered onto that nonce, so move it to a fresh nonce in
+   the same transaction:
+
    ```sql
    -- One per release from step 2. The nonce is given explicitly, so the trigger keeps it.
+   BEGIN;
+   -- Past every nonce the chain or the DB has used.
+   SELECT setval('withdrawal_nonce_seq',
+                 GREATEST(:highest_consumed_nonce,
+                          (SELECT MAX(withdrawal_nonce) FROM transactions
+                            WHERE transaction_type = 'withdrawal')));
+   UPDATE transactions SET withdrawal_nonce = nextval('withdrawal_nonce_seq'), updated_at = NOW()
+    WHERE transaction_type = 'withdrawal' AND withdrawal_nonce = :withdrawal_nonce;
    INSERT INTO transactions
        (signature, instruction_index, inner_index, slot, initiator, recipient, mint, amount,
         transaction_type, withdrawal_nonce, status, counterpart_signature, processed_at)
    VALUES
        (:signature, :instruction_index, :inner_index, :slot, :initiator, :recipient, :mint,
         :amount, 'withdrawal', :withdrawal_nonce, 'completed', :counterpart_signature, NOW());
+   COMMIT;
    ```
 
-   Then make sure the sequence is past every nonce used, as in step 4 of the unexplained
-   nonce procedure, and restart the withdraw operator.
+   Then restart the withdraw operator.
 
 If the log reads `channel fence not checked yet`, there is no verdict: the RPC failed, the
 tip stayed below the fence slot, the node does not serve the fence block yet, or the fence

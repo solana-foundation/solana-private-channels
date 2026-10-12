@@ -614,6 +614,8 @@ pub async fn run(
     indexer_config
         .validate()
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::validate_withdraw_datasource(&common_config, &indexer_config)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // 1. Initialize storage
     let storage: Arc<Storage> = match common_config.storage_type {

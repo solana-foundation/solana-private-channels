@@ -609,21 +609,21 @@ async fn build_consumed_claims(
         crate::config::ProgramType::Escrow => crate::storage::TransactionType::Deposit,
         crate::config::ProgramType::Withdraw => crate::storage::TransactionType::Withdrawal,
     };
-    if !storage.get_mint_addresses().await?.is_empty() {
-        match channel_rpc.get_address_index_slot().await {
-            // Only core indexes addresses after the block lands; a node without the
-            // method writes its index with the block, so its history is complete.
-            Err(e) if crate::operator::utils::rpc_util::is_method_not_found(&e) => {
-                warn!("Channel RPC has no getAddressIndexSlot; its address index is synchronous");
-            }
-            _ => sender::wait_for_address_index(
-                channel_rpc,
-                sender::INDEX_CATCH_UP_BUDGET,
-                std::time::Duration::from_millis(500),
-            )
-            .await
-            .map_err(|reason| OperatorError::ConsumedSet { reason })?,
+    // Waited for even with no mints yet: a mint allowed after boot is walked lazily, and
+    // its pre-boot history must already be indexed by then.
+    match channel_rpc.get_address_index_slot().await {
+        // Only core indexes addresses after the block lands; a node without the
+        // method writes its index with the block, so its history is complete.
+        Err(e) if crate::operator::utils::rpc_util::is_method_not_found(&e) => {
+            warn!("Channel RPC has no getAddressIndexSlot; its address index is synchronous");
         }
+        _ => sender::wait_for_address_index(
+            channel_rpc,
+            sender::INDEX_CATCH_UP_BUDGET,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        .map_err(|reason| OperatorError::ConsumedSet { reason })?,
     }
     let cache = sender::ConsumedSetCache::build_at_boot(
         channel_rpc,
