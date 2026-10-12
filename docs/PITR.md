@@ -116,7 +116,9 @@ reopens this risk (audit finding SOLA6-104) and needs its own review.
 ### Step 1: Stop everything that reads or writes either database
 
 The same services stop for either restore. An indexer or operator left running across a
-primary restore keeps acting on the old channel history.
+primary restore keeps acting on the old channel history, and the checks run at boot only.
+Worse, a withdraw indexer left running moves its fence onto the restored chain, after which
+no later boot can see the restore at all. Stop everything first.
 
 ```bash
 docker compose stop indexer-solana indexer-private-channel operator-solana operator-private-channel streamer read-node write-node
@@ -270,10 +272,13 @@ What happens after `postgres-indexer` is restored to an earlier point:
 **Channel fence.** The withdraw indexer stores the hash of the newest channel block at or
 below its checkpoint (`indexer_state.fence_slot`, `fence_blockhash` on the `withdraw` row).
 At boot the withdraw indexer and both operators wait until the channel tip reaches that
-slot and then compare the block. The withdraw indexer also checks that every new block
-links to the previous one, and the operators re-check the fence on every recovery tick
-(60 seconds). A restored channel re-produces the same slots with new hashes, so any of
-these fails. The log reads `channel fence check failed: ...`, and the metric
+slot and then compare the block. The check is at boot only: a service left running across
+a primary restore may never be detected: a running withdraw indexer moves its fence onto
+the restored chain. That is why Step 1 stops everything first. It refuses only on proof that the channel no longer has the fence block: the slot
+holds a block with another hash, or the node serves a later block whose parent is below
+the fence slot (its chain skips the slot). A block a node does not serve yet is never
+proof, because a read node's cached tip can be ahead of its replica. The log reads
+`channel fence mismatch: ...` with the proof, and the metric
 `private_channel_channel_fence_mismatch_total` increases.
 
 - Cause: the primary was restored without the indexer, or the indexer was restored to a
@@ -285,15 +290,15 @@ these fails. The log reads `channel fence check failed: ...`, and the metric
   withdrawals paid for burns the channel no longer has) are not repaired automatically.
   Treat them through [withdrawal_pipeline_halt_runbook.md](runbooks/withdrawal_pipeline_halt_runbook.md#channel-fence-refused).
 
-`channel fence could not be checked: ...` means the RPC did not answer, the tip stayed
-below the fence slot for 10 minutes, or the fence block was pruned by `truncate` (the
-message says so). A pruned fence block can only happen if the withdraw indexer was stopped
-or lagging for longer than the retention window. Confirm that no primary restore happened
-since the indexer last ran, then set `fence_slot` and `fence_blockhash` to NULL on the
-`withdraw` row of `indexer_state`; the next checkpoint flush writes a new fence. This is
-the only case where clearing the fence by hand is right. If the RPC answers and the tip is far below the fence
-slot, that is almost certainly a primary restore that rolled back more than 10 minutes:
-treat it as a fence refusal. Otherwise restore the channel RPC; the next restart retries.
+`channel fence not checked yet: ...` is not a verdict. The node could not answer within
+10 minutes: the RPC failed, the tip stayed below the fence slot, the node does not serve
+the fence block yet (a lagging replica), or the fence block was pruned by `truncate` (the
+message says which). Fix the node or wait; the next restart checks again. A pruned fence
+block can only happen if the withdraw indexer was stopped or lagging for longer than the
+retention window. Confirm that no primary restore happened since the indexer last ran,
+then set `fence_slot` and `fence_blockhash` to NULL on the `withdraw` row of
+`indexer_state`; the next checkpoint flush writes a new fence. This is the only case where
+clearing the fence by hand is right.
 
 A fence that is null (first boot after upgrade, or right after a withdraw resync) is not
 checked; the first checkpoint flush writes it.

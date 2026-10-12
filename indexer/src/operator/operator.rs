@@ -176,7 +176,6 @@ pub async fn run(
         verify_fence_for_operator(&storage, &channel_rpc, common_config.program_type),
     )
     .await?;
-    let fence_broken = CancellationToken::new();
 
     // Rows an indexer restore re-created are checked against this before anything is sent.
     let consumed = under_live_lock(
@@ -372,13 +371,8 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
-    // Recovery worker: resolves rows stuck in Processing after a crash, and re-checks
-    // the channel fence every tick.
+    // Recovery worker: resolves rows stuck in Processing after a crash.
     let recovery_handle = {
-        let fence_watch = recovery::ChannelFenceWatch {
-            rpc: channel_rpc.clone(),
-            broken: fence_broken.clone(),
-        };
         let recovery_storage = storage.clone();
         let recovery_rpc = rpc_client.clone();
         let recovery_fallback = fallback_rpc_client.clone();
@@ -394,7 +388,6 @@ pub async fn run(
                 recovery_instance,
                 recovery_storage_tx,
                 recovery_token,
-                Some(fence_watch),
             )
             .await
             {
@@ -587,12 +580,6 @@ pub async fn run(
         if let Err(e) = promotion_handle.await {
             error!("Release promotion join error during shutdown: {}", e);
         }
-    }
-
-    if fence_broken.is_cancelled() {
-        return Err(OperatorError::ChannelFence {
-            reason: "the channel was restored while the operator was running".to_string(),
-        });
     }
 
     info!("Operator shutdown complete");
@@ -927,7 +914,7 @@ mod tests {
             ))
             .with_body(
                 json!({ "jsonrpc": "2.0", "id": 1, "result": {
-                    "blockhash": "Reproduced300", "previousBlockhash": "p"
+                    "blockhash": "Reproduced300", "parentSlot": 299
                 }})
                 .to_string(),
             )

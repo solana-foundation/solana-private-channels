@@ -354,17 +354,16 @@ These `UPDATE`s are bookkeeping only. They record releases the chain already mad
 
 ### Symptom
 
-- The withdraw indexer or an operator exits at boot, or stops while running, with
-  `channel fence check failed: ...` (for example `channel block <slot> is <hash>, the
-  indexer recorded <hash>` or `channel has no block at fence slot <slot>`), or the withdraw
-  indexer logs `Block <slot> does not extend the channel history the indexer read`.
+- The withdraw indexer or an operator exits at boot with `channel fence mismatch: ...`,
+  followed by the proof: `channel block <slot> has hash <hash>, the indexer recorded <hash>`,
+  or `the channel skips fence slot <slot>: its block <later> follows block <parent>`.
 - `private_channel_channel_fence_mismatch_total` increases.
 
 ### Why it refuses
 
 The withdraw indexer records the hash of the channel block its checkpoint was built on. A
 channel primary restored to an earlier point re-produces the same slots with new hashes, so
-the recorded block is gone. Left running, the withdraw indexer would skip burns above the
+the recorded block is gone. Started on it, the withdraw indexer would skip burns above the
 restored tip, the escrow operator would keep crediting a channel that lost earlier credits,
 and the withdraw operator would release pending rows whose burn was rolled back, or a
 second time for a burn the user repeats on the restored channel.
@@ -417,9 +416,7 @@ second time for a burn the user repeats on the restored channel.
    Then make sure the sequence is past every nonce used, as in step 4 of the unexplained
    nonce procedure, and restart the withdraw operator.
 
-If the log reads `channel fence could not be checked`, the channel RPC did not answer, its
-tip stayed below the fence slot for 10 minutes, or the fence block was pruned. A tip far
-below the fence with a healthy RPC is a primary restore that rolled back more than 10
-minutes: treat it as above. For a pruned fence block, follow
-[`../PITR.md`](../PITR.md#what-a-refusal-after-a-restore-means). Otherwise fix the RPC
-and restart.
+If the log reads `channel fence not checked yet`, there is no verdict: the RPC failed, the
+tip stayed below the fence slot, the node does not serve the fence block yet, or the fence
+block was pruned. Fix the node or wait and restart. For a pruned fence block, follow
+[`../PITR.md`](../PITR.md#what-a-refusal-after-a-restore-means).

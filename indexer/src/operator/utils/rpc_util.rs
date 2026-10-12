@@ -322,12 +322,12 @@ impl RpcClientWithRetry {
         }
     }
 
-    /// Read `(blockhash, previousBlockhash)` of the block at `slot`, or `None` when the
-    /// node reports it skipped or missing (-32004, -32007, -32009, or a null result).
-    pub async fn get_block_hashes(
+    /// Read `(blockhash, parentSlot)` of the block at `slot`, or `None` when the node
+    /// reports it skipped or missing (-32004, -32007, -32009, or a null result).
+    pub async fn get_block_summary(
         &self,
         slot: u64,
-    ) -> Result<Option<(String, String)>, Box<client_error::Error>> {
+    ) -> Result<Option<(String, u64)>, Box<client_error::Error>> {
         let params = serde_json::json!([slot, {
             "transactionDetails": "none",
             "rewards": false,
@@ -335,7 +335,7 @@ impl RpcClientWithRetry {
             "commitment": self.rpc_client.commitment().commitment.to_string(),
         }]);
         let block = self
-            .with_retry("get_block_hashes", RetryPolicy::Idempotent, || async {
+            .with_retry("get_block_summary", RetryPolicy::Idempotent, || async {
                 match self
                     .rpc_client
                     .send::<Option<serde_json::Value>>(RpcRequest::GetBlock, params.clone())
@@ -349,15 +349,30 @@ impl RpcClientWithRetry {
         let Some(block) = block else {
             return Ok(None);
         };
-        match (
-            block["blockhash"].as_str(),
-            block["previousBlockhash"].as_str(),
-        ) {
-            (Some(hash), Some(prev)) => Ok(Some((hash.to_string(), prev.to_string()))),
+        match (block["blockhash"].as_str(), block["parentSlot"].as_u64()) {
+            (Some(hash), Some(parent)) => Ok(Some((hash.to_string(), parent))),
             _ => Err(Box::new(client_error::Error::from(ErrorKind::Custom(
-                format!("getBlock({slot}) reply lacks blockhash or previousBlockhash"),
+                format!("getBlock({slot}) reply lacks blockhash or parentSlot"),
             )))),
         }
+    }
+
+    /// The first `limit` slots at or after `start_slot` that hold a block.
+    pub async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>, Box<client_error::Error>> {
+        self.with_retry("get_blocks_with_limit", RetryPolicy::Idempotent, || async {
+            self.rpc_client
+                .get_blocks_with_limit_and_commitment(
+                    start_slot,
+                    limit,
+                    self.rpc_client.commitment(),
+                )
+                .await
+        })
+        .await
     }
 
     /// Get the cluster genesis hash with retry. Used once at withdraw startup to

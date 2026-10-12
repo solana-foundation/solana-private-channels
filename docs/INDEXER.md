@@ -191,12 +191,13 @@ newest channel block at or below its checkpoint, slot and hash, on its `indexer_
 (`fence_slot`, `fence_blockhash`), in the same statement as the checkpoint. A block hash
 is used, not a counter, because the channel produces it and a restored channel re-produces
 the same slots with new hashes. At boot the withdraw indexer and both operators wait for
-the channel tip to reach the fence slot and refuse to start if that block is missing or
-has another hash; the operators repeat the check on every recovery tick. While running,
-the withdraw indexer checks that every block's `previousBlockhash` matches the block
-before it (the backfill and live pollers share one chain link, seeded with the fence) and
-exits on a break. Because only the RPC poller sees block hashes, the withdraw indexer
-requires the `rpc_polling` datasource.
+the channel tip to reach the fence slot and refuse to start only on proof: the slot holds
+a block with another hash, or the node serves a later block whose parent is below the
+fence slot. A block the node does not serve yet only makes boot wait, since a read node's
+cached tip can be ahead of its replica. The check runs at boot only, and a withdraw indexer
+left running moves its fence onto a restored chain, so every service must be stopped before
+a restore. Because only the RPC poller sees block hashes, the withdraw
+indexer requires the `rpc_polling` datasource.
 
 An indexer DB restored to an earlier point is allowed. At boot each operator walks every
 receipt mint's channel history, newest first, down to the newest mint of its own kind the

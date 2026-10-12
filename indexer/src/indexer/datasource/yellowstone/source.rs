@@ -1011,7 +1011,6 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot.saturating_sub(1),
-                        "previousBlockhash": "TestBlockHash11111111111111111111111111111",
                         "transactions": [],
                         // Also answers the signatures view, so an escrow consumer can confirm it empty.
                         "signatures": []

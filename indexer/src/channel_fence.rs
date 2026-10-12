@@ -1,35 +1,31 @@
-use crate::metrics::CHANNEL_FENCE_MISMATCH;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::ChannelFence;
-use crate::storage::Storage;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// Outcome of checking the channel against the withdraw indexer's fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FenceVerdict {
     /// The channel still has the fence block, or there is no fence yet.
     Ok,
-    /// The channel was restored behind the indexer DB.
+    /// The channel proved it no longer has the fence block: another hash, or a chain that
+    /// skips the slot. Nothing else counts, so this never fires without a restore.
     Mismatch(String),
-    /// The check could not run; never read as a verdict either way.
+    /// No verdict yet: a lagging or pruned node, or an RPC error. Never read as a restore.
     Unavailable(String),
 }
 
-/// How long the check may wait for the channel tip to reach the fence slot.
+/// How long boot may wait for the channel to give a verdict.
 #[derive(Debug, Clone, Copy)]
 pub enum FenceWait {
-    /// Boot: a tip below the fence may be a node still catching up, so wait for it.
     UntilTip { poll: Duration, budget: Duration },
-    /// Recovery tick: wait out a moment of replica lag, then a tip still below is a rewind.
-    Brief { poll: Duration, budget: Duration },
 }
 
-/// The fence was read from this channel, so a tip still below it after this is a rewind.
-const TICK_WAIT: FenceWait = FenceWait::Brief {
-    poll: Duration::from_secs(1),
-    budget: Duration::from_secs(15),
-};
+/// One read of the channel: a verdict, or a reason to look again.
+enum Probe {
+    Final(FenceVerdict),
+    Retry(String),
+}
 
 /// Check the channel still holds the fence block. A block hash is used rather than a
 /// counter because the channel produces it: a restored channel re-produces the fence slot
@@ -42,93 +38,99 @@ pub async fn verify_channel_fence(
     let Some(fence) = fence else {
         return FenceVerdict::Ok;
     };
+    let FenceWait::UntilTip { poll, budget } = wait;
     let started = tokio::time::Instant::now();
     loop {
-        let tip = match rpc.get_slot().await {
-            Ok(tip) => tip,
-            Err(e) => return FenceVerdict::Unavailable(format!("channel tip unreadable: {e}")),
+        let reason = match probe(rpc, fence).await {
+            Probe::Final(verdict) => return verdict,
+            Probe::Retry(reason) => reason,
         };
-        if tip >= fence.slot {
-            break;
+        if started.elapsed() >= budget {
+            return FenceVerdict::Unavailable(format!("{reason}, still after {budget:?}"));
         }
-        match wait {
-            FenceWait::Brief { poll, budget } => {
-                if started.elapsed() >= budget {
-                    return FenceVerdict::Mismatch(format!(
-                        "channel tip {tip} stayed below fence slot {} for {budget:?}",
-                        fence.slot
-                    ));
-                }
-                tokio::time::sleep(poll).await;
-            }
-            FenceWait::UntilTip { poll, budget } => {
-                if started.elapsed() >= budget {
-                    return FenceVerdict::Unavailable(format!(
-                        "channel tip {tip} stayed below fence slot {} for {budget:?}",
-                        fence.slot
-                    ));
-                }
-                info!(
-                    tip,
-                    fence_slot = fence.slot,
-                    "Waiting for the channel tip to reach the fence"
-                );
-                tokio::time::sleep(poll).await;
-            }
-        }
-    }
-
-    match rpc.get_block_hashes(fence.slot).await {
-        Ok(Some((hash, _))) if hash == fence.blockhash => FenceVerdict::Ok,
-        Ok(Some((hash, _))) => FenceVerdict::Mismatch(format!(
-            "channel block {} is {hash}, the indexer recorded {}",
-            fence.slot, fence.blockhash
-        )),
-        // The tip is past the slot, so a missing block is an answer, not lag, unless
-        // `truncate` pruned it, which says nothing about a restore.
-        Ok(None) => match rpc.get_first_available_block().await {
-            Ok(floor) if fence.slot < floor => FenceVerdict::Unavailable(format!(
-                "fence block {} is below the channel's first available block {floor}; it was \
-                 pruned, so the fence cannot be checked",
-                fence.slot
-            )),
-            Ok(_) => FenceVerdict::Mismatch(format!(
-                "channel has no block at fence slot {}, the indexer recorded {}",
-                fence.slot, fence.blockhash
-            )),
-            Err(e) => FenceVerdict::Unavailable(format!(
-                "channel has no block at fence slot {} and its first available block is \
-                 unreadable: {e}",
-                fence.slot
-            )),
-        },
-        Err(e) => {
-            FenceVerdict::Unavailable(format!("channel block {} unreadable: {e}", fence.slot))
-        }
+        info!(
+            fence_slot = fence.slot,
+            "Waiting to check the channel fence: {reason}"
+        );
+        tokio::time::sleep(poll).await;
     }
 }
 
-/// Re-check on a running operator. Only a mismatch counts: a check that cannot run is
-/// retried on the next tick instead of stopping withdrawals over an RPC blip.
-pub async fn fence_broken_on_tick(storage: &Storage, rpc: &RpcClientWithRetry, role: &str) -> bool {
-    let fence = match storage.get_channel_fence().await {
-        Ok(fence) => fence,
+async fn probe(rpc: &RpcClientWithRetry, fence: &ChannelFence) -> Probe {
+    let tip = match rpc.get_slot().await {
+        Ok(tip) => tip,
         Err(e) => {
-            warn!("Channel fence unreadable on recovery tick, retrying next tick: {e}");
-            return false;
+            return Probe::Final(FenceVerdict::Unavailable(format!(
+                "channel tip unreadable: {e}"
+            )))
         }
     };
-    match verify_channel_fence(rpc, fence.as_ref(), TICK_WAIT).await {
-        FenceVerdict::Ok => false,
-        FenceVerdict::Mismatch(reason) => {
-            CHANNEL_FENCE_MISMATCH.with_label_values(&[role]).inc();
-            error!("Channel was restored under the running operator, stopping: {reason}");
-            true
+    if tip < fence.slot {
+        return Probe::Retry(format!(
+            "channel tip {tip} is below fence slot {}",
+            fence.slot
+        ));
+    }
+    match rpc.get_block_summary(fence.slot).await {
+        Ok(Some((hash, _))) if hash == fence.blockhash => Probe::Final(FenceVerdict::Ok),
+        Ok(Some((hash, _))) => Probe::Final(FenceVerdict::Mismatch(format!(
+            "channel block {} has hash {hash}, the indexer recorded {}",
+            fence.slot, fence.blockhash
+        ))),
+        Ok(None) => probe_missing_block(rpc, fence).await,
+        Err(e) => Probe::Final(FenceVerdict::Unavailable(format!(
+            "channel block {} unreadable: {e}",
+            fence.slot
+        ))),
+    }
+}
+
+/// A missing fence block is not proof: a read node's cached tip can be ahead of its replica.
+/// The proof is a later block on the same node whose parent is below the fence slot. Its
+/// block list reads Postgres, and replication is ordered, so it holds every earlier block.
+async fn probe_missing_block(rpc: &RpcClientWithRetry, fence: &ChannelFence) -> Probe {
+    match rpc.get_first_available_block().await {
+        Ok(floor) if fence.slot < floor => {
+            return Probe::Final(FenceVerdict::Unavailable(format!(
+                "fence block {} is below the channel's first available block {floor} (pruned)",
+                fence.slot
+            )))
         }
-        FenceVerdict::Unavailable(reason) => {
-            warn!("Channel fence unchecked on recovery tick, retrying next tick: {reason}");
-            false
+        Ok(_) => {}
+        Err(e) => {
+            return Probe::Final(FenceVerdict::Unavailable(format!(
+                "channel first available block unreadable: {e}"
+            )))
         }
+    }
+    let later = match rpc.get_blocks_with_limit(fence.slot + 1, 1).await {
+        Ok(slots) => slots.into_iter().next(),
+        Err(e) => {
+            return Probe::Final(FenceVerdict::Unavailable(format!(
+                "channel block list unreadable: {e}"
+            )))
+        }
+    };
+    let Some(later) = later else {
+        return Probe::Retry(format!(
+            "channel does not serve fence block {} yet",
+            fence.slot
+        ));
+    };
+    match rpc.get_block_summary(later).await {
+        Ok(Some((_, parent))) if parent < fence.slot => {
+            Probe::Final(FenceVerdict::Mismatch(format!(
+                "the channel skips fence slot {}: its block {later} follows block {parent}",
+                fence.slot
+            )))
+        }
+        Ok(_) => Probe::Retry(format!(
+            "channel does not serve fence block {} yet but has block {later}",
+            fence.slot
+        )),
+        Err(e) => Probe::Final(FenceVerdict::Unavailable(format!(
+            "channel block {later} unreadable: {e}"
+        ))),
     }
 }
 
@@ -159,11 +161,15 @@ mod tests {
         }
     }
 
+    fn reply(result: serde_json::Value) -> String {
+        json!({ "jsonrpc": "2.0", "id": 1, "result": result }).to_string()
+    }
+
     fn mock_slot(server: &mut ServerGuard, slot: u64) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(Matcher::PartialJson(json!({ "method": "getSlot" })))
-            .with_body(json!({ "jsonrpc": "2.0", "result": slot, "id": 1 }).to_string())
+            .with_body(reply(json!(slot)))
             .create()
     }
 
@@ -177,9 +183,9 @@ mod tests {
             .create()
     }
 
-    fn block_body(hash: &str) -> serde_json::Value {
+    fn block_body(hash: &str, parent: u64) -> serde_json::Value {
         json!({ "jsonrpc": "2.0", "id": 1, "result": {
-            "blockhash": hash, "previousBlockhash": "prev", "parentSlot": 99,
+            "blockhash": hash, "previousBlockhash": "prev", "parentSlot": parent,
             "blockHeight": 10, "blockTime": null
         }})
     }
@@ -188,63 +194,151 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": code, "message": "missing" } })
     }
 
-    const BOOT: FenceWait = FenceWait::UntilTip {
-        poll: Duration::from_millis(5),
-        budget: Duration::from_millis(300),
-    };
-
-    const TICK: FenceWait = FenceWait::Brief {
-        poll: Duration::from_millis(5),
-        budget: Duration::from_millis(50),
-    };
-
     fn mock_floor(server: &mut ServerGuard, floor: u64) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(Matcher::PartialJson(
                 json!({ "method": "getFirstAvailableBlock" }),
             ))
-            .with_body(json!({ "jsonrpc": "2.0", "result": floor, "id": 1 }).to_string())
+            .with_body(reply(json!(floor)))
             .create()
     }
 
+    fn mock_later_blocks(server: &mut ServerGuard, slots: &[u64]) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({ "method": "getBlocksWithLimit" }),
+            ))
+            .with_body(reply(json!(slots)))
+            .create()
+    }
+
+    const BOOT: FenceWait = FenceWait::UntilTip {
+        poll: Duration::from_millis(5),
+        budget: Duration::from_millis(100),
+    };
+
+    fn label(verdict: &FenceVerdict) -> &'static str {
+        match verdict {
+            FenceVerdict::Ok => "ok",
+            FenceVerdict::Mismatch(_) => "mismatch",
+            FenceVerdict::Unavailable(_) => "unavailable",
+        }
+    }
+
+    /// The fence block is slot 100. A served block never changes or disappears without a
+    /// restore, so only a different hash, or the node's own later block skipping slot 100,
+    /// proves one. Everything else is a node that cannot answer yet.
     #[tokio::test]
     async fn fence_verify_matrix() {
-        // (tip, getBlock answer, first available block, wait, expected)
-        type Case = (u64, serde_json::Value, u64, FenceWait, &'static str);
+        // (case, getBlock(100), first available block, later blocks, getBlock(later), want)
+        type Case = (
+            &'static str,
+            serde_json::Value,
+            u64,
+            Vec<u64>,
+            Option<serde_json::Value>,
+            &'static str,
+        );
         let cases: Vec<Case> = vec![
-            (100, block_body("H"), 0, BOOT, "ok"),
-            (100, block_body("other"), 0, BOOT, "mismatch"),
-            (150, error_body(-32007), 0, BOOT, "mismatch"),
-            (150, error_body(-32004), 0, BOOT, "mismatch"),
+            ("same hash", block_body("H", 99), 0, vec![], None, "ok"),
             (
-                150,
-                json!({ "jsonrpc": "2.0", "id": 1, "result": null }),
+                "hash differs",
+                block_body("other", 99),
                 0,
-                BOOT,
+                vec![],
+                None,
                 "mismatch",
             ),
-            (150, error_body(-32000), 0, BOOT, "unavailable"),
-            // Pruned by truncate, not restored: the block is gone for another reason.
-            (150, error_body(-32007), 120, BOOT, "unavailable"),
-            (150, error_body(-32007), 120, TICK, "unavailable"),
-            (90, block_body("H"), 0, TICK, "mismatch"),
-            (90, block_body("H"), 0, BOOT, "unavailable"),
+            // A read node whose cached tip is ahead of its replica: no later block yet.
+            (
+                "lagging node, skipped",
+                error_body(-32007),
+                0,
+                vec![],
+                None,
+                "unavailable",
+            ),
+            (
+                "lagging node, not available",
+                error_body(-32004),
+                0,
+                vec![],
+                None,
+                "unavailable",
+            ),
+            (
+                "lagging node, null",
+                json!({ "jsonrpc": "2.0", "id": 1, "result": null }),
+                0,
+                vec![],
+                None,
+                "unavailable",
+            ),
+            (
+                "lagging node, -32009",
+                error_body(-32009),
+                0,
+                vec![],
+                None,
+                "unavailable",
+            ),
+            (
+                "restored chain skips the slot",
+                error_body(-32007),
+                0,
+                vec![105],
+                Some(block_body("N105", 98)),
+                "mismatch",
+            ),
+            (
+                "later block names the fence slot",
+                error_body(-32007),
+                0,
+                vec![105],
+                Some(block_body("N105", 100)),
+                "unavailable",
+            ),
+            (
+                "truncated below the fence",
+                error_body(-32007),
+                120,
+                vec![150],
+                Some(block_body("N150", 98)),
+                "unavailable",
+            ),
+            (
+                "block read fails",
+                error_body(-32000),
+                0,
+                vec![],
+                None,
+                "unavailable",
+            ),
         ];
-        for (tip, answer, floor, wait, want) in cases {
+        for (case, answer, floor, later, later_block, want) in cases {
             let mut server = Server::new_async().await;
-            let _slot = mock_slot(&mut server, tip);
-            let _block = mock_block(&mut server, 100, answer.clone());
+            let _slot = mock_slot(&mut server, 150);
+            let _block = mock_block(&mut server, 100, answer);
             let _floor = mock_floor(&mut server, floor);
+            let _later = mock_later_blocks(&mut server, &later);
+            let _later_block = later_block.map(|body| mock_block(&mut server, later[0], body));
             let verdict =
-                verify_channel_fence(&fast_rpc(&server.url()), Some(&fence(100, "H")), wait).await;
-            let got = match verdict {
-                FenceVerdict::Ok => "ok",
-                FenceVerdict::Mismatch(_) => "mismatch",
-                FenceVerdict::Unavailable(_) => "unavailable",
-            };
-            assert_eq!(got, want, "tip {tip}, answer {answer}, verdict {verdict:?}");
+                verify_channel_fence(&fast_rpc(&server.url()), Some(&fence(100, "H")), BOOT).await;
+            assert_eq!(label(&verdict), want, "{case}: {verdict:?}");
         }
+    }
+
+    /// A tip below the fence slot is a node catching up: waited for, and never a mismatch.
+    #[tokio::test]
+    async fn fence_verify_tip_below_is_never_a_mismatch() {
+        let mut server = Server::new_async().await;
+        let _slot = mock_slot(&mut server, 90);
+        let _block = mock_block(&mut server, 100, block_body("H", 99));
+        let verdict =
+            verify_channel_fence(&fast_rpc(&server.url()), Some(&fence(100, "H")), BOOT).await;
+        assert_eq!(label(&verdict), "unavailable", "{verdict:?}");
     }
 
     /// A node still catching up at boot is waited for, not refused.
@@ -252,7 +346,7 @@ mod tests {
     async fn fence_verify_waits_for_the_tip() {
         let mut server = Server::new_async().await;
         let behind = mock_slot(&mut server, 90).expect(2);
-        let _block = mock_block(&mut server, 100, block_body("H"));
+        let _block = mock_block(&mut server, 100, block_body("H", 99));
         let rpc = fast_rpc(&server.url());
         let check =
             tokio::spawn(
@@ -264,20 +358,22 @@ mod tests {
         assert_eq!(check.await.unwrap(), FenceVerdict::Ok);
     }
 
-    /// A replica lagging for a moment on the recovery tick is waited for, not taken as a restore.
+    /// A lagging replica that catches up within the budget is waited for, then verified.
     #[tokio::test]
-    async fn fence_tick_waits_out_a_brief_lag() {
+    async fn fence_verify_waits_for_a_lagging_replica() {
         let mut server = Server::new_async().await;
-        let behind = mock_slot(&mut server, 90).expect(2);
-        let _block = mock_block(&mut server, 100, block_body("H"));
+        let _slot = mock_slot(&mut server, 150);
+        let _floor = mock_floor(&mut server, 0);
+        let _later = mock_later_blocks(&mut server, &[]);
+        let missing = mock_block(&mut server, 100, error_body(-32007)).expect_at_least(1);
         let rpc = fast_rpc(&server.url());
         let check =
             tokio::spawn(
-                async move { verify_channel_fence(&rpc, Some(&fence(100, "H")), TICK).await },
+                async move { verify_channel_fence(&rpc, Some(&fence(100, "H")), BOOT).await },
             );
-        tokio::time::sleep(Duration::from_millis(8)).await;
-        behind.remove();
-        let _caught_up = mock_slot(&mut server, 120);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        missing.remove();
+        let _present = mock_block(&mut server, 100, block_body("H", 99));
         assert_eq!(check.await.unwrap(), FenceVerdict::Ok);
     }
 

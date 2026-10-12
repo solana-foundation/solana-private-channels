@@ -1,6 +1,6 @@
 //! Channel fence: a channel restored behind the indexer DB re-produces slots with new
-//! hashes, so the withdraw indexer must refuse to resume (SOLA13-99) or stop if it runs,
-//! and the escrow operator, which reads the same fence, must refuse too (SOLA13-164).
+//! hashes, so the withdraw indexer must refuse to resume (SOLA13-99) and both operators,
+//! which read the same fence, must refuse to start too (SOLA13-164, 186, 212).
 
 #[path = "helpers/private_channel_node.rs"]
 mod private_channel_node;
@@ -186,35 +186,6 @@ async fn primary_pitr_below_fence_refuses_boot() {
     assert_eq!(checkpoint_of(&pool).await, Some(CHECKPOINT as i64));
 }
 
-/// The channel is restored while the indexer keeps running. The first new block does not
-/// link to the fence, so the indexer stops before it writes anything for that block.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn primary_pitr_while_running_exits_on_broken_link() {
-    let (_pg, pool, postgres) = start_postgres("fence_link").await;
-    seed_fenced_checkpoint(&postgres).await;
-
-    let mut rpc = MockitoServer::new_async().await;
-    let _slot = mock_slot(&mut rpc, 105).await;
-    // Boot check passes: the fence block is still there.
-    let _fence_block = mock_block(&mut rpc, CHECKPOINT, FENCE_HASH, 99, "x").await;
-    let _listing = rpc
-        .mock("POST", "/")
-        .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
-        .with_body(json!({"jsonrpc": "2.0", "result": [101], "id": 1}).to_string())
-        .create_async()
-        .await;
-    // Then the channel is rewound under it: block 101 names a different parent hash.
-    let _forked = mock_block(&mut rpc, 101, "NewHash101", CHECKPOINT, "OtherHash100").await;
-
-    let (common, indexer) = configs(postgres, rpc.url());
-    let err = tokio::time::timeout(Duration::from_secs(30), run(common, indexer, None))
-        .await
-        .expect("the indexer must stop on a broken link")
-        .expect_err("a broken link is fatal");
-    assert!(matches!(err, IndexerError::ChannelFence { .. }), "{err}");
-    assert_eq!(checkpoint_of(&pool).await, Some(CHECKPOINT as i64));
-}
-
 /// Apex 164: the channel was restored behind the indexer DB, so completed deposits lost
 /// their credit. The escrow operator must refuse to start rather than keep minting there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -332,6 +303,9 @@ async fn primary_restore_refuses_everything() {
     node.restore_and_restart(&channel_backup)
         .await
         .expect("restored node");
+    // The restored chain's next block follows the last restored one, skipping the fence slot.
+    // A node that merely lags never shows that, so this is what the refusal rests on.
+    channel_block(&node.url).await;
 
     let (common, indexer) = configs(postgres.clone(), node.url.clone());
     let err = tokio::time::timeout(Duration::from_secs(120), run(common, indexer, None))
@@ -364,6 +338,47 @@ async fn primary_restore_refuses_everything() {
     .await
     .expect("the escrow operator must not wait forever")
     .expect_err("a restored primary must refuse the escrow operator");
+    assert!(matches!(err, OperatorError::ChannelFence { .. }), "{err}");
+
+    // The withdraw operator reads the channel as its source chain. Its Solana endpoints only
+    // need to answer the boot genesis probe, which runs before the fence.
+    let mut solana = MockitoServer::new_async().await;
+    let _genesis = solana
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getGenesisHash"})))
+        .with_body(
+            json!({"jsonrpc": "2.0", "id": 1, "result": "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY"})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let withdraw = PrivateChannelIndexerConfig {
+        program_type: ProgramType::Withdraw,
+        storage_type: StorageType::Postgres,
+        rpc_url: solana.url(),
+        source_rpc_url: Some(node.url.clone()),
+        fallback_rpc_url: Some(test_utils::operator_helper::same_host_fallback_url(
+            &solana.url(),
+        )),
+        postgres: postgres.clone(),
+        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+    };
+    let storage = std::sync::Arc::new(Storage::Postgres(
+        PostgresDb::new(&postgres).await.expect("storage"),
+    ));
+    let err = tokio::time::timeout(
+        Duration::from_secs(120),
+        private_channel_indexer::operator::run(
+            storage,
+            withdraw,
+            test_utils::operator_helper::default_operator_config(),
+            None,
+        ),
+    )
+    .await
+    .expect("the withdraw operator must not wait forever")
+    .expect_err("a restored primary must refuse the withdraw operator");
     assert!(matches!(err, OperatorError::ChannelFence { .. }), "{err}");
 
     // The documented order: the indexer restored to before the primary's target.

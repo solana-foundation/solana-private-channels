@@ -46,7 +46,7 @@ dispatch table below routes by webhook + `transaction_type`.
 > [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
 > The **channel fence** refusal is the third: the channel primary was restored
 > behind the indexer DB, so the withdraw indexer and both operators exit at
-> boot (or stop while running) with `channel fence check failed`; see
+> boot with `channel fence mismatch`; see
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md#channel-fence-refused).
 >
 > A **startup backfill** that cannot fetch or decode a slot also exits and is
