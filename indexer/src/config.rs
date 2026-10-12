@@ -463,17 +463,6 @@ impl IndexerConfig {
             }
         }
 
-        // Gap repair and the startup anchor run over RPC. Without them a dropped or
-        // cold-started stream checkpoints past slots it never indexed.
-        #[cfg(not(feature = "datasource-rpc"))]
-        if self.datasource_type == DatasourceType::Yellowstone {
-            return Err(
-                "Yellowstone datasource needs the datasource-rpc feature for gap repair \
-                 (build with both datasource features)"
-                    .to_string(),
-            );
-        }
-
         // The one-shot repair only runs when backfill is also enabled. Without this the
         // pair reads as a typo that starts a normal live indexer, which for a job the
         // operator expects to exit means it silently never does.
@@ -532,7 +521,7 @@ impl IndexerConfig {
 /// - `ADMIN_SIGNER`: Signer type (memory|vault|turnkey|privy)
 /// - `ADMIN_PRIVATE_KEY`: Private key or key identifier
 ///
-/// ## Optional (falls back to admin if not set):
+/// ## Optional (admin is used only when OPERATOR_SIGNER is unset; a set but broken one fails startup):
 /// - `OPERATOR_SIGNER`: Signer type for operator-specific operations
 /// - `OPERATOR_PRIVATE_KEY`: Private key or key identifier for operator
 ///
@@ -902,33 +891,6 @@ mod tests {
             assert!(result.is_err());
             let err_msg = result.unwrap_err();
             assert!(err_msg.contains("Yellowstone datasource not compiled"));
-        }
-    }
-
-    /// Gap repair and the startup anchor run over RPC, so a Yellowstone indexer built
-    /// without it would checkpoint past slots it never saw.
-    #[cfg(feature = "datasource-yellowstone")]
-    #[test]
-    fn yellowstone_indexer_requires_the_rpc_feature() {
-        let config = IndexerConfig {
-            datasource_type: DatasourceType::Yellowstone,
-            yellowstone: Some(YellowstoneConfig {
-                endpoint: "http://localhost:10000".to_string(),
-                x_token: None,
-                commitment: "finalized".to_string(),
-            }),
-            ..create_indexer_config()
-        };
-
-        let result = config.validate();
-
-        #[cfg(feature = "datasource-rpc")]
-        assert!(result.is_ok(), "got: {result:?}");
-
-        #[cfg(not(feature = "datasource-rpc"))]
-        {
-            let err = result.expect_err("a Yellowstone indexer without gap repair must be refused");
-            assert!(err.contains("datasource-rpc"), "got: {err}");
         }
     }
 

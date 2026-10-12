@@ -63,7 +63,7 @@ channel_buffer_size = 100
 #   ADMIN_SIGNER=memory|vault|turnkey|privy
 #   ADMIN_PRIVATE_KEY=<key-or-identifier>
 #
-# Optional (falls back to admin if not set):
+# Optional (admin is used only when OPERATOR_SIGNER is unset; a set but broken one fails startup):
 #   OPERATOR_SIGNER=memory|vault|turnkey|privy
 #   OPERATOR_PRIVATE_KEY=<key-or-identifier>
 #

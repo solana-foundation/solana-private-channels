@@ -105,10 +105,12 @@ static ADMIN_SIGNER_INSTANCE: Lazy<Signer> = Lazy::new(|| {
 
 /// Global operator signer (optional, only for release and rotation). Falls back to the admin
 /// only when OPERATOR_SIGNER is unset; a set but unloadable one is fatal, like the admin.
-static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> = Lazy::new(|| {
+static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> = Lazy::new(init_operator_signer);
+
+fn init_operator_signer() -> Option<Signer> {
     load_operator_signer()
         .unwrap_or_else(|e| panic!("OPERATOR_SIGNER is set but could not be loaded: {e}"))
-});
+}
 
 fn load_operator_signer() -> Result<Option<Signer>, LoadError> {
     if env::var_os(OPERATOR_SIGNER).is_none() {
@@ -279,6 +281,7 @@ mod tests {
     // runs tests in parallel by default, which causes races on shared process
     // environment variables (set_var / remove_var).
     use serial_test::serial;
+    use std::panic;
 
     /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
     /// string, including an empty one, must return an InvalidPrivateKey error.
@@ -533,10 +536,11 @@ mod tests {
         }
     }
 
-    /// A set but unloadable operator is an error, not a silent swap to the admin.
+    /// A set but unloadable operator stops startup, not a silent swap to the admin.
+    /// catch_unwind instead of should_panic so the env is restored before asserting.
     #[test]
     #[serial]
-    fn load_operator_signer_set_but_broken_errors() {
+    fn init_operator_signer_panics_on_a_broken_operator() {
         // Settle the global first: a parallel test loading it during the broken env below would poison it.
         Lazy::force(&OPERATOR_SIGNER_INSTANCE);
         let orig_type = env::var(OPERATOR_SIGNER).ok();
@@ -544,14 +548,7 @@ mod tests {
         env::set_var(OPERATOR_SIGNER, "memory");
         env::remove_var(OPERATOR_PRIVATE_KEY);
 
-        let err = load_operator_signer()
-            .err()
-            .expect("a broken operator must not fall back to the admin");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OPERATOR_PRIVATE_KEY") && msg.contains("not set"),
-            "error should name the missing var, got: {msg}"
-        );
+        let outcome = panic::catch_unwind(init_operator_signer);
 
         env::remove_var(OPERATOR_SIGNER);
         if let Some(val) = orig_type {
@@ -560,5 +557,17 @@ mod tests {
         if let Some(val) = orig_key {
             env::set_var(OPERATOR_PRIVATE_KEY, val);
         }
+
+        let payload = outcome
+            .err()
+            .expect("a broken operator must not fall back to the admin");
+        let msg = payload
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            msg.contains("OPERATOR_SIGNER is set but could not be loaded")
+                && msg.contains("OPERATOR_PRIVATE_KEY"),
+            "panic should name the missing var, got: {msg}"
+        );
     }
 }

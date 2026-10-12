@@ -21,6 +21,9 @@ pub async fn run_feepayer_monitor(
     // Same pick as the sender: the first release signer pays.
     let feepayer_pubkey = TransactionBuilder::release_signers()[0].pubkey();
     let label = program_type.as_label();
+    // Seeded here, not in init_labels: the alerts read a missing series as healthy, so an
+    // RPC that fails every read must still page on the zero.
+    FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[label]);
 
     info!(
         "Starting feepayer balance monitor for {} (pubkey: {})",

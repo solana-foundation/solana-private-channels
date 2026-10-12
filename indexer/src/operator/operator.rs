@@ -933,6 +933,7 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use private_channel_metrics::prometheus;
     use serial_test::serial;
     use solana_keychain::SolanaSigner;
     use solana_sdk::hash::Hash;
@@ -1846,6 +1847,46 @@ mod tests {
             "the withdraw operator must read the fee payer balance on its rpc_url"
         );
         source_balance.assert_async().await;
+    }
+
+    /// The alerts treat a missing series as healthy, so the monitor seeds it before its
+    /// first read: an RPC that fails every getBalance still pages on the zero. Escrow label
+    /// because no other test writes it, so this cannot pass on test order. Serial for
+    /// ADMIN_SIGNER, as above.
+    #[tokio::test]
+    #[serial]
+    async fn feepayer_monitor_seeds_its_series_before_the_first_read() {
+        std::env::set_var("ADMIN_SIGNER", "memory");
+        std::env::set_var(
+            "ADMIN_PRIVATE_KEY",
+            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
+        );
+        let (_, config) = startup_fixture(ProgramType::Escrow);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        feepayer_monitor::run_feepayer_monitor(
+            config,
+            Arc::new(make_rpc_client("http://127.0.0.1:1")),
+            ProgramType::Escrow,
+            cancelled,
+        )
+        .await
+        .expect("a cancelled monitor stops cleanly");
+
+        let seeded = prometheus::gather().iter().any(|family| {
+            family.name() == "private_channel_feepayer_balance_lamports"
+                && family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "program_type" && label.value() == "escrow")
+                })
+        });
+        assert!(
+            seeded,
+            "the monitor must seed its series before any balance read"
+        );
     }
 
     #[tokio::test]
