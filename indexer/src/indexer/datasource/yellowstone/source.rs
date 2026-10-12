@@ -23,10 +23,9 @@ use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
 use crate::indexer::datasource::common::tx_validation::{
     check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+    targets_configured_instance,
 };
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
-use crate::indexer::datasource::rpc_polling::decoder::targets_configured_instance;
-use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
 use crate::storage::Storage;
 
 #[cfg(feature = "datasource-rpc")]

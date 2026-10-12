@@ -244,6 +244,14 @@ jobs:
       - name: Generate clients
         run: make generate-clients
 
+      # The shipped build and each datasource alone. Runs before the workspace check,
+      # which is not --locked and could rewrite a stale Cargo.lock first.
+      - name: Check indexer feature profiles
+        run: |
+          cargo check -p private-channel-indexer --locked
+          cargo check -p private-channel-indexer --locked --no-default-features --features datasource-rpc
+          cargo check -p private-channel-indexer --locked --no-default-features --features datasource-yellowstone
+
       - name: Run cargo check
         run: |
           cargo check --workspace --all-features \
