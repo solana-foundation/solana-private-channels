@@ -202,11 +202,15 @@ impl TransactionBuilder {
 
     pub fn signers(&self) -> Vec<&'static Signer> {
         match self {
-            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => {
-                vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
-            }
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => Self::release_signers(),
             Self::InitializeMint(_) | Self::Mint(_) => vec![SignerUtil::admin_signer()],
         }
+    }
+
+    /// Signers of the Solana-side transactions. The sender bills the first, so the
+    /// fee payer monitor reads it from here too.
+    pub fn release_signers() -> Vec<&'static Signer> {
+        vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
     }
 
     /// Get the database transaction ID for storage/logging operations

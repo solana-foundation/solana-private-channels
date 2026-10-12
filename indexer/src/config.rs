@@ -568,7 +568,7 @@ pub struct OperatorConfig {
     /// Webhook URL for reconciliation alerts. Required and non-blank for the escrow
     /// operator, ignored by withdraw. Carries both balance mismatch and orphan deposit alerts.
     pub reconciliation_webhook_url: Option<String>,
-    /// How often to check the feepayer SOL balance (escrow operators only)
+    /// How often to check the feepayer SOL balance (withdraw operators only)
     #[serde(default = "default_feepayer_monitor_interval")]
     pub feepayer_monitor_interval: std::time::Duration,
     /// Milliseconds between `getSignatureStatuses` polls when confirming a sent transaction.

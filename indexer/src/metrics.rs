@@ -149,7 +149,7 @@ gauge_vec!(
 gauge_vec!(
     FEEPAYER_BALANCE_LAMPORTS,
     "private_channel_feepayer_balance_lamports",
-    "Current SOL balance of the escrow operator feepayer wallet in lamports",
+    "Current SOL balance of the withdraw operator feepayer wallet in lamports",
     &["program_type"]
 );
 

@@ -136,7 +136,7 @@ reconciliation_tolerance_bps = 10
 reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"
 
 # Feepayer balance monitoring interval (seconds)
-# Only applies to escrow operators (ReleaseFunds feepayer on Solana mainnet)
+# Only applies to withdraw operators (ReleaseFunds feepayer on Solana mainnet)
 # Minimum: 5 seconds
 # Default: 60 seconds
 feepayer_monitor_interval_secs = 60
