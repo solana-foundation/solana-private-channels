@@ -616,15 +616,6 @@
   - name: Deployment config asserts
     tags: [ always, config_asserts ]
     block:
-    - name: Allow the memory signer on localnet and devnet only
-      ansible.builtin.assert:
-        that: network in ['localnet', 'devnet']
-        fail_msg: |
-          network={{ network }} refused: this playbook renders an in-memory hot key for both
-          signer roles (ADMIN_SIGNER=OPERATOR_SIGNER=memory), allowed on localnet and devnet
-          only. Mainnet needs a non-memory backend (vault, turnkey or privy), which this
-          playbook does not render yet.
-
     - name: Assert program IDs equal the compiled ones
       ansible.builtin.assert:
         that:

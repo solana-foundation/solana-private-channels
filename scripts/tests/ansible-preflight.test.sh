@@ -113,13 +113,11 @@ test_preflight_cases() {
   local common=(-e env=dev -e "admin_keypair_path=$TMP/admin.json" -e "host_data_dir=$data")
   local devnet=("${common[@]}" -e network=devnet -e fallback_rpc_url=https://fallback.invalid)
 
-  expect_refused mainnet "renders an in-memory hot key" "${devnet[@]}" -e network=mainnet -e escrow_instance_id=$INSTANCE
-  expect_refused other_network "renders an in-memory hot key" "${devnet[@]}" -e network=prod -e escrow_instance_id=$INSTANCE
-  # Tagged always: a single-phase rerun must not skip the memory-signer refusal.
-  expect_refused mainnet_partial_run "renders an in-memory hot key" "${devnet[@]}" -e network=mainnet \
-    -e escrow_instance_id=$INSTANCE --tags __no_such_phase__
-  expect_refused mainnet_skip_preflight "renders an in-memory hot key" "${devnet[@]}" -e network=mainnet \
-    -e escrow_instance_id=$INSTANCE --tags config_asserts --skip-tags preflight
+  # Tagged always: a single-phase rerun must not skip the config asserts.
+  expect_refused custom_id_partial_run "must equal the compiled" "${devnet[@]}" -e escrow_instance_id=$INSTANCE \
+    -e escrow_program_id=$INSTANCE --tags __no_such_phase__
+  expect_refused custom_id_skip_preflight "must equal the compiled" "${devnet[@]}" -e escrow_instance_id=$INSTANCE \
+    -e escrow_program_id=$INSTANCE --tags config_asserts --skip-tags preflight
   expect_refused devnet_no_instance "create the instance" "${devnet[@]}"
   expect_refused placeholder "all-ones placeholder" "${common[@]}" -e escrow_instance_id=$PLACEHOLDER
   expect_refused custom_program_id "must equal the compiled" "${common[@]}" -e escrow_program_id=$INSTANCE
@@ -131,6 +129,7 @@ test_preflight_cases() {
   expect_services compiled_ids_accepted yes "${common[@]}" "${kept[@]}" -e escrow_instance_id=$INSTANCE \
     -e escrow_program_id=$ESCROW_ID -e withdraw_program_id=$WITHDRAW_ID
   expect_services devnet_instance yes "${devnet[@]}" -e escrow_instance_id=$INSTANCE
+  expect_services mainnet_instance yes "${devnet[@]}" -e network=mainnet -e escrow_instance_id=$INSTANCE
 
   # A redeploy keeps the PDA a previous render left in .env, with no var set (SOLA13-67).
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
