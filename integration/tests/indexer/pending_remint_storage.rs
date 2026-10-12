@@ -7,9 +7,11 @@
 //! The operator-side `recover_pending_remints` is `pub(super)` and unit-tested
 //! in-file (in `sender/state.rs`). The observable public seam for integration
 //! testing is the storage round-trip: if the operator crashes with pending
-//! remints in flight, it relies on `set_pending_remint` to have durably
-//! persisted them and `get_pending_remint_transactions` to return them on
-//! restart.
+//! remints in flight, it relies on `get_pending_remint_transactions` to return
+//! the rows on restart, and takes their signatures from
+//! `pending_release_signatures`. The `remint_signatures` mirror that
+//! `set_pending_remint` writes feeds its own replay guard and the stalled-row
+//! sweep.
 //!
 //! Binary: `reconciliation_integration` (existing, has Postgres fixtures
 //! via the nearby `db_migration_race` tests).

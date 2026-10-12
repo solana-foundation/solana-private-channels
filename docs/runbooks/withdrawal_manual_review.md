@@ -117,7 +117,8 @@ have prefixes.
 | `with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
 | `release still unproven after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
 | `release still unproven after` together with `release signature lookup failed:` | C - ambiguous (database unreadable past the escalation window; check Postgres first) | no | recovery worker quarantine |
-| `malformed stored release signature` | C - ambiguous (journal corrupt, so a signature was recorded) | no | recovery worker quarantine |
+| `malformed stored release signature` | C - ambiguous (journal corrupt, so a signature was recorded) | no | recovery worker quarantine, sender boot |
+| `no withdrawal signatures stored` | C - ambiguous (empty journal on a PendingRemint row) | no | sender boot |
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |

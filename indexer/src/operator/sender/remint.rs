@@ -1566,12 +1566,22 @@ mod tests {
     }
 
     /// A stored PendingRemint row for a release the program refused: real
-    /// signatures so the finality check can classify them, a deadline that has
-    /// already matured so the entry is due on the first pass, and the refusal
-    /// recorded on the row rather than only in the queue.
+    /// signatures so the finality check can classify them, journaled as the
+    /// handoff does, a deadline that has already matured so the entry is due on
+    /// the first pass, and the refusal recorded on the row rather than only in
+    /// the queue.
     fn seed_refused_pending_remint_row(mock: &MockStorage, id: i64, nonce: i64) {
         use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
         let now = Utc::now();
+        let release_signature = Signature::new_unique().to_string();
+        mock.release_signatures.lock().unwrap().insert(
+            id,
+            vec![StoredSig {
+                signature: release_signature.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         mock.pending_remint_transactions
             .lock()
             .unwrap()
@@ -1592,7 +1602,7 @@ mod tests {
                 updated_at: now,
                 processed_at: None,
                 counterpart_signature: None,
-                remint_signatures: Some(vec![Signature::new_unique().to_string()]),
+                remint_signatures: Some(vec![release_signature]),
                 remint_last_valid_block_heights: Some(vec![0]),
                 pending_remint_deadline_at: Some(now - chrono::Duration::seconds(1)),
                 finality_check_attempts: 0,
@@ -3019,15 +3029,25 @@ mod tests {
         mock.update_committed_checkpoint("escrow", 8_970)
             .await
             .unwrap();
-        seed_pending_remint_row(&mock, 99, 2);
+        let transaction_id = 99;
+        seed_pending_remint_row(&mock, transaction_id, 2);
+        let release_signature = Signature::new_unique().to_string();
         {
             let mut rows = mock.pending_remint_transactions.lock().unwrap();
             let row = &mut rows[0];
             row.withdrawal_nonce = Some(3);
-            row.remint_signatures = Some(vec![Signature::new_unique().to_string()]);
+            row.remint_signatures = Some(vec![release_signature.clone()]);
             row.remint_last_valid_block_heights = Some(vec![0]);
             row.pending_remint_deadline_at = Some(Utc::now() - chrono::Duration::seconds(1));
         }
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: release_signature,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.recover_pending_remints(&storage_tx).await.unwrap();
@@ -3041,7 +3061,7 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
-        assert_eq!(persisted_attempts(&mock, 99).0, 2);
+        assert_eq!(persisted_attempts(&mock, transaction_id).0, 2);
     }
 
     /// Once the checkpoint reaches the bound, the absence is real evidence and
@@ -3287,6 +3307,65 @@ mod tests {
             journaled_attempts(&mock, 55),
             1,
             "a refusal recovered from storage is still proof enough to return the tokens"
+        );
+    }
+
+    /// A restart must keep each release attempt's journaled blockhash slot. On a
+    /// pruned endpoint that slot is the only proof the attempt's window is still
+    /// retained, so without it an expired release reads as Uncertain, not Dead.
+    #[tokio::test]
+    async fn a_recovered_release_is_proven_dead_by_its_journaled_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+
+        let transaction_id = 98;
+        let release_signature = Signature::new_unique().to_string();
+        let last_valid_block_height = 1_000;
+        // At or above the floor below, while the height bound (lvbh - 150) is under it.
+        let blockhash_slot = 1_200;
+        let ledger_floor = 1_100;
+        seed_pending_remint_row(&mock, transaction_id, 0);
+        {
+            let mut rows = mock.pending_remint_transactions.lock().unwrap();
+            let row = &mut rows[0];
+            row.remint_signatures = Some(vec![release_signature.clone()]);
+            row.remint_last_valid_block_heights = Some(vec![last_valid_block_height]);
+        }
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: release_signature,
+                last_valid_block_height,
+                blockhash_slot: Some(blockhash_slot),
+            }],
+        );
+
+        // The release expired unseen, on a pruned endpoint with no fallback.
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":2000},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":2000,"id":0}"#,
+        )
+        .await;
+        let _floor = mock_ledger_floor(&mut server, ledger_floor).await;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.pending_remints.len(), 1, "the row must re-hydrate");
+
+        assert!(
+            matches!(
+                classify_signatures(&state.dest_finality(), &state.pending_remints[0].signatures)
+                    .await,
+                SigFinality::Dead
+            ),
+            "the journaled slot proves the pruned endpoint still retains the attempt's window"
         );
     }
 
