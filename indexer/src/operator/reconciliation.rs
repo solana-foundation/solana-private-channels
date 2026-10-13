@@ -564,7 +564,7 @@ async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<Vec<(Pubkey, Pubkey
 
 /// Whether the ledger can be compared at the custody slot this tick.
 #[derive(Debug, PartialEq, Eq)]
-enum LedgerWait {
+pub(crate) enum LedgerWait {
     Covered,
     Unknown,
     /// Every checkpoint read failed, so the ledger is unknown and the input is missing.
@@ -576,7 +576,7 @@ enum LedgerWait {
 ///
 /// A checkpoint at or past `slot` means every deposit and release up to it is in the DB,
 /// so the ledger is exact there. Giving up returns Unknown, which holds the liability counter.
-async fn wait_for_ledger(
+pub(crate) async fn wait_for_ledger(
     storage: &Arc<Storage>,
     slot: u64,
     cancellation_token: &CancellationToken,

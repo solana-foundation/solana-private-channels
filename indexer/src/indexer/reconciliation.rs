@@ -31,13 +31,13 @@
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
-    error::{IndexerError, ReconciliationError},
+    error::{IndexerError, ReconciliationError, StorageError},
     indexer::checkpoint::program_key,
     operator::{
         escrow_sweep::{
             fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
         },
-        reconciliation::insolvency_tolerance_raw,
+        reconciliation::{insolvency_tolerance_raw, wait_for_ledger, LedgerWait},
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
@@ -48,6 +48,8 @@ use crate::{
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// What this boot tolerates for one mint: the absolute floor, or the same relative cushion
@@ -269,6 +271,45 @@ pub async fn reconcile_against_snapshot(
     classify_and_report(config, &results)?;
 
     Ok(())
+}
+
+/// One read-only reconciliation for an operator: capture custody, wait for the escrow
+/// ledger to cover that slot, then compare. A ledger that never gets there is reported,
+/// never compared, so status cannot stand in for a release the indexer has not recorded.
+pub async fn run_manual_reconciliation(
+    config: &ReconciliationConfig,
+    storage: &Arc<Storage>,
+    rpc_url: &str,
+    channel_rpc_url: Option<&str>,
+    instance_pda: &Pubkey,
+) -> Result<(), IndexerError> {
+    let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
+    match wait_for_ledger(storage, snapshot.slot, &CancellationToken::new()).await {
+        LedgerWait::Covered => {}
+        LedgerWait::Unknown => {
+            return Err(ReconciliationError::LedgerCoverageIncomplete {
+                snapshot_slot: snapshot.slot,
+            }
+            .into())
+        }
+        // Nothing cancels this token, so only an unreadable checkpoint lands here.
+        LedgerWait::Unreadable | LedgerWait::Cancelled => {
+            return Err(ReconciliationError::Storage(StorageError::DatabaseError {
+                message: "the escrow checkpoint could not be read".to_string(),
+            })
+            .into())
+        }
+    }
+    reconcile_against_snapshot(
+        config,
+        ProgramType::Escrow,
+        storage,
+        rpc_url,
+        channel_rpc_url,
+        instance_pda,
+        &snapshot,
+    )
+    .await
 }
 
 /// Readings a supply breach must appear in, consecutively, before it is believed.
@@ -2242,6 +2283,132 @@ mod tests {
             ),
             "supply over custody must still halt: {:?}",
             breach
+        );
+    }
+
+    /// A manual run compares nothing until the escrow ledger reaches the custody slot, so
+    /// status never stands in for a release the indexer has not recorded.
+    #[tokio::test]
+    async fn manual_reconciliation_refuses_a_ledger_behind_custody() {
+        // mock_escrow_sweep answers at this slot.
+        let snapshot_slot = 100;
+        for checkpoint in [None, Some(snapshot_slot - 10)] {
+            let mut server = mockito::Server::new_async().await;
+            let seed = Pubkey::new_unique();
+            let mint = Pubkey::new_unique();
+            mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+
+            let mock_storage = MockStorage::new();
+            mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+            if let Some(slot) = checkpoint {
+                mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), slot);
+            }
+            let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+            let url = server.url();
+            let result = run_manual_reconciliation(
+                &ReconciliationConfig::default(),
+                &storage,
+                &url,
+                Some(&url),
+                &seed,
+            )
+            .await;
+            match result {
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::LedgerCoverageIncomplete {
+                        snapshot_slot: reported,
+                    },
+                )) => assert_eq!(reported, snapshot_slot),
+                other => panic!("checkpoint {checkpoint:?} must be incomplete coverage: {other:?}"),
+            }
+            assert_eq!(
+                mock_storage.calls("get_mint_balances_for_reconciliation"),
+                0
+            );
+            assert_eq!(
+                mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+                0
+            );
+        }
+    }
+
+    /// Once the ledger covers the custody slot, a manual run judges the pinned ledger.
+    #[tokio::test]
+    async fn manual_reconciliation_judges_the_pinned_ledger_once_covered() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        // Custody 980 against a ledger of 1000, past a threshold of 10.
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+        mock_channel_supply(&mut server, 980).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        // mock_escrow_sweep answers at slot 100.
+        mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), 100);
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+            ..Default::default()
+        };
+        let url = server.url();
+        let result = run_manual_reconciliation(&config, &storage, &url, Some(&url), &seed).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covered ledger must be compared: {result:?}"
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+            0
+        );
+    }
+
+    /// A checkpoint that cannot be read proves nothing about coverage, so the run stops as
+    /// an error before any ledger read.
+    #[tokio::test]
+    async fn manual_reconciliation_stops_on_an_unreadable_checkpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), 980)]).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        mock_storage.set_should_fail("get_committed_checkpoint", true);
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let url = server.url();
+        let result = run_manual_reconciliation(
+            &ReconciliationConfig::default(),
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(ReconciliationError::Storage(
+                    _
+                )))
+            ),
+            "an unreadable checkpoint must stop the run: {result:?}"
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_reconciliation"),
+            0
+        );
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+            0
         );
     }
 }

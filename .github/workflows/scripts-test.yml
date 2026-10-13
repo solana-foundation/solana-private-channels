@@ -45,10 +45,6 @@ jobs:
       - name: Setup Solana CLI
         uses: ./.github/actions/setup-solana
 
-      # reconcile-escrow-balance.test.sh needs jq.
-      - name: Install jq
-        run: command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
-
       - name: Run script tests
         run: |
           for test_script in scripts/tests/*.test.sh; do

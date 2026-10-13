@@ -108,6 +108,11 @@ pub enum ReconciliationError {
     #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
     CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
 
+    /// The escrow indexer never indexed up to the custody slot, so the ledger is missing
+    /// deposits or releases custody already reflects and cannot be compared there.
+    #[error("the escrow indexer did not reach the custody slot {snapshot_slot}; the ledger cannot be compared there")]
+    LedgerCoverageIncomplete { snapshot_slot: u64 },
+
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 

@@ -9,6 +9,8 @@ use private_channel_indexer::config::{
 };
 #[cfg(feature = "datasource-rpc")]
 use private_channel_indexer::config::{validate_rpc_batch_size, validate_rpc_encoding};
+use private_channel_indexer::error::{IndexerError, ReconciliationError};
+use private_channel_indexer::indexer::reconciliation::run_manual_reconciliation;
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
     PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -168,7 +170,17 @@ enum Mode {
         #[arg(long)]
         escrow_rpc_url: Option<String>,
     },
+    /// Reconcile escrow custody against the indexed ledger once, read-only, with the
+    /// escrow indexer's config. Exits 0 on a pass, 1 on a shortfall or supply breach,
+    /// 2 on an error and 3 when the escrow indexer has not reached the custody slot.
+    Reconcile,
 }
+
+/// `reconcile` exit codes.
+const RECONCILE_PASS: i32 = 0;
+const RECONCILE_MISMATCH: i32 = 1;
+const RECONCILE_ERROR: i32 = 2;
+const RECONCILE_LEDGER_BEHIND: i32 = 3;
 
 const INDEXER_PREFIX: &str = "INDEXER";
 const COMMON_PREFIX: &str = "COMMON";
@@ -250,6 +262,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Resync { .. } => {
             Err("resync requires a build with the datasource-rpc feature".into())
         }
+        // Exits here so a setup failure reports as an error, not as the mismatch code a
+        // returned error would produce.
+        Mode::Reconcile => std::process::exit(run_reconcile(figment, args.verbose).await),
+    }
+}
+
+/// Run one reconciliation and return its exit code.
+async fn run_reconcile(figment: Figment, verbose: bool) -> i32 {
+    tracing_subscriber::fmt()
+        .with_env_filter(if verbose {
+            "info,private_channel_indexer=debug"
+        } else {
+            "info"
+        })
+        .init();
+
+    let result = match reconcile_once(figment).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Reconciliation could not run: {e}");
+            return RECONCILE_ERROR;
+        }
+    };
+    let code = reconcile_exit_code(&result);
+    match &result {
+        Ok(()) => println!("PASS: escrow custody reconciles with the indexed ledger"),
+        Err(e) => println!("FAIL (exit {code}): {e}"),
+    }
+    code
+}
+
+/// Load the escrow indexer's config and reconcile once. The outer error is a setup
+/// failure; the inner result is the reconciliation's verdict.
+async fn reconcile_once(
+    figment: Figment,
+) -> Result<Result<(), IndexerError>, Box<dyn std::error::Error>> {
+    let common: CommonSection = figment.extract_inner("common")?;
+    let storage: StorageSection = figment.extract_inner("storage")?;
+    let indexer: IndexerSection = figment.extract_inner("indexer")?;
+
+    // Reconciliation skips any other program, which would read as a pass.
+    if common.program_type != ProgramType::Escrow {
+        return Err("reconcile requires the escrow indexer config (program_type = escrow)".into());
+    }
+
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
+    let escrow_instance_id = common
+        .escrow_instance_id
+        .map(|id_str| {
+            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
+        })
+        .transpose()?;
+
+    let common_config = PrivateChannelIndexerConfig {
+        program_type: common.program_type,
+        storage_type: storage.storage_type,
+        postgres: PostgresConfig {
+            database_url,
+            max_connections: storage.max_connections,
+        },
+        rpc_url: common.rpc_url,
+        fallback_rpc_url: common.fallback_rpc_url,
+        source_rpc_url: common.source_rpc_url,
+        escrow_instance_id,
+    };
+    common_config.validate()?;
+    let instance_pda = common_config
+        .escrow_instance_id
+        .ok_or("escrow_instance_id required when program_type is Escrow")?;
+
+    let reconciliation_config = ReconciliationConfig {
+        mismatch_threshold_raw: indexer.reconciliation.mismatch_threshold_raw,
+        reconciliation_tolerance_bps: indexer.reconciliation.reconciliation_tolerance_bps,
+    };
+
+    let storage_instance: Arc<private_channel_indexer::storage::Storage> =
+        match common_config.storage_type {
+            StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
+                private_channel_indexer::storage::PostgresDb::new(&common_config.postgres).await?,
+            )),
+        };
+
+    Ok(run_manual_reconciliation(
+        &reconciliation_config,
+        &storage_instance,
+        &common_config.rpc_url,
+        common_config.source_rpc_url.as_deref(),
+        &instance_pda,
+    )
+    .await)
+}
+
+/// The exit code for a reconciliation verdict.
+fn reconcile_exit_code(result: &Result<(), IndexerError>) -> i32 {
+    match result {
+        Ok(()) => RECONCILE_PASS,
+        Err(IndexerError::Reconciliation(
+            ReconciliationError::MismatchExceedsThreshold { .. }
+            | ReconciliationError::SupplyExceedsCustody { .. },
+        )) => RECONCILE_MISMATCH,
+        Err(IndexerError::Reconciliation(ReconciliationError::LedgerCoverageIncomplete {
+            ..
+        })) => RECONCILE_LEDGER_BEHIND,
+        Err(_) => RECONCILE_ERROR,
     }
 }
 
@@ -946,5 +1063,51 @@ mod tests {
         indexer.rpc_polling.as_mut().unwrap().encoding = Some(UiTransactionEncoding::JsonParsed);
         let err = validate_resync_config(&storage_section(), &indexer).expect_err("encoding");
         assert!(err.contains("INDEXER_RPC_POLLING_ENCODING"), "got: {err}");
+    }
+
+    /// A ledger behind custody has its own exit code, so a caller never reads it as a pass
+    /// or as a proven shortfall.
+    #[test]
+    fn reconcile_exit_codes_keep_coverage_distinct() {
+        let cases: Vec<(Result<(), IndexerError>, i32)> = vec![
+            (Ok(()), 0),
+            (
+                Err(ReconciliationError::MismatchExceedsThreshold {
+                    count: 1,
+                    threshold: 0,
+                }
+                .into()),
+                1,
+            ),
+            (
+                Err(ReconciliationError::SupplyExceedsCustody {
+                    count: 1,
+                    threshold: 0,
+                }
+                .into()),
+                1,
+            ),
+            (
+                Err(ReconciliationError::LedgerCoverageIncomplete { snapshot_slot: 100 }.into()),
+                3,
+            ),
+            (Err(ReconciliationError::MissingChannelRpc.into()), 2),
+            (
+                Err(ReconciliationError::SupplyInvariantUnverified { count: 1 }.into()),
+                2,
+            ),
+            (
+                Err(ReconciliationError::CustodySlotUnsettled {
+                    attempts: 3,
+                    low: 1,
+                    high: 2,
+                }
+                .into()),
+                2,
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(reconcile_exit_code(&result), expected, "{result:?}");
+        }
     }
 }

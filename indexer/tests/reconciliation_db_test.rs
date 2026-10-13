@@ -619,6 +619,35 @@ async fn release_counts_at_the_bound_not_above() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Custody moves when a deposit lands and when a release lands, not when the operator
+/// finishes either. A stuck deposit still backs custody and a release still left it, so
+/// neither may wait on its row's status.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stuck_deposit_and_a_trailing_release_both_count(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    insert_transaction(&pool, "d_done", &mint, 100, "deposit", "completed", 100).await?;
+    insert_transaction(
+        &pool,
+        "d_stuck",
+        &mint,
+        100,
+        "deposit",
+        "manual_review",
+        100,
+    )
+    .await?;
+    let nonce = insert_withdrawal(&pool, "w_trailing", &mint, 50, "processing", 100).await?;
+    observe_release(&storage, nonce, 150).await?;
+
+    let at_200 = storage.get_mint_balances_for_reconciliation(200).await?;
+    assert_eq!(at_200[0].total_deposits, BigDecimal::from(200u64));
+    assert_eq!(at_200[0].total_withdrawals, BigDecimal::from(50u64));
+    Ok(())
+}
+
 /// Withdrawal rows carry a channel slot, so a row far above the Solana bound still
 /// subtracts once its release is observed below it.
 #[tokio::test(flavor = "multi_thread")]
