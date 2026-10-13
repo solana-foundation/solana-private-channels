@@ -202,6 +202,14 @@ const DELEGATE_OPTION_OFFSET: usize = 72;
 const DELEGATE_OFFSET: usize = 76;
 const DELEGATE_END: usize = 108;
 
+/// Byte offset of the `state` field; 0 is Uninitialized.
+const STATE_OFFSET: usize = 108;
+const STATE_UNINITIALIZED: u8 = 0;
+
+/// Byte range of the `delegated_amount` field: the delegate's allowance, a u64 LE.
+const DELEGATED_AMOUNT_OFFSET: usize = 121;
+const DELEGATED_AMOUNT_END: usize = 129;
+
 // ---------------------------------------------------------------------------
 // DvP swap escrow program
 //
@@ -639,9 +647,9 @@ fn slot_ranges_for_owner(
 
 /// Ownership check for SPL Token and Token-2022 accounts. Both programs share
 /// the same base layout, so this checks the `owner` field (bytes 32-63) and,
-/// if it doesn't match, the `delegate` field (bytes 76-107) when present. The
-/// delegate grants read access for a current-state method, but is skipped for
-/// an `OWNER_ONLY_METHODS` one.
+/// if it doesn't match, the `delegate` field (bytes 76-107) when present with a
+/// nonzero allowance on an initialized account. The delegate grants read access
+/// for a current-state method, but is skipped for an `OWNER_ONLY_METHODS` one.
 ///
 /// Mints are owned by the same programs but are only 82 bytes, below
 /// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
@@ -671,9 +679,14 @@ async fn check_token_account_ownership(
         return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
 
-    // Check the `delegate` field if one is set.
+    // Check the `delegate` field if one is set, the account is initialized and the
+    // allowance is nonzero. Approve(delegate, 0) leaves the delegate set with
+    // nothing to spend, so it must not keep read access.
     // Bytes 72-75 == [1, 0, 0, 0] means the Option<Pubkey> is Some.
-    if data[DELEGATE_OPTION_OFFSET..DELEGATE_OPTION_OFFSET + 4] == [1, 0, 0, 0] {
+    if data[DELEGATE_OPTION_OFFSET..DELEGATE_OPTION_OFFSET + 4] == [1, 0, 0, 0]
+        && data[STATE_OFFSET] != STATE_UNINITIALIZED
+        && data[DELEGATED_AMOUNT_OFFSET..DELEGATED_AMOUNT_END] != [0; 8]
+    {
         let delegate = bs58::encode(&data[DELEGATE_OFFSET..DELEGATE_END]).into_string();
 
         match is_wallet_owned_by_user(auth_db, user_id, &delegate).await {

@@ -323,15 +323,17 @@ fn null_account_response() -> String {
 
 /// Build a getAccountInfo JSON-RPC response for an SPL token account.
 ///
-/// `owner_bytes` is placed at bytes 32-63 of the account data (the token
-/// account owner field). If `delegate_bytes` is `Some`, bytes 72-75 are set
-/// to `[1,0,0,0]` (Some discriminant) and bytes 76-107 hold the delegate.
-fn token_account_response(owner_bytes: &[u8; 32], delegate_bytes: Option<&[u8; 32]>) -> String {
+/// `owner_bytes` is placed at bytes 32-63 and the account is marked Initialized.
+/// If `delegate` is `Some((pubkey, allowance))`, bytes 72-75 are `[1,0,0,0]`,
+/// bytes 76-107 hold the delegate and bytes 121-128 its allowance.
+fn token_account_response(owner_bytes: &[u8; 32], delegate: Option<(&[u8; 32], u64)>) -> String {
     let mut data = vec![0u8; 165];
     data[32..64].copy_from_slice(owner_bytes);
-    if let Some(d) = delegate_bytes {
+    data[108] = 1; // Initialized
+    if let Some((delegate_bytes, allowance)) = delegate {
         data[72..76].copy_from_slice(&[1, 0, 0, 0]);
-        data[76..108].copy_from_slice(d);
+        data[76..108].copy_from_slice(delegate_bytes);
+        data[121..129].copy_from_slice(&allowance.to_le_bytes());
     }
     let encoded = BASE64.encode(&data);
     json!({
@@ -889,7 +891,7 @@ async fn test_get_account_info_ata_delegated_to_user_wallet_is_proxied() {
     let ata_pubkey = bs58::encode([11u8; 32]).into_string();
     let backend = start_mock_backend_with_body(token_account_response(
         &unrelated_owner,
-        Some(&delegate_bytes),
+        Some((&delegate_bytes, 1_000)),
     ))
     .await;
     let addr = start_gateway(
@@ -913,6 +915,50 @@ async fn test_get_account_info_ata_delegated_to_user_wallet_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// Approve(delegate, 0) leaves the delegate set with nothing to spend, so it
+/// must not keep read access.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_zero_allowance_delegate_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate_bytes = [94u8; 32];
+    let delegate_pubkey = bs58::encode(delegate_bytes).into_string();
+    let unrelated_owner = [95u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &delegate_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([96u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &unrelated_owner,
+        Some((&delegate_bytes, 0)),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
 }
 
 /// A user querying an ATA whose owner and delegate do not match any of their
@@ -1684,7 +1730,7 @@ async fn test_get_token_account_balance_delegate_is_proxied() {
 
     let ata_pubkey = bs58::encode([49u8; 32]).into_string();
     let backend = start_mock_backend_with_sequence(vec![
-        token_account_response(&unrelated_owner, Some(&delegate_bytes)),
+        token_account_response(&unrelated_owner, Some((&delegate_bytes, 1_000))),
         token_balance_response(0, 6, LEDGER_TIP),
     ])
     .await;
@@ -1735,6 +1781,8 @@ async fn test_get_token_account_balance_serves_the_balance_it_authorized() {
     account[64..72].copy_from_slice(&authorized_amount.to_le_bytes());
     account[72..76].copy_from_slice(&[1, 0, 0, 0]);
     account[76..108].copy_from_slice(&delegate);
+    account[108] = 1; // Initialized
+    account[121..129].copy_from_slice(&1_000u64.to_le_bytes());
     let authorized_account = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -2254,7 +2302,7 @@ async fn test_get_signatures_for_address_delegate_returns_403() {
     let ata_pubkey = bs58::encode([46u8; 32]).into_string();
     let backend = start_mock_backend_with_body(token_account_response(
         &unrelated_owner,
-        Some(&delegate_bytes),
+        Some((&delegate_bytes, 1_000)),
     ))
     .await;
     let addr = start_gateway(
@@ -2351,7 +2399,7 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
 
     let ata_pubkey = bs58::encode(untouched_ata_of(&owner_bytes)).into_string();
     let (backend, requests) = start_recording_mock_backend(vec![
-        token_account_response(&owner_bytes, Some(&unrelated_delegate)),
+        token_account_response(&owner_bytes, Some((&unrelated_delegate, 1_000))),
         history_page_for_slots(&[1]),
     ])
     .await;
