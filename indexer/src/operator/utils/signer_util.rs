@@ -693,8 +693,9 @@ mod tests {
         env::set_var(wallet_id, "fake-wallet");
     }
 
-    /// Cantina #13: complete Privy creds are awaited on the running runtime. The old
-    /// nested `block_on` panicked here; a fake wallet must end in an error or the timeout.
+    /// Complete Privy creds must reach Privy's own request on the running runtime, which
+    /// the old nested `block_on` panicked on. A zero timeout stops it there with no network
+    /// round trip; a config error means we refused Privy before calling it.
     #[tokio::test]
     #[serial]
     async fn privy_signer_is_awaited_on_the_runtime() {
@@ -702,10 +703,11 @@ mod tests {
         set_fake_privy(SignerRole::Admin);
 
         let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), build(SignerRole::Admin)).await;
+            tokio::time::timeout(std::time::Duration::ZERO, build(SignerRole::Admin)).await;
         assert!(
-            !matches!(result, Ok(Ok(_))),
-            "a fake privy wallet must not load"
+            matches!(result, Err(_) | Ok(Err(LoadError::Keychain(_)))),
+            "build must await Privy, got {:?}",
+            result.map(|r| r.map(|s| s.pubkey()).map_err(|e| e.to_string()))
         );
     }
 
