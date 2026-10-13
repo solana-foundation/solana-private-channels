@@ -103,6 +103,24 @@ pub fn lists_native_mint(tx: &SanitizedTransaction) -> bool {
         .any(|key| *key == spl_token::native_mint::id())
 }
 
+/// Rejection reason for a writable key that no instruction is given.
+pub const UNUSED_WRITABLE_ACCOUNT: &str =
+    "Every writable account other than the fee payer must be passed to an instruction";
+
+/// The scheduler write-locks every writable key, so one no instruction uses would
+/// serialize unrelated transactions on that account. A CPI can only reach accounts
+/// its outer instruction was given, so forwarding still works.
+pub fn has_unused_writable_account(tx: &SanitizedTransaction) -> bool {
+    let message = tx.message();
+    let used: HashSet<usize> = message
+        .program_instructions_iter()
+        .flat_map(|(_, ix)| ix.accounts.iter().map(|&index| usize::from(index)))
+        .collect();
+    // Index 0 is the fee payer, writable without being passed to an instruction.
+    (1..message.account_keys().len())
+        .any(|index| message.is_writable(index) && !used.contains(&index))
+}
+
 /// Rejection reason shared by every admission path, so clients see one wording.
 pub const ADDRESS_LOOKUP_UNSUPPORTED: &str =
     "Address lookup tables are not supported; submit a transaction with no address table lookups";
