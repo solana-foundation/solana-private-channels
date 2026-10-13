@@ -15,7 +15,7 @@ use private_channel_metrics::{HealthState, MetricLabel};
 use solana_commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -414,28 +414,26 @@ pub async fn run(
     // withdraw role, and reconciliation on the escrow role: a dead loop silently
     // stops every solvency check. The feepayer monitor is not watched.
     //
-    // Handles are polled by mutable reference so ownership stays here and
-    // they can still be moved into `shutdown_operator` below — awaiting an
-    // already-completed JoinHandle is a no-op.
+    // Handles are polled by mutable reference so ownership stays here. A JoinHandle
+    // panics if polled again after it completed, so the one select joins is never
+    // handed to shutdown.
     let mut fetcher_handle = fetcher_handle;
     let mut processor_handle = processor_handle;
     let mut sender_handle = sender_handle;
     let mut storage_writer_handle = storage_writer_handle;
     let mut recovery_handle = recovery_handle;
     let mut promotion_handle = promotion_handle;
-    // A JoinHandle panics if polled again after it completed, so remember when select did.
-    let mut promotion_joined = false;
     let mut reconciliation_handle = reconciliation_handle;
     // The withdraw role's placeholder finishes at once, so only escrow watches it.
     let watch_reconciliation = program_type == crate::config::ProgramType::Escrow;
-    let mut reconciliation_joined = false;
     let pt_label = program_type.as_label();
 
     // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
     // branch, so a task ending at the same instant cannot turn a deliberate stop into a
     // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
     // an interrupt, which is what stop_signal settles.
-    tokio::select! {
+    // Yields the critical task select joined, with its join result.
+    let exited = tokio::select! {
         biased;
         reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
             match reason.map_err(|_| OperatorError::ShutdownChannelSend)? {
@@ -465,30 +463,22 @@ pub async fn run(
                     info!("Shutdown signal received, initiating graceful shutdown...");
                 }
             }
+            None
         }
-        _ = &mut fetcher_handle => {
-            critical_exit(pt_label, "fetcher");
+        joined = &mut fetcher_handle => Some(("fetcher", joined)),
+        joined = &mut processor_handle => Some(("processor", joined)),
+        joined = &mut sender_handle => Some(("sender", joined)),
+        joined = &mut storage_writer_handle => Some(("storage_writer", joined)),
+        joined = &mut recovery_handle => Some(("recovery", joined)),
+        joined = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
+            Some(("release_promotion", joined))
         }
-        _ = &mut processor_handle => {
-            critical_exit(pt_label, "processor");
+        joined = &mut reconciliation_handle, if watch_reconciliation => {
+            Some(("reconciliation", joined))
         }
-        _ = &mut sender_handle => {
-            critical_exit(pt_label, "sender");
-        }
-        _ = &mut storage_writer_handle => {
-            critical_exit(pt_label, "storage_writer");
-        }
-        _ = &mut recovery_handle => {
-            critical_exit(pt_label, "recovery");
-        }
-        _ = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
-            promotion_joined = true;
-            critical_exit(pt_label, "release_promotion");
-        }
-        _ = &mut reconciliation_handle, if watch_reconciliation => {
-            reconciliation_joined = true;
-            critical_exit(pt_label, "reconciliation");
-        }
+    };
+    if let Some((task, _)) = &exited {
+        critical_exit(pt_label, task);
     }
 
     // A critical task dying and the lock going are one failure when the database is what
@@ -512,36 +502,36 @@ pub async fn run(
         return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
     }
 
-    // shutdown_operator awaits this handle, so hand it a finished stand-in once select joined it.
-    let reconciliation_handle = if reconciliation_joined {
-        tokio::spawn(async {})
-    } else {
-        reconciliation_handle
-    };
+    let joined = exited.as_ref().map(|(task, _)| *task);
 
-    // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
-    // exit path.  On the exit path, the handle that tripped the select is
-    // already completed; shutdown_operator will wait on the others.
+    // Graceful shutdown, on both the ctrl-c path and the critical-task-exit path. On the
+    // exit path the joined task gets a finished stand-in, so shutdown_operator only waits
+    // on the workers still running.
     shutdown_operator(
         cancellation_token,
         storage,
-        fetcher_handle,
-        processor_handle,
-        sender_handle,
-        storage_writer_handle,
-        reconciliation_handle,
+        unless_joined(fetcher_handle, "fetcher", joined),
+        unless_joined(processor_handle, "processor", joined),
+        unless_joined(sender_handle, "sender", joined),
+        unless_joined(storage_writer_handle, "storage_writer", joined),
+        unless_joined(reconciliation_handle, "reconciliation", joined),
         feepayer_monitor_handle,
-        recovery_handle,
+        unless_joined(recovery_handle, "recovery", joined),
         config.batch_size,
         config.db_poll_interval,
     )
     .await
     .map_err(|_| OperatorError::ShutdownChannelSend)?;
     // Already cancelled by shutdown_operator; this only waits out the pass in progress.
-    if !promotion_joined {
-        if let Err(e) = promotion_handle.await {
-            error!("Release promotion join error during shutdown: {}", e);
-        }
+    if let Err(e) = unless_joined(promotion_handle, "release_promotion", joined).await {
+        error!("Release promotion join error during shutdown: {}", e);
+    }
+    // Reported once the others have drained.
+    if let Some((task, Err(join_error))) = &exited {
+        error!(
+            task = *task,
+            "Critical operator task failed: {}", join_error
+        );
     }
 
     info!("Operator shutdown complete");
@@ -702,12 +692,6 @@ async fn validate_withdraw_fallback(
     Ok(())
 }
 
-/// Log + metric for a critical task that exited before cancellation.
-///
-/// We don't abort the process here — the caller falls through to
-/// `shutdown_operator` so the remaining tasks get the usual graceful-shutdown
-/// treatment.  The process will exit naturally once `shutdown_operator`
-/// returns, and the supervisor will restart the operator.
 /// Stop every worker outright, for a lost live-state lock.
 ///
 /// Nothing may drain: Postgres frees the lock the instant our session dies, so a resync may
@@ -753,6 +737,11 @@ async fn stop_boot_writer(
     }
 }
 
+/// Log + metric for a critical task that exited before cancellation.
+///
+/// We don't abort the process here: the caller falls through to `shutdown_operator`, so
+/// the workers still running get the usual graceful shutdown. The process exits once it
+/// returns, and the supervisor restarts the operator.
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -761,6 +750,16 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
     metrics::OPERATOR_TASK_EXIT
         .with_label_values(&[program_type_label, task_name])
         .inc();
+}
+
+/// The handle shutdown may await. A JoinHandle panics if polled after it completed, so
+/// the one supervision already joined is swapped for a finished stand-in.
+fn unless_joined(handle: JoinHandle<()>, task: &str, joined: Option<&str>) -> JoinHandle<()> {
+    if joined == Some(task) {
+        tokio::spawn(async {})
+    } else {
+        handle
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +795,29 @@ mod tests {
                 "a worker that was only signalled, not aborted, could still write"
             );
         }
+    }
+
+    /// Supervision consumes the handle it joins, and a JoinHandle panics if polled again,
+    /// so shutdown must get an awaitable stand-in for that one and the real handle for
+    /// every other worker.
+    #[tokio::test]
+    async fn shutdown_never_awaits_the_handle_supervision_joined() {
+        let mut fetcher = tokio::spawn(async {});
+        let processor = tokio::spawn(std::future::pending::<()>());
+        let processor_id = processor.id();
+        // Joined by mutable reference, as supervision does.
+        (&mut fetcher).await.expect("the fetcher ran");
+
+        unless_joined(fetcher, "fetcher", Some("fetcher"))
+            .await
+            .expect("the stand-in must be awaitable");
+        let processor = unless_joined(processor, "processor", Some("fetcher"));
+        assert_eq!(
+            processor.id(),
+            processor_id,
+            "a running worker must keep its own handle"
+        );
+        processor.abort();
     }
 
     /// A real storage writer on a mock, with one ManualReview update already queued.
