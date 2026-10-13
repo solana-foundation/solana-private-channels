@@ -521,7 +521,7 @@ impl IndexerConfig {
 /// - `ADMIN_SIGNER`: Signer type (memory|vault|turnkey|privy)
 /// - `ADMIN_PRIVATE_KEY`: Private key or key identifier
 ///
-/// ## Optional (falls back to admin if not set):
+/// ## Optional (admin is used only when OPERATOR_SIGNER is unset; a set but broken one fails startup):
 /// - `OPERATOR_SIGNER`: Signer type for operator-specific operations
 /// - `OPERATOR_PRIVATE_KEY`: Private key or key identifier for operator
 ///
@@ -568,7 +568,7 @@ pub struct OperatorConfig {
     /// Webhook URL for reconciliation alerts. Required and non-blank for the escrow
     /// operator, ignored by withdraw. Carries both balance mismatch and orphan deposit alerts.
     pub reconciliation_webhook_url: Option<String>,
-    /// How often to check the feepayer SOL balance (escrow operators only)
+    /// How often to check the feepayer SOL balance (withdraw operators only)
     #[serde(default = "default_feepayer_monitor_interval")]
     pub feepayer_monitor_interval: std::time::Duration,
     /// Milliseconds between `getSignatureStatuses` polls when confirming a sent transaction.

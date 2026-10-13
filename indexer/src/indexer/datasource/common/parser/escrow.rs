@@ -2,7 +2,6 @@ use crate::{
     error::{account::AccountError, ParserError},
     indexer::datasource::common::parser::resolve_account,
     indexer::datasource::common::types::*,
-    indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions},
     operator::utils::account_util::find_instance_pda,
 };
 
