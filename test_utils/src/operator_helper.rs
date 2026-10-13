@@ -132,7 +132,7 @@ pub async fn start_solana_to_private_channel_operator_with_config(
 //   - getSignatureStatuses      — poll-task confirmation loop
 //   - getSignaturesForAddress   — mint idempotency check
 //   - getAccountInfo            — mint initialization / JIT mint path
-//   - getBalance                — feepayer_monitor (escrow operators only)
+//   - getBalance                — feepayer_monitor (withdraw operators only)
 // Unscripted methods return JSON-RPC error -32603 ("no scripted response"),
 // which production paths treat as transient — usually harmless for tests
 // that care about a narrow failure mode and just want the rest of the

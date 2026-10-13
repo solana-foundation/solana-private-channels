@@ -1,5 +1,9 @@
 //! Structural checks shared by the Yellowstone and RPC decoders. The runtime enforces every
 //! rule here, so a successful transaction that breaks one was corrupted by the provider.
+//! `targets_configured_instance` is the exception: a shared filter, not a runtime rule.
+
+use crate::indexer::datasource::common::types::CompiledInstruction;
+use solana_sdk::pubkey::Pubkey;
 
 /// Length of an ed25519 transaction signature.
 pub const SIGNATURE_LEN: usize = 64;
@@ -68,6 +72,26 @@ pub fn check_inner_set_index(index: u32, top_level_count: usize) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Whether this instruction names the configured escrow instance among its own accounts.
+/// Instance admission is transaction-wide, so a transaction of ours also carries other
+/// instances' instructions, and only ours are worth failing a slot on. `None` (withdraw) and
+/// an unresolvable index count as in scope, so an unreadable instruction still fails closed.
+pub(crate) fn targets_configured_instance(
+    instruction: &CompiledInstruction,
+    account_keys: &[Pubkey],
+    escrow_instance_id: Option<&Pubkey>,
+) -> bool {
+    let Some(instance_id) = escrow_instance_id else {
+        return true;
+    };
+
+    instruction.accounts.iter().any(|index| {
+        account_keys
+            .get(*index as usize)
+            .is_none_or(|key| key == instance_id)
+    })
 }
 
 #[cfg(test)]

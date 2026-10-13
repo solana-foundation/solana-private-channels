@@ -149,7 +149,7 @@ gauge_vec!(
 gauge_vec!(
     FEEPAYER_BALANCE_LAMPORTS,
     "private_channel_feepayer_balance_lamports",
-    "Current SOL balance of the escrow operator feepayer wallet in lamports",
+    "Current SOL balance of the withdraw operator feepayer wallet in lamports",
     &["program_type"]
 );
 
@@ -418,7 +418,8 @@ pub fn init_labels(program_type: &str) {
     }
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
-    FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
+    // FEEPAYER_BALANCE_LAMPORTS is seeded by the withdraw operator's monitor, the only
+    // writer; seeding it here would pin every other process at a 0 SOL balance.
 
     // Quarantine reasons must match the string constants returned by
     // `classify_processor_error` in processor.rs - any mismatch is a dead
@@ -596,7 +597,6 @@ mod tests {
             "private_channel_operator_db_update_errors_total",
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
-            "private_channel_feepayer_balance_lamports",
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_reconciliation_input_dark_ticks",
         ];
@@ -609,6 +609,17 @@ mod tests {
                 name
             );
         }
+
+        // Only the withdraw operator pays release fees, so a seeded balance would sit at
+        // zero in every other process.
+        let seeded_fee_payer = prometheus::gather().iter().any(|family| {
+            family.name() == "private_channel_feepayer_balance_lamports"
+                && metric_with_labels(family, &[("program_type", program_type)])
+        });
+        assert!(
+            !seeded_fee_payer,
+            "init_labels must not seed the fee payer balance"
+        );
     }
 
     #[test]
@@ -635,7 +646,6 @@ mod tests {
             "private_channel_operator_transaction_errors_total",
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
-            "private_channel_feepayer_balance_lamports",
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
             "private_channel_operator_stale_processing_recovered_total",
@@ -653,10 +663,10 @@ mod tests {
             );
         }
 
-        // The live-state lock family is deliberately not in the list above. Gathering
-        // reports only families that already carry a series, and its series are created
-        // with the role label when a role takes the lock, not by init. Asserting on its
-        // absence here would depend on test ordering, since sibling tests in this same
-        // process create those series.
+        // The live-state lock and fee payer families are deliberately not in the list
+        // above. Gathering reports only families that already carry a series, and theirs
+        // are created when a role takes the lock or the fee payer monitor starts, not by
+        // init. Asserting on their absence here would depend on test
+        // ordering, since sibling tests in this same process create those series.
     }
 }

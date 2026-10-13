@@ -1,4 +1,4 @@
-use crate::indexer::datasource::common::types::CompiledInstruction;
+use crate::indexer::datasource::common::types::{CompiledInstruction, InnerInstructions};
 use serde::Deserialize;
 
 /// RPC block response types
@@ -93,19 +93,4 @@ pub struct TransactionMeta {
     /// Never null from a node, so missing and null are both incomplete.
     #[serde(rename = "loadedAddresses")]
     pub loaded_addresses: Option<solana_transaction_status::UiLoadedAddresses>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct InnerInstructions {
-    pub index: u8,
-    pub instructions: Vec<InnerInstruction>,
-}
-
-/// A single inner (CPI) instruction; `stack_height` is its CPI depth, used to match a deposit to the event it emitted.
-#[derive(Debug, Deserialize, Clone)]
-pub struct InnerInstruction {
-    #[serde(flatten)]
-    pub instruction: CompiledInstruction,
-    #[serde(rename = "stackHeight")]
-    pub stack_height: Option<u32>,
 }

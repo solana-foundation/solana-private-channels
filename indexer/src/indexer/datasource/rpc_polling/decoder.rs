@@ -13,12 +13,11 @@ use crate::indexer::datasource::common::parser::withdraw::{
 use crate::indexer::datasource::common::parser::{EscrowInstruction, WithdrawInstruction};
 use crate::indexer::datasource::common::tx_validation::{
     check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+    targets_configured_instance,
 };
 use crate::indexer::datasource::common::types::CompiledInstruction;
 use crate::indexer::datasource::common::types::*;
-use crate::indexer::datasource::rpc_polling::types::{
-    InnerInstructions, Reported, RpcBlock, RpcTransactionWithMeta,
-};
+use crate::indexer::datasource::rpc_polling::types::{Reported, RpcBlock, RpcTransactionWithMeta};
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, error};
 
@@ -227,26 +226,6 @@ pub fn decode_slot(
     }
 
     parse_block(block, slot, program_type, escrow_instance_id)
-}
-
-/// Whether this instruction names the configured escrow instance among its own accounts.
-/// Instance admission is transaction-wide, so a transaction of ours also carries other
-/// instances' instructions, and only ours are worth failing a slot on. `None` (withdraw) and
-/// an unresolvable index count as in scope, so an unreadable instruction still fails closed.
-pub(crate) fn targets_configured_instance(
-    instruction: &CompiledInstruction,
-    account_keys: &[Pubkey],
-    escrow_instance_id: Option<&Pubkey>,
-) -> bool {
-    let Some(instance_id) = escrow_instance_id else {
-        return true;
-    };
-
-    instruction.accounts.iter().any(|index| {
-        account_keys
-            .get(*index as usize)
-            .is_none_or(|key| key == instance_id)
-    })
 }
 
 /// First byte (Anchor-style discriminator) of an instruction's base58 data, or `None` if empty/undecodable.
@@ -1339,7 +1318,7 @@ mod tests {
     // CPI (inner instruction) Tests
     // ============================================================================
 
-    use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
+    use crate::indexer::datasource::common::types::{InnerInstruction, InnerInstructions};
     use solana_transaction_status::{UiAddressTableLookup, UiLoadedAddresses};
 
     fn inner(program_id_index: u8, data: &str, stack_height: u32) -> InnerInstruction {
