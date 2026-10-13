@@ -686,6 +686,15 @@ mod tests {
         assert_eq!(resp.context.slot, 10);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_recent_blockhash_fails_when_the_store_cannot_be_read() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let err = get_recent_blockhash_impl::get_recent_blockhash_impl(&deps)
+            .await
+            .expect_err("a failed read must not return a zero hash");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+    }
+
     // ── get_transaction_count ─────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]

@@ -64,9 +64,9 @@ pub mod test_hooks {
         super::mint::try_jit_mint_initialization(state, transaction_id, instruction).await
     }
 
-    /// Drives `process_pending_remints` end-to-end. Each call walks
-    /// every matured `PendingRemint` in `state.pending_remints` and
-    /// either re-queues it (RPC error), promotes to `Completed`
+    /// Drives `process_pending_remints` end-to-end. Each call walks up to
+    /// `MAX_REMINTS_PER_TICK` matured entries in `state.pending_remints` and
+    /// either re-queues each (RPC error), promotes to `Completed`
     /// (withdrawal finalized), or hands off to `execute_deferred_remint`.
     pub async fn process_pending_remints(
         state: &mut SenderState,

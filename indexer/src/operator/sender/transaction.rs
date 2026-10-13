@@ -1059,9 +1059,15 @@ pub(super) async fn handle_nonce_already_used(
     // manual review for want of evidence we already wrote down.
     if signatures.is_empty() {
         if let Some(transaction_id) = ctx.transaction_id {
+            // This runtime path still reads a failed lookup as nothing to attribute, which
+            // ends in manual review. Known follow-up; the boot check surfaces the error instead.
             signatures =
                 super::state::load_persisted_release_signatures(&state.storage, transaction_id)
-                    .await;
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!(transaction_id, "Release signature lookup failed: {e}");
+                        Vec::new()
+                    });
         }
     }
 

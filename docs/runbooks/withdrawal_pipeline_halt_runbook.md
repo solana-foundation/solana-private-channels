@@ -197,7 +197,11 @@ persists after correcting the named rows and restarting.
 - The withdraw operator exits at boot and the supervisor restarts it in a loop.
 - The error log reads `Withdraw boot pre-flight failed, refusing to start: Program error:
   Withdrawal bitmap unavailable: ...`, or a `Storage error:` or `Account error:` instead.
-- No row is marked `failed` by this check. No `bitmap_divergence` increment.
+- No row is marked `failed` by this check. Nonces resolved earlier in the same pass may still
+  have counted a `bitmap_divergence`.
+- One `Storage error:` cause is a failed read of a release signature journal for a consumed
+  nonce whose row is still `processing` or `pending_remint`. The row is left as it is and the
+  restart retries the read.
 
 ### Why the operator refuses
 
