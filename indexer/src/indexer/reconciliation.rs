@@ -18,7 +18,7 @@
 //! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
-//! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
+//! 4. If any mint's channel supply exceeds its custody by more than its tolerance, log
 //!    error, emit alert, abort startup. Checked first: it reads the chain on both sides,
 //!    so it is unaffected by how far behind the DB is and can never be repaired by
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
@@ -404,7 +404,7 @@ async fn measure_supply_breaches(
     for (r, mint, supply) in supplies {
         let on_chain_custody = custody.balances.get(&mint).copied().unwrap_or(0);
         let gap = supply.saturating_sub(on_chain_custody);
-        if gap > config.mismatch_threshold_raw {
+        if gap > startup_tolerance_raw(config, on_chain_custody) {
             breaches.push(SupplyBreach {
                 mint: r.mint.clone(),
                 key: mint,
@@ -527,6 +527,7 @@ async fn check_channel_supply_invariant(
             custody_slot = b.custody_slot,
             gap = b.gap,
             threshold = config.mismatch_threshold_raw,
+            tolerance = startup_tolerance_raw(config, b.custody),
             readings,
             required = SUPPLY_BREACH_CONFIRMATIONS,
             "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
@@ -2283,6 +2284,43 @@ mod tests {
             ),
             "supply over custody must still halt: {:?}",
             breach
+        );
+    }
+
+    /// The supply check allows the same cushion as the ledger check: the larger of the
+    /// absolute threshold and the bps share of custody.
+    #[tokio::test]
+    async fn startup_supply_gap_within_bps_tolerance_passes() {
+        let custody = 1_000;
+        // 100 bps of 1,000 custody allows 10 units, so a 5-unit gap is within it.
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            reconciliation_tolerance_bps: 100,
+        };
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), custody)]).await;
+        mock_channel_supply(&mut server, custody + 5).await;
+
+        // A balanced ledger, so the supply check is the only thing that can fail.
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), custody, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a supply gap within the bps tolerance must not stop startup: {result:?}"
         );
     }
 
