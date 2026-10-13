@@ -108,53 +108,69 @@ enum Loaded {
     },
 }
 
-/// Both role signers. `operator: None` means release and rotation sign with admin.
-struct Signers {
-    admin: Signer,
-    operator: Option<Signer>,
-}
+static ADMIN: OnceCell<Signer> = OnceCell::new();
 
-static SIGNERS: OnceCell<Signers> = OnceCell::new();
+/// `None` means release and rotation sign with admin.
+static OPERATOR: OnceCell<Option<Signer>> = OnceCell::new();
 
-/// Loads both signers once, awaiting Privy on the caller's runtime. Startup calls this
-/// before it connects to anything; later calls do nothing.
-pub async fn init_signers() -> Result<(), String> {
-    if SIGNERS.get().is_none() {
-        let _ = SIGNERS.set(load_signers().await?);
+/// Loads the admin signer once, awaiting Privy on the caller's runtime. Resync needs only
+/// this; later calls do nothing.
+pub async fn init_admin_signer() -> Result<(), String> {
+    if ADMIN.get().is_none() {
+        let _ = ADMIN.set(load_admin().await?);
     }
     Ok(())
 }
 
-/// Accessors reached before `init_signers` (tests and tools) load synchronously.
-fn signers() -> &'static Signers {
-    SIGNERS.get_or_init(|| load_signers_sync().unwrap_or_else(|e| panic!("{e}")))
+/// Loads both signers once, awaiting Privy on the caller's runtime. Operator startup calls
+/// this before it connects to anything; later calls do nothing.
+pub async fn init_signers() -> Result<(), String> {
+    init_admin_signer().await?;
+    if OPERATOR.get().is_none() {
+        let _ = OPERATOR.set(load_operator().await?);
+    }
+    Ok(())
 }
 
-async fn load_signers() -> Result<Signers, String> {
-    let admin = build(SignerRole::Admin).await.map_err(admin_error)?;
-    let operator = if operator_unset() {
-        None
-    } else {
-        Some(build(SignerRole::Operator).await.map_err(operator_error)?)
-    };
-    Ok(Signers { admin, operator })
+/// Accessors reached before init (tests and tools) load synchronously.
+fn admin() -> &'static Signer {
+    ADMIN.get_or_init(|| load_admin_sync().unwrap_or_else(|e| panic!("{e}")))
 }
 
-/// Refuses Privy rather than blocking on it inside a runtime.
-fn load_signers_sync() -> Result<Signers, String> {
-    let admin = match load_signer(SignerRole::Admin).map_err(admin_error)? {
-        Loaded::Built(signer) => signer,
-        Loaded::Privy { .. } => return Err(privy_needs_init(ADMIN_SIGNER)),
-    };
-    let operator = if operator_unset() {
-        None
-    } else {
-        match load_signer(SignerRole::Operator).map_err(operator_error)? {
-            Loaded::Built(signer) => Some(signer),
-            Loaded::Privy { .. } => return Err(privy_needs_init(OPERATOR_SIGNER)),
-        }
-    };
-    Ok(Signers { admin, operator })
+fn operator() -> &'static Option<Signer> {
+    OPERATOR.get_or_init(|| load_operator_sync().unwrap_or_else(|e| panic!("{e}")))
+}
+
+async fn load_admin() -> Result<Signer, String> {
+    build(SignerRole::Admin).await.map_err(admin_error)
+}
+
+async fn load_operator() -> Result<Option<Signer>, String> {
+    if operator_unset() {
+        return Ok(None);
+    }
+    build(SignerRole::Operator)
+        .await
+        .map(Some)
+        .map_err(operator_error)
+}
+
+/// The sync loaders refuse Privy rather than blocking on it inside a runtime.
+fn load_admin_sync() -> Result<Signer, String> {
+    match load_signer(SignerRole::Admin).map_err(admin_error)? {
+        Loaded::Built(signer) => Ok(signer),
+        Loaded::Privy { .. } => Err(privy_needs_init(ADMIN_SIGNER)),
+    }
+}
+
+fn load_operator_sync() -> Result<Option<Signer>, String> {
+    if operator_unset() {
+        return Ok(None);
+    }
+    match load_signer(SignerRole::Operator).map_err(operator_error)? {
+        Loaded::Built(signer) => Ok(Some(signer)),
+        Loaded::Privy { .. } => Err(privy_needs_init(OPERATOR_SIGNER)),
+    }
 }
 
 async fn build(role: SignerRole) -> Result<Signer, LoadError> {
@@ -344,12 +360,11 @@ impl SignerUtil {
     }
 
     pub fn admin_signer() -> &'static Signer {
-        &signers().admin
+        admin()
     }
 
     pub fn operator_signer() -> &'static Signer {
-        let signers = signers();
-        signers.operator.as_ref().unwrap_or(&signers.admin)
+        operator().as_ref().unwrap_or_else(admin)
     }
 }
 
@@ -379,6 +394,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_admin_no_env_var_errors() {
+        settle_globals();
         let original = env::var(ADMIN_SIGNER).ok();
         env::remove_var(ADMIN_SIGNER);
 
@@ -401,6 +417,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_memory_missing_private_key_errors() {
+        settle_globals();
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
         env::set_var(ADMIN_SIGNER, "memory");
@@ -429,6 +446,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_memory_empty_private_key_errors() {
+        settle_globals();
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
         env::set_var(ADMIN_SIGNER, "memory");
@@ -460,6 +478,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_vault_missing_vault_addr_errors() {
+        settle_globals();
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_addr = env::var(ADMIN_VAULT_ADDR).ok();
         env::set_var(ADMIN_SIGNER, "vault");
@@ -490,6 +509,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_turnkey_missing_api_public_key_errors() {
+        settle_globals();
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_key = env::var(ADMIN_TURNKEY_API_PUBLIC_KEY).ok();
         env::set_var(ADMIN_SIGNER, "turnkey");
@@ -520,6 +540,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_privy_missing_app_id_errors() {
+        settle_globals();
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_app_id = env::var(ADMIN_PRIVY_APP_ID).ok();
         env::set_var(ADMIN_SIGNER, "privy");
@@ -549,6 +570,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_operator_no_env_var_errors() {
+        settle_globals();
         let orig = env::var(OPERATOR_SIGNER).ok();
         env::remove_var(OPERATOR_SIGNER);
 
@@ -571,6 +593,7 @@ mod tests {
     #[test]
     #[serial]
     fn load_signer_operator_memory_missing_key_errors() {
+        settle_globals();
         let orig_type = env::var(OPERATOR_SIGNER).ok();
         let orig_key = env::var(OPERATOR_PRIVATE_KEY).ok();
         env::set_var(OPERATOR_SIGNER, "memory");
@@ -594,11 +617,19 @@ mod tests {
         }
     }
 
+    /// Loads the global signers from a valid env before a test breaks it, so parallel
+    /// tests that read them never load from the broken env.
+    fn settle_globals() {
+        crate::operator::sender::test_support::ensure_test_signer();
+        SignerUtil::operator_signer();
+    }
+
     /// Saves the named env vars, clears them, and restores them on drop.
     struct EnvGuard(Vec<(&'static str, Option<String>)>);
 
     impl EnvGuard {
         fn clear(names: &[&'static str]) -> Self {
+            settle_globals();
             let saved = names.iter().map(|n| (*n, env::var(n).ok())).collect();
             for name in names {
                 env::remove_var(name);
@@ -679,26 +710,30 @@ mod tests {
     }
 
     /// A bad admin is a startup error, not a panic. Only an unset OPERATOR_SIGNER falls
-    /// back to admin; a set but unloadable one is an error on both load paths.
+    /// back to admin; a set but unloadable one is an error on both load paths, and never
+    /// blocks the admin-only load resync uses.
     #[tokio::test]
     #[serial]
-    async fn load_signers_errors_on_admin_and_only_unset_operator_falls_back() {
+    async fn admin_errors_and_only_unset_operator_falls_back() {
         let _env = EnvGuard::clear(&ALL_VARS);
-        let err = load_signers().await.err().expect("admin unset must fail");
+        let err = load_admin().await.err().expect("admin unset must fail");
         assert!(
             err.contains("ADMIN_SIGNER must be configured") && err.contains("ADMIN_SIGNER not set"),
             "got: {err}"
         );
 
         let admin = set_memory_admin();
-        let signers = load_signers().await.expect("unset operator must load");
-        assert_eq!(signers.admin.pubkey(), admin);
-        assert!(signers.operator.is_none(), "unset operator signs as admin");
+        let unset = load_operator().await.expect("unset operator must load");
+        assert!(unset.is_none(), "unset operator signs as admin");
 
         env::set_var(OPERATOR_SIGNER, "memory");
+        let loaded = load_admin()
+            .await
+            .expect("a broken operator must not block admin");
+        assert_eq!(loaded.pubkey(), admin);
         let errs = [
-            load_signers().await.err().expect("async: broken operator"),
-            load_signers_sync().err().expect("sync: broken operator"),
+            load_operator().await.err().expect("async: broken operator"),
+            load_operator_sync().err().expect("sync: broken operator"),
         ];
         for err in errs {
             assert!(
@@ -715,7 +750,7 @@ mod tests {
     async fn sync_loader_refuses_privy_for_either_role() {
         let _env = EnvGuard::clear(&ALL_VARS);
         set_fake_privy(SignerRole::Admin);
-        let err = load_signers_sync()
+        let err = load_admin_sync()
             .err()
             .expect("privy admin must be refused");
         assert!(
@@ -725,7 +760,7 @@ mod tests {
 
         set_memory_admin();
         set_fake_privy(SignerRole::Operator);
-        let err = load_signers_sync()
+        let err = load_operator_sync()
             .err()
             .expect("privy operator must be refused");
         assert!(

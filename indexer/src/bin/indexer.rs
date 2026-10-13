@@ -590,8 +590,8 @@ async fn run_resync(
     let indexer: IndexerSection = figment.extract_inner("indexer")?;
     // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
     validate_resync_config(&storage, &indexer)?;
-    // Reconcile reads the admin pubkey; load signers before anything connects.
-    private_channel_indexer::operator::init_signers()
+    // Reconcile reads only the admin pubkey; load it before anything connects.
+    private_channel_indexer::operator::init_admin_signer()
         .await
         .map_err(|e| format!("Signer configuration error: {}", e))?;
 
