@@ -3,6 +3,7 @@ use crate::error::account::AccountError;
 use crate::error::OperatorError;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
     find_withdrawal_bitmap_pda, BitmapState, RetryConfig, RpcClientWithRetry,
@@ -31,6 +32,7 @@ use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
 use super::{classify_signatures, SigFinality};
 
 impl SenderState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -39,6 +41,7 @@ impl SenderState {
         retry_max_attempts: u32,
         confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+        solvency_fence: SolvencyFence,
     ) -> Result<Self, OperatorError> {
         // Initialize global RPC client with retry
         let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -96,6 +99,7 @@ impl SenderState {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            solvency_fence,
         })
     }
 }
@@ -1520,6 +1524,7 @@ mod tests {
             3,
             400,
             None,
+            SolvencyFence::open_from_start(),
         );
 
         assert!(result.is_ok());
@@ -1547,6 +1552,7 @@ mod tests {
             5,
             400,
             None,
+            SolvencyFence::open_from_start(),
         );
 
         assert!(result.is_ok());

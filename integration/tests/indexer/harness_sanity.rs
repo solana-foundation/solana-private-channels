@@ -38,7 +38,11 @@ use {
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::time::{Duration, Instant},
     test_utils::{
-        mock_rpc::Reply, operator_helper::start_solana_to_private_channel_operator_with_mocks,
+        mock_rpc::Reply,
+        operator_helper::{
+            start_solana_to_private_channel_operator_with_mocks,
+            start_solana_to_private_channel_operator_with_mocks_dark,
+        },
     },
 };
 
@@ -235,6 +239,71 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
         blockhash_calls >= send_calls,
         "invariant: every sendTransaction is preceded by a getLatestBlockhash \
          (got {blockhash_calls} vs {send_calls})"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The escrow operator moves nothing before its first clean reconciliation tick: with custody
+/// unreadable the fence stays closed, so a ready deposit is never locked or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escrow_operator_moves_nothing_until_its_first_clean_tick() {
+    let harness = start_solana_to_private_channel_operator_with_mocks_dark(
+        Pubkey::new_unique(),
+        Keypair::new(),
+    )
+    .await
+    .expect("harness start");
+    let mint_pk = Pubkey::new_unique();
+    harness.storage.mints.lock().unwrap().insert(
+        mint_pk.to_string(),
+        DbMint::new(
+            mint_pk.to_string(),
+            6,
+            spl_token::id().to_string(),
+            TokenAmount(1),
+        ),
+    );
+    harness
+        .storage
+        .mint_status_history
+        .lock()
+        .unwrap()
+        .push(DbMintStatus {
+            withdrawals_blocked: false,
+            mint_address: mint_pk.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+            signature: format!("test-seed-{mint_pk}"),
+            created_at: chrono::Utc::now(),
+        });
+    harness.storage.set_checkpoint("escrow", 100);
+    harness
+        .storage
+        .pending_transactions
+        .lock()
+        .unwrap()
+        .push(pending_deposit_row(1, mint_pk, Pubkey::new_unique()));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let custody = harness.custody_rpc.as_ref().expect("escrow harness");
+    assert!(
+        custody.call_count("getSlot") >= 1,
+        "the first reconciliation tick ran and found custody dark"
+    );
+    assert_eq!(
+        harness.storage.calls("get_and_lock_pending_transactions"),
+        0,
+        "no row is locked while the fence is closed"
+    );
+    assert_eq!(harness.rpc.call_count("sendTransaction"), 0);
+    assert_eq!(
+        harness.storage.pending_transactions.lock().unwrap()[0].status,
+        TransactionStatus::Pending
     );
 
     harness.shutdown().await;

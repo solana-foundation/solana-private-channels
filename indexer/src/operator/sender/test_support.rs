@@ -101,6 +101,7 @@ pub(super) fn sender_state_with_storage_and_role(
         pending_remints: Vec::new(),
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
     }
 }
 

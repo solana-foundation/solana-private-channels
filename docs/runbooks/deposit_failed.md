@@ -128,6 +128,9 @@ never broadcast goes straight back to `pending` without using a requeue attempt 
 mints once the halt is cleared. A row that already has an earlier journaled attempt stays
 in `processing` for recovery, which checks that attempt on chain and can spend a requeue
 attempt as for any other stuck row; see [`reconciliation_halt_runbook.md`](reconciliation_halt_runbook.md).
+A claim the escrow operator's in-process solvency fence refuses (before its first clean
+reconciliation tick, or after it confirmed a breach) is counted as
+`error_reason="solvency_fence_closed"` and is put back to `pending` the same way.
 
 `OPERATOR_TRANSACTION_ERRORS{error_reason="jit_missing_claim_lease"}` is a
 defensive counter that should never fire: a JIT re-fire arrived without the

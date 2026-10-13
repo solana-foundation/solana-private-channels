@@ -206,6 +206,13 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_SOLVENCY_FENCE_STATE,
+    "private_channel_operator_solvency_fence_state",
+    "Escrow solvency fence: 0 closed (no clean reconciliation tick yet), 1 open, 2 tripped by a confirmed insolvency",
+    &["program_type"]
+);
+
+gauge_vec!(
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
     "private_channel_operator_reconciliation_liability_dark_ticks",
     "Consecutive reconciliation ticks whose ledger could not be pinned to the custody slot (0 when the liability invariant is armed)",
@@ -405,6 +412,7 @@ pub fn init_labels(program_type: &str) {
         "deposit_ownership_lost",
         "release_claim_lost",
         "halted_before_broadcast",
+        "solvency_fence_closed",
         "halt_read_error",
         "release_missing_claim_lease",
         "jit_missing_claim_lease",
@@ -510,6 +518,7 @@ pub fn init_labels(program_type: &str) {
     // dark tick or "no data" and "armed" look the same.
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS.with_label_values(&[program_type]);
     OPERATOR_RECONCILIATION_INPUT_DARK_TICKS.with_label_values(&[program_type]);
+    OPERATOR_SOLVENCY_FENCE_STATE.with_label_values(&[program_type]);
 }
 
 pub fn init() {
@@ -545,6 +554,7 @@ pub fn init() {
         LIVE_STATE_LOCK_LOST,
         OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
+        OPERATOR_SOLVENCY_FENCE_STATE,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
         OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
@@ -599,6 +609,7 @@ mod tests {
             "private_channel_feepayer_balance_lamports",
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_reconciliation_input_dark_ticks",
+            "private_channel_operator_solvency_fence_state",
         ];
 
         for name in single_label_metrics {

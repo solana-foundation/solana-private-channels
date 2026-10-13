@@ -308,6 +308,7 @@ impl MockStorage {
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_and_lock_pending_transactions")?;
         // Same deposit gate as Postgres: only slots the escrow checkpoint covers.
         let escrow_checkpoint = self
             .committed_checkpoints
@@ -587,6 +588,36 @@ impl MockStorage {
             .collect())
     }
 
+    /// Mirrors the Postgres query: history and deposit mints across every store, minus `mints`.
+    pub async fn get_unlisted_mints(&self) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_unlisted_mints")?;
+        let mut found: std::collections::BTreeSet<String> = self
+            .mint_status_history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.mint_address.clone())
+            .collect();
+        {
+            let pending = self.pending_transactions.lock().unwrap();
+            let singles = self.inserted_single_transactions.lock().unwrap();
+            let batches = self.inserted_transactions.lock().unwrap();
+            found.extend(
+                pending
+                    .iter()
+                    .chain(singles.iter())
+                    .chain(batches.iter().flatten())
+                    .filter(|t| t.transaction_type == TransactionType::Deposit)
+                    .map(|t| t.mint.clone()),
+            );
+        }
+        let listed = self.mints.lock().unwrap();
+        Ok(found
+            .into_iter()
+            .filter(|mint| !listed.contains_key(mint))
+            .collect())
+    }
+
     pub async fn get_in_flight_amounts_by_mint(
         &self,
         deposits_after: Option<u64>,
@@ -594,8 +625,8 @@ impl MockStorage {
     ) -> Result<Vec<MintInFlightAmount>, StorageError> {
         self.check_should_fail("get_in_flight_amounts_by_mint")?;
         *self.last_envelope_bounds.lock().unwrap() = Some((deposits_after, withdrawals_after));
-        // Mirror the Postgres query: per mint, unsettled rows into the envelope and settled rows
-        // above their own type's bound into the adjustment, across every store, deduped by id.
+        // Mirror the Postgres query: per mint, unsettled deposits into the envelope and every other
+        // row above its own type's bound into the adjustment, across every store, deduped by id.
         let mut seen_ids = std::collections::HashSet::new();
         let mut sums: HashMap<String, (BigDecimal, BigDecimal)> = HashMap::new();
         {
@@ -610,13 +641,14 @@ impl MockStorage {
                 if !seen_ids.insert(t.id) {
                     continue;
                 }
-                let in_envelope = matches!(
-                    t.status,
-                    TransactionStatus::Pending
-                        | TransactionStatus::Processing
-                        | TransactionStatus::Parked
-                        | TransactionStatus::PendingRemint
-                );
+                let in_envelope = t.transaction_type == TransactionType::Deposit
+                    && matches!(
+                        t.status,
+                        TransactionStatus::Pending
+                            | TransactionStatus::Processing
+                            | TransactionStatus::Parked
+                            | TransactionStatus::PendingRemint
+                    );
                 let bound = match t.transaction_type {
                     TransactionType::Deposit => deposits_after,
                     TransactionType::Withdrawal => withdrawals_after,
@@ -647,6 +679,15 @@ impl MockStorage {
     }
 
     pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("set_reconciliation_halt")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("set_reconciliation_halt")?;
         *self.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
             reason: reason.to_string(),
@@ -1156,6 +1197,34 @@ impl MockStorage {
             .get(&transaction_id)
             .is_some_and(|sigs| !sigs.is_empty());
         if !halted || journaled {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        txn.status = TransactionStatus::Pending;
+        txn.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    pub async fn requeue_unclaimed(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("requeue_unclaimed")?;
+        let journaled = self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .is_some_and(|sigs| !sigs.is_empty());
+        if journaled {
             return Ok(false);
         }
         let mut pending = self.pending_transactions.lock().unwrap();

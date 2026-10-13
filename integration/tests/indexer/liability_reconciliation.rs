@@ -293,6 +293,7 @@ fn spawn_reconciliation(
             instance,
             Some(health),
             cancel,
+            private_channel_indexer::operator::solvency_fence::SolvencyFence::closed(),
         )
         .await
         {

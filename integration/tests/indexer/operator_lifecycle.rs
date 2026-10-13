@@ -412,6 +412,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     // rpc_url (mint target) = PC node; the escrow instance stays on Solana.
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -513,6 +514,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -895,6 +897,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
     let pc_client = RpcClient::new(pc_node.url.clone());
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -968,6 +971,7 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_solana_to_private_channel_operator(
+        test_validator.rpc_url(),
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -1056,7 +1060,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     mint_to_owner(&client, &admin, mint, holder.pubkey(), &admin, OVER_ISSUED).await?;
 
     // One active (pending) withdrawal so the halt's quarantine has a row to flip.
-    // Its amount joins the mint's in-flight envelope but stays well under the gap.
+    // A withdrawal never widens the envelope, since its burn is already in the supply.
     let wd_sig = Signature::new_unique().to_string();
     let withdrawal =
         DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
@@ -1104,6 +1108,8 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 
     let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
+    let fence = private_channel_indexer::operator::solvency_fence::SolvencyFence::closed();
+    let recon_fence = fence.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = run_reconciliation(
             recon_storage,
@@ -1113,6 +1119,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
             instance,
             health_for_task,
             recon_token_clone,
+            recon_fence,
         )
         .await
         {
@@ -1157,6 +1164,15 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     assert!(
         !health.is_healthy(),
         "operator health must be forced unhealthy after a halt"
+    );
+    // The in-process fence tripped too, so this process moves nothing even without the row.
+    assert!(
+        !fence.is_open(),
+        "a confirmed breach trips the solvency fence"
+    );
+    assert_eq!(
+        fence.state(),
+        private_channel_indexer::operator::solvency_fence::FenceState::Tripped
     );
 
     // The active withdrawal was quarantined to manual_review by the halt.

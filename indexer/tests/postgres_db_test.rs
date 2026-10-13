@@ -2911,6 +2911,63 @@ async fn halted_claim_requeues_only_an_unsent_row() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// A claim the operator refused in process goes back to Pending with no halt row, spending no
+/// requeue attempt; a row with a journaled attempt or a stale token stays put.
+#[tokio::test(flavor = "multi_thread")]
+async fn requeue_unclaimed_returns_a_processing_row_to_pending(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    let lock = |sig: &'static str| {
+        let storage = &storage;
+        let pool = &pool;
+        async move {
+            let id = storage
+                .insert_db_transaction(&make_db_transaction(sig, TransactionType::Deposit))
+                .await?;
+            storage
+                .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+                .await?;
+            sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>((id, updated_at_of(pool, id).await))
+        }
+    };
+
+    let (unsent, unsent_token) = lock("unclaimed_unsent").await?;
+    let (journaled, journaled_token) = lock("unclaimed_journaled").await?;
+    let journaled_token = storage
+        .claim_and_persist_signature(journaled, journaled_token, "sig-sent".to_string(), 1, None)
+        .await?
+        .expect("claim");
+
+    let stale = unsent_token - chrono::Duration::seconds(1);
+    assert!(
+        !storage.requeue_unclaimed(unsent, stale).await?,
+        "stale token"
+    );
+    assert!(
+        !storage
+            .requeue_unclaimed(journaled, journaled_token)
+            .await?,
+        "a row that may have broadcast is left for recovery"
+    );
+    assert!(storage.requeue_unclaimed(unsent, unsent_token).await?);
+    assert!(storage.is_reconciliation_halted().await?.is_none());
+
+    let (status, attempts): (String, i32) = sqlx::query_as(
+        "SELECT status::text, recovery_requeue_attempts FROM transactions WHERE id = $1",
+    )
+    .bind(unsent)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(status, "pending");
+    assert_eq!(attempts, 3, "no requeue attempt spent");
+    Ok(())
+}
+
 /// Claiming the same signature twice yields a single row (ON CONFLICT
 /// (signature) DO NOTHING), even though each claim owns the current token.
 #[tokio::test(flavor = "multi_thread")]

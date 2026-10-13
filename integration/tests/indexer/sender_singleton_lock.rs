@@ -125,6 +125,7 @@ fn spawn_sender(
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             sender_lock,
+            private_channel_indexer::operator::solvency_fence::SolvencyFence::open_from_start(),
         )
         .await
     });

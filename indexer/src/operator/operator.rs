@@ -1,6 +1,7 @@
 use crate::config::OperatorConfig;
 use crate::error::{OperatorError, StorageError};
 use crate::metrics;
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, release_promotion, sender,
     DbTransactionWriter, RetryConfig, RpcClientWithRetry,
@@ -218,7 +219,12 @@ pub async fn run(
         }
     }
 
+    // In memory rather than a row: a process that skipped its first clean reconciliation tick,
+    // or saw a confirmed breach whose halt write failed, must not move value either way.
+    let solvency_fence = SolvencyFence::for_role(program_type);
+
     // Start fetcher task
+    let fetcher_fence = solvency_fence.clone();
     let fetcher_storage = storage.clone();
     let fetcher_config = config.clone();
     let fetcher_token = cancellation_token.clone();
@@ -231,6 +237,7 @@ pub async fn run(
             common_config.program_type,
             fetcher_token,
             fetcher_health,
+            fetcher_fence,
         )
         .await
         {
@@ -264,6 +271,7 @@ pub async fn run(
     });
 
     // Start sender task
+    let sender_fence = solvency_fence.clone();
     let sender_token = cancellation_token.clone();
     let sender_storage = storage.clone();
     let sender_commitment = config.rpc_commitment;
@@ -282,6 +290,7 @@ pub async fn run(
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
             sender_lock,
+            sender_fence,
         )
         .await
         {
@@ -307,6 +316,7 @@ pub async fn run(
                 let reconciliation_channel_rpc = rpc_client.clone();
                 let reconciliation_health = health.clone();
                 let reconciliation_token = cancellation_token.clone();
+                let reconciliation_fence = solvency_fence.clone();
                 tokio::spawn(async move {
                     if let Err(e) = reconciliation::run_reconciliation(
                         reconciliation_storage,
@@ -316,6 +326,7 @@ pub async fn run(
                         reconciliation_escrow,
                         reconciliation_health,
                         reconciliation_token,
+                        reconciliation_fence,
                     )
                     .await
                     {

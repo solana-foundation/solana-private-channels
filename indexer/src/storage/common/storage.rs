@@ -35,6 +35,7 @@ pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
+pub mod get_unlisted_mints;
 pub mod get_withdrawal_by_nonce;
 pub mod init_schema;
 pub mod insert_db_transaction;
@@ -47,6 +48,7 @@ pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod requeue_halted_claim;
+pub mod requeue_unclaimed;
 pub mod resync_state;
 pub mod sender_lock;
 pub mod set_pending_remint;
@@ -283,6 +285,11 @@ impl Storage {
         get_mint_addresses::get_mint_addresses(self).await
     }
 
+    /// Mints the DB holds status history or deposit rows for but no `mints` row.
+    pub async fn get_unlisted_mints(&self) -> Result<Vec<String>, StorageError> {
+        get_unlisted_mints::get_unlisted_mints(self).await
+    }
+
     /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, where a
     /// withdrawal the operator marked `completed` counts as released too. Startup only;
     /// runtime holds out for the observed release.
@@ -296,9 +303,9 @@ impl Storage {
         .await
     }
 
-    /// Per-mint sum of every unsettled transaction amount (pending / processing /
-    /// parked / pending_remint), used as the in-flight envelope by the runtime
-    /// reconciliation halt decision, plus settled rows above each type's bound.
+    /// Per-mint sum of unsettled deposits (pending / processing / parked / pending_remint),
+    /// the in-flight envelope of the runtime reconciliation halt decision, plus settled
+    /// deposits and withdrawals in any status above each type's bound.
     pub async fn get_in_flight_amounts_by_mint(
         &self,
         deposits_after: Option<u64>,
@@ -579,6 +586,16 @@ impl Storage {
         expected_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, StorageError> {
         requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
+    }
+
+    /// CAS `Processing` to `Pending` for a claim the sender refused before claiming, only if
+    /// nothing was ever journaled for the row; spends no requeue attempt.
+    pub async fn requeue_unclaimed(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        requeue_unclaimed::requeue_unclaimed(self, transaction_id, expected_updated_at).await
     }
 
     /// Cap-gated CAS `Processing` → `Pending` on `updated_at` for pre-broadcast
@@ -2909,10 +2926,13 @@ mod tests {
             // Above the deposit bound but a withdrawal, whose bound it is below.
             db.push(sloted_txn(6, Withdrawal, Completed, 5_000, 32));
             db.push(sloted_txn(7, Deposit, Processing, 2_000, 64));
+            // Unsettled withdrawals count only above their bound, and only as the adjustment.
+            db.push(sloted_txn(8, Withdrawal, Pending, 11, 128));
+            db.push(sloted_txn(9, Withdrawal, Pending, 10, 256));
         }
         let (in_flight, adjustment) = envelope_parts(&storage, Some(1_000), Some(10)).await;
         assert_eq!(in_flight, BigDecimal::from(64u64));
-        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32));
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32 + 128));
 
         // Raising the withdrawal bound drops every withdrawal, leaving the deposits.
         let (_, adjustment) = envelope_parts(&storage, Some(1_000), Some(5_000)).await;
@@ -2948,16 +2968,65 @@ mod tests {
         );
     }
 
+    /// Mock twin of the Postgres test of the same name, with the same rows.
+    #[tokio::test]
+    async fn unlisted_mints_come_from_history_and_deposits_only() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        let history = |mint: &str| crate::storage::common::models::DbMintStatus {
+            withdrawals_blocked: true,
+            mint_address: mint.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 1,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+            signature: format!("history-{mint}"),
+            created_at: Utc::now(),
+        };
+        mock.mints.lock().unwrap().insert(
+            "listed".to_string(),
+            DbMint::new("listed".to_string(), 6, "spl".to_string(), TokenAmount(1)),
+        );
+        mock.mint_status_history.lock().unwrap().extend([
+            history("listed"),
+            history("history_only"),
+            history("history_only"),
+        ]);
+        let row = |id, mint: &str, kind, status| {
+            let mut t = sloted_txn(id, kind, status, 1, 1);
+            t.mint = mint.to_string();
+            t
+        };
+        mock.pending_transactions.lock().unwrap().extend([
+            row(1, "listed", Deposit, Completed),
+            row(2, "deposit_only", Deposit, Pending),
+            row(3, "withdrawal_only", Withdrawal, Completed),
+        ]);
+        mock.inserted_single_transactions.lock().unwrap().push(row(
+            4,
+            "deposit_only",
+            Deposit,
+            Completed,
+        ));
+
+        let mut unlisted = storage.get_unlisted_mints().await.unwrap();
+        unlisted.sort();
+        assert_eq!(unlisted, vec!["deposit_only", "history_only"]);
+    }
+
     /// Every status is either in the envelope or counted by the slot arms; a new status
-    /// must be classified here before this compiles.
+    /// must be classified here before this compiles. Only deposits enter the envelope.
     #[tokio::test]
     async fn every_status_is_counted_exactly_once_above_the_bound() {
         use TransactionStatus::*;
-        fn in_envelope(status: TransactionStatus) -> bool {
-            match status {
+        fn in_envelope(status: TransactionStatus, kind: TransactionType) -> bool {
+            let unsettled = match status {
                 Pending | Processing | Parked | PendingRemint => true,
                 Completed | Failed | FailedReminted | ManualReview => false,
-            }
+            };
+            unsettled && kind == TransactionType::Deposit
         }
         let all = [
             Pending,
@@ -2979,7 +3048,7 @@ mod tests {
                 let (in_flight, adjustment) = envelope_parts(&storage, Some(10), Some(10)).await;
                 let seven = BigDecimal::from(7u64);
                 let zero = BigDecimal::from(0u64);
-                let expected = if in_envelope(status) {
+                let expected = if in_envelope(status, kind) {
                     (seven, zero)
                 } else {
                     (zero, seven)

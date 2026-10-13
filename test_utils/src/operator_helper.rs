@@ -13,7 +13,7 @@ use {
 };
 
 #[cfg(feature = "test-mock-storage")]
-use crate::mock_rpc::MockRpcServer;
+use crate::mock_rpc::{MockRpcServer, Reply};
 #[cfg(feature = "test-mock-storage")]
 use private_channel_indexer::storage::common::storage::mock::MockStorage;
 
@@ -56,14 +56,17 @@ fn set_operator_env_vars(keypair: &Keypair) {
 }
 
 /// Start the operator that reads from Solana indexer and mints tokens on PrivateChannel.
+/// Custody is read from `solana_rpc_url` and channel supply from `private_channel_rpc_url`.
 pub async fn start_solana_to_private_channel_operator(
     private_channel_rpc_url: String,
+    solana_rpc_url: String,
     solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     start_solana_to_private_channel_operator_with_config(
         private_channel_rpc_url,
+        solana_rpc_url,
         solana_indexer_db_url,
         operator_keypair,
         escrow_instance_id,
@@ -75,6 +78,7 @@ pub async fn start_solana_to_private_channel_operator(
 /// Same as `start_solana_to_private_channel_operator`, with a caller-supplied operator config.
 pub async fn start_solana_to_private_channel_operator_with_config(
     private_channel_rpc_url: String,
+    solana_rpc_url: String,
     solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
@@ -90,8 +94,8 @@ pub async fn start_solana_to_private_channel_operator_with_config(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
-        // Single-validator harness: Solana custody and the channel share one node.
-        source_rpc_url: Some(private_channel_rpc_url.clone()),
+        // Custody lives on Solana and supply on the channel, as in production.
+        source_rpc_url: Some(solana_rpc_url),
         rpc_url: private_channel_rpc_url,
         fallback_rpc_url: None,
         postgres: postgres_config,
@@ -143,10 +147,13 @@ pub struct OperatorMockHarness {
     /// for both fault injection (`set_should_fail`) and direct seeding
     /// (`pending_transactions.lock().unwrap().push(...)`).
     pub storage: MockStorage,
-    /// Scripted JSON-RPC endpoint. Every RPC call the operator makes hits
-    /// this server. Use `enqueue` / `enqueue_sequence` to script replies
+    /// Scripted JSON-RPC endpoint. Every RPC call the operator makes on its main
+    /// chain hits this server. Use `enqueue` / `enqueue_sequence` to script replies
     /// and `call_count` / `call_timestamps` to assert interactions.
     pub rpc: MockRpcServer,
+    /// Escrow harness only: the Solana side (custody, mint cache, feepayer balance),
+    /// kept apart so the reconciler's custody reads never touch the channel's script.
+    pub custody_rpc: Option<MockRpcServer>,
     /// Handle to the spawned `operator::run` task — same type the Postgres
     /// helpers return. Dropping the handle or calling `shutdown` aborts
     /// the operator on the next await point.
@@ -159,6 +166,9 @@ impl OperatorMockHarness {
     pub async fn shutdown(self) {
         self.handle.shutdown().await;
         self.rpc.shutdown().await;
+        if let Some(custody) = self.custody_rpc {
+            custody.shutdown().await;
+        }
     }
 }
 
@@ -234,6 +244,7 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
     Ok(OperatorMockHarness {
         storage: mock_storage,
         rpc,
+        custody_rpc: None,
         handle: OperatorHandle {
             _handle: task_handle,
         },
@@ -242,13 +253,50 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
 
 /// Start the operator that reads from Solana indexer and mints on PrivateChannel,
 /// wired against a scripted `MockRpcServer` + in-memory `Storage::Mock`. Program
-/// type is `Escrow`.
+/// type is `Escrow`. Returns once the first reconciliation tick has opened the
+/// solvency fence, so rows seeded afterwards never race it.
 #[cfg(feature = "test-mock-storage")]
 pub async fn start_solana_to_private_channel_operator_with_mocks(
     escrow_instance_id: Pubkey,
     operator_keypair: Keypair,
 ) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
+    let harness = start_escrow_mock_harness(escrow_instance_id, operator_keypair, true).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.storage.calls("get_and_lock_pending_transactions") == 0 {
+        if tokio::time::Instant::now() > deadline {
+            return Err("escrow operator never passed its first reconciliation tick".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(harness)
+}
+
+/// Same, but the custody side answers nothing, so reconciliation can never complete a tick
+/// and the solvency fence stays closed. Returns at once.
+#[cfg(feature = "test-mock-storage")]
+pub async fn start_solana_to_private_channel_operator_with_mocks_dark(
+    escrow_instance_id: Pubkey,
+    operator_keypair: Keypair,
+) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
+    start_escrow_mock_harness(escrow_instance_id, operator_keypair, false).await
+}
+
+#[cfg(feature = "test-mock-storage")]
+async fn start_escrow_mock_harness(
+    escrow_instance_id: Pubkey,
+    operator_keypair: Keypair,
+    clean_first_tick: bool,
+) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
     let rpc = MockRpcServer::start().await;
+    let custody_rpc = MockRpcServer::start().await;
+    // With no mints the first tick reads only the custody slot, then opens the fence.
+    // Scripted before the operator starts, since that tick runs at once.
+    if clean_first_tick {
+        custody_rpc.enqueue_sequence(
+            "getSlot",
+            std::iter::repeat_n(Reply::result(100.into()), 16),
+        );
+    }
     let mock_storage = MockStorage::new();
     let storage = Arc::new(Storage::Mock(mock_storage.clone()));
 
@@ -260,8 +308,8 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
-        // Mock harness: custody and channel both point at the one mock RPC.
-        source_rpc_url: Some(rpc.url()),
+        // Custody on its own mock, supply on the channel's, as in production.
+        source_rpc_url: Some(custody_rpc.url()),
         rpc_url: rpc.url(),
         fallback_rpc_url: None,
         postgres: postgres_config,
@@ -284,6 +332,7 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     Ok(OperatorMockHarness {
         storage: mock_storage,
         rpc,
+        custody_rpc: Some(custody_rpc),
         handle: OperatorHandle {
             _handle: task_handle,
         },

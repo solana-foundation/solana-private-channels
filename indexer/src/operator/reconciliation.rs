@@ -13,9 +13,10 @@ use crate::metrics::{
     OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
 use crate::operator::escrow_sweep::{
-    channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply, EscrowCustody,
-    SUPPLY_REREAD_BUDGET,
+    allowed_mint_token_programs, channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply,
+    EscrowCustody, SUPPLY_REREAD_BUDGET,
 };
+use crate::operator::solvency_fence::{FenceState, SolvencyFence};
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::common::models::MintDbBalance;
@@ -110,6 +111,7 @@ impl BreachCounters {
 /// Each tick reads escrow custody, channel supply and the ledger per mint, then halts
 /// (durable flag + quarantine + forced-unhealthy + webhook) when either invariant breaches
 /// for `HALT_CONFIRM_TICKS` consecutive ticks. Reads never mutate state outside the halt path.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reconciliation(
     storage: Arc<Storage>,
     config: OperatorConfig,
@@ -118,6 +120,7 @@ pub async fn run_reconciliation(
     escrow_instance_id: Pubkey,
     health: Option<Arc<HealthState>>,
     cancellation_token: CancellationToken,
+    fence: SolvencyFence,
 ) -> Result<(), OperatorError> {
     info!("Starting reconciliation");
     info!(
@@ -180,6 +183,7 @@ pub async fn run_reconciliation(
             &mut liability_dark_ticks,
             &mut input_dark_ticks,
             &cancellation_token,
+            &fence,
         )
         .await
         {
@@ -335,6 +339,7 @@ async fn perform_reconciliation_check(
     liability_dark_ticks: &mut u32,
     input_dark_ticks: &mut u32,
     cancellation_token: &CancellationToken,
+    fence: &SolvencyFence,
 ) -> Result<(), OperatorError> {
     let result = check_invariants(
         storage,
@@ -350,6 +355,7 @@ async fn perform_reconciliation_check(
         halted,
         liability_dark_ticks,
         cancellation_token,
+        fence,
     )
     .await;
     // A tick cut short by shutdown is evidence of nothing.
@@ -375,6 +381,17 @@ async fn perform_reconciliation_check(
     // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
     if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
         breach_counters.clear_announced();
+    }
+    // Opens on a tick that read every input, under no halt, with no breach even suspected.
+    let clean = matches!(result, Ok(TickInputs::Complete))
+        && !*halted
+        && breach_counters.supply.is_empty()
+        && breach_counters.liability.is_empty();
+    if clean && fence.open() {
+        info!("Solvency fence open after a clean reconciliation tick");
+    }
+    if fence.state() == FenceState::Closed {
+        fence.note_closed_tick();
     }
     result.map(|_| ())
 }
@@ -453,6 +470,7 @@ async fn check_invariants(
     halted: &mut bool,
     liability_dark_ticks: &mut u32,
     cancellation_token: &CancellationToken,
+    fence: &SolvencyFence,
 ) -> Result<TickInputs, OperatorError> {
     check_orphan_deposit_rows(
         storage,
@@ -475,13 +493,14 @@ async fn check_invariants(
     }
 
     // Custody is read at each known mint's ATA, so the mint set comes first.
-    let db_mints = fetch_db_mint_set(storage).await?;
-    let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id, &db_mints).await?;
+    let universe = fetch_mint_universe(storage, rpc_client, escrow_instance_id).await?;
+    let custody =
+        fetch_on_chain_balances(rpc_client, escrow_instance_id, &universe.resolved).await?;
 
     // Channel supply (PrivateChannel RPC) and the envelope (DB) are read here, next to
     // custody, because the supply invariant compares all three as one instant. The ledger
     // wait below costs seconds and must never sit between two readings being compared.
-    let mut mints: HashSet<Pubkey> = db_mints.iter().map(|(mint, _)| *mint).collect();
+    let mut mints: HashSet<Pubkey> = universe.resolved.iter().map(|(mint, _)| *mint).collect();
     let (supply, anchor, supply_missing) = load_halt_inputs(channel_rpc, &mints).await;
     // Read last, so every transfer custody or supply already shows has its row. An envelope
     // failure holds the breach counters and skips the tick, so a glitch cannot reset a breach.
@@ -522,6 +541,17 @@ async fn check_invariants(
     let (ledger_mints, liabilities) =
         fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
+    // The ledger values an unresolved mint too, but its custody was never read and would count
+    // as 0, so both arms skip it and the tick is reported missing instead.
+    for mint in &universe.unresolved {
+        mints.remove(mint);
+    }
+    let unresolved_missing = (!universe.unresolved.is_empty()).then(|| {
+        format!(
+            "no AllowedMint read for unlisted mint(s) {:?}",
+            universe.unresolved
+        )
+    });
 
     let masked = evaluate_and_maybe_halt(
         storage,
@@ -538,28 +568,75 @@ async fn check_invariants(
         covered.then_some(&liabilities),
         breach_counters,
         halted,
+        fence,
     )
     .await;
     for masked_breach in masked {
         masked_alerts.send(masked_breach);
     }
 
-    Ok(match supply_missing.or(ledger_missing) {
-        Some(reason) => TickInputs::Missing(reason),
-        None => TickInputs::Complete,
-    })
+    Ok(
+        match supply_missing.or(ledger_missing).or(unresolved_missing) {
+            Some(reason) => TickInputs::Missing(reason),
+            None => TickInputs::Complete,
+        },
+    )
+}
+
+/// The mints a tick checks. Unlisted mints (status history or deposits, no `mints` row) take
+/// their token program from their `AllowedMint`; one that cannot be resolved is `unresolved`.
+#[derive(Debug, Default)]
+struct MintUniverse {
+    resolved: Vec<(Pubkey, Pubkey)>,
+    unresolved: Vec<Pubkey>,
 }
 
 /// Every mint the DB knows with its token program, parsed. Read before the ledger wait so
 /// enumeration never depends on whether the ledger can be pinned this tick.
-async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<Vec<(Pubkey, Pubkey)>, OperatorError> {
-    storage
+async fn fetch_mint_universe(
+    storage: &Arc<Storage>,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    escrow_instance_id: Pubkey,
+) -> Result<MintUniverse, OperatorError> {
+    let mut resolved = storage
         .get_mint_addresses()
         .await
         .map_err(OperatorError::Storage)?
         .iter()
         .map(|(address, token_program)| Ok((parse_mint(address)?, parse_mint(token_program)?)))
-        .collect()
+        .collect::<Result<Vec<_>, OperatorError>>()?;
+    let unlisted = storage
+        .get_unlisted_mints()
+        .await
+        .map_err(OperatorError::Storage)?
+        .iter()
+        .map(|address| parse_mint(address))
+        .collect::<Result<Vec<_>, OperatorError>>()?;
+    if unlisted.is_empty() {
+        return Ok(MintUniverse {
+            resolved,
+            unresolved: Vec::new(),
+        });
+    }
+    let programs = allowed_mint_token_programs(rpc_client, escrow_instance_id, &unlisted)
+        .await
+        .map_err(|e| OperatorError::RpcError(e.to_string()))?;
+    let mut unresolved = Vec::new();
+    for mint in unlisted {
+        match programs.get(&mint) {
+            Some(program) => resolved.push((mint, *program)),
+            None => unresolved.push(mint),
+        }
+    }
+    warn!(
+        unlisted = programs.len() + unresolved.len(),
+        unresolved = ?unresolved,
+        "Mints with history or deposits but no mints row; checking them from their AllowedMint"
+    );
+    Ok(MintUniverse {
+        resolved,
+        unresolved,
+    })
 }
 
 /// Whether the ledger can be compared at the custody slot this tick.
@@ -710,8 +787,8 @@ async fn fetch_ledger_at(
     Ok((all_mints, liabilities))
 }
 
-/// Query the per-mint in-flight envelope (unsettled amount) and the adjustment for settled
-/// rows above the given bounds, both as u64.
+/// Query the per-mint in-flight envelope (unsettled deposits) and the adjustment for rows above
+/// the given bounds, both as u64.
 async fn fetch_in_flight_envelope(
     storage: &Arc<Storage>,
     deposits_after: Option<u64>,
@@ -818,6 +895,7 @@ async fn evaluate_and_maybe_halt(
     liabilities: Option<&HashMap<Pubkey, u64>>,
     breach_counters: &mut BreachCounters,
     halted: &mut bool,
+    fence: &SolvencyFence,
 ) -> Vec<MaskedBreach> {
     // Paged by the caller off this path, so a slow webhook never holds back a later halt.
     let mut masked = Vec::new();
@@ -886,7 +964,8 @@ async fn evaluate_and_maybe_halt(
             continue;
         }
 
-        // Confirmed insolvency: trip the halt once the flag lands; a failed write retries next tick.
+        // Confirmed insolvency: the fence trips at once, the guard waits for the flag, and a
+        // failed write retries next tick.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
              envelope {} (adjustment {}) tolerance {} over {} consecutive finalized ticks",
@@ -904,6 +983,7 @@ async fn evaluate_and_maybe_halt(
             c.saturating_add(breach.supply_gap),
             &reason,
             &mut next_counters.announced_mints,
+            fence,
         )
         .await
         {
@@ -976,6 +1056,7 @@ async fn evaluate_and_maybe_halt(
             breach.liabilities,
             &reason,
             &mut next_counters.announced_mints,
+            fence,
         )
         .await
         {
@@ -988,10 +1069,9 @@ async fn evaluate_and_maybe_halt(
     masked
 }
 
-/// Fire every fail-closed lever for a confirmed insolvency. Each is best-effort
-/// and independently logged: the durable flag is the cross-process freeze,
-/// quarantine flips rows active right now, forced-unhealthy pages orchestration,
-/// and the webhook notifies operators. None of them gate the others.
+/// Fire every fail-closed lever for a confirmed insolvency. The in-process fence trips first and
+/// cannot fail; the flag, quarantine, forced-unhealthy and webhook are each best-effort and
+/// independently logged, and none of them gate the others.
 #[allow(clippy::too_many_arguments)]
 async fn trip_halt(
     storage: &Arc<Storage>,
@@ -1004,7 +1084,10 @@ async fn trip_halt(
     db_balance: u64,
     reason: &str,
     announced: &mut HashSet<Pubkey>,
+    fence: &SolvencyFence,
 ) -> bool {
+    // Before the write: the in-process stop must not wait on, or depend on, the row landing.
+    fence.trip();
     let persisted = freeze_pipelines(storage, health, reason, HaltKind::Insolvency)
         .await
         .is_some();
@@ -1072,11 +1155,11 @@ async fn freeze_pipelines(
             Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
         }
     }
-    // The latch never clears, so it waits for a flag that is really set, and only carries this
-    // reason when this kind is in force. An insolvency found in force is latched by the fetcher.
+    // An outage latch waits for a flag that is really set, since nothing is proven. A proven
+    // breach latches either way: a restarted process starts closed and holds while it persists.
     if let Some(h) = health {
         match (kind, in_force) {
-            (HaltKind::Insolvency, Some(_)) => h.force_unhealthy(reason.to_string()),
+            (HaltKind::Insolvency, _) => h.force_unhealthy(reason.to_string()),
             (HaltKind::Outage, Some(HaltKind::Outage)) => {
                 h.force_unhealthy_provisional(reason.to_string())
             }
@@ -1532,6 +1615,7 @@ mod tests {
             solana_sdk::pubkey::Pubkey::new_unique(),
             None,
             ct,
+            SolvencyFence::closed(),
         )
         .await;
         assert!(
@@ -1744,6 +1828,7 @@ mod tests {
             None,
             &mut counters,
             &mut halted,
+            &SolvencyFence::closed(),
         )
         .await;
 
@@ -1780,6 +1865,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -1825,6 +1911,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -1863,6 +1950,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -1883,6 +1971,7 @@ mod tests {
             None,
             &mut counters,
             &mut halted,
+            &SolvencyFence::closed(),
         )
         .await;
         assert!(halted, "held counter reaches 3 and halts");
@@ -1913,6 +2002,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -1936,6 +2026,7 @@ mod tests {
             None,
             &mut counters,
             &mut halted,
+            &SolvencyFence::closed(),
         )
         .await;
 
@@ -1980,6 +2071,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -2027,6 +2119,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -2073,6 +2166,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -2137,6 +2231,7 @@ mod tests {
             liabilities,
             counters,
             halted,
+            &SolvencyFence::closed(),
         )
         .await;
     }
@@ -2209,6 +2304,7 @@ mod tests {
             Some(&liabilities),
             &mut counters,
             &mut halted,
+            &SolvencyFence::closed(),
         )
         .await;
 
@@ -2646,35 +2742,8 @@ mod tests {
     /// `mint` with `amount` at slot 1, and any other requested key as absent.
     async fn mock_custody_sweep(server: &mut mockito::Server, mint: Pubkey, amount: u64) {
         crate::operator::escrow_sweep::tests::mock_channel_clock(server, 1, vec![1], Some(1)).await;
-        use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        let account = spl_token::state::Account {
-            mint,
-            owner: test_instance(),
-            amount,
-            delegate: COption::None,
-            state: spl_token::state::AccountState::Initialized,
-            is_native: COption::None,
-            delegated_amount: 0,
-            close_authority: COption::None,
-        };
-        let mut buf = vec![0u8; spl_token::state::Account::LEN];
-        account.pack_into_slice(&mut buf);
-        let held = serde_json::json!({
-            "lamports": 2_039_280u64,
-            "owner": spl_token::id().to_string(),
-            "executable": false,
-            "rentEpoch": 0,
-            "space": buf.len(),
-            "data": [base64::engine::general_purpose::STANDARD.encode(&buf), "base64"],
-        });
-        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-            &test_instance(),
-            &mint,
-            &spl_token::id(),
-        )
-        .to_string();
+        let held = escrow_ata_account(mint, amount);
+        let ata = escrow_ata(mint).to_string();
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(
@@ -2705,6 +2774,42 @@ mod tests {
             })
             .create_async()
             .await;
+    }
+
+    /// The test instance's SPL ATA for `mint`.
+    fn escrow_ata(mint: Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &test_instance(),
+            &mint,
+            &spl_token::id(),
+        )
+    }
+
+    /// The `getMultipleAccounts` entry for the test instance's SPL ATA holding `amount` of `mint`.
+    fn escrow_ata_account(mint: Pubkey, amount: u64) -> serde_json::Value {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        let account = spl_token::state::Account {
+            mint,
+            owner: test_instance(),
+            amount,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut buf = vec![0u8; spl_token::state::Account::LEN];
+        account.pack_into_slice(&mut buf);
+        serde_json::json!({
+            "lamports": 2_039_280u64,
+            "owner": spl_token::id().to_string(),
+            "executable": false,
+            "rentEpoch": 0,
+            "space": buf.len(),
+            "data": [base64::engine::general_purpose::STANDARD.encode(&buf), "base64"],
+        })
     }
 
     /// Register mints in the `mints` table, the universe every ledger read groups over.
@@ -2807,6 +2912,7 @@ mod tests {
         channel: mockito::ServerGuard,
         mock: MockStorage,
         storage: Arc<Storage>,
+        fence: SolvencyFence,
     }
 
     async fn tick_env(mint: Pubkey, custody: u64, supply: u64) -> TickEnv {
@@ -2823,6 +2929,7 @@ mod tests {
             channel,
             mock,
             storage,
+            fence: SolvencyFence::closed(),
         }
     }
 
@@ -2872,6 +2979,7 @@ mod tests {
             dark_ticks,
             input_dark_ticks,
             token,
+            &env.fence,
         )
         .await
     }
@@ -3196,6 +3304,7 @@ mod tests {
             channel,
             mock,
             storage,
+            fence: SolvencyFence::closed(),
         };
 
         run_tick(
@@ -3495,7 +3604,7 @@ mod tests {
         );
         let env = tick_env(c, 100, 50).await;
         seed_checkpoint(&env.mock, 1);
-        // The aggregate's universe is the `mints` table, so a row there implies a row here.
+        // The aggregate's universe includes the `mints` table, so a row there implies a row here.
         seed_mints(&env.mock, &[a, b]).await;
         env.mock.set_mint_balances(vec![
             ledger_row(&a.to_string(), 0, 0),
@@ -3590,6 +3699,7 @@ mod tests {
             &mut 0,
             &mut 0,
             &CancellationToken::new(),
+            &SolvencyFence::closed(),
         )
         .await;
         assert!(res.is_ok(), "tick should complete: {res:?}");
@@ -3646,6 +3756,7 @@ mod tests {
             &mut 0,
             &mut 0,
             &CancellationToken::new(),
+            &SolvencyFence::closed(),
         )
         .await;
         assert!(halted, "a set durable flag must raise the in-memory guard");
@@ -3668,6 +3779,7 @@ mod tests {
             &mut 0,
             &mut 0,
             &CancellationToken::new(),
+            &SolvencyFence::closed(),
         )
         .await;
         assert!(
@@ -4076,6 +4188,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut false,
+                &SolvencyFence::closed(),
             )
             .await;
             assert_eq!(masked.len(), alerts, "custody {custody}");
@@ -4115,6 +4228,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
             assert_eq!(
@@ -4212,6 +4326,7 @@ mod tests {
                     Some(&HashMap::from([(mint, 2_000u64)])),
                     &mut counters,
                     &mut false,
+                    &SolvencyFence::closed(),
                 )
                 .await
             }
@@ -4597,9 +4712,14 @@ mod tests {
     }
 
     /// A confirmed breach whose flag write keeps failing retries the write each tick and pages once.
+    /// The in-process fence and /health still stop value without the row.
     #[tokio::test]
     async fn a_breach_with_a_failing_halt_write_alerts_once() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
         use std::sync::atomic::Ordering;
+        let health = HealthState::new(HealthConfig::operator());
+        let label = "failing_halt_write_test";
+        let fence = SolvencyFence::closed().reporting_as(label);
         let (hook, alerts) = counting_halt_hook().await;
         let mock = MockStorage::new();
         mock.set_should_fail("set_reconciliation_halt", true);
@@ -4616,7 +4736,7 @@ mod tests {
             evaluate_and_maybe_halt(
                 &storage,
                 &config,
-                &None,
+                &Some(health.clone()),
                 &test_webhook_client(),
                 &custody,
                 1,
@@ -4628,17 +4748,35 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &fence,
             )
             .await;
         }
 
-        assert!(!halted);
+        assert!(!halted, "the guard still waits for the row");
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
         assert_eq!(
             mock.calls("set_reconciliation_halt"),
             3 * HALT_WRITE_ATTEMPTS as usize,
             "the write is retried on every confirmed tick"
         );
         assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
+        assert_eq!(
+            fence.state(),
+            FenceState::Tripped,
+            "value stops without the row"
+        );
+        assert_eq!(
+            crate::metrics::OPERATOR_SOLVENCY_FENCE_STATE
+                .with_label_values(&[label])
+                .get(),
+            2.0
+        );
+        assert!(
+            matches!(health.check(), HealthOutcome::ForcedUnhealthy { .. }),
+            "a proven breach forces /health without the row: {:?}",
+            health.check()
+        );
     }
 
     /// Two mints confirming while the flag write fails each page once, not only the first.
@@ -4677,6 +4815,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -4715,6 +4854,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -4841,6 +4981,7 @@ mod tests {
             &mut 0,
             input_dark,
             &CancellationToken::new(),
+            &env.fence,
         )
         .await;
     }
@@ -4883,6 +5024,7 @@ mod tests {
                 None,
                 &mut counters,
                 &mut halted,
+                &SolvencyFence::closed(),
             )
             .await;
         }
@@ -4941,9 +5083,10 @@ mod tests {
         );
     }
 
-    /// Health is forced unhealthy only once the flag has landed, since that latch never clears.
+    /// An outage forces health unhealthy only once its flag has landed, since that latch never
+    /// clears and nothing is proven. A proven breach latches without the flag.
     #[tokio::test]
-    async fn health_is_forced_only_once_the_halt_flag_lands() {
+    async fn outage_health_is_forced_only_once_the_halt_flag_lands() {
         use private_channel_metrics::{HealthConfig, HealthOutcome};
         let (mut env, _) = dark_env().await;
         set_input_failing(&mut env, Input::Envelope, true).await;
@@ -5011,6 +5154,7 @@ mod tests {
             channel,
             storage: Arc::new(Storage::Mock(mock.clone())),
             mock,
+            fence: SolvencyFence::closed(),
         };
         let mut input_dark = 0;
         run_tick_full(
@@ -5046,6 +5190,354 @@ mod tests {
         )
         .await;
         assert_eq!(input_dark, 0);
+    }
+
+    // ── solvency fence ────────────────────────────────────────────────
+
+    /// One zero-tolerance tick on `env` with fresh counters held by the caller.
+    async fn fence_tick(env: &TickEnv, counters: &mut BreachCounters, halted: &mut bool) {
+        let _ = run_tick(
+            env,
+            &recon_config_zero_tolerance(),
+            counters,
+            halted,
+            &CancellationToken::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fence_opens_after_the_first_clean_complete_tick() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 1_000, 1_000).await;
+        let label = "fence_opens_test";
+        env.fence = SolvencyFence::closed().reporting_as(label);
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+
+        assert!(env.fence.is_open());
+        assert_eq!(env.fence.closed_ticks(), 0);
+        assert_eq!(
+            crate::metrics::OPERATOR_SOLVENCY_FENCE_STATE
+                .with_label_values(&[label])
+                .get(),
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn fence_stays_closed_while_a_breach_is_suspected() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 900, 1_200).await;
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert_eq!(env.fence.state(), FenceState::Closed);
+        assert_eq!(counters.supply.get(&mint).copied(), Some(1));
+        assert_eq!(env.fence.closed_ticks(), 1);
+
+        env.channel.reset();
+        mock_channel_supply(&mut env.channel, 900).await;
+        mock_fresh_channel_clock(&mut env.channel).await;
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert!(env.fence.is_open(), "the next clean tick opens it");
+    }
+
+    #[tokio::test]
+    async fn fence_stays_closed_on_a_dark_tick() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 1_000, 1_000).await;
+        set_input_failing(&mut env, Input::ChannelSupply, true).await;
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+
+        assert_eq!(env.fence.state(), FenceState::Closed);
+        assert_eq!(env.fence.closed_ticks(), 1);
+    }
+
+    #[tokio::test]
+    async fn fence_stays_closed_while_the_halt_row_is_set() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_000).await;
+        env.storage
+            .set_reconciliation_halt("prior halt")
+            .await
+            .unwrap();
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert_eq!(env.fence.state(), FenceState::Closed);
+
+        env.storage.clear_reconciliation_halt().await.unwrap();
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert!(env.fence.is_open(), "a clean tick after the clear opens it");
+    }
+
+    /// A tick cut short in the ledger wait reports Complete as a sentinel; that must not open it.
+    #[tokio::test]
+    async fn a_cancelled_tick_never_opens_the_fence() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_000).await;
+        // Behind the custody slot, so the tick waits on the ledger and sees the cancel there.
+        seed_checkpoint(&env.mock, 0);
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let _ = run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut BreachCounters::default(),
+            &mut false,
+            &token,
+        )
+        .await;
+
+        assert_eq!(env.fence.state(), FenceState::Closed);
+        assert_eq!(
+            env.fence.closed_ticks(),
+            0,
+            "a cancelled tick is not counted"
+        );
+    }
+
+    /// The fence is down while the first halt write is still in flight, so no value moves in
+    /// process for however long the write and its retries take.
+    #[tokio::test]
+    async fn a_confirmed_breach_trips_the_fence_before_the_halt_write() {
+        let mock = MockStorage::new();
+        mock.set_delay("set_reconciliation_halt", Duration::from_millis(300));
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (custody, mints, supply, envelope, _) = breach_maps();
+        let fence = SolvencyFence::closed();
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(*mints.iter().next().unwrap(), HALT_CONFIRM_TICKS - 1)]),
+            ..Default::default()
+        };
+
+        let tick = {
+            let (storage, fence) = (storage.clone(), fence.clone());
+            tokio::spawn(async move {
+                let mut halted = false;
+                evaluate_and_maybe_halt(
+                    &storage,
+                    &recon_config_zero_tolerance(),
+                    &None,
+                    &test_webhook_client(),
+                    &custody,
+                    1,
+                    &HashMap::new(),
+                    &mints,
+                    &supply,
+                    &envelope,
+                    &HashMap::new(),
+                    None,
+                    &mut counters,
+                    &mut halted,
+                    &fence,
+                )
+                .await;
+                halted
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fence.state(),
+            FenceState::Tripped,
+            "tripped before the write"
+        );
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+        assert!(tick.await.unwrap(), "the write still lands");
+    }
+
+    /// The auditor's case on real ticks: a pending withdrawal whose burn the supply read already
+    /// shows cannot explain supply above custody, so it must not mask the breach.
+    #[tokio::test]
+    async fn a_pending_withdrawal_does_not_mask_a_supply_breach() {
+        use crate::storage::common::models::{TransactionStatus, TransactionType};
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_200).await;
+        seed_row(
+            &env.mock,
+            mint,
+            TransactionType::Withdrawal,
+            TransactionStatus::Pending,
+            CHANNEL_TIP as i64,
+            200,
+        );
+        assert!(halts_within(&env, HALT_CONFIRM_TICKS as usize).await);
+        assert_eq!(env.fence.state(), FenceState::Tripped);
+
+        // Control: a deposit settled after the custody read still explains the gap.
+        let control = tick_env(mint, 1_000, 1_200).await;
+        seed_row(
+            &control.mock,
+            mint,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+            2,
+            200,
+        );
+        assert!(!halts_within(&control, HALT_CONFIRM_TICKS as usize).await);
+    }
+
+    // ── unlisted mints ────────────────────────────────────────────────
+
+    /// A `BlockMint` status row and nothing else for `mint`: the shape of an indexer that
+    /// started after the `AllowMint`.
+    fn seed_history_only(mock: &MockStorage, mint: Pubkey) {
+        mock.mint_status_history.lock().unwrap().push(
+            crate::storage::common::models::DbMintStatus {
+                withdrawals_blocked: true,
+                mint_address: mint.to_string(),
+                status: "allowed".to_string(),
+                effective_slot: 1,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
+                signature: format!("history-{mint}"),
+                created_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    /// Listed mint `listed` and unlisted mint `unlisted`. Custody answers both ATAs and, when
+    /// `pda`, the unlisted mint's `AllowedMint`; every supply read answers `supply`.
+    /// Returns the env and the keys each `getMultipleAccounts` call asked for.
+    async fn unlisted_env(
+        (listed, listed_custody): (Pubkey, u64),
+        (unlisted, unlisted_custody): (Pubkey, u64),
+        pda: bool,
+        supply: u64,
+    ) -> (TickEnv, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        use crate::operator::escrow_sweep::tests::{
+            allowed_mint_account, mock_channel_clock, mock_multiple_accounts,
+        };
+        let mut custody = mockito::Server::new_async().await;
+        mock_channel_clock(&mut custody, 1, vec![1], Some(1)).await;
+        let mut accounts = HashMap::from([
+            (
+                escrow_ata(listed),
+                escrow_ata_account(listed, listed_custody),
+            ),
+            (
+                escrow_ata(unlisted),
+                escrow_ata_account(unlisted, unlisted_custody),
+            ),
+        ]);
+        if pda {
+            accounts.insert(
+                crate::operator::utils::account_util::find_allowed_mint_pda(
+                    &test_instance(),
+                    &unlisted,
+                ),
+                allowed_mint_account(),
+            );
+        }
+        let requested = Arc::default();
+        mock_multiple_accounts(&mut custody, accounts, vec![1], Arc::clone(&requested)).await;
+        let mut channel = mockito::Server::new_async().await;
+        mock_channel_supply(&mut channel, supply).await;
+        mock_fresh_channel_clock(&mut channel).await;
+        let mock = MockStorage::new();
+        seed_mints(&mock, &[listed]).await;
+        seed_history_only(&mock, unlisted);
+        let env = TickEnv {
+            custody,
+            channel,
+            storage: Arc::new(Storage::Mock(mock.clone())),
+            mock,
+            fence: SolvencyFence::closed(),
+        };
+        (env, requested)
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_mint_is_checked_for_supply_and_custody() {
+        let (listed, unlisted) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let (env, requested) = unlisted_env((listed, 1_200), (unlisted, 1_000), true, 1_200).await;
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+
+        assert_eq!(counters.supply.get(&unlisted).copied(), Some(1), "checked");
+        assert_eq!(
+            counters.supply.get(&listed),
+            None,
+            "the listed mint is unaffected"
+        );
+        assert_eq!(
+            requested.lock().unwrap().len(),
+            2,
+            "one PDA read, one custody read"
+        );
+    }
+
+    /// No unlisted mint, no PDA read: the extra call is paid only by partial-range databases.
+    #[tokio::test]
+    async fn no_unlisted_mint_means_no_pda_read() {
+        use crate::operator::escrow_sweep::tests::{mock_channel_clock, mock_multiple_accounts};
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 1_000, 1_000).await;
+        env.custody.reset();
+        mock_channel_clock(&mut env.custody, 1, vec![1], Some(1)).await;
+        let requested = Arc::default();
+        let accounts = HashMap::from([(escrow_ata(mint), escrow_ata_account(mint, 1_000))]);
+        mock_multiple_accounts(&mut env.custody, accounts, vec![1], Arc::clone(&requested)).await;
+
+        fence_tick(&env, &mut BreachCounters::default(), &mut false).await;
+
+        assert!(env.fence.is_open());
+        assert_eq!(requested.lock().unwrap().len(), 1, "custody only");
+    }
+
+    /// An unlisted mint whose `AllowedMint` cannot be read has no custody reading, so it is held
+    /// out of both arms (its custody would read as 0) and the tick counts as dark.
+    #[tokio::test]
+    async fn an_unlisted_mint_without_a_pda_marks_the_tick_missing() {
+        let (listed, unlisted) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let (env, _) = unlisted_env((listed, 1_200), (unlisted, 0), false, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
+        // The unlisted mint owes deposits; the listed one is 50 short, so it shows as evaluated.
+        env.mock.set_mint_balances(vec![
+            ledger_row(&listed.to_string(), 1_250, 0),
+            ledger_row(&unlisted.to_string(), 500, 0),
+        ]);
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+
+        one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+
+        assert_eq!(input_dark, 1, "the tick is missing an input");
+        assert_eq!(counters.supply.get(&unlisted), None);
+        assert_eq!(
+            counters.liability.get(&unlisted),
+            None,
+            "no custody, no liability verdict"
+        );
+        assert_eq!(
+            counters.liability.get(&listed).copied(),
+            Some(1),
+            "listed still evaluated"
+        );
+        assert_eq!(env.fence.state(), FenceState::Closed);
+
+        // Fail closed: with the listed mint clean, three such ticks raise only the outage halt.
+        env.mock.set_mint_balances(vec![
+            ledger_row(&listed.to_string(), 1_200, 0),
+            ledger_row(&unlisted.to_string(), 500, 0),
+        ]);
+        let mut counters = BreachCounters::default();
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        }
+        let halt = env.storage.is_reconciliation_halted().await.unwrap();
+        assert!(
+            halt.is_some_and(|h| !h.insolvency),
+            "an outage halt, not an insolvency"
+        );
+        assert_eq!(env.fence.state(), FenceState::Closed);
     }
 
     /// A lagging escrow checkpoint is not a failed read: it stays on the liability-dark

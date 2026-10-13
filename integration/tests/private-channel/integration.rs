@@ -335,6 +335,7 @@ async fn setup(
     let (solana_to_private_channel_result, private_channel_to_solana_result) = tokio::join!(
         start_solana_to_private_channel_operator(
             private_channel_rpc_url.clone(),
+            test_validator.rpc_url(),
             solana_indexer_db_url.clone(),
             operator_key_solana_to_private_channel,
             instance_pda,

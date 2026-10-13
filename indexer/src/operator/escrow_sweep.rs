@@ -13,7 +13,7 @@
 use crate::operator::utils::account_util::find_allowed_mint_pda;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
-use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_escrow_program_client::{AllowedMint, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use solana_account_decoder_client_types::{UiAccount, UiAccountData};
 use solana_client::rpc_request::{RpcRequest, TokenAccountsFilter};
 use solana_client::rpc_response::Response;
@@ -244,6 +244,39 @@ pub async fn fetch_escrow_custody(
         slots,
         slot,
     })
+}
+
+/// The token program each mint's `AllowedMint` names, for mints the DB holds no `mints` row for.
+/// A fixed read of keys the caller names, and only the escrow program can create these accounts,
+/// so nobody can inflate it. A mint whose PDA is absent, foreign or undecodable is left out.
+pub async fn allowed_mint_token_programs(
+    rpc_client: &RpcClientWithRetry,
+    escrow_instance_id: Pubkey,
+    mints: &[Pubkey],
+) -> Result<HashMap<Pubkey, Pubkey>, EscrowSweepError> {
+    let anchor = newest_block_anchor(rpc_client, "Solana").await?;
+    let pdas: Vec<Pubkey> = mints
+        .iter()
+        .map(|mint| find_allowed_mint_pda(&escrow_instance_id, mint))
+        .collect();
+    let accounts = read_accounts_chunked(rpc_client, &pdas, anchor, "AllowedMint PDAs").await?;
+
+    let escrow_program = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+    let mut programs = HashMap::new();
+    for (mint, (account, _)) in mints.iter().zip(accounts) {
+        let Some(account) = account.filter(|account| account.owner == escrow_program) else {
+            continue;
+        };
+        let Some(allowed) = account
+            .data
+            .decode()
+            .and_then(|data| AllowedMint::from_bytes(&data).ok())
+        else {
+            continue;
+        };
+        programs.insert(*mint, allowed.token_program);
+    }
+    Ok(programs)
 }
 
 fn read_failure(reason: String) -> SweepFailure {
@@ -630,7 +663,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::operator::RetryConfig;
     use base64::Engine as _;
-    use private_channel_escrow_program_client::AllowedMint;
     use solana_commitment_config::CommitmentConfig;
     use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
     use spl_token::solana_program::program_option::COption;
@@ -943,13 +975,18 @@ pub(crate) mod tests {
 
     /// The `AllowedMint` account the admin's `AllowMint` creates at the mint's PDA.
     pub(crate) fn allowed_mint_account() -> serde_json::Value {
+        allowed_mint_account_for(spl_token::id())
+    }
+
+    /// The same, naming `token_program`.
+    pub(crate) fn allowed_mint_account_for(token_program: Pubkey) -> serde_json::Value {
         let allowed_mint = AllowedMint {
             discriminator: 2,
             bump: 255,
             deposits_blocked: false,
             withdrawals_blocked: false,
             decimals: 6,
-            token_program: spl_token::id(),
+            token_program,
             extensions: 0,
             has_freeze_authority: false,
             min_deposit_amount: 0,
@@ -1054,6 +1091,64 @@ pub(crate) mod tests {
             .balances;
 
         assert_eq!(balances, HashMap::from([(allowed, 100)]));
+    }
+
+    /// Only an escrow-owned, decodable `AllowedMint` names a token program; anything else at the
+    /// PDA leaves the mint unresolved.
+    #[tokio::test]
+    async fn allowed_mint_token_programs_reads_the_pda() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let [resolved, absent, foreign, garbled] = std::array::from_fn(|_| Pubkey::new_unique());
+        mock_channel_clock(&mut server, 50, vec![50], Some(1)).await;
+        let pda = |mint: &Pubkey| find_allowed_mint_pda(&instance, mint);
+        let accounts = HashMap::from([
+            (
+                pda(&resolved),
+                allowed_mint_account_for(spl_token_2022::id()),
+            ),
+            (pda(&foreign), ui_account(SYSTEM_PROGRAM_ID, &[])),
+            (
+                pda(&garbled),
+                ui_account(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &[1, 2, 3]),
+            ),
+        ]);
+        let requested = Arc::default();
+        mock_multiple_accounts(&mut server, accounts, vec![50], Arc::clone(&requested)).await;
+
+        let programs = allowed_mint_token_programs(
+            &client(&server.url()),
+            instance,
+            &[resolved, absent, foreign, garbled],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(programs, HashMap::from([(resolved, spl_token_2022::id())]));
+        assert_eq!(requested.lock().unwrap().len(), 1, "one fixed read");
+    }
+
+    #[tokio::test]
+    async fn allowed_mint_token_programs_fails_on_a_read_error() {
+        let mut server = mockito::Server::new_async().await;
+        mock_channel_clock(&mut server, 50, vec![50], Some(1)).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getMultipleAccounts"}),
+            ))
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let result = allowed_mint_token_programs(
+            &fast_client(&server.url()),
+            Pubkey::new_unique(),
+            &[Pubkey::new_unique()],
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     /// getAccountInfo response wrapping an 82-byte SPL Mint blob with `supply`.

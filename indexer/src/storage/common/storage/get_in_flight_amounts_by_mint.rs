@@ -6,8 +6,8 @@ use crate::{
     },
 };
 
-/// Per-mint sum of every unsettled transaction amount (the in-flight envelope), plus settled
-/// deposits above `deposits_after` and settled withdrawals above `withdrawals_after`.
+/// Per-mint sum of unsettled deposits (the in-flight envelope), plus settled deposits above
+/// `deposits_after` and withdrawals in any status above `withdrawals_after` (the adjustment).
 /// A `None` bound skips that arm.
 pub async fn get_in_flight_amounts_by_mint(
     storage: &Storage,

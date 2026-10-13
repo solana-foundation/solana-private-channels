@@ -46,6 +46,7 @@ pub mod test_hooks {
             retry_max_attempts,
             confirmation_poll_interval_ms,
             source_rpc_client,
+            crate::operator::solvency_fence::SolvencyFence::open_from_start(),
         )
     }
 
@@ -274,6 +275,7 @@ pub async fn run_sender(
     confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
     sender_lock: SenderLockGuard,
+    solvency_fence: crate::operator::solvency_fence::SolvencyFence,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -290,6 +292,7 @@ pub async fn run_sender(
         retry_max_attempts,
         confirmation_poll_interval_ms,
         source_rpc_client,
+        solvency_fence,
     )?;
 
     // Taken by the caller via `acquire_sender_lock`, held for the rest of
@@ -694,6 +697,7 @@ mod tests {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             SenderLockGuard::Noop,
+            crate::operator::solvency_fence::SolvencyFence::open_from_start(),
         )
         .await;
 
@@ -728,6 +732,7 @@ mod tests {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             SenderLockGuard::Noop,
+            crate::operator::solvency_fence::SolvencyFence::open_from_start(),
         )
         .await;
 

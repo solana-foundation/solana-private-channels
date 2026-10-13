@@ -5,6 +5,7 @@ use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS};
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::utils::instruction_util::{
     mint_extra_error_checks_policy, TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
 };
@@ -393,7 +394,8 @@ pub(super) enum SignatureClaim {
     /// The row is still the incarnation we were handed; `lease` is the token the
     /// next claim on it must present.
     Owned(chrono::DateTime<Utc>),
-    /// Another writer reached the row first, or a reconciliation halt is active. Never broadcast.
+    /// Another writer reached the row first, a reconciliation halt is active, or the solvency
+    /// fence is not open. Never broadcast.
     Lost,
     /// The claim write itself failed, so ownership is unknown. Never broadcast.
     Failed,
@@ -410,6 +412,7 @@ pub(super) enum SignatureClaim {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn claim_and_persist_or_abort(
     storage: &Storage,
+    fence: &SolvencyFence,
     pt: &str,
     transaction_id: i64,
     expected_updated_at: chrono::DateTime<Utc>,
@@ -418,6 +421,31 @@ pub(super) async fn claim_and_persist_or_abort(
     blockhash_slot: u64,
     lost_label: &str,
 ) -> SignatureClaim {
+    // Checked before the claim so builders already past the fetcher stop the moment it trips.
+    if !fence.is_open() {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt, "solvency_fence_closed"])
+            .inc();
+        warn!(
+            transaction_id,
+            signature = %signature,
+            state = ?fence.state(),
+            "Solvency fence not open; dropping builder without sending"
+        );
+        // Never claimed, so nothing can have broadcast: back to Pending, no attempt spent.
+        match storage
+            .requeue_unclaimed(transaction_id, expected_updated_at)
+            .await
+        {
+            Ok(true) => info!(transaction_id, "Returned the refused row to Pending"),
+            Ok(false) => {}
+            Err(e) => warn!(
+                transaction_id,
+                "Could not return the refused row to Pending; recovery will: {}", e
+            ),
+        }
+        return SignatureClaim::Lost;
+    }
     match storage
         .claim_and_persist_signature(
             transaction_id,
@@ -663,6 +691,7 @@ pub(super) async fn send_and_confirm(
 
         match claim_and_persist_or_abort(
             &state.storage,
+            &state.solvency_fence,
             pt,
             txid,
             expected_updated_at,
@@ -851,6 +880,7 @@ pub(super) fn handle_confirmation_result<'a>(
                                 deposit_expected_updated_at: lease,
                             },
                             permit,
+                            state.solvency_fence.clone(),
                         )
                         .await;
                     }
@@ -1950,6 +1980,7 @@ pub(super) fn spawn_fire_and_store(
         storage_tx,
         durability,
         permit,
+        state.solvency_fence.clone(),
     ));
 
     true
@@ -1973,6 +2004,7 @@ pub(super) async fn fire_and_store_task(
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     durability: SendDurability,
     permit: OwnedSemaphorePermit,
+    solvency_fence: SolvencyFence,
 ) {
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
@@ -2038,6 +2070,7 @@ pub(super) async fn fire_and_store_task(
             };
             match claim_and_persist_or_abort(
                 &storage,
+                &solvency_fence,
                 pt,
                 txid,
                 deposit_expected_updated_at,
@@ -7395,6 +7428,7 @@ mod tests {
                 deposit_expected_updated_at: lease,
             },
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7458,6 +7492,7 @@ mod tests {
                 deposit_expected_updated_at: lease,
             },
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7528,6 +7563,7 @@ mod tests {
                 deposit_expected_updated_at: lease,
             },
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7553,6 +7589,118 @@ mod tests {
             halted_label.get() > halted_before,
             "a halted claim is counted as halted_before_broadcast"
         );
+    }
+
+    /// A fence that is not open refuses the claim before storage sees it. The unsent row goes
+    /// back to Pending without spending a requeue attempt and with no halt row needed.
+    #[tokio::test]
+    async fn claim_refuses_without_storage_while_the_fence_is_closed() {
+        let closed = SolvencyFence::closed();
+        let tripped = SolvencyFence::closed();
+        tripped.trip();
+        for (name, fence) in [("closed", closed), ("tripped", tripped)] {
+            let mock = MockStorage::new();
+            push_processing_deposit_row(&mock, 77);
+            let lease = row_updated_at(&mock, 77).expect("seeded row present");
+            let storage = Storage::Mock(mock.clone());
+            let label = metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&["escrow", "solvency_fence_closed"]);
+            let before = label.get();
+
+            let claim = claim_and_persist_or_abort(
+                &storage,
+                &fence,
+                "escrow",
+                77,
+                lease,
+                &Signature::default(),
+                100,
+                1,
+                "deposit_ownership_lost",
+            )
+            .await;
+
+            assert!(matches!(claim, SignatureClaim::Lost), "{name}");
+            assert_eq!(mock.calls("claim_and_persist_signature"), 0, "{name}");
+            assert_eq!(mock.calls("requeue_unclaimed"), 1, "{name}");
+            assert_eq!(
+                row_status(&mock, 77),
+                Some(crate::storage::common::models::TransactionStatus::Pending),
+                "{name}: the unsent row waits in Pending"
+            );
+            assert_eq!(requeue_attempts(&mock, 77), 0, "{name}: no attempt spent");
+            assert!(label.get() > before, "{name}: counted");
+        }
+
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, 78);
+        let lease = row_updated_at(&mock, 78).expect("seeded row present");
+        let claim = claim_and_persist_or_abort(
+            &Storage::Mock(mock.clone()),
+            &SolvencyFence::open_from_start(),
+            "escrow",
+            78,
+            lease,
+            &Signature::default(),
+            100,
+            1,
+            "deposit_ownership_lost",
+        )
+        .await;
+        assert!(
+            matches!(claim, SignatureClaim::Owned(_)),
+            "open fence claims"
+        );
+        assert_eq!(mock.calls("requeue_unclaimed"), 0);
+    }
+
+    /// The deposit mint path carries the sender's fence to its claim: closed means no broadcast.
+    #[tokio::test]
+    async fn mint_send_aborts_while_the_fence_is_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let (mut state, lease) = mint_state_with_lease(&server.url(), 77);
+        state.solvency_fence = SolvencyFence::closed();
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
+            permit,
+            state.solvency_fence.clone(),
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(mock.get_release_signatures(77).await.unwrap().is_empty());
+        assert_eq!(
+            row_status(mock, 77),
+            Some(crate::storage::common::models::TransactionStatus::Pending)
+        );
+        assert!(state.in_flight.is_empty(), "nothing stashed");
     }
 
     /// Even an explicit node rejection can be a stale-node false negative, so once the
@@ -7598,6 +7746,7 @@ mod tests {
                 deposit_expected_updated_at: lease,
             },
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7673,6 +7822,7 @@ mod tests {
             storage_tx,
             SendDurability::Terminal,
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7749,6 +7899,7 @@ mod tests {
                 deposit_expected_updated_at: lease,
             },
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 
@@ -7797,6 +7948,7 @@ mod tests {
             storage_tx,
             SendDurability::Terminal,
             permit,
+            state.solvency_fence.clone(),
         )
         .await;
 

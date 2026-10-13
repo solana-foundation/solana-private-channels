@@ -237,8 +237,10 @@ const DROP_STATEMENTS: [&str; 11] = [
 /// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
 const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
 
-/// Statuses the reconciliation envelope counts as unsettled.
-const ENVELOPE_STATUSES: &str = "('pending', 'processing', 'parked', 'pending_remint')";
+/// Rows the reconciliation envelope counts: unsettled deposits only. A withdrawal burns before it releases,
+/// so an unsettled one can never explain supply above custody, only hide a real shortfall.
+const ENVELOPE_ROWS: &str =
+    "(transaction_type = 'deposit' AND status IN ('pending', 'processing', 'parked', 'pending_remint'))";
 
 /// Statuses that can still have a broadcast in flight whether or not a journal survives.
 const UNSETTLED_STATUSES: &str = "('processing', 'pending_remint', 'manual_review')";
@@ -253,8 +255,13 @@ const RELEASED_BY_OBSERVATION: &str = "r.withdrawal_nonce IS NOT NULL";
 const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
     "(t.status = 'completed' OR r.withdrawal_nonce IS NOT NULL)";
 
+/// Mint sources besides `mints` that only the admin can create: status history and deposits,
+/// which the program takes only for a mint with an `AllowedMint`. Withdrawal rows are channel-side.
+const UNLISTED_MINT_SOURCES: &str = "SELECT mint_address FROM mint_status_history \
+     UNION SELECT mint AS mint_address FROM transactions WHERE transaction_type = 'deposit'";
+
 /// The per-mint reconciliation aggregate. Only the test for a released withdrawal varies, so
-/// both reads share one shape and one mint universe.
+/// both reads share one shape and one mint universe: `mints` plus the unlisted mints.
 ///
 /// A payout discharges what the chain says it moved, capped at what its row owed: releasing
 /// less leaves the rest owed, and releasing more leaves the excess standing as a shortfall
@@ -262,9 +269,13 @@ const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
 fn mint_balances_query(released: &str) -> String {
     format!(
         r#"
+            WITH universe AS (
+                SELECT mint_address FROM mints
+                UNION {UNLISTED_MINT_SOURCES}
+            )
             SELECT
-                m.mint_address,
-                m.token_program,
+                u.mint_address,
+                COALESCE(m.token_program, '') AS token_program,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
                     0
@@ -276,14 +287,15 @@ fn mint_balances_query(released: &str) -> String {
                              ELSE 0 END),
                     0
                 )::NUMERIC AS total_withdrawals
-            FROM mints m
+            FROM universe u
+            LEFT JOIN mints m ON m.mint_address = u.mint_address
             LEFT JOIN transactions t
-              ON t.mint = m.mint_address
+              ON t.mint = u.mint_address
              AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
             LEFT JOIN observed_releases r
               ON r.withdrawal_nonce = t.withdrawal_nonce
              AND r.slot <= $1
-            GROUP BY m.mint_address, m.token_program
+            GROUP BY u.mint_address, m.token_program
             "#
     )
 }
@@ -2035,6 +2047,32 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// `requeue_halted_claim_internal` without the halt predicate, for a claim the operator
+    /// refused in process before it was made. Same lease CAS and same journal guard.
+    pub async fn requeue_unclaimed_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+              )
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Status-only CAS `Processing` to `Pending` for pre-broadcast build/sign
     /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
     /// survives restarts.
@@ -3258,32 +3296,40 @@ impl PostgresDb {
             .await
     }
 
-    /// Every mint address the DB knows: the mint universe runtime reconciliation checks.
-    /// Addresses only, so it can be read before the tick knows whether the ledger is
-    /// pinnable at all.
-    /// Every mint with its token program, which custody needs to derive the escrow ATA.
+    /// Every `mints` row with its token program, which custody needs to derive the escrow ATA.
+    /// With `get_unlisted_mints_internal` it is the universe runtime reconciliation checks.
     pub async fn get_mint_addresses_internal(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
         sqlx::query_as("SELECT mint_address, token_program FROM mints")
             .fetch_all(&self.pool)
             .await
     }
 
-    /// Per-mint sum of every unsettled transaction amount (the in-flight
-    /// envelope). Both types are summed as a deliberate over-approximation: a
-    /// larger envelope only ever delays detection of a real insolvency, never
-    /// fabricates a false halt.
+    /// Mints with status history or deposit rows but no `mints` row. A `BlockMint` in range
+    /// writes only history, and an indexer that started after the `AllowMint` has no row.
+    pub async fn get_unlisted_mints_internal(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(&format!(
+            "SELECT mint_address FROM ({UNLISTED_MINT_SOURCES}) u \
+             WHERE NOT EXISTS (SELECT 1 FROM mints m WHERE m.mint_address = u.mint_address)"
+        ))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Per-mint sum of unsettled deposits (the in-flight envelope). Withdrawals stay out: their
+    /// burn is already in the supply read, and a wider envelope would hide a real shortfall.
     ///
-    /// Settled deposits above `deposits_after` and settled withdrawals above `withdrawals_after`
-    /// are summed apart as the adjustment; one statement, so each row is counted once.
+    /// Settled deposits above `deposits_after` and withdrawals in any status above
+    /// `withdrawals_after` are summed apart as the adjustment; one statement, so each row is
+    /// counted once.
     pub async fn get_in_flight_amounts_by_mint_internal(
         &self,
         deposits_after: Option<i64>,
         withdrawals_after: Option<i64>,
     ) -> Result<Vec<MintInFlightAmount>, sqlx::Error> {
-        // Sum of every in-flight row per mint: the supply-vs-custody transient bound.
-        // Deposits and pending_remint raise supply; burn-side withdrawals over-count but only widen it, never false-halt.
+        // A withdrawal explains supply above custody only when its release landed and its burn is
+        // newer than the supply anchor, so in any status it counts only through its slot arm.
         // `slot` holds Solana slots for deposits and channel slots for withdrawals, so each arm has its own bound.
-        let mut rows = format!("status IN {ENVELOPE_STATUSES}");
+        let mut rows = ENVELOPE_ROWS.to_string();
         let mut binds = Vec::new();
         for (kind, bound) in [
             ("deposit", deposits_after),
@@ -3300,9 +3346,9 @@ impl PostgresDb {
         let sql = format!(
             r#"
             SELECT mint AS mint_address,
-                   COALESCE(SUM(amount) FILTER (WHERE status IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                   COALESCE(SUM(amount) FILTER (WHERE {ENVELOPE_ROWS}), 0)::NUMERIC
                        AS in_flight_amount,
-                   COALESCE(SUM(amount) FILTER (WHERE status NOT IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                   COALESCE(SUM(amount) FILTER (WHERE NOT {ENVELOPE_ROWS}), 0)::NUMERIC
                        AS adjustment_amount
             FROM transactions
             WHERE {rows}

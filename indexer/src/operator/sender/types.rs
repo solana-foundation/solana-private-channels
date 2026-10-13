@@ -1,5 +1,6 @@
 use crate::config::ProgramType;
 use crate::operator::sender::remint::FinalityRpc;
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::utils::instruction_util::{
     ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind, WithdrawalRemintInfo,
 };
@@ -233,6 +234,8 @@ pub struct SenderState {
     /// (confirmed, permanent failure, or transfer to a retry), so
     /// `available_permits()` accurately reflects remaining capacity at all times.
     pub semaphore: Arc<Semaphore>,
+    /// Escrow solvency gate; a refused claim never broadcasts. Always open for the withdraw role.
+    pub solvency_fence: SolvencyFence,
 }
 
 impl SenderState {
