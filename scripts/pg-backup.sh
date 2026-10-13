@@ -65,7 +65,7 @@ take_backup() {
         -U "${PGUSER}" \
         -D "${dest}" \
         -Ft -z -X stream -P; then
-      echo "[$(date -Iseconds)] Backup complete: ${dest}"
+      echo "[$(date -Iseconds)] Base backup written: ${dest}"
       return 0
     fi
     echo "[$(date -Iseconds)] ERROR: pg_basebackup failed (attempt ${attempt}/${MAX_ATTEMPTS})" >&2
@@ -150,6 +150,8 @@ while true; do
     if backup_remains; then
       echo "[$(date -Iseconds)] Retention verified: ${BACKUP_DIR} holds a complete base backup"
       prune_old_wal
+      # Success is logged only here, after a complete base backup was verified to remain.
+      echo "[$(date -Iseconds)] Backup complete"
     else
       echo "[$(date -Iseconds)] ERROR: no complete base backup remains after pruning, skipping WAL pruning" >&2
     fi

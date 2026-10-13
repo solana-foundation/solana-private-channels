@@ -50,6 +50,9 @@ After each backup and prune, the sidecar checks that a complete base backup is s
 disk and logs `Retention verified`. If none is left it logs an `ERROR` and skips WAL
 pruning, so the archive is not trimmed with no base backup to restore from. It does not
 exit, since a restart would only take another full backup. Alert on that `ERROR` line.
+`Backup complete` is logged only after that check passes, and a failed WAL prune still only
+warns. `Base backup written` with no later `Backup complete` means the cycle did not finish
+cleanly.
 
 ## Restore Procedure
 

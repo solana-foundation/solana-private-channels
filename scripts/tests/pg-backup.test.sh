@@ -95,11 +95,14 @@ test_rejects_bad_interval() {
 }
 
 test_valid_values_complete_one_cycle() {
-  local d
+  local d verified complete
   d="$(new_case valid)"
   run_script "$d" PG_BACKUP_RETENTION_COUNT=1 PG_BACKUP_INTERVAL_HOURS=2
-  grep -q "Backup complete" "$d/out" || fail "valid: backup must run"
+  grep -q "Base backup written" "$d/out" || fail "valid: backup must run"
   grep -q "Retention verified" "$d/out" || fail "valid: the post-prune check must pass and say so"
+  verified="$(grep -n "Retention verified" "$d/out" | head -n 1 | cut -d: -f1 || true)"
+  complete="$(grep -n "Backup complete" "$d/out" | head -n 1 | cut -d: -f1 || true)"
+  [ -n "$complete" ] && [ "$complete" -gt "$verified" ] || fail "valid: Backup complete must be logged after Retention verified"
   grep -q "pg_archivecleanup" "$d/calls" || fail "valid: WAL pruning must still run"
   grep -qx "sleep 7200" "$d/calls" || fail "valid: interval must be converted to seconds"
   [ "$(find "$d/backups" -maxdepth 1 -type d -name 'base_*' | wc -l)" -eq 1 ] || fail "valid: one backup must remain"
@@ -120,6 +123,8 @@ test_missing_complete_backup_skips_wal_pruning() {
   grep -q "ERROR" "$d/out" || fail "incomplete: the missing backup must be logged as an error"
   ! grep -q "Retention verified" "$d/out" || fail "incomplete: must not claim retention was verified"
   ! grep -q pg_archivecleanup "$d/calls" || fail "incomplete: WAL must not be pruned without a base backup"
+  grep -q "Base backup written" "$d/out" || fail "incomplete: pg_basebackup itself must succeed"
+  ! grep -q "Backup complete" "$d/out" || fail "incomplete: an unverified cycle must not be logged as complete"
 }
 
 test_rejects_bad_retention
