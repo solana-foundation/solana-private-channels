@@ -60,8 +60,8 @@ pub enum SweepFailure {
     /// describes the merged balances.
     SlotUnsettled { attempts: u32, low: u64, high: u64 },
     /// The node could not answer at or past `floor`, or its newest block is too old. A
-    /// lagging node catches up, so this is worth another sweep. `slot` is where it answered, if known.
-    Stale { slot: Option<u64>, floor: u64 },
+    /// lagging node catches up, so this is worth another sweep. `reason` keeps the cause.
+    Stale { floor: u64, reason: String },
 }
 
 impl From<EscrowSweepError> for SweepFailure {
@@ -82,10 +82,7 @@ impl std::fmt::Display for SweepFailure {
                 f,
                 "token program sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high})"
             ),
-            SweepFailure::Stale { slot, floor } => write!(
-                f,
-                "custody could not be read at or past slot {floor} (answered at {slot:?}); the node is behind"
-            ),
+            SweepFailure::Stale { reason, .. } => write!(f, "{reason}; the node is behind"),
         }
     }
 }
@@ -272,12 +269,15 @@ fn read_failure(reason: String) -> SweepFailure {
     SweepFailure::Read(EscrowSweepError { reason })
 }
 
-/// A failed read at `floor`: `Stale` when the node was behind it, `Read` otherwise.
-fn sweep_rpc_failure(e: &client_error::Error, floor: u64, reason: String) -> SweepFailure {
+/// A failed read of `what` at `floor`: `Stale` when the node was behind it, `Read` otherwise.
+fn sweep_rpc_failure(e: &client_error::Error, floor: u64, what: String) -> SweepFailure {
     if is_min_context_slot_error(e) {
-        SweepFailure::Stale { slot: None, floor }
+        SweepFailure::Stale {
+            floor,
+            reason: format!("{what} at or past slot {floor}: {e}"),
+        }
     } else {
-        read_failure(reason)
+        read_failure(format!("{what}: {e}"))
     }
 }
 
@@ -345,7 +345,7 @@ async fn read_accounts_chunked(
                 Ok(response)
             })
             .await
-            .map_err(|e| sweep_rpc_failure(&e, min_slot, format!("Failed to read {what}: {e}")))?;
+            .map_err(|e| sweep_rpc_failure(&e, min_slot, format!("Failed to read {what}")))?;
 
         if response.value.len() != chunk.len() {
             return Err(read_failure(format!(
@@ -442,7 +442,7 @@ async fn sweep_once(
                 sweep_rpc_failure(
                     &e,
                     floor,
-                    format!("Failed to fetch token accounts for program {token_program_id}: {e}"),
+                    format!("Failed to fetch token accounts for program {token_program_id}"),
                 )
             })?;
 
@@ -626,7 +626,10 @@ impl AnchorError {
     /// A stale anchor is a lagging node, so a sweep that needed it is `Stale` against `floor`.
     fn into_sweep_failure(self, floor: u64) -> SweepFailure {
         match self {
-            AnchorError::Stale { .. } => SweepFailure::Stale { slot: None, floor },
+            stale @ AnchorError::Stale { .. } => SweepFailure::Stale {
+                floor,
+                reason: stale.to_string(),
+            },
             AnchorError::Read(e) => SweepFailure::Read(e),
         }
     }
@@ -1690,7 +1693,8 @@ pub(crate) mod tests {
             let result = fetch_escrow_custody(&fast_client(&server.url()), instance, mints).await;
 
             assert!(
-                matches!(result, Err(SweepFailure::Stale { floor: 50, .. })),
+                matches!(result, Err(SweepFailure::Stale { floor: 50, ref reason })
+                    if reason.contains("answered at slot 40")),
                 "{label}: {result:?}"
             );
         }
@@ -2236,10 +2240,8 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 result,
-                Err(SweepFailure::Stale {
-                    slot: None,
-                    floor: 7
-                })
+                Err(SweepFailure::Stale { floor: 7, ref reason })
+                    if reason.contains("newest block 50 is") && reason.contains("past the 120s limit")
             ),
             "{result:?}"
         );

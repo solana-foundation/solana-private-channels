@@ -190,7 +190,7 @@ async fn reconcile_once(
         .unwrap_or(0);
     let snapshot = capture_custody_snapshot(rpc_url, instance_pda, floor).await?;
 
-    // The indexer keeps committing while custody is read, so the checkpoint is read again:
+    // Nothing commits before the checkpoint writer starts, so this re-read is a safety net:
     // a ledger already past the reading holds liabilities the custody side never saw.
     let committed = storage
         .get_committed_checkpoint(&key)
@@ -250,8 +250,8 @@ pub async fn capture_custody_snapshot(
                 low,
                 high,
             },
-            SweepFailure::Stale { slot, floor } => {
-                ReconciliationError::CustodyStale { slot, floor }
+            SweepFailure::Stale { floor, reason } => {
+                ReconciliationError::CustodyStale { floor, reason }
             }
             SweepFailure::Read(e) => ReconciliationError::Rpc {
                 mint: instance_pda.to_string(),
@@ -825,8 +825,8 @@ mod tests {
             high: 2,
         };
         let stale = ReconciliationError::CustodyStale {
-            slot: None,
             floor: 5,
+            reason: String::new(),
         };
         let mismatch = ReconciliationError::SupplyInvariantUnverified { count: 1 };
         assert!(custody_read_may_clear(&unsettled.into()));

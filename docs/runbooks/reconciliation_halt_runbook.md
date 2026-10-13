@@ -255,11 +255,11 @@ the halt reason:
 
    A boot also refuses when it cannot read custody fresh, before any comparison:
 
-   - `CustodyStale` (`custody could not be read at or past slot N`): every custody
+   - `CustodyStale` (`custody could not be read fresh: <cause>`): every custody
      read must answer at or past the larger of Solana's newest finalized block and the
      committed escrow checkpoint, and that block must be under 120 s old. A refusal
-     (-32016), an older answer or an old newest block is retried three times, 2 s
-     apart, about 10 s in all, then the indexer exits for the supervisor to restart.
+     (-32016), an older answer or an old newest block is read up to three times in
+     all, 2 s apart, about 10 s in all, then the indexer exits for the supervisor to restart.
      Fix the Solana RPC (lag, a backend replaying a snapshot, host clock). A
      checkpoint above the node's tip (a DB restored from another cluster, or a
      cluster reset) fails every restart by design: confirm the database belongs to

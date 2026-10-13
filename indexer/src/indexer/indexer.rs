@@ -1322,8 +1322,8 @@ mod tests {
             // So is a custody read the node could not give at a fresh enough slot.
             (
                 ReconciliationError::CustodyStale {
-                    slot: None,
                     floor: 100,
+                    reason: String::new(),
                 },
                 true,
             ),

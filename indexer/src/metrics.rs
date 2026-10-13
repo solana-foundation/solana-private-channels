@@ -396,7 +396,7 @@ pub fn init_labels(program_type: &str) {
         "rotation_lost",
         "rotation_blocked_by_lower_nonce",
         "rotation_origination_read_failed",
-        "generation_floor_unmet",
+        "generation_read_failed",
         "rotation_retry_held",
         "release_sent_unchecked",
         "hook_freshness_unproven",

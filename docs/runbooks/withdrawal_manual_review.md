@@ -244,11 +244,11 @@ would reopen the free retry loop it exists to close.
      creates that account: only the hook program can, so contact the mint issuer.
      Its address is the `["extra-account-metas", mint]` PDA of the hook program the
      mint names; re-arm the row once `solana account <that address>` shows it
-     exists. The operator reports it missing only when a node answered at or past
-     the gate's slot and that node's newest block is under 120 s old. One residual
-     remains: the first withdrawal of a mint can still park here if a live node is
-     behind the account's creation, so check the account before contacting anyone.
-     Expect every withdrawal of that mint to park here. Deposits of it fail
+     exists. The operator reports it missing only for an account it has seen before,
+     read at or past that slot from a node whose newest block is under 120 s old. An
+     account it never saw parks under Path J at the requeue cap instead, since a node
+     behind its creation looks the same. Expect every withdrawal of that mint to park
+     here or under Path J. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account invalid for mint` - the mint's
@@ -754,7 +754,7 @@ keys.
 `error_message` names `(freshness)` or `freshness unproven`. The hook validation
 account, or an account its list resolves to, could not be read at or past the slot
 the allowlist gate proved, or it read as absent from a node whose newest block is
-older than 120 s. The row was requeued without a verdict up to the requeue cap
+older than 120 s, or it read as absent and this operator has never seen it. The row was requeued without a verdict up to the requeue cap
 (each try restarts the processor task), then parked. Nothing was broadcast.
 
 1. Check the operator's Solana RPC: its finalized slot against a reference node,

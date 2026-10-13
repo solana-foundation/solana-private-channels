@@ -699,7 +699,7 @@ impl SenderState {
             }
             Err(e) => {
                 crate::metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[self.program_type.as_label(), "generation_floor_unmet"])
+                    .with_label_values(&[self.program_type.as_label(), "generation_read_failed"])
                     .inc();
                 Err(e)
             }
