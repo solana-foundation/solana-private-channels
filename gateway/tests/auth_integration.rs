@@ -961,6 +961,66 @@ async fn test_get_account_info_zero_allowance_delegate_returns_403() {
     assert_eq!(res.status(), 403);
 }
 
+/// An uninitialized account grants no delegate access, whatever its delegate bytes say.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_uninitialized_delegated_account_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate = [97u8; 32];
+    let owner = [98u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(delegate).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // Delegated to the caller with an allowance, but byte 108 stays 0: Uninitialized.
+    let mut account = vec![0u8; 165];
+    account[32..64].copy_from_slice(&owner);
+    account[72..76].copy_from_slice(&[1, 0, 0, 0]);
+    account[76..108].copy_from_slice(&delegate);
+    account[121..129].copy_from_slice(&1_000u64.to_le_bytes());
+    let uninitialized_account = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": LEDGER_TIP},
+            "value": {
+                "lamports": 2_039_280,
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": [BASE64.encode(&account), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string();
+
+    let ata_pubkey = bs58::encode([100u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(uninitialized_account).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
 /// A user querying an ATA whose owner and delegate do not match any of their
 /// verified wallets must be denied with 403.
 #[tokio::test(flavor = "multi_thread")]

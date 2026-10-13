@@ -187,7 +187,7 @@ pub async fn reconcile_against_snapshot(
     snapshot: &CustodySnapshot,
 ) -> Result<(), IndexerError> {
     if program_type != ProgramType::Escrow {
-        info!("Startup reconciliation skipped (program_type is not Escrow)");
+        info!("Reconciliation skipped (program_type is not Escrow)");
         return Ok(());
     }
 
@@ -203,7 +203,7 @@ pub async fn reconcile_against_snapshot(
     info!(
         instance_pda = %instance_pda,
         snapshot_slot = snapshot.slot,
-        "Running startup reconciliation"
+        "Running reconciliation"
     );
 
     // Snapshot of any deposit rows whose mint never had an `AllowMint` row.
@@ -385,7 +385,7 @@ async fn measure_supply_breaches(
                 warn!(
                     mint = %r.mint,
                     reason = %e.reason,
-                    "Startup supply invariant: channel supply read failed"
+                    "Supply invariant: channel supply read failed"
                 );
             }
         }
@@ -507,7 +507,7 @@ async fn check_channel_supply_invariant(
                 round,
                 required = SUPPLY_BREACH_CONFIRMATIONS,
                 unresolved = unresolved_count,
-                "Startup supply invariant: possible breach, re-reading before acting on it"
+                "Supply invariant: possible breach, re-reading before acting on it"
             );
             tokio::time::sleep(std::time::Duration::from_millis(
                 SUPPLY_BREACH_RECHECK_DELAY_MS,
@@ -596,18 +596,15 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
             error!(
                 row_count = orphans.len(),
                 orphan_ids = ?orphans,
-                "Startup reconciliation: orphan deposit row(s) present (deposit rows with \
-                 no allowed mint status at the deposit's slot) — surfaced for visibility, does not fail startup"
+                "Reconciliation: orphan deposit row(s) present (deposit rows with \
+                 no allowed mint status at the deposit's slot); surfaced for visibility, does not fail reconciliation"
             );
         }
         Ok(_) => {
-            info!("Startup reconciliation: no orphan deposit rows");
+            info!("Reconciliation: no orphan deposit rows");
         }
         Err(e) => {
-            warn!(
-                "Startup reconciliation: failed to query orphan deposit ids: {}",
-                e
-            );
+            warn!("Reconciliation: failed to query orphan deposit ids: {}", e);
         }
     }
 }
@@ -688,7 +685,7 @@ fn classify_and_report(
             db_expected = r.db_expected,
             on_chain_actual = r.on_chain_actual,
             surplus = r.surplus(),
-            "Reconciliation: escrow holds more than DB expects (benign surplus, not a solvency issue), continuing startup"
+            "Reconciliation: escrow holds more than DB expects (benign surplus, not a solvency issue), continuing"
         );
     }
 
@@ -700,7 +697,7 @@ fn classify_and_report(
             shortfall = r.shortfall(),
             threshold = config.mismatch_threshold_raw,
             tolerance = startup_tolerance_raw(config, r.on_chain_actual),
-            "Reconciliation: custody shortfall within tolerance, continuing startup"
+            "Reconciliation: custody shortfall within tolerance, continuing"
         );
     }
 
@@ -716,7 +713,7 @@ fn classify_and_report(
         balanced,
         within_tolerance = within_tolerance.len(),
         surplus,
-        "Startup reconciliation passed"
+        "Reconciliation passed"
     );
 
     Ok(())
@@ -2288,11 +2285,11 @@ mod tests {
     }
 
     /// The supply check allows the same cushion as the ledger check: the larger of the
-    /// absolute threshold and the bps share of custody.
+    /// absolute threshold and the bps share of custody, and no more.
     #[tokio::test]
-    async fn startup_supply_gap_within_bps_tolerance_passes() {
+    async fn startup_supply_gap_within_bps_tolerance_passes_but_past_it_halts() {
         let custody = 1_000;
-        // 100 bps of 1,000 custody allows 10 units, so a 5-unit gap is within it.
+        // 100 bps of 1,000 custody allows 10 units: a 5-unit gap is within it, 11 is not.
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
             reconciliation_tolerance_bps: 100,
@@ -2321,6 +2318,43 @@ mod tests {
         assert!(
             result.is_ok(),
             "a supply gap within the bps tolerance must not stop startup: {result:?}"
+        );
+
+        // One unit past the allowance, so a tolerance computed too large shows here.
+        let mut breach_server = mockito::Server::new_async().await;
+        let breach_mint = Pubkey::new_unique();
+        mock_escrow_sweep(
+            &mut breach_server,
+            &seed,
+            &[(breach_mint.to_string(), custody)],
+        )
+        .await;
+        mock_channel_supply(&mut breach_server, custody + 11).await;
+        let breach_storage = MockStorage::new();
+        breach_storage.set_mint_balances(vec![make_mint_balance(
+            &breach_mint.to_string(),
+            custody,
+            0,
+        )]);
+        let breach_storage = Storage::Mock(breach_storage);
+        let breach_url = breach_server.url();
+        let breach = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &breach_storage,
+            &breach_url,
+            Some(&breach_url),
+            &seed,
+        )
+        .await;
+        assert!(
+            matches!(
+                breach,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "a supply gap past the bps tolerance must still halt: {breach:?}"
         );
     }
 

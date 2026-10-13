@@ -465,20 +465,20 @@ pub async fn run(
             }
             None
         }
-        joined = &mut fetcher_handle => Some(("fetcher", joined)),
-        joined = &mut processor_handle => Some(("processor", joined)),
-        joined = &mut sender_handle => Some(("sender", joined)),
-        joined = &mut storage_writer_handle => Some(("storage_writer", joined)),
-        joined = &mut recovery_handle => Some(("recovery", joined)),
+        joined = &mut fetcher_handle => Some((CriticalTask::Fetcher, joined)),
+        joined = &mut processor_handle => Some((CriticalTask::Processor, joined)),
+        joined = &mut sender_handle => Some((CriticalTask::Sender, joined)),
+        joined = &mut storage_writer_handle => Some((CriticalTask::StorageWriter, joined)),
+        joined = &mut recovery_handle => Some((CriticalTask::Recovery, joined)),
         joined = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
-            Some(("release_promotion", joined))
+            Some((CriticalTask::ReleasePromotion, joined))
         }
         joined = &mut reconciliation_handle, if watch_reconciliation => {
-            Some(("reconciliation", joined))
+            Some((CriticalTask::Reconciliation, joined))
         }
     };
     if let Some((task, _)) = &exited {
-        critical_exit(pt_label, task);
+        critical_exit(pt_label, task.as_label());
     }
 
     // A critical task dying and the lock going are one failure when the database is what
@@ -510,26 +510,26 @@ pub async fn run(
     shutdown_operator(
         cancellation_token,
         storage,
-        unless_joined(fetcher_handle, "fetcher", joined),
-        unless_joined(processor_handle, "processor", joined),
-        unless_joined(sender_handle, "sender", joined),
-        unless_joined(storage_writer_handle, "storage_writer", joined),
-        unless_joined(reconciliation_handle, "reconciliation", joined),
+        unless_joined(fetcher_handle, CriticalTask::Fetcher, joined),
+        unless_joined(processor_handle, CriticalTask::Processor, joined),
+        unless_joined(sender_handle, CriticalTask::Sender, joined),
+        unless_joined(storage_writer_handle, CriticalTask::StorageWriter, joined),
+        unless_joined(reconciliation_handle, CriticalTask::Reconciliation, joined),
         feepayer_monitor_handle,
-        unless_joined(recovery_handle, "recovery", joined),
+        unless_joined(recovery_handle, CriticalTask::Recovery, joined),
         config.batch_size,
         config.db_poll_interval,
     )
     .await
     .map_err(|_| OperatorError::ShutdownChannelSend)?;
     // Already cancelled by shutdown_operator; this only waits out the pass in progress.
-    if let Err(e) = unless_joined(promotion_handle, "release_promotion", joined).await {
+    if let Err(e) = unless_joined(promotion_handle, CriticalTask::ReleasePromotion, joined).await {
         error!("Release promotion join error during shutdown: {}", e);
     }
     // Reported once the others have drained.
     if let Some((task, Err(join_error))) = &exited {
         error!(
-            task = *task,
+            task = task.as_label(),
             "Critical operator task failed: {}", join_error
         );
     }
@@ -752,9 +752,39 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
         .inc();
 }
 
+/// The workers supervision watches, named in logs and the task-exit metric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CriticalTask {
+    Fetcher,
+    Processor,
+    Sender,
+    StorageWriter,
+    Recovery,
+    ReleasePromotion,
+    Reconciliation,
+}
+
+impl CriticalTask {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Fetcher => "fetcher",
+            Self::Processor => "processor",
+            Self::Sender => "sender",
+            Self::StorageWriter => "storage_writer",
+            Self::Recovery => "recovery",
+            Self::ReleasePromotion => "release_promotion",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
 /// The handle shutdown may await. A JoinHandle panics if polled after it completed, so
 /// the one supervision already joined is swapped for a finished stand-in.
-fn unless_joined(handle: JoinHandle<()>, task: &str, joined: Option<&str>) -> JoinHandle<()> {
+fn unless_joined(
+    handle: JoinHandle<()>,
+    task: CriticalTask,
+    joined: Option<CriticalTask>,
+) -> JoinHandle<()> {
     if joined == Some(task) {
         tokio::spawn(async {})
     } else {
@@ -808,10 +838,11 @@ mod tests {
         // Joined by mutable reference, as supervision does.
         (&mut fetcher).await.expect("the fetcher ran");
 
-        unless_joined(fetcher, "fetcher", Some("fetcher"))
+        let joined = Some(CriticalTask::Fetcher);
+        unless_joined(fetcher, CriticalTask::Fetcher, joined)
             .await
             .expect("the stand-in must be awaitable");
-        let processor = unless_joined(processor, "processor", Some("fetcher"));
+        let processor = unless_joined(processor, CriticalTask::Processor, joined);
         assert_eq!(
             processor.id(),
             processor_id,

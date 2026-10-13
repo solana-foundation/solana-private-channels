@@ -80,13 +80,13 @@ pub enum ReconciliationError {
     #[error("RPC error for mint {mint}: {reason}")]
     Rpc { mint: String, reason: String },
 
-    #[error("{count} mint(s) have a custody shortfall exceeding the threshold of {threshold} raw units; see logs for per-mint details")]
+    #[error("{count} mint(s) have a custody shortfall past their tolerance (the larger of {threshold} raw units and the bps cushion); see logs for per-mint details")]
     MismatchExceedsThreshold { count: usize, threshold: u64 },
 
     /// Minted channel supply is above the custody backing it. Kept separate from a
     /// custody-versus-ledger mismatch because no amount of indexing changes either side
     /// of this comparison: it reads the chain twice and never touches the database.
-    #[error("{count} mint(s) have channel supply above escrow custody by more than {threshold} raw units; see logs for per-mint details")]
+    #[error("{count} mint(s) have channel supply above escrow custody by more than their tolerance (the larger of {threshold} raw units and the bps cushion); see logs for per-mint details")]
     SupplyExceedsCustody { count: usize, threshold: u64 },
 
     /// Channel supply could not be read at all, so the invariant never ran. Startup stops
