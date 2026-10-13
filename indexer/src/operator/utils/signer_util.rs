@@ -108,7 +108,7 @@ enum Loaded {
     },
 }
 
-/// Both role signers. `operator: None` means release funds signs with admin.
+/// Both role signers. `operator: None` means release and rotation sign with admin.
 struct Signers {
     admin: Signer,
     operator: Option<Signer>,
@@ -132,24 +132,27 @@ fn signers() -> &'static Signers {
 
 async fn load_signers() -> Result<Signers, String> {
     let admin = build(SignerRole::Admin).await.map_err(admin_error)?;
-    let operator = match build(SignerRole::Operator).await {
-        Ok(signer) => Some(signer),
-        Err(e) => operator_fallback(e),
+    let operator = if operator_unset() {
+        None
+    } else {
+        Some(build(SignerRole::Operator).await.map_err(operator_error)?)
     };
     Ok(Signers { admin, operator })
 }
 
-/// Refuses Privy rather than blocking on it, and never lets a Privy operator fall
-/// back to admin.
+/// Refuses Privy rather than blocking on it inside a runtime.
 fn load_signers_sync() -> Result<Signers, String> {
     let admin = match load_signer(SignerRole::Admin).map_err(admin_error)? {
         Loaded::Built(signer) => signer,
         Loaded::Privy { .. } => return Err(privy_needs_init(ADMIN_SIGNER)),
     };
-    let operator = match load_signer(SignerRole::Operator) {
-        Ok(Loaded::Built(signer)) => Some(signer),
-        Ok(Loaded::Privy { .. }) => return Err(privy_needs_init(OPERATOR_SIGNER)),
-        Err(e) => operator_fallback(e),
+    let operator = if operator_unset() {
+        None
+    } else {
+        match load_signer(SignerRole::Operator).map_err(operator_error)? {
+            Loaded::Built(signer) => Some(signer),
+            Loaded::Privy { .. } => return Err(privy_needs_init(OPERATOR_SIGNER)),
+        }
     };
     Ok(Signers { admin, operator })
 }
@@ -173,17 +176,26 @@ async fn build(role: SignerRole) -> Result<Signer, LoadError> {
     }
 }
 
+/// The admin stands in for the operator only when OPERATOR_SIGNER is unset; a set but
+/// unloadable one is fatal, like the admin.
+fn operator_unset() -> bool {
+    if env::var_os(OPERATOR_SIGNER).is_some() {
+        return false;
+    }
+    warn!("OPERATOR_SIGNER not set - release and rotation will use admin as operator");
+    true
+}
+
 fn admin_error(e: LoadError) -> String {
     format!("ADMIN_SIGNER must be configured: {e}")
 }
 
-fn privy_needs_init(type_var: &str) -> String {
-    format!("{type_var}=privy loads asynchronously; call init_signers at startup")
+fn operator_error(e: LoadError) -> String {
+    format!("OPERATOR_SIGNER is set but could not be loaded: {e}")
 }
 
-fn operator_fallback(e: LoadError) -> Option<Signer> {
-    warn!("OPERATOR_SIGNER not configured ({e}) - release funds will use admin as operator");
-    None
+fn privy_needs_init(type_var: &str) -> String {
+    format!("{type_var}=privy loads asynchronously; call init_signers at startup")
 }
 
 /// Load signer from environment variables
@@ -533,8 +545,7 @@ mod tests {
         }
     }
 
-    /// When OPERATOR_SIGNER is absent, load_signer returns an error so the caller
-    /// (the global Lazy) can fall back to the admin signer and log a warning.
+    /// When OPERATOR_SIGNER is absent, load_signer names the missing variable.
     #[test]
     #[serial]
     fn load_signer_operator_no_env_var_errors() {
@@ -667,11 +678,11 @@ mod tests {
         );
     }
 
-    /// A bad admin is a startup error, not a panic; a missing or broken operator still
-    /// falls back to admin.
+    /// A bad admin is a startup error, not a panic. Only an unset OPERATOR_SIGNER falls
+    /// back to admin; a set but unloadable one is an error on both load paths.
     #[tokio::test]
     #[serial]
-    async fn load_signers_errors_on_admin_and_keeps_the_operator_fallback() {
+    async fn load_signers_errors_on_admin_and_only_unset_operator_falls_back() {
         let _env = EnvGuard::clear(&ALL_VARS);
         let err = load_signers().await.err().expect("admin unset must fail");
         assert!(
@@ -680,20 +691,25 @@ mod tests {
         );
 
         let admin = set_memory_admin();
-        for operator_type in [None, Some("memory")] {
-            if let Some(t) = operator_type {
-                env::set_var(OPERATOR_SIGNER, t);
-            }
-            let signers = load_signers()
-                .await
-                .unwrap_or_else(|e| panic!("{operator_type:?}: {e}"));
-            assert_eq!(signers.admin.pubkey(), admin);
-            assert!(signers.operator.is_none(), "{operator_type:?}");
+        let signers = load_signers().await.expect("unset operator must load");
+        assert_eq!(signers.admin.pubkey(), admin);
+        assert!(signers.operator.is_none(), "unset operator signs as admin");
+
+        env::set_var(OPERATOR_SIGNER, "memory");
+        let errs = [
+            load_signers().await.err().expect("async: broken operator"),
+            load_signers_sync().err().expect("sync: broken operator"),
+        ];
+        for err in errs {
+            assert!(
+                err.contains("OPERATOR_SIGNER is set but could not be loaded")
+                    && err.contains("OPERATOR_PRIVATE_KEY"),
+                "got: {err}"
+            );
         }
     }
 
-    /// The sync fallback refuses Privy for either role instead of blocking, and a Privy
-    /// operator never falls back to admin there.
+    /// The sync fallback refuses Privy for either role instead of blocking on it.
     #[tokio::test]
     #[serial]
     async fn sync_loader_refuses_privy_for_either_role() {

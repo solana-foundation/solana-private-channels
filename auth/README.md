@@ -14,7 +14,7 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |
 | `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register`, `/auth/login` and `/auth/challenge-wallet`. |
 | `AUTH_RATE_LIMIT_BURST` | `10` | Burst allowance above the sustained per-IP rate. |
-| `AUTH_USERNAME_ATTEMPTS_PER_MINUTE` | `5` | Credential attempts per minute against a single username, across all IPs. |
+| `AUTH_USERNAME_FAILED_LOGINS_PER_MINUTE` | `5` | Failed logins (and registrations of a taken name) per minute on one username, across all IPs, before further failures return `429` instead of `401`/`409`. Not a guess limit: a correct password always succeeds, so it cannot lock an account out. |
 | `AUTH_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections. Past this, a new connection is dropped rather than queued. |
 | `AUTH_MAX_CONNECTIONS_PER_IP` | `64` | Maximum concurrent connections from one client IP, so one host cannot take the whole budget. |
 | `AUTH_HEADER_READ_TIMEOUT_SECS` | `10` | Seconds a client may take to send a full request header block (slowloris protection). Doubles as the idle timeout: see below. |
@@ -23,8 +23,10 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `AUTH_TCP_KEEPALIVE_INTERVAL_SECS` | `15` | Seconds between TCP keepalive probes. |
 
 The credential routes run Argon2, which is deliberately CPU and memory heavy. They are
-rate limited per IP and per username, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent
-hashes, and limited to a 4 KB request body. Over-budget requests get `429`; requests that
+rate limited per IP, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent hashes, and
+limited to a 4 KB request body. `AUTH_USERNAME_FAILED_LOGINS_PER_MINUTE` only shapes
+failure responses; it does not bound the guesses one account receives across many IPs.
+Over-budget requests get `429`; requests that
 wait too long for a hashing slot, outrun `AUTH_REQUEST_TIMEOUT_SECS`, or find the database
 unreachable, get `503`. A `500` means the database answered and we asked it wrong.
 

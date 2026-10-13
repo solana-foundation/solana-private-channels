@@ -1,13 +1,14 @@
 use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
 use crate::metrics::FEEPAYER_BALANCE_LAMPORTS;
-use crate::operator::{RpcClientWithRetry, SignerUtil};
+use crate::operator::RpcClientWithRetry;
 use private_channel_metrics::MetricLabel;
+use solana_keychain::SolanaSigner;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::operator::utils::instruction_util::RetryPolicy;
+use crate::operator::utils::instruction_util::{RetryPolicy, TransactionBuilder};
 
 const LOW_BALANCE_LAMPORTS: u64 = 500_000_000; // 0.5 SOL
 
@@ -17,9 +18,12 @@ pub async fn run_feepayer_monitor(
     program_type: ProgramType,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
-    // The admin signs releases first, so it pays their fees, not the operator.
-    let feepayer_pubkey = SignerUtil::get_admin_pubkey();
+    // Same pick as the sender: the first release signer pays.
+    let feepayer_pubkey = TransactionBuilder::release_signers()[0].pubkey();
     let label = program_type.as_label();
+    // Seeded here, not in init_labels: the alerts read a missing series as healthy, so an
+    // RPC that fails every read must still page on the zero.
+    FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[label]);
 
     info!(
         "Starting feepayer balance monitor for {} (pubkey: {})",

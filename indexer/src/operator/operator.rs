@@ -380,14 +380,12 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
-    // Start feepayer balance monitor for escrow operators only.
-    // Monitors SOL balance of the feepayer wallet used for ReleaseFunds transactions.
+    // Withdraw operators only: they broadcast ReleaseFunds to rpc_url, where the
+    // first release signer pays.
     let feepayer_monitor_handle =
-        if common_config.program_type == crate::config::ProgramType::Escrow {
+        if common_config.program_type == crate::config::ProgramType::Withdraw {
             let feepayer_config = config.clone();
-            let feepayer_rpc = source_rpc_client
-                .clone()
-                .unwrap_or_else(|| rpc_client.clone());
+            let feepayer_rpc = rpc_client.clone();
             let feepayer_program_type = common_config.program_type;
             let feepayer_token = cancellation_token.clone();
             tokio::spawn(async move {
@@ -934,11 +932,15 @@ mod tests {
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::rpc_util::RetryConfig;
+    use crate::operator::TransactionBuilder;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use private_channel_metrics::prometheus;
+    use serial_test::serial;
+    use solana_keychain::SolanaSigner;
     use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
@@ -1791,6 +1793,108 @@ mod tests {
         assert!(
             !mock.call_order.lock().unwrap().is_empty(),
             "the withdraw operator must reach storage"
+        );
+    }
+
+    /// The withdraw role broadcasts releases to its rpc_url, so the monitor must watch
+    /// their fee payer there, not on the source chain. Admin and operator share a key
+    /// in this binary, so this pins the role and the RPC, not which signer pays.
+    /// Serial because the signer_util tests remove ADMIN_SIGNER while they run.
+    #[tokio::test]
+    #[serial]
+    async fn withdraw_operator_watches_the_fee_payer_on_its_destination_rpc() {
+        std::env::set_var("ADMIN_SIGNER", "memory");
+        std::env::set_var(
+            "ADMIN_PRIVATE_KEY",
+            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
+        );
+        let fee_payer = TransactionBuilder::release_signers()[0].pubkey();
+
+        let mut destination = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut destination);
+        let _bitmap = mock_bitmap_not_found(&mut destination);
+        let fee_payer_balance = destination
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getBalance""#.into()),
+                mockito::Matcher::Regex(fee_payer.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":1000000000}}"#,
+            )
+            .create_async()
+            .await;
+        let mut source = mockito::Server::new_async().await;
+        let source_balance = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBalance""#.into(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut common, config) = startup_fixture(ProgramType::Withdraw);
+        common.rpc_url = destination.url();
+        common.source_rpc_url = Some(source.url());
+        let operator = tokio::spawn(run(
+            Arc::new(Storage::Mock(MockStorage::new())),
+            common,
+            config,
+            None,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !fee_payer_balance.matched_async().await && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        operator.abort();
+
+        assert!(
+            fee_payer_balance.matched_async().await,
+            "the withdraw operator must read the fee payer balance on its rpc_url"
+        );
+        source_balance.assert_async().await;
+    }
+
+    /// The alerts treat a missing series as healthy, so the monitor seeds it before its
+    /// first read: an RPC that fails every getBalance still pages on the zero. Escrow label
+    /// because no other test writes it, so this cannot pass on test order. Serial for
+    /// ADMIN_SIGNER, as above.
+    #[tokio::test]
+    #[serial]
+    async fn feepayer_monitor_seeds_its_series_before_the_first_read() {
+        std::env::set_var("ADMIN_SIGNER", "memory");
+        std::env::set_var(
+            "ADMIN_PRIVATE_KEY",
+            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
+        );
+        let (_, config) = startup_fixture(ProgramType::Escrow);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        feepayer_monitor::run_feepayer_monitor(
+            config,
+            Arc::new(make_rpc_client("http://127.0.0.1:1")),
+            ProgramType::Escrow,
+            cancelled,
+        )
+        .await
+        .expect("a cancelled monitor stops cleanly");
+
+        let seeded = prometheus::gather().iter().any(|family| {
+            family.name() == "private_channel_feepayer_balance_lamports"
+                && family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "program_type" && label.value() == "escrow")
+                })
+        });
+        assert!(
+            seeded,
+            "the monitor must seed its series before any balance read"
         );
     }
 

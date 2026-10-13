@@ -34,7 +34,6 @@ use crate::{
 };
 #[cfg(feature = "datasource-rpc")]
 use private_channel_metrics::MetricLabel;
-#[cfg(feature = "datasource-rpc")]
 use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]

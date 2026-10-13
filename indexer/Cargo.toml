@@ -8,7 +8,9 @@ default = ["datasource-yellowstone", "datasource-rpc"]
 
 # Datasource features
 datasource-rpc = []
+# Gap repair and the startup anchor run over RPC, so the stream cannot index without it.
 datasource-yellowstone = [
+    "datasource-rpc",
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
     "dep:rustls",

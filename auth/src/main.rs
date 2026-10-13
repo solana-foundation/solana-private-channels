@@ -46,7 +46,7 @@ async fn main() {
     let auth_throttle = Arc::new(AuthThrottle::new(
         config.auth_rate_limit_per_second,
         config.auth_rate_limit_burst,
-        config.auth_username_attempts_per_minute,
+        config.auth_username_failed_logins_per_minute,
     ));
     throttle::spawn_pruner(auth_throttle.clone());
 

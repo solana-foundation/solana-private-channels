@@ -5,8 +5,10 @@ use figment::{
 };
 use private_channel_indexer::config::{
     floor_operator_commitment, normalize_optional, validate_operator_startup,
-    validate_rpc_batch_size, validate_rpc_encoding, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
+#[cfg(feature = "datasource-rpc")]
+use private_channel_indexer::config::{validate_rpc_batch_size, validate_rpc_encoding};
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
     PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -226,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
+        #[cfg(feature = "datasource-rpc")]
         Mode::Resync {
             genesis_slot,
             channel_rpc_url,
@@ -241,6 +244,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 escrow_rpc_url,
             )
             .await
+        }
+        // Resync rebuilds from RPC blocks, so a build without that datasource cannot run it.
+        #[cfg(not(feature = "datasource-rpc"))]
+        Mode::Resync { .. } => {
+            Err("resync requires a build with the datasource-rpc feature".into())
         }
     }
 }
@@ -526,6 +534,7 @@ fn build_operator_config(
 
 /// Resync skips `IndexerConfig::validate`, so it repeats the rules for what it uses: the
 /// pool, the backfill batch size and the poller encoding. Runs before anything connects.
+#[cfg(feature = "datasource-rpc")]
 fn validate_resync_config(
     storage: &StorageSection,
     indexer: &IndexerSection,
@@ -548,6 +557,7 @@ fn validate_resync_config(
     Ok(())
 }
 
+#[cfg(feature = "datasource-rpc")]
 async fn run_resync(
     figment: Figment,
     verbose: bool,
@@ -920,6 +930,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "datasource-rpc")]
     #[test]
     fn resync_refuses_a_zero_pool_a_zero_batch_and_a_non_json_encoding() {
         validate_resync_config(&storage_section(), &indexer_section())
