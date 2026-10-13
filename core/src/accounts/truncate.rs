@@ -194,7 +194,7 @@ async fn truncate_slots_inner(
         return Ok(report);
     }
 
-    ensure_two_windows_kept(pool, latest_slot, truncate_before_slot).await?;
+    let window = ensure_two_windows_kept(pool, latest_slot, truncate_before_slot).await?;
     ensure_withdraw_indexer_read_past(&options.consumer_check, truncate_before_slot).await?;
 
     // Taken after T is fixed: rows written during the proof land at or above T and are
@@ -230,7 +230,8 @@ async fn truncate_slots_inner(
 
     if options.dry_run {
         let (_, tx_count) =
-            process_block_batches(pool, truncate_before_slot, options.batch_size, true).await?;
+            process_block_batches(pool, truncate_before_slot, options.batch_size, window, true)
+                .await?;
         report.blocks_deleted = blocks_to_delete;
         report.transactions_deleted = tx_count;
         report.account_history_rows_deleted = account_history_rows_to_delete;
@@ -242,8 +243,14 @@ async fn truncate_slots_inner(
     // A resync wipes the checkpoint, so one read before a long proof proves nothing now.
     ensure_withdraw_indexer_read_past(&options.consumer_check, truncate_before_slot).await?;
 
-    let (blocks_deleted, transactions_deleted) =
-        process_block_batches(pool, truncate_before_slot, options.batch_size, false).await?;
+    let (blocks_deleted, transactions_deleted) = process_block_batches(
+        pool,
+        truncate_before_slot,
+        options.batch_size,
+        window,
+        false,
+    )
+    .await?;
     report.blocks_deleted = blocks_deleted;
     report.transactions_deleted = transactions_deleted;
 
@@ -275,7 +282,7 @@ async fn ensure_two_windows_kept(
     pool: &PgPool,
     latest_slot: u64,
     truncate_before_slot: u64,
-) -> Result<()> {
+) -> Result<u64> {
     let window = blockhash_window::read(pool)
         .await
         .context("Failed to read the published blockhash window")?
@@ -311,7 +318,26 @@ async fn ensure_two_windows_kept(
              use keep_slots >= {}",
             latest_slot - floor_slot as u64 + 1
         )),
-        Some(_) => Ok(()),
+        Some(_) => Ok(window),
+    }
+}
+
+/// Refuse a batch if a writer published a larger window since the cut was checked. The
+/// row lock makes a writer's publish wait for this batch to commit.
+async fn ensure_window_not_grown(conn: &mut PgConnection, approved: u64) -> Result<()> {
+    let value: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = $1 FOR SHARE")
+            .bind(MAX_BLOCKHASHES_KEY)
+            .fetch_optional(&mut *conn)
+            .await
+            .context("Failed to lock the published blockhash window")?;
+    match blockhash_window::decode(value.as_deref()) {
+        Some(current) if current <= approved => Ok(()),
+        current => Err(anyhow!(
+            "max_blockhashes grew from {approved} to {} during truncation; rerun so the cut \
+             is checked against it",
+            current.map_or_else(|| "unset".to_string(), |w| w.to_string())
+        )),
     }
 }
 
@@ -373,6 +399,7 @@ async fn process_block_batches(
     pool: &PgPool,
     truncate_before_slot: u64,
     batch_size: usize,
+    window: u64,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
     let mut total_blocks = 0_u64;
@@ -446,6 +473,7 @@ async fn process_block_batches(
             .begin()
             .await
             .context("Failed to begin truncation transaction")?;
+        ensure_window_not_grown(&mut tx, window).await?;
 
         if !signatures.is_empty() {
             let sig_vec: Vec<Vec<u8>> = signatures.into_iter().collect();
@@ -1315,6 +1343,28 @@ mod tests {
 
         let err = assert_refused(&url, &options, &db.pool).await;
         assert!(err.contains("no committed checkpoint"), "{err}");
+    }
+
+    /// A writer can boot with a larger window while the proof runs, which moves the 2W
+    /// floor past a cut that was checked against the old window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_a_window_that_grew_during_the_proof() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        // Publishes a window of 2 while the proof runs, then restores as usual.
+        let restore = executable_script(&format!(
+            "#!/bin/sh\n\
+             docker exec {id} psql -U postgres -d pg_test -qAtc \
+             \"UPDATE metadata SET value = '\\\\x0200000000000000' \
+             WHERE key = 'max_blockhashes'\" >/dev/null\n\
+             exec docker exec -i {id} pg_restore \"$@\"\n",
+            id = _pg.id()
+        ));
+
+        let err = assert_refused(&url, &apply_opts(3, 100, dump.path(), &restore), &db.pool).await;
+        assert!(err.contains("grew from 1 to 2"), "{err}");
     }
 
     /// A deployment with no withdraw indexer opts out explicitly and needs no indexer database.

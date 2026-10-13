@@ -236,15 +236,14 @@ mod tests {
         assert!(height > last_valid_block_height);
     }
 
-    /// With the cache on, a status miss is answered by Postgres, which can lag the
-    /// cache. A cached height could then pass a deadline the store answering the null
-    /// has not reached, so getBlockHeight reads Postgres. getLatestBlockhash keeps the
-    /// cached height: its deadline must pair with the cached hash, or it comes out low.
+    /// With the cache on, getBlockHeight reads Postgres so it cannot pass a deadline the
+    /// store answering a status miss has not reached. getLatestBlockhash reads Postgres
+    /// too: the window lives there, and a lagging replica would pair it with a newer tip.
     #[tokio::test(flavor = "multi_thread")]
-    async fn block_height_reads_postgres_while_blockhash_deadline_reads_the_cache() {
+    async fn block_height_and_blockhash_deadline_read_postgres() {
         let postgres_height = 5;
         let cached_height = 10;
-        let cached_blockhash = Hash::new_unique();
+        let postgres_blockhash = Hash::new_unique();
         let (postgres_db, _pg) = start_test_postgres_raw().await;
         publish_window(
             &AccountsDB::Postgres(postgres_db.clone()),
@@ -259,7 +258,7 @@ mod tests {
                 Some(make_sparse_block_info(
                     50,
                     postgres_height,
-                    Hash::new_unique(),
+                    postgres_blockhash,
                 )),
             )
             .await
@@ -268,7 +267,11 @@ mod tests {
             &mut redis_db,
             &[],
             vec![],
-            Some(make_sparse_block_info(100, cached_height, cached_blockhash)),
+            Some(make_sparse_block_info(
+                100,
+                cached_height,
+                Hash::new_unique(),
+            )),
         )
         .await
         .unwrap();
@@ -286,11 +289,11 @@ mod tests {
             .await
             .unwrap()
             .value;
-        assert_eq!(latest.blockhash, cached_blockhash.to_string());
+        assert_eq!(latest.blockhash, postgres_blockhash.to_string());
         assert_eq!(
             latest.last_valid_block_height,
-            cached_height + TEST_MAX_BLOCKHASHES - 1,
-            "the deadline must pair with the cached hash"
+            postgres_height + TEST_MAX_BLOCKHASHES - 1,
+            "the hash, its height and the window must come from one store"
         );
     }
 

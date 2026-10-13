@@ -35,10 +35,12 @@ pub struct BlockhashSnapshot {
     pub max_blockhashes: Option<u64>,
 }
 
+/// Always Postgres: the window is not mirrored, and a cached tip read beside a lagging
+/// replica could pair a new hash with a window the writer has already replaced.
 pub async fn get_blockhash_snapshot(db: &AccountsDB) -> Result<BlockhashSnapshot> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_blockhash_snapshot_postgres(postgres_db).await,
-        AccountsDB::Redis(redis_db) => get_blockhash_snapshot_redis(redis_db).await,
+        AccountsDB::Redis(redis_db) => get_blockhash_snapshot_postgres(&redis_db.fallback).await,
     }
 }
 
@@ -80,46 +82,6 @@ async fn get_blockhash_snapshot_postgres(db: &PostgresAccountsDB) -> Result<Bloc
         blockhash: Hash::new_from_array(hash_array),
         max_blockhashes: blockhash_window::decode(row.get::<Option<Vec<u8>>, _>(5).as_deref()),
     })
-}
-
-/// The stamp, current slot, block height and blockhash, as one `MGET` returns them.
-type CachedTip = (Option<Vec<u8>>, Option<u64>, Option<u64>, Option<String>);
-
-/// One `MGET`, which sees one mirrored block. Anything short of a full answer reads
-/// all three from Postgres, so a cached hash is never paired with a Postgres height.
-async fn get_blockhash_snapshot_redis(db: &RedisAccountsDB) -> Result<BlockhashSnapshot> {
-    let mut conn = db.connection.clone();
-    let cached: redis::RedisResult<CachedTip> = redis::cmd("MGET")
-        .arg(super::redis_coherence::DEPLOYMENT_ID_KEY)
-        .arg(CURRENT_SLOT_KEY)
-        .arg(BLOCK_HEIGHT_KEY)
-        .arg(LATEST_BLOCKHASH_KEY)
-        .query_async(&mut conn)
-        .await;
-
-    match cached {
-        Ok((stamp, Some(slot), Some(block_height), Some(hash_str)))
-            if db.stamp_is_current(stamp.as_ref()) =>
-        {
-            let blockhash = Hash::from_str(&hash_str)
-                .map_err(|e| anyhow!("Invalid blockhash format: {}", e))?;
-            // Read from Postgres, not mirrored: it only changes when a writer boots.
-            let max_blockhashes = blockhash_window::read(db.fallback.pool.as_ref())
-                .await
-                .context("Failed to read the published blockhash window")?;
-            Ok(BlockhashSnapshot {
-                slot: Some(slot),
-                block_height: Some(block_height),
-                blockhash,
-                max_blockhashes,
-            })
-        }
-        Ok(_) => get_blockhash_snapshot_postgres(&db.fallback).await,
-        Err(e) => {
-            warn!("Failed to get the blockhash snapshot from Redis: {}", e);
-            get_blockhash_snapshot_postgres(&db.fallback).await
-        }
-    }
 }
 
 async fn get_latest_blockhash_postgres(db: &PostgresAccountsDB) -> Result<Hash> {
