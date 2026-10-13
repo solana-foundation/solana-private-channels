@@ -838,11 +838,12 @@ pub async fn process_pending_remints(
             remaining.push(entry);
         }
     }
-    // Oldest deadline first; past the cap, entries wait unchanged for the next tick.
-    matured.sort_by_key(|entry| entry.deadline);
+    // Keep the oldest deadlines in linear time; past the cap, entries wait unchanged for the next tick.
     if matured.len() > MAX_REMINTS_PER_TICK {
+        matured.select_nth_unstable_by_key(MAX_REMINTS_PER_TICK, |entry| entry.deadline);
         remaining.extend(matured.drain(MAX_REMINTS_PER_TICK..));
     }
+    matured.sort_by_key(|entry| entry.deadline);
 
     // Each matured entry leaves the queue unless we push it back into `remaining`.
     for mut entry in matured {
