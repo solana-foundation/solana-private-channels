@@ -63,6 +63,11 @@ pub async fn run(
         .filter(|s| !s.is_empty());
     reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
 
+    // Library callers skip the binary, so load signers here too; a second call is a no-op.
+    crate::operator::init_signers()
+        .await
+        .map_err(OperatorError::InvalidConfig)?;
+
     let cancellation_token = CancellationToken::new();
 
     // Take the live-state lock before touching the schema or any row. A resync
@@ -1766,8 +1771,12 @@ mod tests {
 
     /// The withdraw role never reads the webhook, so omitting it must pass the config
     /// gate. The run then proceeds to storage (and stalls on the unreachable RPC).
+    // Past the config gate `run` loads the signers, and `signer_util`'s tests clear that
+    // env while they run, so this has to be ordered against them.
     #[tokio::test]
+    #[serial_test::serial]
     async fn withdraw_without_a_webhook_passes_the_config_gate() {
+        crate::operator::sender::test_support::ensure_test_signer();
         let (common, mut config) = startup_fixture(ProgramType::Withdraw);
         config.reconciliation_webhook_url = None;
         let mock = MockStorage::new();

@@ -96,6 +96,7 @@ fn common_config(postgres: PostgresConfig) -> PrivateChannelIndexerConfig {
 }
 
 fn operator_config() -> OperatorConfig {
+    test_utils::operator_helper::set_operator_env_vars(&solana_sdk::signature::Keypair::new());
     OperatorConfig {
         db_poll_interval: Duration::from_secs(60),
         batch_size: 10,

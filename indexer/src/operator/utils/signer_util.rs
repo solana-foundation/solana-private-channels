@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use solana_keychain::{Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
 use std::env;
@@ -97,26 +97,97 @@ enum SignerRole {
     Operator,
 }
 
-/// Global admin signer (required for both programs)
-static ADMIN_SIGNER_INSTANCE: Lazy<Signer> = Lazy::new(|| {
-    load_signer(SignerRole::Admin)
-        .unwrap_or_else(|e| panic!("ADMIN_SIGNER must be configured: {e}"))
-});
+/// What `load_signer` read: a built signer, or Privy settings still to be awaited,
+/// since the Privy constructor is async.
+enum Loaded {
+    Built(Signer),
+    Privy {
+        app_id: String,
+        app_secret: String,
+        wallet_id: String,
+    },
+}
 
-/// Global operator signer (optional, only for release funds)
-static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> =
-    Lazy::new(|| match load_signer(SignerRole::Operator) {
+/// Both role signers. `operator: None` means release funds signs with admin.
+struct Signers {
+    admin: Signer,
+    operator: Option<Signer>,
+}
+
+static SIGNERS: OnceCell<Signers> = OnceCell::new();
+
+/// Loads both signers once, awaiting Privy on the caller's runtime. Startup calls this
+/// before it connects to anything; later calls do nothing.
+pub async fn init_signers() -> Result<(), String> {
+    if SIGNERS.get().is_none() {
+        let _ = SIGNERS.set(load_signers().await?);
+    }
+    Ok(())
+}
+
+/// Accessors reached before `init_signers` (tests and tools) load synchronously.
+fn signers() -> &'static Signers {
+    SIGNERS.get_or_init(|| load_signers_sync().unwrap_or_else(|e| panic!("{e}")))
+}
+
+async fn load_signers() -> Result<Signers, String> {
+    let admin = build(SignerRole::Admin).await.map_err(admin_error)?;
+    let operator = match build(SignerRole::Operator).await {
         Ok(signer) => Some(signer),
-        Err(e) => {
-            warn!(
-                "OPERATOR_SIGNER not configured ({e}) - release funds will use admin as operator"
-            );
-            None
+        Err(e) => operator_fallback(e),
+    };
+    Ok(Signers { admin, operator })
+}
+
+/// Refuses Privy rather than blocking on it, and never lets a Privy operator fall
+/// back to admin.
+fn load_signers_sync() -> Result<Signers, String> {
+    let admin = match load_signer(SignerRole::Admin).map_err(admin_error)? {
+        Loaded::Built(signer) => signer,
+        Loaded::Privy { .. } => return Err(privy_needs_init(ADMIN_SIGNER)),
+    };
+    let operator = match load_signer(SignerRole::Operator) {
+        Ok(Loaded::Built(signer)) => Some(signer),
+        Ok(Loaded::Privy { .. }) => return Err(privy_needs_init(OPERATOR_SIGNER)),
+        Err(e) => operator_fallback(e),
+    };
+    Ok(Signers { admin, operator })
+}
+
+async fn build(role: SignerRole) -> Result<Signer, LoadError> {
+    match load_signer(role)? {
+        Loaded::Built(signer) => Ok(signer),
+        Loaded::Privy {
+            app_id,
+            app_secret,
+            wallet_id,
+        } => {
+            let signer = Signer::from_privy(app_id, app_secret, wallet_id, None).await?;
+            let role_name = match role {
+                SignerRole::Admin => "admin",
+                SignerRole::Operator => "operator",
+            };
+            info!("Loaded {} signer (privy): {}", role_name, signer.pubkey());
+            Ok(signer)
         }
-    });
+    }
+}
+
+fn admin_error(e: LoadError) -> String {
+    format!("ADMIN_SIGNER must be configured: {e}")
+}
+
+fn privy_needs_init(type_var: &str) -> String {
+    format!("{type_var}=privy loads asynchronously; call init_signers at startup")
+}
+
+fn operator_fallback(e: LoadError) -> Option<Signer> {
+    warn!("OPERATOR_SIGNER not configured ({e}) - release funds will use admin as operator");
+    None
+}
 
 /// Load signer from environment variables
-fn load_signer(role: SignerRole) -> Result<Signer, LoadError> {
+fn load_signer(role: SignerRole) -> Result<Loaded, LoadError> {
     let (role_name, type_var) = match role {
         SignerRole::Admin => ("admin", ADMIN_SIGNER),
         SignerRole::Operator => ("operator", OPERATOR_SIGNER),
@@ -232,9 +303,11 @@ fn load_signer(role: SignerRole) -> Result<Signer, LoadError> {
             let wallet_id = env::var(wallet_id_var)
                 .map_err(|_| LoadError::Config(format!("{} not set", wallet_id_var)))?;
 
-            // Block on async initialization
-            tokio::runtime::Handle::current()
-                .block_on(Signer::from_privy(app_id, app_secret, wallet_id, None))?
+            return Ok(Loaded::Privy {
+                app_id,
+                app_secret,
+                wallet_id,
+            });
         }
     };
 
@@ -244,7 +317,7 @@ fn load_signer(role: SignerRole) -> Result<Signer, LoadError> {
         signer_type_str,
         signer.pubkey()
     );
-    Ok(signer)
+    Ok(Loaded::Built(signer))
 }
 
 pub struct SignerUtil;
@@ -259,13 +332,12 @@ impl SignerUtil {
     }
 
     pub fn admin_signer() -> &'static Signer {
-        &ADMIN_SIGNER_INSTANCE
+        &signers().admin
     }
 
     pub fn operator_signer() -> &'static Signer {
-        OPERATOR_SIGNER_INSTANCE
-            .as_ref()
-            .unwrap_or(&ADMIN_SIGNER_INSTANCE)
+        let signers = signers();
+        signers.operator.as_ref().unwrap_or(&signers.admin)
     }
 }
 
@@ -509,5 +581,140 @@ mod tests {
         if let Some(val) = orig_key {
             env::set_var(OPERATOR_PRIVATE_KEY, val);
         }
+    }
+
+    /// Saves the named env vars, clears them, and restores them on drop.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn clear(names: &[&'static str]) -> Self {
+            let saved = names.iter().map(|n| (*n, env::var(n).ok())).collect();
+            for name in names {
+                env::remove_var(name);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(v) => env::set_var(name, v),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    const ALL_VARS: [&str; 10] = [
+        ADMIN_SIGNER,
+        ADMIN_PRIVATE_KEY,
+        ADMIN_PRIVY_APP_ID,
+        ADMIN_PRIVY_APP_SECRET,
+        ADMIN_PRIVY_WALLET_ID,
+        OPERATOR_SIGNER,
+        OPERATOR_PRIVATE_KEY,
+        OPERATOR_PRIVY_APP_ID,
+        OPERATOR_PRIVY_APP_SECRET,
+        OPERATOR_PRIVY_WALLET_ID,
+    ];
+
+    fn set_memory_admin() -> Pubkey {
+        let keypair = solana_sdk::signer::keypair::Keypair::new();
+        env::set_var(ADMIN_SIGNER, "memory");
+        env::set_var(
+            ADMIN_PRIVATE_KEY,
+            bs58::encode(keypair.to_bytes()).into_string(),
+        );
+        solana_sdk::signer::Signer::pubkey(&keypair)
+    }
+
+    fn set_fake_privy(role: SignerRole) {
+        let (type_var, app_id, app_secret, wallet_id) = match role {
+            SignerRole::Admin => (
+                ADMIN_SIGNER,
+                ADMIN_PRIVY_APP_ID,
+                ADMIN_PRIVY_APP_SECRET,
+                ADMIN_PRIVY_WALLET_ID,
+            ),
+            SignerRole::Operator => (
+                OPERATOR_SIGNER,
+                OPERATOR_PRIVY_APP_ID,
+                OPERATOR_PRIVY_APP_SECRET,
+                OPERATOR_PRIVY_WALLET_ID,
+            ),
+        };
+        env::set_var(type_var, "privy");
+        env::set_var(app_id, "fake-app");
+        env::set_var(app_secret, "fake-secret");
+        env::set_var(wallet_id, "fake-wallet");
+    }
+
+    /// Cantina #13: complete Privy creds are awaited on the running runtime. The old
+    /// nested `block_on` panicked here; a fake wallet must end in an error or the timeout.
+    #[tokio::test]
+    #[serial]
+    async fn privy_signer_is_awaited_on_the_runtime() {
+        let _env = EnvGuard::clear(&ALL_VARS);
+        set_fake_privy(SignerRole::Admin);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), build(SignerRole::Admin)).await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "a fake privy wallet must not load"
+        );
+    }
+
+    /// A bad admin is a startup error, not a panic; a missing or broken operator still
+    /// falls back to admin.
+    #[tokio::test]
+    #[serial]
+    async fn load_signers_errors_on_admin_and_keeps_the_operator_fallback() {
+        let _env = EnvGuard::clear(&ALL_VARS);
+        let err = load_signers().await.err().expect("admin unset must fail");
+        assert!(
+            err.contains("ADMIN_SIGNER must be configured") && err.contains("ADMIN_SIGNER not set"),
+            "got: {err}"
+        );
+
+        let admin = set_memory_admin();
+        for operator_type in [None, Some("memory")] {
+            if let Some(t) = operator_type {
+                env::set_var(OPERATOR_SIGNER, t);
+            }
+            let signers = load_signers()
+                .await
+                .unwrap_or_else(|e| panic!("{operator_type:?}: {e}"));
+            assert_eq!(signers.admin.pubkey(), admin);
+            assert!(signers.operator.is_none(), "{operator_type:?}");
+        }
+    }
+
+    /// The sync fallback refuses Privy for either role instead of blocking, and a Privy
+    /// operator never falls back to admin there.
+    #[tokio::test]
+    #[serial]
+    async fn sync_loader_refuses_privy_for_either_role() {
+        let _env = EnvGuard::clear(&ALL_VARS);
+        set_fake_privy(SignerRole::Admin);
+        let err = load_signers_sync()
+            .err()
+            .expect("privy admin must be refused");
+        assert!(
+            err.contains("ADMIN_SIGNER") && err.contains("init_signers"),
+            "got: {err}"
+        );
+
+        set_memory_admin();
+        set_fake_privy(SignerRole::Operator);
+        let err = load_signers_sync()
+            .err()
+            .expect("privy operator must be refused");
+        assert!(
+            err.contains("OPERATOR_SIGNER") && err.contains("init_signers"),
+            "got: {err}"
+        );
     }
 }

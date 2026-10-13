@@ -419,7 +419,9 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     )?;
 
     // Validate signer configuration early (from environment variables)
-    OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
+    private_channel_indexer::operator::init_signers()
+        .await
+        .map_err(|e| format!("Signer configuration error: {}", e))?;
 
     // Initialize storage
     let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type
@@ -578,6 +580,10 @@ async fn run_resync(
     let indexer: IndexerSection = figment.extract_inner("indexer")?;
     // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
     validate_resync_config(&storage, &indexer)?;
+    // Reconcile reads the admin pubkey; load signers before anything connects.
+    private_channel_indexer::operator::init_signers()
+        .await
+        .map_err(|e| format!("Signer configuration error: {}", e))?;
 
     // Get DATABASE_URL from environment
     let database_url =

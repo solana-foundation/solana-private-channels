@@ -339,6 +339,7 @@ pub(super) fn withdraw_operator_configs(
     rpc_url: &str,
     source_rpc_url: Option<String>,
 ) -> (PrivateChannelIndexerConfig, OperatorConfig) {
+    test_utils::operator_helper::set_operator_env_vars(&solana_sdk::signature::Keypair::new());
     let common = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,

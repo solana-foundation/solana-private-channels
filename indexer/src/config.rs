@@ -8,7 +8,6 @@ use solana_transaction_status::UiTransactionEncoding;
 use crate::indexer::datasource::common::parser::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
-use crate::operator::SignerUtil;
 use crate::storage::common::models::TransactionType;
 
 /// Program type to index
@@ -597,20 +596,6 @@ fn default_feepayer_monitor_interval() -> std::time::Duration {
 
 fn default_confirmation_poll_interval_ms() -> u64 {
     DEFAULT_CONFIRMATION_POLL_INTERVAL_MS
-}
-
-impl OperatorConfig {
-    /// Validate that required signers are configured
-    ///
-    /// This triggers lazy initialization of signers and will fail fast
-    /// if required environment variables are missing or invalid.
-    pub fn validate_signers() -> Result<(), String> {
-        let _ = SignerUtil::get_admin_pubkey();
-
-        let _ = SignerUtil::get_operator_pubkey();
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
