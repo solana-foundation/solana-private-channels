@@ -48,13 +48,14 @@ Refusing to resync: the live-state lock is held by live indexer or operator work
 ```
 
 **Action:** scale every indexer and operator on this database to zero, confirm with
-the query above (`ShareLock` rows are workers), then re-run. Do not try to force it.
+the query above (`ShareLock` rows are workers or an in-flight `indexer reconcile`), then
+re-run. Do not try to force it.
 
 > **Deploy-ordering caveat.** Only a worker running a build that takes this lock is
 > visible to the refusal. During a rolling upgrade, confirm workers are stopped by
 > process or deployment, not by the absence of a refusal.
 
-**If the query shows a holder but no such worker is running**, its host vanished
+**If the query shows a holder but no such worker or reconcile is running**, its host vanished
 without closing the socket. The lock session carries TCP keepalives (60s idle, 15s
 apart, 3 missed) so Postgres reaps it in under two minutes on its own. Wait that out
 and re-run. If a holder outlives it, confirm the pid against

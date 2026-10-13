@@ -9,8 +9,9 @@ use private_channel_indexer::config::{
 };
 #[cfg(feature = "datasource-rpc")]
 use private_channel_indexer::config::{validate_rpc_batch_size, validate_rpc_encoding};
-use private_channel_indexer::error::{IndexerError, ReconciliationError};
+use private_channel_indexer::error::{IndexerError, ReconciliationError, StorageError};
 use private_channel_indexer::indexer::reconciliation::run_manual_reconciliation;
+use private_channel_indexer::storage::common::storage::live_lock::LiveLockMode;
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
     PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -172,7 +173,8 @@ enum Mode {
     },
     /// Reconcile escrow custody against the indexed ledger once, read-only, with the
     /// escrow indexer's config. Exits 0 on a pass, 1 on a shortfall or supply breach,
-    /// 2 on an error and 3 when the escrow indexer has not reached the custody slot.
+    /// 2 on an error and 3 when the ledger cannot be compared yet: the escrow indexer has
+    /// not reached the custody slot, or a resync is rebuilding it.
     Reconcile,
 }
 
@@ -366,6 +368,13 @@ fn reconcile_exit_code(result: &Result<(), IndexerError>) -> i32 {
         Err(IndexerError::Reconciliation(ReconciliationError::LedgerCoverageIncomplete {
             ..
         })) => RECONCILE_LEDGER_BEHIND,
+        // Only a resync holds the lock exclusively, and either way it is mid-rebuild.
+        Err(IndexerError::Storage(
+            StorageError::LiveStateLockHeld {
+                requested: LiveLockMode::Shared,
+            }
+            | StorageError::UnfinishedResync { .. },
+        )) => RECONCILE_LEDGER_BEHIND,
         Err(_) => RECONCILE_ERROR,
     }
 }
@@ -1065,8 +1074,8 @@ mod tests {
         assert!(err.contains("INDEXER_RPC_POLLING_ENCODING"), "got: {err}");
     }
 
-    /// A ledger behind custody has its own exit code, so a caller never reads it as a pass
-    /// or as a proven shortfall.
+    /// A ledger behind custody or mid-resync has its own exit code, so a caller never reads
+    /// it as a pass or as a proven shortfall.
     #[test]
     fn reconcile_exit_codes_keep_coverage_distinct() {
         let cases: Vec<(Result<(), IndexerError>, i32)> = vec![
@@ -1091,6 +1100,22 @@ mod tests {
                 Err(ReconciliationError::LedgerCoverageIncomplete { snapshot_slot: 100 }.into()),
                 3,
             ),
+            // A resync holds the lock exclusively while it rebuilds the ledger.
+            (
+                Err(StorageError::LiveStateLockHeld {
+                    requested: LiveLockMode::Shared,
+                }
+                .into()),
+                3,
+            ),
+            (
+                Err(StorageError::UnfinishedResync {
+                    program: "escrow".to_string(),
+                }
+                .into()),
+                3,
+            ),
+            (Err(StorageError::LiveStateLockLost.into()), 2),
             (Err(ReconciliationError::MissingChannelRpc.into()), 2),
             (
                 Err(ReconciliationError::SupplyInvariantUnverified { count: 1 }.into()),

@@ -7,16 +7,22 @@
 
 use bigdecimal::BigDecimal;
 use private_channel_indexer::{
+    error::{IndexerError, StorageError},
+    indexer::reconciliation::run_manual_reconciliation,
     storage::{
-        common::{amount::TokenAmount, models::DbObservedRelease},
+        common::{
+            amount::TokenAmount, models::DbObservedRelease, storage::live_lock::LiveLockMode,
+        },
         PostgresDb, Storage,
     },
-    PostgresConfig,
+    PostgresConfig, ReconciliationConfig,
 };
 use solana_sdk::pubkey::Pubkey;
 use sqlx::PgPool;
+use std::{sync::Arc, time::Duration};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio_util::sync::CancellationToken;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -645,6 +651,44 @@ async fn a_stuck_deposit_and_a_trailing_release_both_count(
     let at_200 = storage.get_mint_balances_for_reconciliation(200).await?;
     assert_eq!(at_200[0].total_deposits, BigDecimal::from(200u64));
     assert_eq!(at_200[0].total_withdrawals, BigDecimal::from(50u64));
+    Ok(())
+}
+
+/// A resync deletes the ledger it rebuilds, so a manual run must not compare while one
+/// holds the live-state lock: rows deleted mid-run would read as smaller liabilities.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_reconciliation_is_refused_during_a_resync() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    // Held as a resync holds it.
+    let _resync_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Exclusive,
+            "reconcile_test_resync",
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await?;
+    // Nothing listens here, so a run that gets past the lock fails on the custody read.
+    let unreachable_rpc = "http://127.0.0.1:1";
+
+    let result = run_manual_reconciliation(
+        &ReconciliationConfig::default(),
+        &Arc::new(storage),
+        unreachable_rpc,
+        Some(unreachable_rpc),
+        &Pubkey::new_unique(),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockHeld {
+                requested: LiveLockMode::Shared
+            }))
+        ),
+        "a run must be refused while a resync holds the lock: {result:?}"
+    );
     Ok(())
 }
 

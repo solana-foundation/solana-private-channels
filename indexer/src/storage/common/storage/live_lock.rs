@@ -384,7 +384,7 @@ fn spawn_heartbeat(
     }
 }
 
-/// Run one startup step, refusing it if the live-state lock is lost while it runs.
+/// Run one step, refusing it if the live-state lock is lost while it runs.
 ///
 /// Biased, so a lock already lost refuses without starting the step. It only drops the step,
 /// so a caller that already has a writer running must stop that writer itself.
@@ -398,7 +398,7 @@ where
     tokio::select! {
         biased;
         _ = lock_lost.cancelled() => {
-            error!("Live-state lock lost during startup; refusing to continue");
+            error!("Live-state lock lost; refusing to continue");
             Err(StorageError::LiveStateLockLost.into())
         }
         result = step => result,

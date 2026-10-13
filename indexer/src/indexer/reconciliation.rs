@@ -43,6 +43,9 @@ use crate::{
     },
     storage::common::amount::{net_to_u64, NetBalance},
     storage::common::models::MintDbBalance,
+    storage::common::storage::live_lock::{
+        under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
+    },
     storage::Storage,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -273,9 +276,14 @@ pub async fn reconcile_against_snapshot(
     Ok(())
 }
 
+/// Metric label for the live-state lock a manual reconciliation holds.
+const RECONCILE_LOCK_ROLE: &str = "reconcile";
+
 /// One read-only reconciliation for an operator: capture custody, wait for the escrow
 /// ledger to cover that slot, then compare. A ledger that never gets there is reported,
 /// never compared, so status cannot stand in for a release the indexer has not recorded.
+/// The live-state lock is held shared throughout, so a resync cannot delete the ledger
+/// between the coverage wait and the comparison.
 pub async fn run_manual_reconciliation(
     config: &ReconciliationConfig,
     storage: &Arc<Storage>,
@@ -283,33 +291,51 @@ pub async fn run_manual_reconciliation(
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
 ) -> Result<(), IndexerError> {
-    let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
-    match wait_for_ledger(storage, snapshot.slot, &CancellationToken::new()).await {
-        LedgerWait::Covered => {}
-        LedgerWait::Unknown => {
-            return Err(ReconciliationError::LedgerCoverageIncomplete {
-                snapshot_slot: snapshot.slot,
+    let live_lock_lost = CancellationToken::new();
+    let live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            RECONCILE_LOCK_ROLE,
+            live_lock_lost.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await?;
+    let verdict = under_live_lock(&live_lock_lost, async {
+        // A resync that deleted rows and died no longer holds the lock; its marker is what
+        // stops us.
+        storage.ensure_no_unfinished_resync().await?;
+        let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
+        match wait_for_ledger(storage, snapshot.slot, &CancellationToken::new()).await {
+            LedgerWait::Covered => {}
+            LedgerWait::Unknown => {
+                return Err(ReconciliationError::LedgerCoverageIncomplete {
+                    snapshot_slot: snapshot.slot,
+                }
+                .into())
             }
-            .into())
+            // Nothing cancels this token, so only an unreadable checkpoint lands here.
+            LedgerWait::Unreadable | LedgerWait::Cancelled => {
+                return Err(ReconciliationError::Storage(StorageError::DatabaseError {
+                    message: "the escrow checkpoint could not be read".to_string(),
+                })
+                .into())
+            }
         }
-        // Nothing cancels this token, so only an unreadable checkpoint lands here.
-        LedgerWait::Unreadable | LedgerWait::Cancelled => {
-            return Err(ReconciliationError::Storage(StorageError::DatabaseError {
-                message: "the escrow checkpoint could not be read".to_string(),
-            })
-            .into())
-        }
-    }
-    reconcile_against_snapshot(
-        config,
-        ProgramType::Escrow,
-        storage,
-        rpc_url,
-        channel_rpc_url,
-        instance_pda,
-        &snapshot,
-    )
-    .await
+        reconcile_against_snapshot(
+            config,
+            ProgramType::Escrow,
+            storage,
+            rpc_url,
+            channel_rpc_url,
+            instance_pda,
+            &snapshot,
+        )
+        .await
+    })
+    .await;
+    // The heartbeat notices a loss late, so prove the lock held through the comparison.
+    live_lock.ensure_held().await?;
+    verdict
 }
 
 /// Readings a supply breach must appear in, consecutively, before it is believed.
@@ -2480,6 +2506,47 @@ mod tests {
         );
         assert_eq!(
             mock_storage.calls("get_mint_balances_for_unpinned_reconciliation"),
+            0
+        );
+    }
+
+    /// A resync that deleted rows and died no longer holds the live-state lock, so its
+    /// marker is what stops a manual run from judging the half-rebuilt ledger.
+    #[tokio::test]
+    async fn manual_reconciliation_stops_on_an_unfinished_resync() {
+        let custody = 980;
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &seed, &[(mint.to_string(), custody)]).await;
+        mock_channel_supply(&mut server, custody).await;
+
+        // The ledger matches custody, so a run that ignored the marker would pass.
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), custody, 0)]);
+        // mock_escrow_sweep answers at slot 100.
+        mock_storage.set_checkpoint(&program_key(ProgramType::Escrow), 100);
+        let resyncing = program_key(ProgramType::Withdraw);
+        *mock_storage.unfinished_resync.lock().unwrap() = Some(resyncing.clone());
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+
+        let url = server.url();
+        let result = run_manual_reconciliation(
+            &ReconciliationConfig::default(),
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        match result {
+            Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) => {
+                assert_eq!(program, resyncing)
+            }
+            other => panic!("an unfinished resync must stop the run: {other:?}"),
+        }
+        assert_eq!(
+            mock_storage.calls("get_mint_balances_for_reconciliation"),
             0
         );
     }
