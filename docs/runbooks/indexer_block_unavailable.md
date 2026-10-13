@@ -35,6 +35,10 @@ does not have it. The usual causes:
 2. A load balancer is splitting requests across replicas at different heights, so
    one replica lists a slot that another will not serve.
 3. The endpoint was restarted from a recent snapshot and never backfilled.
+4. Core truncation ran with `--skip-withdraw-indexer-check` while a withdraw
+   indexer was behind, or a withdraw indexer resync started below a cut that had
+   already been checked. Truncation otherwise refuses to cut past the withdraw
+   indexer's checkpoint.
 
 ### Symptom
 

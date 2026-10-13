@@ -1,7 +1,11 @@
 use {
     super::{
-        current_slot::CURRENT_SLOT_KEY, get_block_height::BLOCK_HEIGHT_KEY,
-        get_latest_slot::LATEST_SLOT_KEY, postgres::PostgresAccountsDB, redis::RedisAccountsDB,
+        blockhash_window::{self, MAX_BLOCKHASHES_KEY},
+        current_slot::CURRENT_SLOT_KEY,
+        get_block_height::BLOCK_HEIGHT_KEY,
+        get_latest_slot::LATEST_SLOT_KEY,
+        postgres::PostgresAccountsDB,
+        redis::RedisAccountsDB,
         traits::AccountsDB,
     },
     anyhow::{anyhow, Context, Result},
@@ -27,6 +31,8 @@ pub struct BlockhashSnapshot {
     pub slot: Option<u64>,
     pub block_height: Option<u64>,
     pub blockhash: Hash,
+    /// The window the write node published; `None` until one has booted on this ledger.
+    pub max_blockhashes: Option<u64>,
 }
 
 pub async fn get_blockhash_snapshot(db: &AccountsDB) -> Result<BlockhashSnapshot> {
@@ -43,12 +49,14 @@ async fn get_blockhash_snapshot_postgres(db: &PostgresAccountsDB) -> Result<Bloc
                 (SELECT value FROM metadata WHERE key = $2),
                 (SELECT value FROM metadata WHERE key = $3),
                 (SELECT value FROM metadata WHERE key = $4),
-                (SELECT MAX(slot) FROM blocks)",
+                (SELECT MAX(slot) FROM blocks),
+                (SELECT value FROM metadata WHERE key = $5)",
     )
     .bind(CURRENT_SLOT_KEY)
     .bind(LATEST_SLOT_KEY)
     .bind(BLOCK_HEIGHT_KEY)
     .bind(LATEST_BLOCKHASH_KEY)
+    .bind(MAX_BLOCKHASHES_KEY)
     .fetch_one(db.pool.as_ref())
     .await
     .context("Failed to query the blockhash snapshot")?;
@@ -70,6 +78,7 @@ async fn get_blockhash_snapshot_postgres(db: &PostgresAccountsDB) -> Result<Bloc
         slot: decode(0).or(decode(1)).or(max_slot),
         block_height: decode(2).or(max_slot),
         blockhash: Hash::new_from_array(hash_array),
+        max_blockhashes: blockhash_window::decode(row.get::<Option<Vec<u8>>, _>(5).as_deref()),
     })
 }
 
@@ -94,10 +103,15 @@ async fn get_blockhash_snapshot_redis(db: &RedisAccountsDB) -> Result<BlockhashS
         {
             let blockhash = Hash::from_str(&hash_str)
                 .map_err(|e| anyhow!("Invalid blockhash format: {}", e))?;
+            // Read from Postgres, not mirrored: it only changes when a writer boots.
+            let max_blockhashes = blockhash_window::read(db.fallback.pool.as_ref())
+                .await
+                .context("Failed to read the published blockhash window")?;
             Ok(BlockhashSnapshot {
                 slot: Some(slot),
                 block_height: Some(block_height),
                 blockhash,
+                max_blockhashes,
             })
         }
         Ok(_) => get_blockhash_snapshot_postgres(&db.fallback).await,

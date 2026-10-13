@@ -56,6 +56,7 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator.pubkey()],
         max_blockhashes: 150,
+        allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
         perf_sample_period_secs: 10,
         metrics: Arc::new(NoopMetrics),

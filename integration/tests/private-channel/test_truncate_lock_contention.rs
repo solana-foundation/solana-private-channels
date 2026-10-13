@@ -22,7 +22,7 @@ use {
     anyhow::{anyhow, Context, Result},
     private_channel_core::accounts::{
         traits::BlockInfo,
-        truncate::{truncate_slots, TruncateOptions},
+        truncate::{truncate_slots, ConsumerCheck, TruncateOptions},
         PostgresAccountsDB,
     },
     solana_sdk::{hash::Hash, signature::Signature},
@@ -96,6 +96,8 @@ async fn seed_blocks(pool: &PgPool, n: u64) -> Result<()> {
             .execute(pool)
             .await?;
     }
+    // The write node publishes its window at boot; W = 1 keeps every cut here allowed.
+    private_channel_core::accounts::blockhash_window::publish(pool, 1).await?;
     Ok(())
 }
 
@@ -119,6 +121,7 @@ async fn test_truncate_concurrent_lock_contention() -> Result<()> {
         pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     // PostgresAccountsDB derives Clone; both tasks get their own handle

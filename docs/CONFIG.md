@@ -24,7 +24,8 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
 | `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Tick interval (ms). A block is produced only when the tick carried transactions or the 1s idle heartbeat came due, and the slot it lands on counts every tick since the last block |
-| `--max-blockhashes` | `PRIVATE_CHANNEL_MAX_BLOCKHASHES` | `150` | How many **blocks** a blockhash stays valid for. Matches Solana's `MAX_PROCESSING_AGE`. Also the depth of the settled-blockhash queue from the settler to dedup |
+| `--max-blockhashes` | `PRIVATE_CHANNEL_MAX_BLOCKHASHES` | `150` | How many **blocks** a blockhash stays valid for. Matches Solana's `MAX_PROCESSING_AGE`. Also the depth of the settled-blockhash queue from the settler to dedup. Write and Aio nodes publish the resolved value to the ledger at every boot; a Read node ignores its own value and advertises the published one, following a writer restarted with a new window within replica lag. A write node refuses to boot with a larger value than the ledger recorded unless `--allow-max-blockhashes-increase` is set |
+| `--allow-max-blockhashes-increase` | `PRIVATE_CHANNEL_ALLOW_MAX_BLOCKHASHES_INCREASE` | `false` | Let a write node boot with a larger `--max-blockhashes` than the ledger recorded. Every hash already handed out then stays admissible past the `lastValidBlockHeight` it was advertised with, by the size of the increase, so a client that re-signs at its old deadline can see both land. Use it only when no client holds an unconfirmed transaction, and remove it after that boot |
 | `--transaction-expiration-ms` | `PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS` | none | **Deprecated.** Expiry as a duration. When set it overrides `--max-blockhashes` with `transaction_expiration_ms / blocktime_ms` and logs a warning. Removed after the next release |
 | `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`, `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount`, mint-side `SetAuthority` and the withdraw program's `SetWithdrawConfig`. Not the escrow `Instance.admin`, which is a separate offline key |
 | `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string. Must be PostgreSQL: Redis is a cache, never the accounts database |
@@ -38,7 +39,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 
 **Startup validation:** The node rejects a missing `--mode`, `blocktime_ms == 0`, `max_blockhashes == 0`, and any write-pipeline queue capacity of `0` (which would panic the channel constructors) to prevent misconfiguration.
 
-**Slot, block height and expiry.** They are separate counters, as on Solana. Slots count ticks, so a block lands on a slot that already counts every idle tick before it; `getSlot` reports the live slot, advancing every tick whether or not a block is produced, so most slots carry no block and `getBlock` on one answers `-32007` (`SlotSkipped`), never a `null`. `getBlockHeight` counts blocks actually produced: one per tick that carried transactions, plus one per second while the node is idle. Expiry is block-counted: `lastValidBlockHeight = getBlockHeight() + max_blockhashes - 1`, the last height at which the hash is still in the window, so a stock client's `confirmTransaction` loop terminates on exactly the event the node uses to evict it.
+**Slot, block height and expiry.** They are separate counters, as on Solana. Slots count ticks, so a block lands on a slot that already counts every idle tick before it; `getSlot` reports the live slot, advancing every tick whether or not a block is produced, so most slots carry no block and `getBlock` on one answers `-32007` (`SlotSkipped`), never a `null`. `getBlockHeight` counts blocks actually produced: one per tick that carried transactions, plus one per second while the node is idle. Expiry is block-counted: `lastValidBlockHeight = getBlockHeight() + max_blockhashes - 1`, with the window the write node published, the last height at which the hash is still in the window, so a stock client's `confirmTransaction` loop terminates on exactly the event the node uses to evict it.
 
 The wall-clock duration of the window therefore moves with load, which is also how Solana behaves. At 150 blocks it is about 15 seconds under continuous load and about 2.5 minutes fully idle; a node taking occasional traffic lands between them. Document a range to clients, never a figure.
 
@@ -160,10 +161,12 @@ The `private-channel-admin` binary provides database maintenance commands:
 pg_dump -Fc -f ledger.dump "$PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL"
 
 # Truncate old blocks/transactions
-private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump
+private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump \
+  --withdraw-indexer-db-url "$WITHDRAW_INDEXER_DB_URL"
 
-# Dry run to preview what would be deleted (proves the dump too)
-private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump --dry-run
+# Dry run to preview what would be deleted (proves the dump and runs every check too)
+private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump \
+  --withdraw-indexer-db-url "$WITHDRAW_INDEXER_DB_URL" --dry-run
 ```
 
 Nothing is deleted, not even in a dry run, until the dump is proven to hold every
@@ -187,17 +190,52 @@ Truncation deletes in batches, and each batch commits the new retention floor
 (`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or
 aborted run therefore never advertises history it has already removed.
 
-**`--keep-slots` is a slot span, not a block count.** Blocks are sparse relative
-to slots: an idle node ticks `1000 / blocktime_ms` slots per block it produces
-(ten at the default), so a given retention keeps far fewer blocks than slots.
-Keep it well above `max_blockhashes x 1000 / blocktime_ms` (1500 at the
-defaults). Below that, a restart rebuilds the dedup window from fewer blocks
-than the node advertises through `lastValidBlockHeight`, and transactions
-carrying a blockhash still inside the published deadline are rejected as
-unknown. Both ends guard it: `truncate` warns when `--keep-slots` is below the
-floor, sized from `--max-blockhashes` and `--blocktime-ms` (defaults 150 and
-100, pass the node's values if they differ), and a node that boots into a window
-shorter than `max_blockhashes` logs the shortfall at warn.
+**Truncation always keeps `2 x max_blockhashes` blocks.** `--keep-slots` is a
+slot span, but `truncate` refuses, dry runs included, any cut that leaves fewer
+than `2 x max_blockhashes` blocks. Blocks are counted from the `blocks` table and
+the window is read from the ledger, where the write node publishes its resolved
+value (deprecated `--transaction-expiration-ms` override applied) at every boot,
+so a ledger whose writer has not yet booted on this build refuses every cut. The
+refusal names the smallest `--keep-slots` that passes. The newest
+`max_blockhashes` blocks are the dedup window a restart rebuilds; the next
+`max_blockhashes` keep a landed transaction's status readable for at least that
+many blocks past its `lastValidBlockHeight`, which is the grace the client retry
+rule relies on (see `getSignatureStatuses` in
+[RPC_COMPATIBILITY_ANALYSIS.md](RPC_COMPATIBILITY_ANALYSIS.md)). Blocks are
+sparse relative to slots: an idle node produces one per second, so on an idle
+ledger the floor is about `2 x max_blockhashes x ceil(1000 / blocktime_ms)`
+slots, 3000 at the defaults. A job sized by the old 1500 figure is refused, so
+read the refusal rather than computing it. `--max-blockhashes` and
+`--blocktime-ms` are still accepted and ignored, but every existing invocation
+must now add `--withdraw-indexer-db-url` or `--skip-withdraw-indexer-check`
+(below) or it fails to parse. A node that boots into a window shorter than
+`max_blockhashes` (after a manual delete, a restore, or an allowed window
+increase) logs the shortfall at warn and still starts, since the missing hashes
+are rejected as unknown either way.
+
+The grace beyond the deadline is only `max_blockhashes` blocks, about 15s under
+load. Channel operators decide a stuck mint or remint from the same retained
+history, so truncating while an operator is down can turn an attempt it would
+have proven dead into a manual review. Truncate while the operators are running.
+
+**Upgrade order.** Upgrade and boot the write node first. Until a write node has
+booted on this build the ledger holds no published window: read nodes answer
+`getLatestBlockhash` with a `-32000` error and truncation refuses. Do not change
+`--max-blockhashes` while a write node runs an older build, which does not
+publish it, or read nodes keep advertising the stale value.
+
+**Truncation never cuts past the withdraw indexer.** The withdraw indexer reads
+core history, and a block deleted before it has read it wedges it until history
+is restored. Pass `--withdraw-indexer-db-url` (env
+`PRIVATE_CHANNEL_WITHDRAW_INDEXER_DB_URL`) pointing at the indexer database
+(`postgres-indexer`, so the admin host must reach it); `truncate` refuses unless
+`indexer_state.last_committed_slot` for `withdraw` is at least the cut slot minus
+one. A missing row, an unset slot (an indexer that has never anchored), an
+unreachable database and a database without `indexer_state` all refuse. A role
+with `SELECT` on `indexer_state` alone is enough and is preferred over
+`POSTGRES_INDEXER_USER`. A deployment with no withdraw indexer passes
+`--skip-withdraw-indexer-check` instead, which logs a warning. The two flags are
+exclusive, and the env var counts as the URL, so unset it when skipping.
 
 ### Makefile Targets
 

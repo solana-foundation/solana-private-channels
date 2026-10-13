@@ -24,7 +24,7 @@
 use {
     anyhow::{Context, Result},
     private_channel_core::accounts::{
-        truncate::{truncate_slots, TruncateOptions, TruncateReport},
+        truncate::{truncate_slots, ConsumerCheck, TruncateOptions, TruncateReport},
         PostgresAccountsDB,
     },
     solana_sdk::{hash::Hash, signature::Signature},
@@ -52,6 +52,7 @@ fn opts(
         pg_restore_bin: pg_restore_bin.to_path_buf(),
         batch_size,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     }
 }
 
@@ -135,6 +136,8 @@ async fn seed_blocks(pool: &PgPool, count: u64) -> Result<()> {
             .await
             .with_context(|| format!("Failed to insert account_history row at slot {}", slot))?;
     }
+    // The write node publishes its window at boot; W = 1 keeps every cut here allowed.
+    private_channel_core::accounts::blockhash_window::publish(pool, 1).await?;
     Ok(())
 }
 
