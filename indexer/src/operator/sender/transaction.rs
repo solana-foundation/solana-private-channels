@@ -1059,15 +1059,20 @@ pub(super) async fn handle_nonce_already_used(
     // manual review for want of evidence we already wrote down.
     if signatures.is_empty() {
         if let Some(transaction_id) = ctx.transaction_id {
-            // This runtime path still reads a failed lookup as nothing to attribute, which
-            // ends in manual review. Known follow-up; the boot check surfaces the error instead.
-            signatures =
-                super::state::load_persisted_release_signatures(&state.storage, transaction_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        error!(transaction_id, "Release signature lookup failed: {e}");
-                        Vec::new()
-                    });
+            signatures = match load_pending_sigs(&state.storage, transaction_id).await {
+                Ok(sigs) => sigs,
+                // An unread journal is not an empty one, so recovery re-reads it instead of a human.
+                Err(reason) => {
+                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                    leave_processing_for_recovery(
+                        state.program_type.as_label(),
+                        Some(transaction_id),
+                        &signature,
+                        &format!("nonce already used and the journal could not be read: {reason}"),
+                    );
+                    return;
+                }
+            };
         }
     }
 
@@ -5571,6 +5576,49 @@ mod tests {
             "no status may be written for a landed release"
         );
         assert!(state.pending_remints.is_empty(), "no remint may be queued");
+    }
+
+    /// A journal that could not be read is not an empty one: the row stays Processing
+    /// for recovery to re-read, instead of going to manual review.
+    #[tokio::test]
+    async fn nonce_already_used_with_unreadable_journal_leaves_row_for_recovery() {
+        let server = mockito::Server::new_async().await;
+        let mock = mock_with_processing_row(70);
+        mock.set_should_fail("get_release_signatures", true);
+        let mut state = sender_state_with_storage(&server.url(), mock);
+        state.program_type = ProgramType::Withdraw;
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.remint_cache.insert(4, make_remint_info(70));
+        state.in_flight_withdrawals.insert(4);
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(70),
+            withdrawal_nonce: Some(4),
+            trace_id: Some("trace-70".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::NonceAlreadyUsed,
+            ))),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no status may be written");
+        assert!(state.pending_remints.is_empty(), "no remint may be queued");
+        assert!(!state.in_flight_withdrawals.contains(&4));
+        assert!(!state.remint_cache.contains_key(&4));
     }
 
     // ── NonceOutsideCurrentGeneration routing ────────────────────────

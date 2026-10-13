@@ -677,11 +677,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_recent_blockhash_impl() {
         let (mut db, _pg) = start_pg().await;
-        seed_db(&mut db).await;
+        let blockhash = Hash::new_unique();
+        db.write_batch(&[], vec![], Some(make_block_info(10, blockhash)))
+            .await
+            .unwrap();
         let deps = make_read_deps(db);
         let resp = get_recent_blockhash_impl::get_recent_blockhash_impl(&deps)
             .await
             .unwrap();
+        assert_eq!(resp.value.blockhash, blockhash.to_string());
         assert_eq!(resp.value.fee_calculator.lamports_per_signature, 5000);
         assert_eq!(resp.context.slot, 10);
     }

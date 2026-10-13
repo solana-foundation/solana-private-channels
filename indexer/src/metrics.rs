@@ -147,6 +147,13 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_PENDING_REMINTS,
+    "private_channel_operator_pending_remints",
+    "Deferred remints queued in the withdraw sender after its last tick",
+    &["program_type"]
+);
+
+gauge_vec!(
     FEEPAYER_BALANCE_LAMPORTS,
     "private_channel_feepayer_balance_lamports",
     "Current SOL balance of the withdraw operator feepayer wallet in lamports",
