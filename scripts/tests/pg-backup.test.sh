@@ -68,6 +68,16 @@ run_script() {
   set -e
 }
 
+# seed_backup DIR NAME: adds a complete backup folder named NAME before the run.
+seed_backup() {
+  local tmp
+  tmp="$(mktemp -d)"
+  echo "START WAL LOCATION: 0/1000028 (file 000000010000000000000001)" >"$tmp/backup_label"
+  mkdir -p "$1/backups/$2"
+  tar -czf "$1/backups/$2/base.tar.gz" -C "$tmp" backup_label
+  rm -rf "$tmp"
+}
+
 assert_rejected() {
   local d="$1" var="$2"
   [ "$(cat "$d/status")" -ne 0 ] || fail "$var: expected a non-zero exit"
@@ -127,9 +137,36 @@ test_missing_complete_backup_skips_wal_pruning() {
   ! grep -q "Backup complete" "$d/out" || fail "incomplete: an unverified cycle must not be logged as complete"
 }
 
+test_prunes_older_backups_and_keeps_this_cycles() {
+  local d left
+  d="$(new_case prune)"
+  seed_backup "$d" base_20000101_000000
+  seed_backup "$d" base_20000102_000000
+  run_script "$d" PG_BACKUP_RETENTION_COUNT=1
+  [ "$(grep -c "Pruning old backup" "$d/out")" -eq 2 ] || fail "prune: both older backups must be pruned"
+  left="$(find "$d/backups" -maxdepth 1 -type d -name 'base_*')"
+  [ "$(echo "$left" | wc -l)" -eq 1 ] || fail "prune: exactly one backup must remain"
+  case "$left" in *base_2000*) fail "prune: the new backup must be the one kept" ;; esac
+  grep -q "Backup complete: $left" "$d/out" || fail "prune: success must name the kept backup"
+}
+
+# A clock that jumped back names the new backup older than an existing one, so pruning removes it.
+test_pruned_new_backup_is_not_logged_complete() {
+  local d
+  d="$(new_case clock-back)"
+  seed_backup "$d" base_29991231_235959
+  run_script "$d" PG_BACKUP_RETENTION_COUNT=1
+  [ -d "$d/backups/base_29991231_235959" ] || fail "clock-back: the later-named backup is the one kept"
+  grep -q "Retention verified" "$d/out" || fail "clock-back: WAL pruning stays guarded by any complete backup"
+  grep -q "ERROR: this cycle's backup" "$d/out" || fail "clock-back: the lost backup must be logged as an error"
+  ! grep -q "Backup complete" "$d/out" || fail "clock-back: must not claim success when this cycle's backup is gone"
+}
+
 test_rejects_bad_retention
 test_rejects_bad_interval
 test_valid_values_complete_one_cycle
 test_defaults_apply_when_unset_or_empty
 test_missing_complete_backup_skips_wal_pruning
+test_prunes_older_backups_and_keeps_this_cycles
+test_pruned_new_backup_is_not_logged_complete
 echo "pg-backup tests passed"
