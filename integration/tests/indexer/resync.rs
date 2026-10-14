@@ -1020,6 +1020,8 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         .await?;
     }
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
@@ -2723,6 +2725,8 @@ async fn resync_refuses_while_a_worker_holds_the_live_lock(
         })
         .await?,
     ));
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
@@ -2792,6 +2796,8 @@ async fn resync_initializes_schema_on_a_fresh_database() -> Result<(), Box<dyn s
     let rpc_url = test_validator.rpc_url();
     let (db_url, storage, _container) = start_bare_postgres_for_resync("resync_fresh_db").await?;
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
