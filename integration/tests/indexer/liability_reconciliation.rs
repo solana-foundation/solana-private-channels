@@ -492,7 +492,7 @@ async fn startup_comparison_at_threshold_zero(
     indexer: &mut EscrowIndexer,
     instance: Pubkey,
 ) -> Result<(), IndexerError> {
-    let snapshot = capture_custody_snapshot(rpc_url, &instance)
+    let snapshot = capture_custody_snapshot(rpc_url, &instance, 0)
         .await
         .expect("custody snapshot");
     wait_for_checkpoint_to_cover(pool, indexer, snapshot.slot).await;
@@ -519,7 +519,7 @@ async fn startup_comparison_over_a_lagging_ledger(
     storage: &Storage,
     instance: Pubkey,
 ) -> Result<(), IndexerError> {
-    let snapshot = capture_custody_snapshot(rpc_url, &instance)
+    let snapshot = capture_custody_snapshot(rpc_url, &instance, 0)
         .await
         .expect("custody snapshot");
     reconcile_against_snapshot(
@@ -586,7 +586,7 @@ async fn wait_for_custody_to_outrun_the_ledger(rpc_url: &str, instance: Pubkey, 
     );
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        let snapshot = fetch_escrow_balances_by_mint(&rpc, instance)
+        let snapshot = fetch_escrow_balances_by_mint(&rpc, instance, 0)
             .await
             .expect("custody sweep");
         if snapshot.slot > committed + MARGIN {

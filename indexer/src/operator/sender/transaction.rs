@@ -124,32 +124,17 @@ impl SenderState {
                     return Err(ProgramError::RotationPending { in_flight_count }.into());
                 }
 
-                // Bind the rotation to the generation the chain is actually on, so
-                // a replayed rotation is rejected rather than skipping a whole
-                // generation of nonces that could then never be released.
-                //
-                // A re-arm keeps the binding it already has. A rotation reported
-                // failed may still have landed, and rebinding it to the chain's
-                // new generation is what would turn that replay into a skip.
-                let expected_generation = match self.rotation_bound_generation {
-                    Some(bound) => bound,
-                    // Read fresh rather than taking the cached value. This is the
-                    // one place a wrong generation would be written on chain and
-                    // left there, instead of being handed straight back by the
-                    // program as a refusal the sender can act on.
-                    None => match self.refresh_generation().await {
-                        Ok(generation) => generation,
-                        // Nothing re-dispatches a rotation once the boundary row
-                        // has been processed, so dropping it here would leave the
-                        // next generation closed and every withdrawal in it
-                        // refused. Park it for the tick to retry instead.
-                        Err(e) => {
-                            self.pending_rotation = Some(builder);
-                            return Err(e);
-                        }
-                    },
+                // Bound to the generation the arming pass read and never re-read, re-arms
+                // included: binding to a later read could close a generation someone else
+                // opened, and rebinding a rotation that landed would turn its replay into a skip.
+                let Some(expected_generation) = self.rotation_bound_generation else {
+                    // Dropped, not sent: the arming pass sees no rotation and arms a bound one.
+                    warn!("Rotation reached the send path with no generation bound; dropping it for re-arming");
+                    return Err(ProgramError::InvalidBuilder {
+                        reason: "rotation armed without a generation read".to_string(),
+                    }
+                    .into());
                 };
-                self.rotation_bound_generation = Some(expected_generation);
                 builder.expected_generation(expected_generation);
 
                 // Kept because a rotation that fails has nothing else to rebuild it from.
@@ -772,22 +757,31 @@ pub(super) fn handle_confirmation_result<'a>(
             Ok(ConfirmationResult::Confirmed) => {
                 handle_success(state, ctx, signature, storage_tx).await;
             }
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceAlreadyUsed,
-            ))) => {
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                ..
+            }) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "nonce_already_used"])
                     .inc();
                 handle_nonce_already_used(state, ctx, signature, storage_tx).await;
             }
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
-            ))) => {
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                slot,
+            }) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "nonce_outside_generation"])
                     .inc();
-                handle_nonce_outside_generation(state, ctx, signature, instruction, storage_tx)
-                    .await;
+                handle_nonce_outside_generation(
+                    state,
+                    ctx,
+                    signature,
+                    slot,
+                    instruction,
+                    storage_tx,
+                )
+                .await;
             }
             Ok(ConfirmationResult::MintNotInitialized) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -932,9 +926,10 @@ pub(super) fn handle_confirmation_result<'a>(
                     .await;
                 }
             },
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::UnexpectedGeneration,
-            ))) => {
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+                ..
+            }) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "rotation_already_landed"])
                     .inc();
@@ -946,7 +941,10 @@ pub(super) fn handle_confirmation_result<'a>(
                 // The refusal says nothing about the next rotation, so charging it would wedge every one after it.
                 clear_rotation_retry_state(state, ctx);
             }
-            Ok(ConfirmationResult::Failed(program_error)) => {
+            Ok(ConfirmationResult::Failed {
+                error: program_error,
+                ..
+            }) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "program_error"])
                     .inc();
@@ -1184,10 +1182,15 @@ pub(super) async fn park_release_for_rotation(
 /// authority rather than a last resort. Which side of the window the nonce falls
 /// on decides everything: ahead of the chain is a timing problem that a rotation
 /// fixes, behind it is unrecoverable.
+///
+/// `refused_at` is the slot of the refusal. The generation is read at or past it:
+/// generations only rise, so at that slot the answer is exact, while an older
+/// snapshot could still show the very generation the program just refused.
 pub(super) async fn handle_nonce_outside_generation(
     state: &mut SenderState,
     ctx: &TransactionContext,
     signature: Signature,
+    refused_at: u64,
     instruction: InstructionWithSigners,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
@@ -1203,21 +1206,34 @@ pub(super) async fn handle_nonce_outside_generation(
         return;
     };
 
+    state.refusal_floor = state.refusal_floor.max(refused_at);
     let chain_generation = match state.refresh_generation().await {
         Ok(generation) => generation,
-        // We cannot tell which side of the window this nonce is on, and the two
-        // answers are terminal in opposite directions: one requeues the
-        // withdrawal, the other declares it permanently unreleasable.
-        //
-        // Guessing either way on an unread bitmap risks the wrong terminal state,
-        // so leave the row Processing and let the recovery worker decide once a
-        // read succeeds.
+        // Which side of the window the nonce is on is unknown, so it is parked and queued
+        // for the drain to classify at or past the refusal. The journaled signature stays:
+        // it is the proof of non-payout a later refund needs.
         Err(e) => {
-            error!(
+            warn!(
                 nonce,
-                "Generation rejection but the bitmap could not be read: {e}; leaving row Processing"
+                refused_at,
+                "Generation rejection but no bitmap read at or past it: {e}; holding the release"
             );
             state.in_flight_withdrawals.remove(&nonce);
+            state.cached_generation = None;
+            let Some(transaction_id) = ctx.transaction_id else {
+                error!(
+                    nonce,
+                    "No row to park this refused release against; not queueing it"
+                );
+                return;
+            };
+            if !park_release_for_rotation(&state.storage, transaction_id, nonce).await {
+                return;
+            }
+            refund_predictable_refusal(state, nonce);
+            // Out of the stash so a pre-broadcast failure can still requeue; the journal keeps it.
+            forget_stashed_signature(state, nonce, &signature);
+            state.rotation_retry_queue.push((ctx.clone(), instruction));
             return;
         }
     };
@@ -1249,14 +1265,7 @@ pub(super) async fn handle_nonce_outside_generation(
             nonce,
             nonce_generation, chain_generation, "Rotation has not landed yet; queuing for retry"
         );
-        // This refusal was predictable and says nothing about the withdrawal, so
-        // give back the attempt it was charged. Spending the budget here would
-        // permanently fail a good withdrawal for the sole reason that its
-        // rotation took a few ticks longer than the budget allowed.
-        state
-            .retry_counts
-            .entry(nonce)
-            .and_modify(|attempts| *attempts = attempts.saturating_sub(1));
+        refund_predictable_refusal(state, nonce);
         forget_rejected_signature(state, nonce, ctx.transaction_id, &signature).await;
         state.rotation_retry_queue.push((ctx.clone(), instruction));
         return;
@@ -1287,6 +1296,26 @@ pub(super) async fn handle_nonce_outside_generation(
     .await;
 }
 
+/// Give back the attempt a generation refusal was charged. It was predictable and says
+/// nothing about the withdrawal; spending the budget would fail a good withdrawal only
+/// because its rotation took a few ticks longer than the budget allowed.
+fn refund_predictable_refusal(state: &mut SenderState, nonce: u64) {
+    state
+        .retry_counts
+        .entry(nonce)
+        .and_modify(|attempts| *attempts = attempts.saturating_sub(1));
+}
+
+/// Remove a refused signature from the in-memory stash only.
+fn forget_stashed_signature(state: &mut SenderState, nonce: u64, signature: &Signature) {
+    if let Some(stashed) = state.pending_signatures.get_mut(&nonce) {
+        stashed.retain(|pending| pending.signature != *signature);
+        if stashed.is_empty() {
+            state.pending_signatures.remove(&nonce);
+        }
+    }
+}
+
 /// Drop a signature the chain confirmed it rejected: it moved no funds, so it is not payout evidence worth keeping.
 async fn forget_rejected_signature(
     state: &mut SenderState,
@@ -1294,12 +1323,7 @@ async fn forget_rejected_signature(
     transaction_id: Option<i64>,
     signature: &Signature,
 ) {
-    if let Some(stashed) = state.pending_signatures.get_mut(&nonce) {
-        stashed.retain(|pending| pending.signature != *signature);
-        if stashed.is_empty() {
-            state.pending_signatures.remove(&nonce);
-        }
-    }
+    forget_stashed_signature(state, nonce, signature);
 
     let Some(transaction_id) = transaction_id else {
         return;
@@ -2151,7 +2175,10 @@ pub(super) async fn route_poll_results(
                     }
                     // Only mints are polled here, and no mint can raise an escrow
                     // error, so a custom code is never decoded as one.
-                    extra_result.unwrap_or(Ok(ConfirmationResult::Failed(None)))
+                    extra_result.unwrap_or(Ok(ConfirmationResult::Failed {
+                        error: None,
+                        slot: status.slot,
+                    }))
                 } else {
                     Ok(ConfirmationResult::Confirmed)
                 };
@@ -2607,9 +2634,10 @@ mod tests {
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
         ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
-        mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
-        push_processing_row, push_withdrawal_with_nonce, requeue_attempts, row_status,
-        row_updated_at, sender_state as make_sender_state_with_server, sender_state_with_storage,
+        mock_bitmap_read_failure, mock_finalized_anchor, mock_initialized_mint,
+        mock_with_processing_row, push_processing_deposit_row, push_processing_row,
+        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
+        sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
@@ -4641,9 +4669,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -4675,7 +4704,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(None)),
+            Ok(ConfirmationResult::Failed {
+                error: None,
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -4710,9 +4742,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::UnexpectedGeneration,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -5417,9 +5450,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceAlreadyUsed,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -5547,9 +5581,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceAlreadyUsed,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -5598,6 +5633,7 @@ mod tests {
         mock: MockStorage,
     ) -> (SenderState, mpsc::Receiver<TransactionStatusUpdate>) {
         if let Some(generation) = chain_generation {
+            let _anchor = mock_finalized_anchor(server, vec![1]);
             let _bitmap = mock_bitmap_account(server, generation, &[]);
         }
 
@@ -5638,9 +5674,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                slot: 1,
+            }),
             Signature::new_unique(),
             None,
             &ctx,
@@ -5687,6 +5724,7 @@ mod tests {
     #[tokio::test]
     async fn a_requeued_release_forgets_the_signature_the_chain_rejected() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let nonce = NONCES_PER_GENERATION;
@@ -5732,9 +5770,10 @@ mod tests {
 
         handle_confirmation_result(
             &mut state,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
-            ))),
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                slot: 1,
+            }),
             rejected,
             None,
             &ctx,
@@ -5861,6 +5900,7 @@ mod tests {
     #[tokio::test]
     async fn nonce_outside_generation_behind_chain_reminds() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (state, mut rx) = route_nonce_outside_generation(&mut server, 1, Some(3)).await;
 
         assert!(
@@ -6093,19 +6133,219 @@ mod tests {
         );
     }
 
-    /// Without a readable bitmap we cannot tell which side of the window the
-    /// nonce is on, and the two outcomes are terminal in opposite directions.
-    /// Leave the row Processing for the recovery worker rather than guess.
+    /// Drive a generation refusal recorded at `refused_at` for `nonce`, where the refused
+    /// signature is the one journaled and stashed, as it is after a real broadcast.
+    async fn refuse_journaled_release(
+        server: &mut mockito::ServerGuard,
+        nonce: u64,
+        refused_at: u64,
+    ) -> (
+        SenderState,
+        MockStorage,
+        Signature,
+        mpsc::Receiver<TransactionStatusUpdate>,
+    ) {
+        let mock = mock_with_processing_row(REFUSED_ROW);
+        let refused = Signature::new_unique();
+        mock.insert_release_signature(REFUSED_ROW, refused.to_string(), 1, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.cached_generation = Some(0);
+        state.in_flight_withdrawals.insert(nonce);
+        state
+            .remint_cache
+            .insert(nonce, make_remint_info(REFUSED_ROW));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: refused,
+                last_valid_block_height: 1,
+                blockhash_slot: None,
+            }],
+        );
+        state.retry_counts.insert(nonce, 2);
+
+        let (tx, rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(REFUSED_ROW),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some("trace-80".to_string()),
+            deposit_claim_lease: None,
+        };
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                slot: refused_at,
+            }),
+            refused,
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+        (state, mock, refused, rx)
+    }
+
+    /// No read at or past the refusal: which side of the window the nonce is on is
+    /// unknown, so nothing terminal happens. The release is parked and queued for the
+    /// drain, and the journal keeps the refused signature a later refund depends on.
     #[tokio::test]
-    async fn nonce_outside_generation_rpc_failure_leaves_row_processing() {
+    async fn refusal_with_an_unanchored_read_parks_queues_clears_in_flight_and_keeps_the_db_journal(
+    ) {
         let mut server = mockito::Server::new_async().await;
-        let (state, mut rx) = route_nonce_outside_generation(&mut server, 1, None).await;
+        let _down = mock_bitmap_read_failure(&mut server);
+        let nonce = NONCES_PER_GENERATION;
+
+        let (state, mock, refused, mut rx) = refuse_journaled_release(&mut server, nonce, 9).await;
 
         assert!(
             rx.try_recv().is_err(),
-            "an unreadable bitmap must not write a terminal status"
+            "nothing terminal on an unread bitmap"
         );
-        assert!(state.rotation_retry_queue.is_empty());
+        assert_eq!(state.rotation_retry_queue.len(), 1, "queued for the drain");
+        assert_eq!(
+            row_status(&mock, REFUSED_ROW),
+            Some(TransactionStatus::Parked)
+        );
+        assert!(
+            !state.in_flight_withdrawals.contains(&nonce),
+            "must not hold the rotation"
+        );
+        assert_eq!(
+            state.retry_counts.get(&nonce),
+            Some(&1),
+            "the refusal is not charged"
+        );
+        assert!(
+            !state.pending_signatures.contains_key(&nonce),
+            "out of the stash, so a pre-broadcast failure can still requeue"
+        );
+        let journal = mock.get_release_signatures(REFUSED_ROW).await.unwrap();
+        assert!(
+            journal
+                .iter()
+                .any(|stored| stored.signature == refused.to_string()),
+            "the journal keeps the refused signature as proof of non-payout"
+        );
+        assert_eq!(
+            state.cached_generation, None,
+            "an unproven cache is dropped"
+        );
+        assert_eq!(state.refusal_floor, 9);
+    }
+
+    /// A refusal held on an unanchored read whose generation later closes ends in a refund,
+    /// not manual review: the drain drops it, recovery requeues the parked row, the rebuild
+    /// finds the window closed, and the journaled refused signature proves non-payout.
+    #[tokio::test]
+    async fn held_refusal_later_closed_refunds_not_manual_review() {
+        // No anchor yet, so the refusal is routed without a generation read.
+        let mut server = mockito::Server::new_async().await;
+        let nonce = NONCES_PER_GENERATION;
+        let (mut state, mock, _refused, mut rx) =
+            refuse_journaled_release(&mut server, nonce, 9).await;
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+
+        // The chain later rotates past the nonce's generation.
+        let _anchor = mock_finalized_anchor(&mut server, vec![10]);
+        let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
+        let (tx, _tx_rx) = mpsc::channel(10);
+        crate::operator::sender::drain_rotation_retry_queue(&mut state, &tx).await;
+        assert!(
+            state.rotation_retry_queue.is_empty(),
+            "a closed window is left to recovery"
+        );
+        assert_eq!(
+            row_status(&mock, REFUSED_ROW),
+            Some(TransactionStatus::Parked)
+        );
+
+        // Recovery requeues the stale parked row and the fetcher hands it back out.
+        let updated_at = row_updated_at(&mock, REFUSED_ROW).unwrap();
+        assert!(mock
+            .try_requeue_parked(REFUSED_ROW, updated_at)
+            .await
+            .unwrap());
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == REFUSED_ROW)
+            .unwrap()
+            .status = TransactionStatus::Processing;
+        state
+            .remint_cache
+            .insert(nonce, make_remint_info(REFUSED_ROW));
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(REFUSED_ROW),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some("trace-80".to_string()),
+            deposit_claim_lease: None,
+        };
+        // The rebuild's pre-send check finds the window closed.
+        route_builder_error(
+            &mut state,
+            &ctx,
+            &tx,
+            ProgramError::GenerationMismatch {
+                nonce,
+                nonce_generation: 1,
+                chain_generation: 2,
+            }
+            .into(),
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "refunded through the deferred remint"
+        );
+        assert!(state.pending_remints[0].release_refused_on_chain);
+        assert_eq!(
+            row_status(&mock, REFUSED_ROW),
+            Some(TransactionStatus::PendingRemint)
+        );
+    }
+
+    /// The refusal's own slot is the floor of the read that routes it, so a node still
+    /// on the refused generation cannot answer for it.
+    #[tokio::test]
+    async fn refusal_reads_at_or_past_the_refused_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let at_refusal = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(r#""minContextSlot"\s*:\s*500\b"#.into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(0, &[], 500),
+            )
+            .expect(1)
+            .create();
+
+        let (state, _mock, _refused, mut rx) =
+            refuse_journaled_release(&mut server, NONCES_PER_GENERATION, 500).await;
+
+        at_refusal.assert();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "generation 1 has not opened at 500"
+        );
     }
 
     // ── fire_and_store ────────────────────────────────────────────────
@@ -8082,88 +8322,71 @@ mod tests {
 
     // ── rotation submit path ─────────────────────────────────────────
 
-    /// The generation read is the only RPC on the rotation submit path, and
-    /// nothing re-dispatches a rotation once its boundary row is done. A failed
-    /// read must therefore park the builder, not drop it, or the next generation
-    /// stays closed and every withdrawal in it is refused forever.
+    /// A rotation with no generation bound at arming has nothing safe to carry, and a
+    /// read here could bind a generation someone else opened. It is dropped, not sent,
+    /// so the arming pass re-reads the chain and arms a bound one.
     #[tokio::test]
-    async fn rotation_parks_itself_when_the_generation_read_fails() {
+    async fn bind_without_a_bound_drops_for_rearm() {
         let mut server = mockito::Server::new_async().await;
-        let _down = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getAccountInfo""#.into(),
-            ))
-            .with_status(500)
-            .with_body("boom")
-            .create();
+        // Anchored, so a read on this path would reach the counted bitmap.
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _bitmap = mock_bitmap_account_counted(&mut server, 7, reads.clone());
 
         let mut state = make_sender_state_with_server(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
 
-        let mut builder =
-            private_channel_escrow_program_client::instructions::RotateBitmapBuilder::new();
-        let pk = Pubkey::new_unique();
-        builder
-            .payer(pk)
-            .operator(pk)
-            .instance(pk)
-            .withdrawal_bitmap(pk)
-            .operator_pda(pk);
-
         let result = state
-            .handle_transaction_builder(TransactionBuilder::RotateBitmap(Box::new(builder)))
+            .handle_transaction_builder(TransactionBuilder::RotateBitmap(rotation_builder()))
             .await;
 
+        assert!(result.is_err(), "an unbound rotation must not be sent");
         assert!(
-            result.is_err(),
-            "an unreadable bitmap must not produce a rotation"
+            state.pending_rotation.is_none(),
+            "dropped so arming can re-arm it"
         );
-        assert!(
-            state.pending_rotation.is_some(),
-            "the rotation must be parked for the next tick, not dropped"
+        assert!(state.rotation_in_flight.is_none());
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the send path never reads the generation"
         );
     }
 
-    /// A successful read binds the rotation to the generation the chain reports,
-    /// which is what makes a replayed rotation fail instead of skipping a window.
+    /// The rotation carries the generation bound when it was armed, and the send path
+    /// never reads the chain, even when the chain has moved on since.
     #[tokio::test]
-    async fn rotation_binds_the_generation_it_reads() {
+    async fn bind_never_reads_the_generation() {
         let mut server = mockito::Server::new_async().await;
-        let bitmap = mock_bitmap_account(&mut server, 3, &[]);
+        // Anchored, so a read on this path would reach the counted bitmap.
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        // A later generation than the bound: a re-read here is what skipped a generation.
+        let _bitmap = mock_bitmap_account_counted(&mut server, 4, reads.clone());
 
         let mut state = make_sender_state_with_server(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
-
-        let mut builder =
-            private_channel_escrow_program_client::instructions::RotateBitmapBuilder::new();
-        let pk = Pubkey::new_unique();
-        builder
-            .payer(pk)
-            .operator(pk)
-            .instance(pk)
-            .withdrawal_bitmap(pk)
-            .operator_pda(pk);
+        state.rotation_bound_generation = Some(3);
 
         let instruction = state
-            .handle_transaction_builder(TransactionBuilder::RotateBitmap(Box::new(builder)))
+            .handle_transaction_builder(TransactionBuilder::RotateBitmap(rotation_builder()))
             .await
-            .expect("a readable bitmap must produce a rotation");
+            .expect("a bound rotation must dispatch");
 
-        assert!(state.pending_rotation.is_none());
         assert_eq!(
-            state.cached_generation,
-            Some(3),
-            "the authoritative read is what the cache is allowed to learn from"
+            reads.load(Ordering::SeqCst),
+            0,
+            "the send path must not read"
         );
         // The only argument, little-endian after the one-byte discriminator.
         let data = &instruction.instructions[0].data;
         assert_eq!(
             u64::from_le_bytes(data[1..9].try_into().unwrap()),
             3,
-            "the rotation must carry the generation the chain reported"
+            "the rotation must carry the generation it was armed against"
         );
-        bitmap.assert();
+        assert_eq!(state.rotation_bound_generation, Some(3));
+        assert!(state.rotation_in_flight.is_some());
     }
 
     /// A rotation that lands but is reported failed comes back through the
@@ -8203,34 +8426,6 @@ mod tests {
             u64::from_le_bytes(data[1..9].try_into().unwrap()),
             3,
             "the re-armed rotation must carry its original generation, so the program refuses it"
-        );
-    }
-
-    /// The first dispatch of a rotation has nothing bound yet, so it must read
-    /// the chain and remember what it bound for any later re-arm.
-    #[tokio::test]
-    async fn a_fresh_rotation_reads_the_chain_and_records_what_it_bound() {
-        let mut server = mockito::Server::new_async().await;
-        let reads = Arc::new(AtomicUsize::new(0));
-        let _bitmap = mock_bitmap_account_counted(&mut server, 7, reads.clone());
-
-        let mut state = make_sender_state_with_server(&server.url());
-        state.instance_pda = Some(Pubkey::new_unique());
-
-        state
-            .handle_transaction_builder(TransactionBuilder::RotateBitmap(rotation_builder()))
-            .await
-            .expect("a readable bitmap must produce a rotation");
-
-        assert_eq!(
-            reads.load(Ordering::SeqCst),
-            1,
-            "an unbound rotation must read the chain exactly once"
-        );
-        assert_eq!(
-            state.rotation_bound_generation,
-            Some(7),
-            "the binding must be recorded so a re-arm can reuse it"
         );
     }
 
