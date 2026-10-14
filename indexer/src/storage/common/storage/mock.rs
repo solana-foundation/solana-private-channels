@@ -860,6 +860,19 @@ impl MockStorage {
         Ok(nonces)
     }
 
+    pub fn highest_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("highest_withdrawal_nonce")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal)
+            .filter_map(|t| t.withdrawal_nonce)
+            .max()
+            .map(|nonce| nonce as u64))
+    }
+
     pub async fn get_withdrawal_by_nonce(
         &self,
         nonce: u64,

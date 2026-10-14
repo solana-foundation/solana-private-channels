@@ -36,6 +36,7 @@ pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
 pub mod get_withdrawal_by_nonce;
+pub mod highest_withdrawal_nonce;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
@@ -417,6 +418,11 @@ impl Storage {
         nonce: u64,
     ) -> Result<Option<DbTransaction>, StorageError> {
         get_withdrawal_by_nonce::get_withdrawal_by_nonce(self, nonce).await
+    }
+
+    /// Highest nonce any withdrawal row holds, whatever its status, or `None` when none does.
+    pub async fn highest_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        highest_withdrawal_nonce::highest_withdrawal_nonce(self).await
     }
 
     /// Transitions a withdrawal to PendingRemint, storing the withdrawal

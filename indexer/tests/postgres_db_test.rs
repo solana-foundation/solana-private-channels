@@ -1386,6 +1386,28 @@ async fn unreleased_nonce_bounds_none_when_no_live_rows() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// The boot frontier check needs the highest nonce any withdrawal holds, terminal and
+/// refunded rows included, since a rotation can be armed from a row that later fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn highest_withdrawal_nonce_spans_every_status() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    assert_eq!(
+        storage.highest_withdrawal_nonce().await?,
+        None,
+        "an empty table holds no withdrawal nonce"
+    );
+
+    seed_withdrawal(&pool, &storage, "live", 1_007, "pending").await?;
+    seed_withdrawal(&pool, &storage, "refunded", 1_020, "failed_reminted").await?;
+    assert_eq!(
+        storage.highest_withdrawal_nonce().await?,
+        Some(1_020),
+        "a refunded row still holds its nonce"
+    );
+    Ok(())
+}
+
 // ── set_pending_remint status guard ──────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

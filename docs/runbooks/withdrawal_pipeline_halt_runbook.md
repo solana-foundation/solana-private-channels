@@ -12,7 +12,11 @@ The diff is **directional**, and the two directions mean opposite things:
 | **Chain ahead** - bit set, no `completed` row | A release landed and only its bookkeeping was lost. The money already moved correctly. | Names the nonces, resolves each from its broadcast signatures, and **starts anyway**. |
 | **DB ahead** - `completed` row, bit clear | The database believes in a release the chain never made. Every later decision would rest on a false history. | **Refuses to start.** |
 
-Only the DB-ahead direction halts on a verdict. The operator also refuses to
+Only the DB-ahead direction halts on a verdict. A set bit or a rotated generation
+above every nonce the database holds is not chain-ahead: this database did not issue
+it, so the operator refuses to start; see
+[Database behind the chain's nonces on startup](#database-behind-the-chains-nonces-on-startup).
+The operator also refuses to
 start when the diff cannot be run at all, because nothing runs it again later;
 see [Bitmap check could not run on startup](#bitmap-check-could-not-run-on-startup).
 
@@ -187,6 +191,34 @@ persists after correcting the named rows and restarting.
 - The RPC endpoint used for verification.
 - Confirmation that `Withdrawal bitmap verification passed` appeared on the
   post-fix restart.
+
+---
+
+## Database behind the chain's nonces on startup
+
+### Symptom
+
+- The withdraw operator exits at boot and the supervisor restarts it in a loop.
+- The error log reads `Withdraw boot pre-flight failed, refusing to start: Program error:
+  Withdrawal database is behind the chain's nonces: ...`.
+- No row is written by this check.
+
+### Why the operator refuses
+
+Nonces come from the database's own sequence. A bitmap that has rotated past, or set
+bits above, every nonce the database holds was advanced by a database that is not this
+one: a fresh or replaced database, or one restored from an old backup. Its next
+withdrawal would be numbered into a closed generation or onto a spent bit, and every
+such release would end in manual review.
+
+### Resolution
+
+1. Confirm `escrow_instance_id` and the Solana `rpc_url` name the instance this
+   database serves.
+2. If this database replaced the one that served the instance, restore that one. Do
+   not fast-forward `withdrawal_nonce_seq` by hand.
+3. Otherwise follow [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) § "Do not
+   resync; stand up a fresh instance", and [escalate](_escalation.md) (Tier 2).
 
 ---
 

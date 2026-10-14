@@ -3629,6 +3629,15 @@ impl PostgresDb {
 
         Ok(nonces.into_iter().map(|(n,)| n).collect())
     }
+
+    /// MAX skips NULL nonces and is NULL itself when no withdrawal carries one.
+    pub async fn highest_withdrawal_nonce_internal(&self) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT MAX(withdrawal_nonce) FROM transactions WHERE transaction_type = 'withdrawal'",
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
 }
 
 #[cfg(test)]

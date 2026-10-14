@@ -45,4 +45,11 @@ pub enum ProgramError {
         db_only: Vec<u64>,
         chain_only: Vec<u64>,
     },
+
+    #[error("Withdrawal database is behind the chain's nonces: the bitmap on generation {generation} has issued nonces up to at least {issued_floor}, but the database's highest withdrawal nonce is {highest_db_nonce:?}. See docs/runbooks/withdrawal_pipeline_halt_runbook.md")]
+    NonceFrontierBehindBitmap {
+        generation: u64,
+        issued_floor: u64,
+        highest_db_nonce: Option<u64>,
+    },
 }

@@ -1127,16 +1127,109 @@ mod tests {
     }
 
     /// Chain ahead of the database: the release landed and only the bookkeeping
-    /// is missing, so the operator repairs what it can and starts.
+    /// is missing, so the operator repairs what it can and starts. The recorded
+    /// release keeps the database at the chain's highest bit, so the orphan below
+    /// it is chain-ahead rather than a database behind the chain.
     #[tokio::test]
     async fn preflight_starts_when_chain_is_ahead() {
+        let orphan = 7;
+        let recorded = 8;
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server);
-        let _account = mock_bitmap_account(&mut server, 0, &[7]);
-        let result = run_preflight(make_rpc_client(&server.url())).await;
+        let _account = mock_bitmap_account(&mut server, 0, &[orphan, recorded]);
+
+        let result = run_preflight_with(
+            Arc::new(Storage::Mock(completed_withdrawal(recorded as i64))),
+            make_rpc_client(&server.url()),
+        )
+        .await;
+
         assert!(
             result.is_ok(),
             "a landed-but-unrecorded release must not halt boot: {result:?}"
+        );
+    }
+
+    /// A fresh database under a bitmap with set bits would number its first withdrawal
+    /// onto a spent nonce, so it refuses rather than start.
+    #[tokio::test]
+    async fn preflight_refuses_an_empty_database_under_a_consumed_bit() {
+        let spent = 7;
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_account(&mut server, 0, &[spent]);
+
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+
+        match result {
+            Err(OperatorError::Program(
+                crate::error::ProgramError::NonceFrontierBehindBitmap {
+                    issued_floor,
+                    highest_db_nonce,
+                    ..
+                },
+            )) => {
+                assert_eq!(issued_floor, spent);
+                assert_eq!(highest_db_nonce, None);
+            }
+            other => panic!("an empty database under a spent nonce must refuse: {other:?}"),
+        }
+    }
+
+    /// A fresh or partial database under a bitmap that has rotated would number its next
+    /// withdrawal into the closed generation, so it refuses rather than start.
+    #[tokio::test]
+    async fn preflight_refuses_a_database_behind_an_advanced_generation() {
+        let generation_start = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let behind = 3;
+        for (storage, highest) in [
+            (MockStorage::new(), None),
+            (completed_withdrawal(behind), Some(behind as u64)),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server);
+            let _account = mock_bitmap_account(&mut server, 1, &[]);
+
+            let result = run_preflight_with(
+                Arc::new(Storage::Mock(storage)),
+                make_rpc_client(&server.url()),
+            )
+            .await;
+
+            match result {
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::NonceFrontierBehindBitmap {
+                        issued_floor,
+                        highest_db_nonce,
+                        ..
+                    },
+                )) => {
+                    assert_eq!(issued_floor, generation_start);
+                    assert_eq!(highest_db_nonce, highest);
+                }
+                other => panic!("highest {highest:?}: must refuse, got {other:?}"),
+            }
+        }
+    }
+
+    /// A database that holds its own history reaches the chain's floor, so an advanced
+    /// generation alone does not stop it.
+    #[tokio::test]
+    async fn preflight_starts_when_the_database_reaches_the_advanced_generation() {
+        let generation_start = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_account(&mut server, 1, &[generation_start]);
+
+        let result = run_preflight_with(
+            Arc::new(Storage::Mock(completed_withdrawal(generation_start as i64))),
+            make_rpc_client(&server.url()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a database at the chain's floor must start: {result:?}"
         );
     }
 

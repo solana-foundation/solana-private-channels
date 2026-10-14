@@ -269,6 +269,7 @@ pub(crate) async fn release_seen_at_confirmed(
 /// Boot check of released nonces, from the current generation up, against Completed rows.
 /// A set bit with no Completed row is repaired in place and boot continues.
 /// A Completed row with a clear bit claims a release the chain never made, so boot refuses.
+/// A generation or set bit above every nonce the database holds was not issued by it, so boot refuses.
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
@@ -349,6 +350,34 @@ pub(crate) async fn validate_bitmap_consistency(
             chain_only,
         }
         .into());
+    }
+
+    // A database that never allocated the nonces the chain has issued would number its next
+    // withdrawal into a closed generation or onto a spent bit. One that holds its own history
+    // always reaches this floor: rotation only arms from a row in the new generation, and
+    // every set bit was released from a row carrying its nonce.
+    if bitmap.generation > 0 || !bitmap.consumed.is_empty() {
+        let issued_floor = bitmap
+            .generation
+            .saturating_mul(NONCES_PER_GENERATION)
+            .max(bitmap.consumed.last().copied().unwrap_or(0));
+        let highest_db_nonce = storage.highest_withdrawal_nonce().await?;
+        if highest_db_nonce.is_none_or(|highest| highest < issued_floor) {
+            error!(
+                instance = %instance_pda,
+                generation = bitmap.generation,
+                issued_floor,
+                ?highest_db_nonce,
+                "Withdrawal database is behind the chain's nonces. Refusing to start; this \
+                 database did not issue them."
+            );
+            return Err(crate::error::ProgramError::NonceFrontierBehindBitmap {
+                generation: bitmap.generation,
+                issued_floor,
+                highest_db_nonce,
+            }
+            .into());
+        }
     }
 
     if chain_only.is_empty() {
