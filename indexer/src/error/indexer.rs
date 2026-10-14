@@ -40,7 +40,7 @@ pub enum IndexerError {
     #[error("Reconciliation failed: {0}")]
     Reconciliation(#[from] ReconciliationError),
 
-    /// A backfill-only run finished without durably recording its whole range.
+    /// A backfill-only run or resync rebuild finished without durably recording its whole range.
     /// `committed` is `None` when no checkpoint was ever written, which is not
     /// the same as a checkpoint that stalled part way and must stay
     /// distinguishable in the logs an operator reads after a failed repair.

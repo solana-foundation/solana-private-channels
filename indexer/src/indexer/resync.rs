@@ -861,20 +861,21 @@ impl ResyncService {
                 }
             }
 
-            // Perform cleanup after backfill, with no completeness target to check. A rebuild
-            // resolves its range inside the backfill service and never surfaces the top slot,
-            // so there is nothing to compare against here. Leaving it unchecked is acceptable
-            // because a stale checkpoint after a rebuild heals itself: the next live start
-            // detects the gap below the tip and fills it.
+            // The writer only logs a failed flush, so read the durable checkpoint back and
+            // fail unless it reached the top slot. The error returns before the marker and
+            // halt are cleared.
             if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
                 checkpoint_handle,
                 checkpoint_tx,
                 storage,
-                None,
+                Some((self.program_type, to_slot)),
             )
             .await
             {
-                error!("Cleanup after resync backfill failed: {}", e);
+                error!(
+                    "Rebuild checkpoint not confirmed, keeping the resync marker and halt; rerun the resync: {}",
+                    e
+                );
                 // Returned as-is so the operator sees which stage failed, not a generic one.
                 return Err(e);
             }
@@ -930,6 +931,7 @@ mod tests {
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use crate::test_utils::rpc_mocks::{chain, mock_get_slot};
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use std::sync::Arc;
@@ -1818,6 +1820,77 @@ mod tests {
             })) => {}
             other => panic!("another program's resync halt must refuse, got: {other:?}"),
         }
+    }
+
+    /// A rebuild whose final checkpoint write fails leaves no durable boundary, so it keeps
+    /// its marker and halt. A rerun that records the top slot clears both.
+    #[tokio::test]
+    async fn lost_final_checkpoint_keeps_the_fence_until_a_rerun_records_it() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        let _blocks = chain(
+            &mut server,
+            genesis,
+            tip,
+            &[(101, 100), (102, 101), (103, 102)],
+        );
+        let mock = MockStorage::new();
+        // Relies on the writer's single flush when its channel closes: the run ends well
+        // before the 5s tick, so the one injected failure lands on that final write.
+        mock.set_fail_times("escrow", 1);
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )),
+            ProgramType::Escrow,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: server.url(),
+                batch_size: 10,
+                max_gap_slots: 500,
+                start_slot: None,
+            },
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO);
+
+        match service.run(genesis).await {
+            Err(IndexerError::BackfillIncomplete {
+                committed: None,
+                target,
+                ..
+            }) => assert_eq!(target, tip),
+            other => panic!("an unrecorded rebuild must not clear its fence, got: {other:?}"),
+        }
+        assert_eq!(
+            mock.unfinished_resync.lock().unwrap().as_deref(),
+            Some("escrow")
+        );
+        assert_eq!(
+            mock.reconciliation_halt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|halt| halt.reason.clone()),
+            Some(resync_halt_reason(ProgramType::Escrow))
+        );
+
+        service
+            .run(genesis)
+            .await
+            .expect("a rerun must finish the rebuild");
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("escrow"),
+            Some(&tip)
+        );
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
+        assert!(mock.reconciliation_halt.lock().unwrap().is_none());
     }
 
     /// A worker whose session just died may still be writing, so nothing is read inside the grace.
