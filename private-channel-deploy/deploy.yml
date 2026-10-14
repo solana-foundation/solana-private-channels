@@ -653,11 +653,15 @@
       changed_when: false
       check_mode: false
 
-    # The validator ledger is wiped when it boots with --reset, or when reset_state deletes
-    # its volume, so a kept or named PDA would name an account that is gone.
+    # The validator ledger is wiped when it boots with --reset, or when this run's reset_state
+    # phase deletes its volume. A run whose tags skip that phase wipes nothing.
     - name: Decide whether this run wipes the localnet ledger
       ansible.builtin.set_fact:
-        _localnet_ledger_wiped: "{{ network == 'localnet' and (validator_reset | default(true) | bool or reset_state | default(false) | bool) }}"
+        _localnet_ledger_wiped: >-
+          {{ network == 'localnet' and (validator_reset | default(true) | bool
+             or (reset_state | default(false) | bool
+                 and ('all' in ansible_run_tags or 'reset_state' in ansible_run_tags)
+                 and 'reset_state' not in ansible_skip_tags)) }}
 
     - name: Set escrow_instance_id_pda from existing .env if present and non-placeholder
       when:

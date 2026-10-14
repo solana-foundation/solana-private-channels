@@ -151,8 +151,11 @@ test_preflight_cases() {
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
   expect_services localnet_reset_drops_preserved_instance no "${common[@]}"
   expect_services localnet_validator_reset_drops_preserved_instance no "${common[@]}" -e reset_state=false
-  # reset_state wipes the validator volume whatever validator_reset says.
-  expect_services localnet_state_reset_drops_preserved_instance no "${common[@]}" -e validator_reset=false
+  # reset_state wipes the validator volume whatever validator_reset says, but only on a run
+  # that includes its phase (check mode skips the wipe's shell tasks).
+  local wipe=(--tags config_asserts,reset_state --check)
+  expect_services localnet_state_reset_drops_preserved_instance no "${common[@]}" -e validator_reset=false "${wipe[@]}"
+  expect_services localnet_partial_run_keeps_instance yes "${common[@]}" -e validator_reset=false
   expect_services localnet_kept_ledger_keeps_instance yes "${common[@]}" "${kept[@]}"
   rm "$data/config/.env"
   # The reset wipes an explicitly named instance too; a create_instance seed is random.
@@ -160,6 +163,8 @@ test_preflight_cases() {
   expect_refused localnet_validator_reset_with_named_instance "a localnet reset wipes" "${common[@]}" \
     -e escrow_instance_id=$INSTANCE -e reset_state=false
   expect_refused localnet_state_reset_with_named_instance "a localnet reset wipes" "${common[@]}" \
+    -e escrow_instance_id=$INSTANCE -e validator_reset=false "${wipe[@]}"
+  expect_services localnet_partial_run_with_named_instance yes "${common[@]}" \
     -e escrow_instance_id=$INSTANCE -e validator_reset=false
   expect_services localnet_named_instance_kept_ledger yes "${common[@]}" -e escrow_instance_id=$INSTANCE \
     -e reset_state=false -e validator_reset=false
