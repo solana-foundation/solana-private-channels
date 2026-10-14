@@ -219,6 +219,15 @@ pub enum ReconciliationError {
     )]
     TipBelowExistingRows { to_slot: u64, latest_slot: i64 },
 
+    /// A lagging source node ends the rebuild below events the channel may already have
+    /// serviced, which catch-up would later insert as new pending work.
+    #[error(
+        "the source RPC's replay tip at slot {to_slot} cannot be shown to be current: \
+         {reason}. Aborted before any delete, the database is intact. Point resync at a \
+         caught-up node and rerun"
+    )]
+    ReplayTipUnverified { to_slot: u64, reason: String },
+
     /// Withdrawal rows cannot prove no burn exists below a later genesis, so an empty or
     /// restored table would let the rebuild drop an unreleased withdrawal for good.
     #[error(

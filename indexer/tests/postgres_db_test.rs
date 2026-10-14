@@ -4548,6 +4548,8 @@ async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
 
     seed("dep_lower", TransactionType::Deposit, 50).await?;
     assert_eq!(earliest(TransactionType::Deposit).await?, Some(50));
+    seed("dep_higher", TransactionType::Deposit, 900).await?;
+    assert_eq!(latest(TransactionType::Deposit).await?, Some(900));
 
     storage
         .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)

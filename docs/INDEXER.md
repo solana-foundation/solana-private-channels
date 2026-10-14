@@ -151,10 +151,12 @@ if anything fails. It is guarded these ways.
 7. **The genesis slot may not drop indexed rows.** The delete takes every row of the
    program but the rebuild replays only from the genesis slot, so a genesis above the
    program's earliest row refuses before anything is deleted. Likewise a replay tip below
-   the program's latest row refuses. The marker keeps the lowest and highest slot its wipe
-   deleted, so a rerun after an interrupted resync is held to the same bounds. A withdraw
-   resync must replay from slot 0, since an empty or restored table cannot prove that no
-   burn exists below a later genesis.
+   the program's latest row refuses, and so does one whose block time is over 120s behind
+   wall clock, since an empty or restored table has no row to catch a lagging node. The
+   marker keeps the lowest and highest slot its wipe deleted, so a rerun after an
+   interrupted resync is held to the same bounds. A withdraw resync must replay from slot
+   0, since an empty or restored table cannot prove that no burn exists below a later
+   genesis.
 8. **The channel history must be complete.** The channel writes its address index after
    each block commits, so its history can briefly miss a mint that is already final.
    Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until

@@ -699,8 +699,9 @@ async fn seed_pending_deposit(db_url: &str, signature: &str) {
 }
 
 /// Slot of every seeded row: above any slot a test validator reaches, so a seed never sits
-/// below the genesis a test resyncs from. A resync refuses to wipe a row above its tip, so a
-/// test whose resync reaches the wipe moves its seed into the replay range first.
+/// below the genesis a test resyncs from. A resync refuses a row above its tip as soon as the
+/// tip is known, so a test whose resync gets past that point moves its seed into the replay
+/// range first.
 const SEED_SLOT: i64 = 1_000_000_000;
 
 /// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
@@ -1880,6 +1881,15 @@ async fn resync_aborts_on_signed_mint_that_does_not_pay_the_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -1981,6 +1991,15 @@ async fn resync_aborts_on_remint_marker_for_a_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_kind_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -2476,6 +2495,14 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
         let (db_url, storage, _pg) =
             start_postgres_for_resync(&format!("resync_pruned_{i}")).await?;
         seed_pending_deposit(&db_url, "resync_pruned_seed").await;
+        // Inside the replay range, or the tip check would refuse before the late floor read.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_pruned_seed'"
+            ),
+        )
+        .await;
 
         let mock = MockRpcServer::start().await;
         script_channel_caught_up(&mock);
@@ -2980,6 +3007,7 @@ enum Refusal {
     ReleaseEvidence,
     OtherMarker,
     GenesisAboveRows,
+    WithdrawGenesis,
 }
 
 /// The unsafe state a refusal case starts from, so each case carries its own setup.
@@ -2995,6 +3023,8 @@ enum Seed {
     OtherMarker,
     /// One row of this type in this status at this slot.
     TxAt(&'static str, &'static str, i64),
+    /// Nothing at all: an empty or lost database.
+    Empty,
 }
 
 struct RefusalCase {
@@ -3033,6 +3063,7 @@ async fn seed_refusal(db_url: &str, seed: Seed) {
             )
             .await;
         }
+        Seed::Empty => {}
     }
 }
 
@@ -3117,7 +3148,15 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
             program: ProgramType::Withdraw,
             seed: Seed::TxAt("withdrawal", "pending", 100),
             genesis: 101,
-            expected: Refusal::GenesisAboveRows,
+            // The genesis-0 rule answers first, so the operator is not sent to 100 and refused again.
+            expected: Refusal::WithdrawGenesis,
+        },
+        RefusalCase {
+            name: "withdraw: empty table, genesis above 0",
+            program: ProgramType::Withdraw,
+            seed: Seed::Empty,
+            genesis: 1,
+            expected: Refusal::WithdrawGenesis,
         },
     ];
     for RefusalCase {
@@ -3157,6 +3196,9 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
                 genesis_slot: 101,
                 earliest_slot: 100,
             })) => Refusal::GenesisAboveRows,
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawGenesisNotZero {
+                ..
+            })) => Refusal::WithdrawGenesis,
             other => panic!("{case}: expected {expected:?}, got {other:?}"),
         };
         assert_eq!(got, expected, "{case}");
