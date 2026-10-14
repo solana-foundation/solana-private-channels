@@ -90,8 +90,8 @@ pub struct NodeConfig {
     /// Optional Redis cache in front of the read path. Reads consult Redis
     /// first and fall through to `accountsdb_connection_url` on a miss.
     pub redis_cache_url: Option<String>,
-    /// Expiry in seconds on cached block entries, bounding the growth an idle
-    /// node's heartbeat blocks cause. Zero disables it.
+    /// Expiry in seconds on cached block and transaction entries, bounding cache
+    /// growth. Zero disables it.
     pub redis_block_ttl_secs: u64,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
     /// How many blocks a blockhash stays valid for. A block count, not a

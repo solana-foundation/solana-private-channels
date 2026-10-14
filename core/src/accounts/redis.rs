@@ -68,9 +68,9 @@ pub struct RedisAccountsDB {
     /// cooldown lapsing under a slow probe cannot start a second one that
     /// resumes on work the first has not finished.
     probing: Arc<AtomicBool>,
-    /// Expiry in seconds applied to cached `block:{slot}` entries, bounding the
-    /// growth an idle node's heartbeat blocks would otherwise cause. Zero
-    /// disables it. Only the writer sets it; a reader never writes blocks.
+    /// Expiry in seconds applied to cached `block:{slot}` and `tx:{signature}`
+    /// entries, bounding cache growth. Zero disables it. Only the writer sets it;
+    /// a reader never writes either.
     block_ttl_secs: u64,
 }
 
@@ -112,14 +112,14 @@ impl RedisAccountsDB {
         Ok(db)
     }
 
-    /// Bound cached block entries with an expiry. Postgres stays the source of
+    /// Bound cached block and transaction entries with an expiry. Postgres stays the source of
     /// truth, so an expired entry is a miss that falls through and re-reads,
     /// never lost history. Zero disables it.
     pub fn set_block_ttl_secs(&mut self, secs: u64) {
         self.block_ttl_secs = secs;
     }
 
-    /// The expiry applied to cached block entries, zero when disabled.
+    /// The expiry applied to cached block and transaction entries, zero when disabled.
     pub(crate) fn block_ttl_secs(&self) -> u64 {
         self.block_ttl_secs
     }

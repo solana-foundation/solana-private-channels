@@ -114,7 +114,7 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
-    /// Expiry in seconds on cached Redis block entries; 0 disables it
+    /// Expiry in seconds on cached Redis block and transaction entries; 0 disables it
     #[arg(
         long,
         default_value_t = 3600,

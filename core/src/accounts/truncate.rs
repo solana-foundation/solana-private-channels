@@ -1505,7 +1505,7 @@ mod tests {
         assert_history_ends_at_the_floor(&db, &address, &sigs).await;
     }
 
-    /// Truncation deletes the index rows of the transactions it removes, and only those.
+    /// Truncation deletes the index rows below the floor and keeps every row at or above it.
     #[tokio::test(flavor = "multi_thread")]
     async fn truncation_prunes_the_address_index_below_the_floor() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
