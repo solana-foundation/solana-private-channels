@@ -71,7 +71,11 @@ const WITHDRAW_AMOUNT: u64 = 50_000;
 
 /// What the fixture hook logs when Token-2022 hands it the resolved list: source, mint,
 /// destination, authority, the validation PDA, and the one declared extra.
-const HOOK_LOG: &str = "hook accounts: 6";
+const RESOLVED_HOOK_LOG: &str = "hook accounts: 6";
+
+/// What the fixture hook logs when Token-2022 runs it with no list: source, mint,
+/// destination and authority.
+const BASE_ONLY_HOOK_LOG: &str = "hook accounts: 4";
 
 // ---------------------------------------------------------------------------
 // Local helpers
@@ -409,6 +413,44 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
     })
 }
 
+/// Logs of the release that settled `withdrawal_sig`, read once the promotion pass has
+/// recorded the row completed with its signature.
+async fn release_logs(
+    env: &HookMintEnv,
+    withdrawal_sig: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let release_sig = loop {
+        let recorded = db::get_transaction(&env.pool, withdrawal_sig)
+            .await?
+            .filter(|row| row.status == "completed")
+            .and_then(|row| row.counterpart_signature);
+        if let Some(signature) = recorded {
+            break signature.parse::<Signature>()?;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("withdrawal recorded no release signature within 90s".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let release = env
+        .client
+        .get_transaction_with_config(
+            &release_sig,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Json),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .await?;
+    Ok(release
+        .transaction
+        .meta
+        .and_then(|meta| Option::<Vec<String>>::from(meta.log_messages))
+        .unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -472,37 +514,11 @@ async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn 
 
     // The fixture hook accepts any account count, so only the count it logged proves the
     // operator attached the resolved list rather than the hook program alone.
-    let release_sig = loop {
-        let recorded = db::get_transaction(&env.pool, &withdrawal_sig)
-            .await?
-            .filter(|row| row.status == "completed")
-            .and_then(|row| row.counterpart_signature);
-        if let Some(signature) = recorded {
-            break signature.parse::<Signature>()?;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("hook-mint withdrawal recorded no release signature within 90s".into());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    let release = env
-        .client
-        .get_transaction_with_config(
-            &release_sig,
-            RpcTransactionConfig {
-                encoding: Some(UiTransactionEncoding::Json),
-                commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
-            },
-        )
-        .await?;
-    let logs = release
-        .transaction
-        .meta
-        .and_then(|meta| Option::<Vec<String>>::from(meta.log_messages))
-        .unwrap_or_default();
+    let logs = release_logs(&env, &withdrawal_sig, deadline).await?;
     assert_eq!(
-        logs.iter().filter(|log| log.contains(HOOK_LOG)).count(),
+        logs.iter()
+            .filter(|log| log.contains(RESOLVED_HOOK_LOG))
+            .count(),
         1,
         "the hook must run once with the resolved list: {logs:?}"
     );
@@ -561,6 +577,17 @@ async fn test_withdrawal_of_base_only_hook_mint_releases() -> Result<(), Box<dyn
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // The fixture hook accepts any account count, so only the count it logged proves the
+    // mint's hook ran, and ran without a list.
+    let logs = release_logs(&env, &withdrawal_sig, deadline).await?;
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.contains(BASE_ONLY_HOOK_LOG))
+            .count(),
+        1,
+        "the hook must run once with the four base accounts: {logs:?}"
+    );
 
     operator_handle.shutdown().await;
     Ok(())
