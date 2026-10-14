@@ -20,7 +20,7 @@ on:
       - "private-channel-withdraw-program/package.json"
 
   pull_request:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit, audit/apex-audit-scan-remediation]
     paths:
       - "private-channel-escrow-program/clients/typescript/**"
       - "private-channel-withdraw-program/clients/typescript/**"

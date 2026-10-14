@@ -98,9 +98,10 @@ async fn drive_and_recv(
 // through to a plain permanent failure.
 #[tokio::test]
 async fn nonce_outside_generation_without_nonce_routes_to_fatal_arm() {
-    let result = Ok(ConfirmationResult::Failed(Some(
-        PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
-    )));
+    let result = Ok(ConfirmationResult::Failed {
+        error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+        slot: 1,
+    });
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 401).await;
     assert_eq!(update.transaction_id, 401);
     assert_eq!(update.status, TransactionStatus::Failed);
@@ -121,9 +122,10 @@ async fn nonce_outside_generation_without_nonce_routes_to_fatal_arm() {
 // error message.
 #[tokio::test]
 async fn unmapped_program_error_routes_to_generic_failed_arm() {
-    let result = Ok(ConfirmationResult::Failed(Some(
-        PrivateChannelEscrowProgramError::InvalidMint,
-    )));
+    let result = Ok(ConfirmationResult::Failed {
+        error: Some(PrivateChannelEscrowProgramError::InvalidMint),
+        slot: 1,
+    });
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 402).await;
     assert_eq!(update.status, TransactionStatus::Failed);
     let msg = update.error_message.unwrap_or_default();

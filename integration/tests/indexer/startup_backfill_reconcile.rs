@@ -161,8 +161,19 @@ async fn wait_for_finalized_custody(rpc_url: &str, ata: &Pubkey, expected: u64) 
 /// not check. Answering absence rather than a fabricated mint keeps any other reader on
 /// this RPC seeing the truth, and the queue is stocked well past what a run consumes.
 fn mock_empty_channel_supply(rpc: &MockRpcServer) {
-    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
+    mock_fresh_channel_clock(rpc);
+    let reply = Reply::result(json!({"context": {"slot": MOCK_TIP}, "value": null}));
     rpc.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 4096));
+}
+
+/// A channel whose newest block, at `MOCK_TIP`, is seconds old, so supply read at that slot is fresh.
+fn mock_fresh_channel_clock(rpc: &MockRpcServer) {
+    let tip = Reply::result(json!(MOCK_TIP));
+    rpc.enqueue_sequence("getSlot", std::iter::repeat_n(tip, 4096));
+    let blocks = Reply::result(json!([MOCK_TIP]));
+    rpc.enqueue_sequence("getBlocks", std::iter::repeat_n(blocks, 4096));
+    let time = Reply::dynamic(|_| json!(chrono::Utc::now().timestamp() - 1));
+    rpc.enqueue_sequence("getBlockTime", std::iter::repeat_n(time, 4096));
 }
 
 /// Spawn `run` on the ordinary recovery configuration and hand back its result.
@@ -380,7 +391,43 @@ async fn mock_escrow_custody_at(
         .create_async()
         .await;
 
-    vec![sweep, allowed_mints]
+    let mut mocks = vec![sweep, allowed_mints];
+    mocks.extend(mock_solana_anchor(rpc, context_slot).await);
+    mocks
+}
+
+/// Solana's clock for the custody anchor: the tip is `MOCK_TIP` and its newest recent
+/// block is `block`, seconds old. A sweep must answer at or past `block`.
+async fn mock_solana_anchor(rpc: &mut MockitoServer, block: u64) -> Vec<mockito::Mock> {
+    let tip = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": MOCK_TIP, "id": 1}).to_string())
+        .create_async()
+        .await;
+    let newest_block = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [MOCK_TIP - 64, MOCK_TIP]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [block], "id": 1}).to_string())
+        .create_async()
+        .await;
+    let block_time = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlockTime"})))
+        .with_status(200)
+        .with_body_from_request(|_| {
+            json!({"jsonrpc": "2.0", "result": chrono::Utc::now().timestamp() - 1, "id": 1})
+                .to_string()
+                .into_bytes()
+        })
+        .create_async()
+        .await;
+
+    vec![tip, newest_block, block_time]
 }
 
 /// A block whose one transaction is a top-level escrow Deposit, shaped the way the fill's
@@ -868,6 +915,7 @@ async fn the_fill_imports_the_deposit_that_explains_custody() {
 }
 
 /// Custody read from behind our own ledger must stop the boot, not produce a verdict.
+/// The checkpoint is the custody read's floor, so the read itself is refused as stale.
 ///
 /// The checkpoint says slots up to 899 are indexed while the custody read only speaks for
 /// slot 890. There is no slot at which the two can be compared: the ledger cannot be
@@ -904,15 +952,12 @@ async fn custody_read_from_behind_the_ledger_stops_startup() {
         .expect("startup must terminate rather than compare across a gap it cannot close")
         .expect("run task must not panic");
 
+    // The committed checkpoint is the read's floor, so the node is refused as stale.
     match result {
-        Err(IndexerError::Reconciliation(ReconciliationError::CustodyBehindLedger {
-            snapshot_slot,
-            committed,
-        })) => {
-            assert_eq!(snapshot_slot, 890);
-            assert_eq!(committed, 899);
+        Err(IndexerError::Reconciliation(ReconciliationError::CustodyStale { floor, .. })) => {
+            assert_eq!(floor, 899);
         }
-        other => panic!("expected a fail-closed custody-behind-ledger halt, got {other:?}"),
+        other => panic!("expected a fail-closed stale-custody halt, got {other:?}"),
     }
 
     chain.shutdown().await;
@@ -1205,6 +1250,7 @@ fn mock_channel_supply(rpc: &MockRpcServer, supply: u64) {
     mint_state.pack_into_slice(&mut buf);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
 
+    mock_fresh_channel_clock(rpc);
     let reply = Reply::result(json!({
         "context": {"slot": MOCK_TIP},
         "value": {
@@ -1249,6 +1295,108 @@ async fn backfill_disabled_counts_completed_withdrawals_when_the_checkpoint_is_b
     assert!(
         !handle.is_finished(),
         "a shortfall a completed withdrawal explains must not abort the boot: {:?}",
+        (&mut handle).await
+    );
+
+    handle.abort();
+    chain.shutdown().await;
+}
+
+/// Answer every custody owner-list call with `reply(call)` as the JSON-RPC body's tail.
+async fn mock_scripted_custody(
+    rpc: &mut MockitoServer,
+    reply: impl Fn(usize) -> serde_json::Value + Send + Sync + 'static,
+) -> (mockito::Mock, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let mock = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getTokenAccountsByOwner"}),
+        ))
+        .with_status(200)
+        .with_body_from_request(move |_| {
+            let mut body = reply(counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+            body["jsonrpc"] = json!("2.0");
+            body["id"] = json!(1);
+            body.to_string().into_bytes()
+        })
+        .create_async()
+        .await;
+    (mock, calls)
+}
+
+fn custody_at(slot: u64) -> serde_json::Value {
+    json!({"result": {"context": {"slot": slot}, "value": []}})
+}
+
+/// A no-backfill boot against a node behind Solana's newest block: refusals and stale
+/// answers are retried, then the boot exits with `CustodyStale` for the supervisor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_boot_exits_when_custody_stays_stale() {
+    init_tracing();
+    let (_pg, _pool, postgres) = start_postgres("startup_nofill_stale").await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let instance = Pubkey::new_unique();
+    let _anchor = mock_solana_anchor(&mut rpc, MOCK_TIP - 5).await;
+    let (_custody, calls) = mock_scripted_custody(&mut rpc, |call| match call {
+        0 => json!({"error": {"code": -32016, "message": "Minimum context slot has not been reached"}}),
+        _ => custody_at(MOCK_TIP - 10),
+    })
+    .await;
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("a stale node must end the boot, not hang it")
+        .expect("run task must not panic");
+
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(ReconciliationError::CustodyStale {
+                floor,
+                ..
+            })) if floor == MOCK_TIP - 5
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3 * 5,
+        "three reads of five inner tries, then the boot stops"
+    );
+    chain.shutdown().await;
+}
+
+/// The same node catching up after a few stale answers lets the boot through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_boot_continues_once_custody_is_fresh() {
+    init_tracing();
+    let (_pg, _pool, postgres) = start_postgres("startup_nofill_fresh").await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let instance = Pubkey::new_unique();
+    let _anchor = mock_solana_anchor(&mut rpc, MOCK_TIP - 5).await;
+    let (_custody, _calls) = mock_scripted_custody(&mut rpc, |call| match call {
+        0 => json!({"error": {"code": -32016, "message": "Minimum context slot has not been reached"}}),
+        1..=4 => custody_at(MOCK_TIP - 10),
+        _ => custody_at(MOCK_TIP),
+    })
+    .await;
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let mut handle = spawn_indexer_with(postgres, rpc.url(), chain.url(), instance, None, None);
+
+    // One stale attempt and its pause, then a clean empty-state reconcile.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(
+        !handle.is_finished(),
+        "a node that caught up must not stop the boot: {:?}",
         (&mut handle).await
     );
 

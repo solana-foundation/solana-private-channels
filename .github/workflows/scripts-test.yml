@@ -15,7 +15,7 @@ on:
       - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
   pull_request:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit, audit/apex-audit-scan-remediation]
     paths:
       - "scripts/**"
       - "versions.env"
