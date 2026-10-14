@@ -275,6 +275,28 @@ fn drill_1_error_message_contracts_present_in_source() {
             "no signatures to verify, remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
         ),
+        (
+            "remint attempt cap reached",
+            "indexer/src/operator/sender/remint.rs",
+        ),
+        // Pre-broadcast requeue cap (Path I). The marker text lives in
+        // recovery.rs; both escalation sites must keep using it.
+        (
+            "requeue cap reached before this attempt broadcast",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, build/sign failed",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, chain state unreadable",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, never handed to the sender",
+            "indexer/src/operator/processor.rs",
+        ),
         // Withdrawal, recovery worker. The signatureless-row verdicts; the
         // proof-gated requeue never reaches manual review, so only the two
         // terminal ones are dispatchable.
@@ -354,6 +376,11 @@ fn drill_1_error_message_contracts_present_in_source() {
         let content = join_continuations(
             &std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}")),
         );
+        // Production code only: a test asserting on the text must not satisfy the contract.
+        let content = content
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or_default();
         if content.contains(substr) {
             eprintln!("OK   {path}: {substr:?}");
         } else {

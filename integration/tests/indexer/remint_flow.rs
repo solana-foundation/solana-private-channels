@@ -847,3 +847,120 @@ async fn coverage_is_certified_by_the_bitmap_slot_not_a_lagging_get_slot() {
     );
     mock.shutdown().await;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// (g) A remint the channel rejects every time escalates at the attempt cap.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Each call sends a fresh MintTo that finalizes with an error. The next call
+// proves it dead and would resend forever; after `MAX` dead attempts the next
+// call must page a human instead of sending again.
+#[tokio::test]
+async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
+    // Mirrors the private cap in `sender/remint.rs`.
+    const MAX: usize = 3;
+    let mock = MockRpcServer::start().await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    let txn_id: i64 = 7_004;
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
+
+    let failed_status = json!({
+        "slot": 42,
+        "confirmations": null,
+        "err": { "InstructionError": [0, { "Custom": 1 }] },
+        "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
+        "confirmationStatus": "finalized"
+    });
+    for _ in 0..MAX {
+        // A repeated blockhash would sign the same bytes, so every attempt would share one signature.
+        mock.enqueue(
+            "getLatestBlockhash",
+            Reply::result(json!({
+                "context": { "slot": 1 },
+                "value": {
+                    "blockhash": solana_sdk::hash::Hash::new_unique().to_string(),
+                    "lastValidBlockHeight": 100
+                }
+            })),
+        );
+        mock.enqueue("sendTransaction", send_transaction_echo_reply());
+        mock.enqueue(
+            "getSignatureStatuses",
+            Reply::result(json!({ "context": { "slot": 42 }, "value": [failed_status] })),
+        );
+        let status = failed_status.clone();
+        mock.enqueue(
+            "getSignatureStatusSnapshot",
+            Reply::dynamic(move |req| {
+                let requested = req["params"][0].as_array().map_or(0, Vec::len);
+                json!({
+                    "blockHeight": 200,
+                    "firstAvailableBlock": 0,
+                    "value": vec![status.clone(); requested],
+                })
+            }),
+        );
+    }
+
+    for call in 1..=MAX {
+        let entry = make_pending_remint(
+            txn_id,
+            34,
+            vec![Signature::new_unique()],
+            0,
+            make_remint_info(txn_id),
+        );
+        let outcome = test_hooks::execute_deferred_remint(&state, entry, &storage_tx).await;
+        assert!(
+            matches!(
+                outcome,
+                test_hooks::DeferredRemintOutcome::DeferInFlight(..)
+            ),
+            "call {call}: a fresh attempt is reconciled on the next tick"
+        );
+        assert!(storage_rx.try_recv().is_err(), "call {call}: no status yet");
+    }
+
+    let journal: Vec<String> = storage_mock.remint_signatures.lock().unwrap()[&txn_id]
+        .iter()
+        .map(|stored| stored.signature.clone())
+        .collect();
+    let distinct: std::collections::HashSet<&String> = journal.iter().collect();
+    assert_eq!(journal.len(), MAX);
+    assert_eq!(distinct.len(), MAX, "every attempt is its own MintTo");
+
+    let entry = make_pending_remint(
+        txn_id,
+        34,
+        vec![Signature::new_unique()],
+        0,
+        make_remint_info(txn_id),
+    );
+    let outcome = test_hooks::execute_deferred_remint(&state, entry, &storage_tx).await;
+    assert!(matches!(
+        outcome,
+        test_hooks::DeferredRemintOutcome::Resolved
+    ));
+    let update = storage_rx
+        .try_recv()
+        .expect("the capped remint must escalate");
+    assert_eq!(update.status, TransactionStatus::ManualReview);
+    assert!(update.remint_attempted);
+    let message = update.error_message.expect("escalation carries a message");
+    assert!(message.contains("remint attempt cap reached"), "{message}");
+    for sig in &journal {
+        assert!(message.contains(sig), "{message} must name {sig}");
+    }
+    assert!(storage_rx.try_recv().is_err(), "exactly one escalation");
+
+    for method in [
+        "getLatestBlockhash",
+        "sendTransaction",
+        "getSignatureStatuses",
+        "getSignatureStatusSnapshot",
+    ] {
+        assert_eq!(mock.call_count(method), MAX, "{method}");
+    }
+    mock.shutdown().await;
+}
