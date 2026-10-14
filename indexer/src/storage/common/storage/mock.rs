@@ -28,6 +28,8 @@ type EnvelopeBounds = (Option<u64>, Option<u64>);
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
+    /// Checkpoint reads answered in order before the stored value, for a ledger moving mid-test.
+    pub checkpoint_script: std::sync::Arc<Mutex<std::collections::VecDeque<u64>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
@@ -129,6 +131,11 @@ impl MockStorage {
             });
         }
         Ok(())
+    }
+
+    /// Answer the next committed-checkpoint reads with `slots`, in order, for any program.
+    pub fn script_checkpoints(&self, slots: Vec<u64>) {
+        self.checkpoint_script.lock().unwrap().extend(slots);
     }
 
     pub fn set_checkpoint(&self, program_type: &str, slot: u64) {
@@ -349,6 +356,9 @@ impl MockStorage {
         program_type: &str,
     ) -> Result<Option<u64>, StorageError> {
         self.check_should_fail("get_committed_checkpoint")?;
+        if let Some(slot) = self.checkpoint_script.lock().unwrap().pop_front() {
+            return Ok(Some(slot));
+        }
         Ok(self
             .committed_checkpoints
             .lock()
@@ -392,13 +402,15 @@ impl MockStorage {
                 .unwrap()
                 .insert(transaction_id, sigs);
         }
-        // Mirror the Postgres status filter (Processing or PendingRemint only).
+        // Mirror the Postgres status filter (Processing or PendingRemint only),
+        // and its refusal to set FailedReminted.
         let mut pending = self.pending_transactions.lock().unwrap();
         let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
             if matches!(
                 txn.status,
                 TransactionStatus::Processing | TransactionStatus::PendingRemint
-            ) {
+            ) && status != TransactionStatus::FailedReminted
+            {
                 txn.status = status;
                 if counterpart_signature.is_some() {
                     txn.counterpart_signature = counterpart_signature.clone();
@@ -1602,6 +1614,7 @@ impl MockStorage {
                 t.id == transaction_id
                     && t.status == TransactionStatus::Processing
                     && t.updated_at == expected_updated_at
+                    && t.landed_remint_signature.is_none()
             });
             // CAS miss: Postgres updates no row and never reaches the insert.
             if !owned {
@@ -1732,7 +1745,7 @@ impl MockStorage {
 
     /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
     /// attempts, then take the one live slot the partial unique index allows.
-    /// A moved parent writes nothing at all, supersedes included.
+    /// A moved parent, or a release recorded for the row's nonce, writes nothing at all.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -1742,6 +1755,13 @@ impl MockStorage {
         superseded_signatures: &[String],
     ) -> Result<RemintClaim, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
+        let nonce = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .and_then(|t| t.withdrawal_nonce);
         if self
             .moved_remint_parents
             .lock()
@@ -1749,6 +1769,9 @@ impl MockStorage {
             .contains(&transaction_id)
         {
             return Ok(RemintClaim::RowMoved);
+        }
+        if nonce.is_some_and(|nonce| self.observed_releases.lock().unwrap().contains_key(&nonce)) {
+            return Ok(RemintClaim::ReleaseObserved);
         }
         let mut map = self.remint_signatures.lock().unwrap();
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();
@@ -1818,20 +1841,27 @@ impl MockStorage {
 
     pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
         self.check_should_fail("gc_stale_remint_signatures")?;
-        // Mirror the Postgres predicate: keep sigs whose parent is still
-        // `PendingRemint`; an unknown transaction id counts as non-pending.
+        // Mirror the Postgres predicate: reclaim only sigs whose parent is
+        // terminal; an unknown transaction id is kept, matching the subquery.
         // The SQL reads one table, so the live mirror wins over the rehydration
         // list for any row that appears in both.
         let live = self.pending_transactions.lock().unwrap();
         let rehydrate = self.pending_remint_transactions.lock().unwrap();
-        let pending_remint_ids: std::collections::HashSet<i64> = live
+        let terminal_ids: std::collections::HashSet<i64> = live
             .iter()
             .chain(
                 rehydrate
                     .iter()
                     .filter(|t| !live.iter().any(|l| l.id == t.id)),
             )
-            .filter(|t| t.status == TransactionStatus::PendingRemint)
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TransactionStatus::Completed
+                        | TransactionStatus::Failed
+                        | TransactionStatus::FailedReminted
+                )
+            })
             .map(|t| t.id)
             .collect();
         drop(live);
@@ -1839,11 +1869,11 @@ impl MockStorage {
         let mut map = self.remint_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {
-            if pending_remint_ids.contains(txn_id) {
-                true
-            } else {
+            if terminal_ids.contains(txn_id) {
                 removed += sigs.len() as u64;
                 false
+            } else {
+                true
             }
         });
         Ok(removed)
