@@ -9,8 +9,8 @@ pub mod types;
 
 pub use mint::ConsumedClaims;
 pub(crate) use mint::{
-    check_consumed_mint, wait_for_address_index, ConsumedLookup, ConsumedSetCache,
-    INDEX_CATCH_UP_BUDGET,
+    check_consumed_mint, ensure_address_index, wait_for_address_index, ConsumedLookup,
+    ConsumedSetCache,
 };
 pub use mint::{
     enumerate_consumed_mints, extend_with_mint_history, ConsumedMint, ConsumedMintKind,

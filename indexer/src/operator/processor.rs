@@ -1952,7 +1952,7 @@ mod tests {
             vec![(SourceEventId::from_row(txn), consumed)],
         );
         (
-            crate::operator::sender::ConsumedClaims::new(cache, Arc::new(unreachable_rpc())),
+            crate::operator::sender::ConsumedClaims::new(cache, Arc::new(unreachable_rpc()), true),
             signature,
         )
     }

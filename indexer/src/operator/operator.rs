@@ -609,21 +609,12 @@ async fn build_consumed_claims(
         crate::config::ProgramType::Escrow => crate::storage::TransactionType::Deposit,
         crate::config::ProgramType::Withdraw => crate::storage::TransactionType::Withdrawal,
     };
-    // Waited for even with no mints yet: a mint allowed after boot is walked lazily, and
-    // its pre-boot history must already be indexed by then.
-    match channel_rpc.get_address_index_slot().await {
-        // Only core indexes addresses after the block lands; a node without the
-        // method writes its index with the block, so its history is complete.
-        Err(e) if crate::operator::utils::rpc_util::is_method_not_found(&e) => {
-            warn!("Channel RPC has no getAddressIndexSlot; its address index is synchronous");
-        }
-        _ => sender::wait_for_address_index(
-            channel_rpc,
-            sender::INDEX_CATCH_UP_BUDGET,
-            std::time::Duration::from_millis(500),
-        )
-        .await
-        .map_err(|reason| OperatorError::ConsumedSet { reason })?,
+    // With no mints yet the wait moves to the first lazy walk, so boot reads no channel RPC.
+    let index_ready = !storage.get_mint_addresses().await?.is_empty();
+    if index_ready {
+        sender::ensure_address_index(channel_rpc)
+            .await
+            .map_err(|reason| OperatorError::ConsumedSet { reason })?;
     }
     let cache = sender::ConsumedSetCache::build_at_boot(
         channel_rpc,
@@ -633,7 +624,11 @@ async fn build_consumed_claims(
     )
     .await
     .map_err(|reason| OperatorError::ConsumedSet { reason })?;
-    Ok(sender::ConsumedClaims::new(cache, channel_rpc.clone()))
+    Ok(sender::ConsumedClaims::new(
+        cache,
+        channel_rpc.clone(),
+        index_ready,
+    ))
 }
 
 /// How long boot waits for a lagging channel tip to reach the fence slot.

@@ -492,6 +492,26 @@ pub async fn extend_with_mint_history(
         .map(|(added, _)| added)
 }
 
+/// Wait for the channel address index unless the node indexes addresses with the block.
+pub(crate) async fn ensure_address_index(channel_rpc: &RpcClientWithRetry) -> Result<(), String> {
+    match channel_rpc.get_address_index_slot().await {
+        // Only core indexes addresses after the block lands; a node without the
+        // method writes its index with the block, so its history is complete.
+        Err(e) if crate::operator::utils::rpc_util::is_method_not_found(&e) => {
+            warn!("Channel RPC has no getAddressIndexSlot; its address index is synchronous");
+            Ok(())
+        }
+        _ => {
+            wait_for_address_index(
+                channel_rpc,
+                INDEX_CATCH_UP_BUDGET,
+                std::time::Duration::from_millis(500),
+            )
+            .await
+        }
+    }
+}
+
 /// How long boot waits for the channel address index to reach the newest block.
 pub(crate) const INDEX_CATCH_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -741,14 +761,34 @@ impl ConsumedSetCache {
 pub struct ConsumedClaims {
     cache: std::sync::Arc<tokio::sync::Mutex<ConsumedSetCache>>,
     rpc: std::sync::Arc<RpcClientWithRetry>,
+    /// Set once the address index has caught up. Boot with no mints skips the wait, so the
+    /// first lazy walk does it and sees every mint landed before it.
+    index_ready: std::sync::Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl ConsumedClaims {
-    pub(crate) fn new(cache: ConsumedSetCache, rpc: std::sync::Arc<RpcClientWithRetry>) -> Self {
+    pub(crate) fn new(
+        cache: ConsumedSetCache,
+        rpc: std::sync::Arc<RpcClientWithRetry>,
+        index_ready: bool,
+    ) -> Self {
+        let ready = if index_ready {
+            tokio::sync::OnceCell::new_with(Some(()))
+        } else {
+            tokio::sync::OnceCell::new()
+        };
         Self {
             cache: std::sync::Arc::new(tokio::sync::Mutex::new(cache)),
             rpc,
+            index_ready: std::sync::Arc::new(ready),
         }
+    }
+
+    async fn ensure_index_ready(&self) -> Result<(), String> {
+        self.index_ready
+            .get_or_try_init(|| ensure_address_index(&self.rpc))
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn lookup(
@@ -756,6 +796,7 @@ impl ConsumedClaims {
         storage: &Storage,
         row: &DbTransaction,
     ) -> Result<ConsumedLookup, String> {
+        self.ensure_index_ready().await?;
         self.cache
             .lock()
             .await
@@ -769,6 +810,7 @@ impl ConsumedClaims {
         mint: &Pubkey,
         id: &SourceEventId,
     ) -> Result<Option<ConsumedMint>, String> {
+        self.ensure_index_ready().await?;
         self.cache
             .lock()
             .await

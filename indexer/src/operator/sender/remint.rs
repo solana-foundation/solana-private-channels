@@ -1619,6 +1619,7 @@ mod tests {
                 vec![(info.source_event_id.clone(), consumed(info.amount))],
             ),
             state.source_rpc_client.clone(),
+            true,
         ));
         match attempt_remint(&state, &info).await {
             RemintAttempt::Confirmed(signature) => assert_eq!(signature, landed),
@@ -1632,6 +1633,7 @@ mod tests {
                 vec![(info.source_event_id.clone(), consumed(1))],
             ),
             state.source_rpc_client.clone(),
+            true,
         ));
         assert!(matches!(
             attempt_remint(&state, &info).await,
