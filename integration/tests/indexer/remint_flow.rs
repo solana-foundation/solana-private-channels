@@ -213,6 +213,8 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
 
     let txn_id: i64 = 7_777;
     let info = make_remint_info(txn_id);
+    // The PendingRemint row this remint resolves.
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
 
     let prior_remint_sig = Signature::from_str(
         "4BxWw1FjwQCHXWkrK4ZehPWauFTPhBafSr9m8Cuht73LG73nUs3wfuJ6gigkhNppP4pYogP5pQDENbE5nQx1Qp4B",
@@ -587,10 +589,12 @@ async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
 #[tokio::test]
 async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_001;
     let info = make_remint_info(txn_id);
+    // The PendingRemint row this remint resolves.
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
 
     // No journaled attempt, so classification is skipped: send + confirm happy path.
     mock.enqueue("getLatestBlockhash", blockhash_reply());

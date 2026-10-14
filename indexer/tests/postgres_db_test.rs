@@ -1260,12 +1260,16 @@ async fn seed_withdrawal(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let row = make_db_transaction(tag, TransactionType::Withdrawal);
     let id = storage.insert_db_transaction(&row).await?;
-    sqlx::query("UPDATE transactions SET status = $2::transaction_status, withdrawal_nonce = $3 WHERE id = $1")
-        .bind(id)
-        .bind(status)
-        .bind(nonce)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = $2::transaction_status, withdrawal_nonce = $3,
+         landed_remint_signature = $4 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(nonce)
+    .bind(landed_remint_for(status))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1986,9 +1990,11 @@ async fn release_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::
         let txn = make_db_transaction(&format!("rel_gc_{status}"), ty);
         let id = storage.insert_db_transaction(&txn).await?;
         sqlx::query(&format!(
-            "UPDATE transactions SET status = '{status}'::transaction_status WHERE id = $1"
+            "UPDATE transactions SET status = '{status}'::transaction_status,
+             landed_remint_signature = $2 WHERE id = $1"
         ))
         .bind(id)
+        .bind(landed_remint_for(status))
         .execute(&pool)
         .await?;
         storage
@@ -2010,6 +2016,122 @@ async fn release_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::
             "status '{status}' signature retention mismatch (survive={survive})"
         );
     }
+    Ok(())
+}
+
+/// A non-terminal row can still have a remint in flight, so only a terminal
+/// parent lets the GC reclaim its remint journal.
+#[tokio::test(flavor = "multi_thread")]
+async fn remint_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // (status, must_survive)
+    let cases = [
+        ("pending", true),
+        ("processing", true),
+        ("parked", true),
+        ("pending_remint", true),
+        ("manual_review", true),
+        ("completed", false),
+        ("failed", false),
+        ("failed_reminted", false),
+    ];
+
+    let mut ids = Vec::new();
+    for (status, survive) in cases {
+        let txn = make_db_transaction(&format!("remint_gc_{status}"), TransactionType::Withdrawal);
+        let id = storage.insert_db_transaction(&txn).await?;
+        // The claim only journals against a pending_remint parent.
+        sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        assert_eq!(
+            storage
+                .claim_remint_attempt(id, format!("remint-{status}"), 1, None, &[])
+                .await?,
+            RemintClaim::Claimed
+        );
+        sqlx::query(&format!(
+            "UPDATE transactions SET status = '{status}'::transaction_status,
+             landed_remint_signature = $2 WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(landed_remint_for(status))
+        .execute(&pool)
+        .await?;
+        ids.push((status, id, survive));
+    }
+
+    let removed = storage.gc_stale_remint_signatures().await?;
+    let expected_removed = ids.iter().filter(|(_, _, survive)| !survive).count() as u64;
+    assert_eq!(
+        removed, expected_removed,
+        "GC must drop only the terminal rows' journals"
+    );
+    for (status, id, survive) in ids {
+        let present = !storage.get_remint_signatures(id).await?.is_empty();
+        assert_eq!(
+            present, survive,
+            "status '{status}' journal retention mismatch (survive={survive})"
+        );
+    }
+    Ok(())
+}
+
+/// Only `record_remint_result` may set `failed_reminted`, because only it stores
+/// the landed signature with it. The generic status write must refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn generic_status_write_cannot_set_failed_reminted() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("generic_failed_reminted", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let written = storage
+        .update_transaction_status(
+            id,
+            TransactionStatus::FailedReminted,
+            None,
+            Utc::now(),
+            None,
+        )
+        .await?;
+
+    assert!(!written, "the generic write must not set failed_reminted");
+    assert_eq!(status_of(&pool, id).await, "pending_remint");
+    Ok(())
+}
+
+/// A reminted row must carry the remint that refunded it, whoever writes it:
+/// without one, nothing can tell a later re-arm that the row was already refunded.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_reminted_requires_a_landed_signature() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("reminted_without_signature", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    let bare = sqlx::query("UPDATE transactions SET status = 'failed_reminted' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await;
+    assert!(
+        matches!(&bare, Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23514")),
+        "failed_reminted without a signature must violate the check: {bare:?}"
+    );
+
+    sqlx::query(
+        "UPDATE transactions SET status = 'failed_reminted', landed_remint_signature = 'remint-landed'
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    assert_eq!(status_of(&pool, id).await, "failed_reminted");
     Ok(())
 }
 
@@ -2302,12 +2424,21 @@ async fn seed_with_status(
     let id = storage
         .insert_db_transaction(&make_db_transaction(sig, txn_type))
         .await?;
-    sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
-        .bind(id)
-        .bind(status)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = $2::transaction_status, landed_remint_signature = $3
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(landed_remint_for(status))
+    .execute(pool)
+    .await?;
     Ok(id)
+}
+
+/// A reminted row must carry its landed remint (table CHECK); no other status does.
+fn landed_remint_for(status: &str) -> Option<String> {
+    (status == "failed_reminted").then(|| "remint-landed".to_string())
 }
 
 /// I1: the promote CAS refuses every source status but `manual_review` and
@@ -2842,6 +2973,133 @@ async fn claim_is_refused_while_halted() -> Result<(), Box<dyn std::error::Error
     );
     assert_eq!(storage.get_release_signatures(id).await?.len(), 1);
     Ok(())
+}
+
+/// A row with a landed remint was already refunded, so the release claim refuses
+/// it even with a valid token: paying it out would credit the user twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_is_refused_for_a_reminted_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim_reminted",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing', landed_remint_signature = 'remint-landed'
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    let token = updated_at_of(&pool, id).await;
+
+    let refused = storage
+        .claim_and_persist_signature(id, token, "sig-reminted".to_string(), 1, None)
+        .await?;
+
+    assert!(refused.is_none(), "a reminted row must not be released");
+    assert!(storage.get_release_signatures(id).await?.is_empty());
+    Ok(())
+}
+
+/// The halt sweep must copy a journal that a concurrent claim commits while the
+/// sweep waits on its row lock, or the quarantined row carries no evidence and
+/// can never clear itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_copies_the_journal_of_a_claim_it_waited_on(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let nonce = 100_i64;
+    let signature = "claim-release-signature";
+    let last_valid_block_height = 777_i64;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "quarantine_race",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing', withdrawal_nonce = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(nonce)
+    .execute(&pool)
+    .await?;
+
+    // Mirrors claim_and_persist_signature, held open so the sweep has to wait on it.
+    let mut claim = pool.begin().await?;
+    sqlx::query(
+        "UPDATE transactions SET updated_at = NOW() WHERE id = $1 AND status = 'processing'",
+    )
+    .bind(id)
+    .execute(&mut *claim)
+    .await?;
+
+    let sweep_storage = storage.clone();
+    let sweep = tokio::spawn(async move {
+        sweep_storage
+            .quarantine_active_withdrawals(None, Some(nonce))
+            .await
+    });
+    wait_for_lock_waiter(&pool, &sweep).await;
+
+    sqlx::query(
+        "INSERT INTO pending_release_signatures (transaction_id, signature, last_valid_block_height)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(id)
+    .bind(signature)
+    .bind(last_valid_block_height)
+    .execute(&mut *claim)
+    .await?;
+    claim.commit().await?;
+
+    assert_eq!(sweep.await??, 1);
+    let (status, signatures, heights): (String, Option<Vec<String>>, Option<Vec<i64>>) =
+        sqlx::query_as(
+            "SELECT status::text, remint_signatures, remint_last_valid_block_heights
+             FROM transactions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "manual_review");
+    assert_eq!(signatures, Some(vec![signature.to_string()]));
+    assert_eq!(heights, Some(vec![last_valid_block_height]));
+    let stalled = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
+        .await?;
+    assert_eq!(
+        stalled.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![id],
+        "the copied journal lets the row clear itself"
+    );
+    Ok(())
+}
+
+/// Waits until some backend is blocked on a lock. Panics if none does, so a
+/// regression fails the test instead of hanging it. Returns early if `task`
+/// already finished, so the caller's await surfaces its real error.
+async fn wait_for_lock_waiter<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) {
+    for _ in 0..500 {
+        if task.is_finished() {
+            return;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the quarantine sweep never waited on the claim's row lock");
 }
 
 /// A halt-refused row that never broadcast goes back to Pending without spending a
