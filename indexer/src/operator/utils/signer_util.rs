@@ -416,7 +416,7 @@ async fn install(cell: &OnceLock<Signers>, env: Env<'_>) -> Result<(), String> {
 }
 
 /// Binaries call `init_signers` first; this sync fallback only serves tests and tools that
-/// never do, and it refuses Privy instead of blocking inside the runtime.
+/// never do. It cannot build Privy, so it panics naming `init_signers` instead of blocking.
 fn signers() -> &'static Signers {
     SIGNERS.get_or_init(|| {
         load_signers_sync(&process_env)
@@ -540,8 +540,8 @@ mod tests {
         }
     }
 
-    /// The SOLA13-75 regression: a configured operator that will not load is an error,
-    /// never a silent fallback to the admin key.
+    /// A configured operator that will not load is an error, never a silent fallback to the
+    /// admin key.
     #[test]
     fn operator_spec_set_must_load() {
         let msg = spec_err(SignerRole::Operator, &[(OPERATOR_SIGNER, "memory")]);
@@ -598,8 +598,8 @@ mod tests {
         );
     }
 
-    /// The SOLA13-17 regression: Privy on the sync path is a config error, not a nested
-    /// `block_on` panic inside the running runtime.
+    /// The sync loader returns an error naming `init_signers` for Privy instead of nesting
+    /// `block_on` inside the runtime. Its only caller, `signers()`, panics with that error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn privy_on_the_sync_path_errors_instead_of_panicking() {
         let env = env_of(&[
@@ -619,8 +619,8 @@ mod tests {
         assert!(err.contains("ADMIN_PRIVY_APP_ID not set"), "got: {err}");
     }
 
-    /// Complete credentials reach the awaited Privy constructor. A nested `block_on` would
-    /// panic on the first poll; the fake wallet only ever yields an error or the timeout.
+    /// Only guards against a nested `block_on` coming back, which panics on the first poll.
+    /// The fake credentials go to the real Privy API, so an error or the timeout both pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn privy_init_awaits_the_constructor_inside_a_runtime() {
         let env = env_of(&[

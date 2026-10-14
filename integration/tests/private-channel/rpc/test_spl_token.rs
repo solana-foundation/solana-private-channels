@@ -1,7 +1,10 @@
 use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{
     RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
 };
+use solana_commitment_config::CommitmentConfig;
+use solana_system_interface::instruction::transfer;
 
 use {
     anyhow::Result,
@@ -87,18 +90,38 @@ async fn request_airdrops(
 }
 
 /// Initialize the escrow instance and allow the mint on Solana test validator
-async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> {
+/// Fund the admin, create the instance and add the operator. Setup runs it before the
+/// indexers and operators start, since they refuse an instance that does not exist yet.
+pub async fn setup_solana_escrow_instance(
+    validator_url: &str,
+    faucet: &Keypair,
+    operator_key: &Keypair,
+    escrow_instance: &Keypair,
+) -> Result<()> {
+    let client =
+        RpcClient::new_with_commitment(validator_url.to_string(), CommitmentConfig::processed());
     println!("\n=== Setting up PrivateChannel escrow instance on test validator ===");
+    let fund = Transaction::new_signed_with_payer(
+        &[transfer(
+            &faucet.pubkey(),
+            &operator_key.pubkey(),
+            AIRDROP_LAMPORTS,
+        )],
+        Some(&faucet.pubkey()),
+        &[faucet],
+        client.get_latest_blockhash().await?,
+    );
+    client.send_and_confirm_transaction(&fund).await?;
 
     // Derive instance PDA
     let (instance_pda, instance_bump) = Pubkey::find_program_address(
-        &[b"instance", solana_ctx.escrow_instance.pubkey().as_ref()],
+        &[b"instance", escrow_instance.pubkey().as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
-    println!("Instance seed: {}", solana_ctx.escrow_instance.pubkey());
+    println!("Instance seed: {}", escrow_instance.pubkey());
     println!("Instance PDA: {} (bump: {})", instance_pda, instance_bump);
 
-    if let Ok(_pda_account) = solana_ctx.client.get_account(&instance_pda).await {
+    if let Ok(_pda_account) = client.get_account(&instance_pda).await {
         println!("Instance PDA account found, skipping creation");
         return Ok(());
     }
@@ -110,25 +133,25 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
     );
 
     let create_instance_ix = CreateInstanceBuilder::new()
-        .payer(solana_ctx.operator_key.pubkey())
-        .admin(solana_ctx.operator_key.pubkey())
-        .instance_seed(solana_ctx.escrow_instance.pubkey())
+        .payer(operator_key.pubkey())
+        .admin(operator_key.pubkey())
+        .instance_seed(escrow_instance.pubkey())
         .instance(instance_pda)
         .withdrawal_bitmap(withdrawal_bitmap_pda)
         .bump(instance_bump)
         .bitmap_bump(bitmap_bump)
         .instruction();
 
-    let blockhash = solana_ctx.get_latest_blockhash().await?;
+    let blockhash = client.get_latest_blockhash().await?;
     let create_instance_tx = Transaction::new_signed_with_payer(
         &[create_instance_ix],
-        Some(&solana_ctx.operator_key.pubkey()),
-        &[&solana_ctx.operator_key, &solana_ctx.escrow_instance],
+        Some(&operator_key.pubkey()),
+        &[operator_key, escrow_instance],
         blockhash,
     );
 
-    let sig = solana_ctx
-        .send_transaction(&create_instance_tx)
+    let sig = client
+        .send_and_confirm_transaction(&create_instance_tx)
         .await
         .unwrap();
     println!("Escrow instance created: {}", sig);
@@ -136,7 +159,7 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
     println!(
         "Escrow instance PDA: {} {}",
         instance_pda,
-        solana_ctx.get_balance(&instance_pda).await?
+        client.get_balance(&instance_pda).await?
     );
 
     // Add the operator to the escrow instance
@@ -145,29 +168,32 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
         &[
             b"operator",
             instance_pda.as_ref(),
-            solana_ctx.operator_key.pubkey().as_ref(),
+            operator_key.pubkey().as_ref(),
         ],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
 
     let add_operator_ix = AddOperatorBuilder::new()
-        .payer(solana_ctx.operator_key.pubkey())
-        .admin(solana_ctx.operator_key.pubkey())
+        .payer(operator_key.pubkey())
+        .admin(operator_key.pubkey())
         .instance(instance_pda)
-        .operator(solana_ctx.operator_key.pubkey())
+        .operator(operator_key.pubkey())
         .operator_pda(operator_pda)
         .bump(operator_bump)
         .instruction();
 
-    let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
+    let blockhash = client.get_latest_blockhash().await.unwrap();
     let add_operator_tx = Transaction::new_signed_with_payer(
         &[add_operator_ix],
-        Some(&solana_ctx.operator_key.pubkey()),
-        &[&solana_ctx.operator_key],
+        Some(&operator_key.pubkey()),
+        &[operator_key],
         blockhash,
     );
 
-    let sig = solana_ctx.send_transaction(&add_operator_tx).await.unwrap();
+    let sig = client
+        .send_and_confirm_transaction(&add_operator_tx)
+        .await
+        .unwrap();
     println!("Operator added to escrow instance: {}", sig);
     println!("Operator PDA: {} (bump: {})", operator_pda, operator_bump);
 
@@ -347,8 +373,6 @@ async fn setup_solana_accounts(
         panic!("Unsupported token program ID: {}", token_program_id);
     };
     println!("Mint created: {}", sig);
-
-    setup_solana_escrow_instance(solana_ctx).await?;
 
     allow_mint_on_escrow_instance(solana_ctx, mint_keypair, token_program_id).await?;
 

@@ -3,13 +3,22 @@ set -euo pipefail
 
 # Deploy preflight refuses a config the binaries will not honour, and env.j2 renders one
 # instance variable, explicit signer backends and the compiled program IDs.
-# Needs ansible-playbook (and solana-keygen for the preflight cases); skips without them.
+# Needs ansible-playbook (and solana-keygen for the preflight cases); skips without them,
+# except in CI (CI=true), where a missing tool fails the run.
 # Run from the repo root: ./scripts/tests/ansible-preflight.test.sh
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+skip() {
+  if [[ "${CI:-}" == true ]]; then
+    echo "FAIL: CI cannot skip $1" >&2
+    exit 1
+  fi
+  echo "skip: $1"
+}
+
 if ! command -v ansible-playbook >/dev/null; then
-  echo "skip: ansible-playbook not installed"
+  skip "the playbook tests (ansible-playbook missing)"
   exit 0
 fi
 
@@ -104,7 +113,7 @@ test_syntax() {
 
 test_preflight_cases() {
   if ! command -v solana-keygen >/dev/null; then
-    echo "skip: preflight cases (solana-keygen missing)"
+    skip "preflight cases (solana-keygen missing)"
     return
   fi
   solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/admin.json" >/dev/null
@@ -134,7 +143,7 @@ test_preflight_cases() {
   expect_services devnet_instance yes "${devnet[@]}" -e escrow_instance_id=$INSTANCE
   expect_services mainnet_instance yes "${devnet[@]}" -e network=mainnet -e escrow_instance_id=$INSTANCE
 
-  # A redeploy keeps the PDA a previous render left in .env, with no var set (SOLA13-67).
+  # A redeploy keeps the PDA a previous render left in .env, with no var set.
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
   expect_services devnet_preserved_instance yes "${devnet[@]}"
   # A validator that boots with --reset wipes the PDA a previous render kept, even when
@@ -142,12 +151,16 @@ test_preflight_cases() {
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$INSTANCE" >"$data/config/.env"
   expect_services localnet_reset_drops_preserved_instance no "${common[@]}"
   expect_services localnet_validator_reset_drops_preserved_instance no "${common[@]}" -e reset_state=false
+  # reset_state wipes the validator volume whatever validator_reset says.
+  expect_services localnet_state_reset_drops_preserved_instance no "${common[@]}" -e validator_reset=false
   expect_services localnet_kept_ledger_keeps_instance yes "${common[@]}" "${kept[@]}"
   rm "$data/config/.env"
   # The reset wipes an explicitly named instance too; a create_instance seed is random.
   expect_refused localnet_reset_with_named_instance "a localnet reset wipes" "${common[@]}" -e escrow_instance_id=$INSTANCE
   expect_refused localnet_validator_reset_with_named_instance "a localnet reset wipes" "${common[@]}" \
     -e escrow_instance_id=$INSTANCE -e reset_state=false
+  expect_refused localnet_state_reset_with_named_instance "a localnet reset wipes" "${common[@]}" \
+    -e escrow_instance_id=$INSTANCE -e validator_reset=false
   expect_services localnet_named_instance_kept_ledger yes "${common[@]}" -e escrow_instance_id=$INSTANCE \
     -e reset_state=false -e validator_reset=false
   printf 'COMMON_ESCROW_INSTANCE_ID=%s\n' "$PLACEHOLDER" >"$data/config/.env"

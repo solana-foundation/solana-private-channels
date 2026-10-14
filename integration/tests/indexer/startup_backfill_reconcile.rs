@@ -14,6 +14,8 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
+use helpers::{mock_instance_account, test_instance};
+
 #[path = "setup.rs"]
 #[allow(dead_code)]
 mod setup;
@@ -329,6 +331,8 @@ async fn mock_escrow_custody_at(
         })
         .collect();
 
+    // The startup instance check reads the instance before custody.
+    let instance_account = mock_instance_account(rpc).await;
     let sweep = rpc
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(
@@ -380,7 +384,7 @@ async fn mock_escrow_custody_at(
         .create_async()
         .await;
 
-    vec![sweep, allowed_mints]
+    vec![instance_account, sweep, allowed_mints]
 }
 
 /// A block whose one transaction is a top-level escrow Deposit, shaped the way the fill's
@@ -749,7 +753,7 @@ async fn unexplainable_mismatch_still_halts_startup() {
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
     // Escrow custody holds nothing, so nothing backs the phantom row.
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     // Only the supply invariant reads this, and it errors on every method, so each mint
@@ -798,7 +802,7 @@ async fn the_fill_imports_the_deposit_that_explains_custody() {
     init_tracing();
     let (_pg, pool, postgres) = start_postgres("startup_backfill_import").await;
 
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let mint = Pubkey::new_unique();
     let deposit_slot = MOCK_START_SLOT + 2;
     seed_allowed_mint(&pool, &mint.to_string()).await;
@@ -892,7 +896,7 @@ async fn custody_read_from_behind_the_ledger_stops_startup() {
 
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody_at(&mut rpc, instance, &[], 890).await;
 
     let chain = MockRpcServer::start().await;
@@ -932,7 +936,7 @@ async fn the_live_source_resumes_where_the_fill_stopped() {
     init_tracing();
     let (_pg, pool, postgres) = start_postgres("startup_backfill_resume").await;
 
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let mint = Pubkey::new_unique();
     // Custody is measured here; the fill covers up to it and stops.
     let custody_slot = MOCK_TIP - 3;
@@ -1050,7 +1054,7 @@ async fn matching_ledger_reconciles_after_the_fill_and_startup_continues() {
 
     let mut rpc = MockitoServer::new_async().await;
     let _range = mock_fill_range(&mut rpc).await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[(mint.clone(), PHANTOM_AMOUNT)]).await;
 
     let chain = MockRpcServer::start().await;
@@ -1104,7 +1108,7 @@ async fn start_slot_ahead_of_checkpoint_refuses_startup() {
 
     let mut rpc = MockitoServer::new_async().await;
     // Custody is captured before the floor is resolved, so that read still has to succeed.
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
     // The fill never starts, so no slot is ever enumerated.
     let no_enumeration = rpc
@@ -1150,7 +1154,7 @@ async fn rpc_polling_start_slot_ahead_of_checkpoint_refuses_startup() {
     seed_checkpoint(&pool, "escrow", stale_checkpoint).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
@@ -1235,7 +1239,7 @@ async fn backfill_disabled_counts_completed_withdrawals_when_the_checkpoint_is_b
     seed_completed_withdrawal(&pool, &mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
@@ -1268,7 +1272,7 @@ async fn backfill_disabled_still_aborts_on_a_shortfall_no_completion_explains() 
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
@@ -1308,7 +1312,7 @@ async fn backfill_disabled_compares_when_the_checkpoint_reaches_the_snapshot() {
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     let chain = MockRpcServer::start().await;
@@ -1348,7 +1352,7 @@ async fn backfill_disabled_with_a_lagging_checkpoint_still_enforces_the_supply_i
     seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
 
     // Custody holds nothing, so any supply at all is supply the escrow cannot honour.
@@ -1382,7 +1386,7 @@ async fn live_source_resumes_from_checkpoint_when_nothing_configures_a_start() {
     seed_checkpoint(&pool, "escrow", checkpoint).await;
 
     let mut rpc = MockitoServer::new_async().await;
-    let instance = Pubkey::new_unique();
+    let instance = test_instance();
     let _custody = mock_escrow_custody(&mut rpc, instance, &[]).await;
     // Answering the tip proves the resume slot is not taken from it.
     let _slot = rpc

@@ -162,7 +162,12 @@ cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin allow_mint -- 
 
 echo ""
 echo "=== Step 4: Update .env ==="
-sedi "s/^COMMON_ESCROW_INSTANCE_ID=.*/COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID/" .env
+# An .env from before the rename has no COMMON_ line to replace, so append one.
+if grep -q '^COMMON_ESCROW_INSTANCE_ID=' .env; then
+    sedi "s/^COMMON_ESCROW_INSTANCE_ID=.*/COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID/" .env
+else
+    echo "COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID" >> .env
+fi
 export COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID
 echo "Updated .env with COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID"
 

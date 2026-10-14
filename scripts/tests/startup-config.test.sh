@@ -3,13 +3,22 @@ set -euo pipefail
 
 # Startup config contract: one instance variable, explicit signer backends, program IDs
 # pinned to the compiled ones, operator metrics on loopback.
-# The compose checks need `docker compose` and jq; they are skipped without them.
+# The compose checks need `docker compose` and jq; they are skipped without them, except
+# in CI (CI=true), where a missing tool fails the run.
 # Run from the repo root: ./scripts/tests/startup-config.test.sh
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+skip() {
+  if [[ "${CI:-}" == true ]]; then
+    echo "FAIL: CI cannot skip $1" >&2
+    exit 1
+  fi
+  echo "skip: $1"
+}
 
 failures=0
 fail() {
@@ -53,6 +62,15 @@ test_program_ids_are_the_compiled_ones() {
   local common=private-channel-deploy/vars/common.yml
   grep -qx "compiled_escrow_program_id: ${ESCROW_ID}" "$common" || fail "common.yml compiled escrow id"
   grep -qx "compiled_withdraw_program_id: ${WITHDRAW_ID}" "$common" || fail "common.yml compiled withdraw id"
+  # The hard-coded IDs the indexer and streamer watch must follow declare_id! too.
+  local watched=(
+    "indexer/src/indexer/datasource/common/parser/escrow.rs:${ESCROW_ID}"
+    "indexer/src/indexer/datasource/common/parser/withdraw.rs:${WITHDRAW_ID}"
+    "core/src/bin/streamer.rs:${ESCROW_ID}"
+  )
+  for entry in "${watched[@]}"; do
+    grep -q "\"${entry#*:}\"" "${entry%%:*}" || fail "${entry%%:*} does not watch ${entry#*:}"
+  done
   grep -qE '^(escrow|withdraw)_program_id:' private-channel-deploy/vars/dev.yml \
     && fail "vars/dev.yml still offers program IDs as config"
   pass "$start" "program IDs"
@@ -88,7 +106,7 @@ compose_json() {
 test_compose_interpolation() {
   local start=$failures
   if ! docker compose version >/dev/null 2>&1 || ! command -v jq >/dev/null; then
-    echo "skip: compose interpolation (docker compose or jq missing)"
+    skip "compose interpolation (docker compose or jq missing)"
     return
   fi
   local preserved=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz

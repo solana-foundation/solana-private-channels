@@ -631,7 +631,32 @@ pub async fn run(
                 },
             ));
         }
-        (ProgramType::Escrow, Some(_)) => {}
+        // rpc_url is Solana for the escrow indexer, where the instance lives.
+        (ProgramType::Escrow, Some(instance)) => {
+            let solana_rpc = crate::operator::utils::RpcClientWithRetry::with_retry_config(
+                common_config.rpc_url.clone(),
+                crate::operator::utils::RetryConfig::default(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            );
+            under_live_lock(&live_lock_lost, async {
+                use crate::operator::utils::InstanceCheckError;
+                crate::operator::utils::verify_escrow_instance(&solana_rpc, &instance)
+                    .await
+                    .map_err(|e| {
+                        IndexerError::from(match e {
+                            InstanceCheckError::Unreadable(reason) => {
+                                DataSourceError::Rpc(crate::error::DataSourceRpcError::Protocol {
+                                    reason,
+                                })
+                            }
+                            InstanceCheckError::Invalid(reason) => {
+                                DataSourceError::InvalidConfig { reason }
+                            }
+                        })
+                    })
+            })
+            .await?;
+        }
         _ => {
             info!("Startup reconciliation skipped (non-escrow program)");
         }

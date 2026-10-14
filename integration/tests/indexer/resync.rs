@@ -3246,6 +3246,7 @@ impl Stack {
             workers.push(
                 Worker::spawn(move || async move {
                     start_solana_to_private_channel_operator_with_config(
+                        rpc.clone(),
                         rpc,
                         db,
                         admin(),

@@ -61,7 +61,8 @@ BENCH_ENV="${BENCH_DIR}/.env"
 #                       running after the bench finishes (or is interrupted)
 #                       so logs and metrics can be collected for offline
 #                       analysis.  Stop them manually afterwards with
-#                       `docker compose -f <repo>/docker-compose.yml down`.
+#                       `docker compose -f <repo>/docker-compose.yml --env-file
+#                       <repo>/versions.env --env-file <bench>/.env down`.
 #
 # --private-channel-threads N  Pin Solana Private Channels service containers to the first N CPU cores
 #                     and the bench binary to the remaining cores.  When

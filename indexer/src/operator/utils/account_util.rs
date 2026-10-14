@@ -17,6 +17,8 @@ const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 
 /// Account-type tag the escrow program writes in the first byte of a bitmap.
 const WITHDRAWAL_BITMAP_DISCRIMINATOR: u8 = 3;
+/// Account-type tag the escrow program writes in the first byte of an instance.
+const INSTANCE_DISCRIMINATOR: u8 = 0;
 
 pub fn find_instance_pda(instance_seed: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -61,6 +63,59 @@ pub fn find_withdrawal_bitmap_pda_with_bump(instance_pda: &Pubkey) -> (Pubkey, u
 
 pub fn parse_instance(instance_data: &[u8]) -> Result<Instance, std::io::Error> {
     Instance::from_bytes(instance_data)
+}
+
+/// Why a configured instance was refused. An unreadable chain is not a config mistake.
+#[derive(Debug)]
+pub enum InstanceCheckError {
+    Unreadable(String),
+    Invalid(String),
+}
+
+/// Refuse a configured instance that is not a live escrow instance on chain. A stale or
+/// mistyped PDA would otherwise start healthy and silently match no deposit or release.
+pub async fn verify_escrow_instance(
+    rpc: &RpcClientWithRetry,
+    instance: &Pubkey,
+) -> Result<(), InstanceCheckError> {
+    let account = rpc
+        .get_account_with_context(instance, rpc.rpc_client.commitment())
+        .await
+        .map_err(|e| {
+            InstanceCheckError::Unreadable(format!(
+                "escrow instance {instance}: startup read failed: {e}"
+            ))
+        })?
+        .value
+        .ok_or_else(|| {
+            InstanceCheckError::Invalid(format!(
+                "escrow instance {instance} does not exist; check COMMON_ESCROW_INSTANCE_ID"
+            ))
+        })?;
+    check_instance_account(instance, &account.owner, &account.data)
+        .map_err(InstanceCheckError::Invalid)
+}
+
+/// Owned by the escrow program, tagged as an `Instance`, and the PDA of its own seed.
+pub fn check_instance_account(address: &Pubkey, owner: &Pubkey, data: &[u8]) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "escrow instance {address} {why}; check COMMON_ESCROW_INSTANCE_ID"
+        ))
+    };
+    if *owner != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
+        return refuse(&format!("is owned by {owner}, not the escrow program"));
+    }
+    let Some(instance) = parse_instance(data)
+        .ok()
+        .filter(|i| i.discriminator == INSTANCE_DISCRIMINATOR)
+    else {
+        return refuse("is not an escrow Instance account");
+    };
+    if find_instance_pda(&instance.instance_seed) != *address {
+        return refuse("is not the instance PDA of its own seed");
+    }
+    Ok(())
 }
 
 /// The consumed-nonce window the chain is currently enforcing.
@@ -244,6 +299,76 @@ pub fn bitmap_account_bytes(generation: u64, consumed: &[u64], bump: u8) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instance_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
+        borsh::to_vec(&Instance {
+            discriminator,
+            bump: 255,
+            version: 1,
+            instance_seed: seed,
+            admin: Pubkey::new_unique(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn instance_account_must_be_a_live_escrow_instance() {
+        let seed = Pubkey::new_unique();
+        let address = find_instance_pda(&seed);
+        let escrow = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+        let good = instance_bytes(INSTANCE_DISCRIMINATOR, seed);
+        assert_eq!(check_instance_account(&address, &escrow, &good), Ok(()));
+
+        let cases = [
+            (
+                "not the escrow program",
+                address,
+                SYSTEM_PROGRAM_ID,
+                good.clone(),
+            ),
+            (
+                "not an escrow Instance",
+                address,
+                escrow,
+                instance_bytes(3, seed),
+            ),
+            ("not an escrow Instance", address, escrow, vec![0u8; 4]),
+            (
+                "of its own seed",
+                Pubkey::new_unique(),
+                escrow,
+                good.clone(),
+            ),
+        ];
+        for (want, address, owner, data) in cases {
+            let err = check_instance_account(&address, &owner, &data).unwrap_err();
+            assert!(
+                err.contains(want) && err.contains("COMMON_ESCROW_INSTANCE_ID"),
+                "want {want:?}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_instance_account_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
+            .create_async()
+            .await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            crate::operator::utils::RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let err = verify_escrow_instance(&rpc, &Pubkey::new_unique()).await;
+        assert!(
+            matches!(&err, Err(InstanceCheckError::Invalid(msg)) if msg.contains("does not exist")),
+            "got: {err:?}"
+        );
+    }
 
     fn pk(i: u8) -> Pubkey {
         let mut b = [0u8; 32];

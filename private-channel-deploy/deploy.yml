@@ -653,11 +653,15 @@
       changed_when: false
       check_mode: false
 
-    # A validator that boots with --reset wipes the ledger on every start, even when Postgres
-    # is kept, so a kept PDA would name an account that is gone.
+    # The validator ledger is wiped when it boots with --reset, or when reset_state deletes
+    # its volume, so a kept or named PDA would name an account that is gone.
+    - name: Decide whether this run wipes the localnet ledger
+      ansible.builtin.set_fact:
+        _localnet_ledger_wiped: "{{ network == 'localnet' and (validator_reset | default(true) | bool or reset_state | default(false) | bool) }}"
+
     - name: Set escrow_instance_id_pda from existing .env if present and non-placeholder
       when:
-      - not (network == 'localnet' and validator_reset | default(true) | bool)
+      - not (_localnet_ledger_wiped | bool)
       - _existing_instance_id.stdout | default('') | trim | length > 0
       - _existing_instance_id.stdout | trim != '11111111111111111111111111111111'
       - escrow_instance_id_pda is not defined
@@ -678,7 +682,7 @@
           scripts/devnet) and set escrow_instance_id to its address.
 
     - name: Refuse a named instance that a localnet reset is about to wipe
-      when: network == 'localnet' and validator_reset | default(true) | bool
+      when: _localnet_ledger_wiped | bool
       ansible.builtin.assert:
         that: escrow_instance_id | default('', true) | length == 0
         fail_msg: |
@@ -1300,6 +1304,15 @@
     # `up -d --wait` blocks until each service's healthcheck passes (or fails).
     # That's the bulk of the deploy-time gating; the explicit health phase
     # below is the second layer (HTTP probes from the control node).
+    # `up` only touches the services it lists, so workers from an earlier deploy would
+    # keep running against the instance this run dropped.
+    - name: Remove the workers when there is no instance
+      when: not (_workers_enabled | default(true) | bool)
+      ansible.builtin.shell: "{{ compose_cmd }} rm --stop --force {{ compose_services_workers }}"
+      args:
+        chdir: "{{ target_config_dir }}"
+      changed_when: true
+
     - name: Bring stack up
       ansible.builtin.shell: "{{ compose_cmd }} up -d --wait {{ compose_services }}"
       args:

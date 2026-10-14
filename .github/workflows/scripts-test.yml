@@ -55,6 +55,17 @@ jobs:
       - name: Install jq
         run: command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
 
+      # ansible-preflight.test.sh runs the deploy playbook's config asserts.
+      - name: Install ansible-core
+        run: |
+          command -v ansible-playbook >/dev/null && exit 0
+          python3 -m venv "$RUNNER_TEMP/ansible" || {
+            sudo apt-get update && sudo apt-get install -y python3-venv
+            python3 -m venv "$RUNNER_TEMP/ansible"
+          }
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet 'ansible-core>=2.16'
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+
       - name: Run script tests
         run: |
           for test_script in scripts/tests/*.test.sh; do

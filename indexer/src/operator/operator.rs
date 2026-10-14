@@ -158,6 +158,23 @@ pub async fn run(
         ))
     });
 
+    // The instance lives on Solana: the withdraw destination, the escrow operator's source.
+    let solana_rpc = match common_config.program_type {
+        crate::config::ProgramType::Withdraw => Some(&rpc_client),
+        crate::config::ProgramType::Escrow => source_rpc_client.as_ref(),
+    }
+    .ok_or_else(|| OperatorError::InvalidConfig("source_rpc_url required".to_string()))?;
+    under_live_lock(&live_lock_lost, async {
+        use crate::operator::utils::InstanceCheckError;
+        crate::operator::utils::verify_escrow_instance(solana_rpc, &escrow_instance)
+            .await
+            .map_err(|e| match e {
+                InstanceCheckError::Unreadable(msg) => OperatorError::RpcError(msg),
+                InstanceCheckError::Invalid(msg) => OperatorError::InvalidConfig(msg),
+            })
+    })
+    .await?;
+
     let (processor_tx, processor_rx) = mpsc::channel(config.channel_buffer_size);
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
