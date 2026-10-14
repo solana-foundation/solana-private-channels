@@ -135,10 +135,11 @@ pub fn v0_memo_transaction(
     // Index 3 is the first lookup-supplied key; 1 is the static recipient.
     let recipient_index = if ix_uses_lookup { 3 } else { 1 };
     let message = VersionedMessage::V0(v0::Message {
+        // `to` is read-only: a writable key only a Memo is given is refused as unused.
         header: MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,
-            num_readonly_unsigned_accounts: 1,
+            num_readonly_unsigned_accounts: 2,
         },
         account_keys: vec![from.pubkey(), *to, spl_memo::id()],
         recent_blockhash,

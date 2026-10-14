@@ -477,8 +477,15 @@ pub async fn run(
             Some((CriticalTask::Reconciliation, joined))
         }
     };
-    if let Some((task, _)) = &exited {
+    if let Some((task, joined)) = &exited {
         critical_exit(pt_label, task.as_label());
+        // Logged here, since a lost lock or a failed drain below returns early.
+        if let Err(join_error) = joined {
+            error!(
+                task = task.as_label(),
+                "Critical operator task failed: {}", join_error
+            );
+        }
     }
 
     // A critical task dying and the lock going are one failure when the database is what
@@ -526,16 +533,15 @@ pub async fn run(
     if let Err(e) = unless_joined(promotion_handle, CriticalTask::ReleasePromotion, joined).await {
         error!("Release promotion join error during shutdown: {}", e);
     }
-    // Reported once the others have drained.
-    if let Some((task, Err(join_error))) = &exited {
-        error!(
-            task = task.as_label(),
-            "Critical operator task failed: {}", join_error
-        );
-    }
 
     info!("Operator shutdown complete");
-    Ok(())
+    // A worker dying is a failure, so the process must exit nonzero for its supervisor.
+    match exited {
+        Some((task, _)) => Err(OperatorError::CriticalTaskExited {
+            task: task.as_label(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Reconcile in-flight releases, then diff the on-chain bitmap against the
@@ -740,8 +746,8 @@ async fn stop_boot_writer(
 /// Log + metric for a critical task that exited before cancellation.
 ///
 /// We don't abort the process here: the caller falls through to `shutdown_operator`, so
-/// the workers still running get the usual graceful shutdown. The process exits once it
-/// returns, and the supervisor restarts the operator.
+/// the workers still running get the usual graceful shutdown. `run` then returns
+/// `CriticalTaskExited`, so the process exits nonzero and the supervisor restarts it.
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,

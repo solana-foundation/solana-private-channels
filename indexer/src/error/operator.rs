@@ -54,4 +54,9 @@ pub enum OperatorError {
         "The {program_type:?} sender lock was lost during the boot pre-flight; refusing to start"
     )]
     SenderLockLostAtBoot { program_type: crate::ProgramType },
+
+    /// A supervised worker exited on its own. Returned after the rest drain, so the process
+    /// exits nonzero and its supervisor treats the stop as a failure.
+    #[error("Critical operator task {task} exited; the operator stopped")]
+    CriticalTaskExited { task: &'static str },
 }

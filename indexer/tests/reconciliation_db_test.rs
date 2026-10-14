@@ -1,13 +1,16 @@
 //! Integration tests for the reconciliation storage queries.
 //!
 //! Covers the ledger balance aggregate shared by startup and runtime
-//! reconciliation, the durable halt flag and the in-flight envelope.
+//! reconciliation, the manual reconcile command run against it, the durable halt
+//! flag and the in-flight envelope.
 //!
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bigdecimal::BigDecimal;
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
-    error::{IndexerError, StorageError},
+    error::{IndexerError, ReconciliationError, StorageError},
     indexer::reconciliation::run_manual_reconciliation,
     storage::{
         common::{
@@ -18,6 +21,11 @@ use private_channel_indexer::{
     PostgresConfig, ReconciliationConfig,
 };
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_token::{
+    solana_program::{program_option::COption, program_pack::Pack},
+    state::Mint,
+};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use testcontainers::runners::AsyncRunner;
@@ -197,6 +205,128 @@ async fn unpinned_withdrawals_at(
         .find(|r| r.mint_address == mint)
         .ok_or("mint missing from the aggregate")?;
     Ok(row.total_withdrawals)
+}
+
+/// Serve the RPC reads a reconcile makes for one allowed `mint`, all at `slot`: the
+/// instance ATA holding `custody`, and a channel supply equal to it so only the ledger
+/// comparison can fail.
+async fn mock_escrow_rpc(
+    instance: &Pubkey,
+    mint: &Pubkey,
+    custody: u64,
+    slot: u64,
+) -> mockito::ServerGuard {
+    let mut server = mockito::Server::new_async().await;
+
+    let ata = get_associated_token_address_with_program_id(instance, mint, &spl_token::id());
+    let token_sweep = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": [{
+                "pubkey": ata.to_string(),
+                "account": {
+                    "lamports": 2_039_280u64,
+                    "owner": spl_token::id().to_string(),
+                    "executable": false,
+                    "rentEpoch": 0,
+                    "space": 165,
+                    "data": {
+                        "program": "spl-token",
+                        "space": 165,
+                        "parsed": {
+                            "type": "account",
+                            "info": {
+                                "mint": mint.to_string(),
+                                "owner": instance.to_string(),
+                                "tokenAmount": {
+                                    "amount": custody.to_string(),
+                                    "decimals": 6,
+                                    "uiAmount": null,
+                                    "uiAmountString": custody.to_string()
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+        .with_body(token_sweep.to_string())
+        .create_async()
+        .await;
+
+    let empty_sweep = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"context": {"slot": slot}, "value": []}
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+        .with_body(empty_sweep.to_string())
+        .create_async()
+        .await;
+
+    // The sweep only checks that the mint's AllowedMint PDA is escrow-owned.
+    let allowed_mint_pda = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": [{
+                "lamports": 1_000_000u64,
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "data": ["", "base64"]
+            }]
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({"method": "getMultipleAccounts"}),
+        ))
+        .with_body(allowed_mint_pda.to_string())
+        .create_async()
+        .await;
+
+    let mut mint_data = vec![0u8; Mint::LEN];
+    Mint {
+        mint_authority: COption::Some(Pubkey::new_unique()),
+        supply: custody,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    }
+    .pack_into_slice(&mut mint_data);
+    let channel_mint = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": slot},
+            "value": {
+                "lamports": 1_000_000u64,
+                "owner": spl_token::id().to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "data": [STANDARD.encode(&mint_data), "base64"]
+            }
+        }
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
+        .with_body(channel_mint.to_string())
+        .create_async()
+        .await;
+
+    server
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -626,31 +756,87 @@ async fn release_counts_at_the_bound_not_above() -> Result<(), Box<dyn std::erro
 }
 
 /// Custody moves when a deposit lands and when a release lands, not when the operator
-/// finishes either. A stuck deposit still backs custody and a release still left it, so
-/// neither may wait on its row's status.
+/// finishes either. A manual reconcile must count a stuck deposit as backing custody and a
+/// release whose row trails as having left it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stuck_deposit_and_a_trailing_release_both_count(
+async fn manual_reconciliation_counts_a_stuck_deposit_and_a_trailing_release(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
-    let mint = Pubkey::new_unique().to_string();
-    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
-    insert_transaction(&pool, "d_done", &mint, 100, "deposit", "completed", 100).await?;
+    let instance = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let mint_address = mint.to_string();
+    let deposit = 100;
+    let release = 50;
+    let custody_slot = 100;
+    insert_mint(&pool, &mint_address, 6, &spl_token::id().to_string()).await?;
+    insert_transaction(
+        &pool,
+        "d_done",
+        &mint_address,
+        deposit,
+        "deposit",
+        "completed",
+        50,
+    )
+    .await?;
     insert_transaction(
         &pool,
         "d_stuck",
-        &mint,
-        100,
+        &mint_address,
+        deposit,
         "deposit",
         "manual_review",
-        100,
+        50,
     )
     .await?;
-    let nonce = insert_withdrawal(&pool, "w_trailing", &mint, 50, "processing", 100).await?;
-    observe_release(&storage, nonce, 150).await?;
+    let nonce = insert_withdrawal(
+        &pool,
+        "w_trailing",
+        &mint_address,
+        release,
+        "processing",
+        60,
+    )
+    .await?;
+    observe_release(&storage, nonce, 70).await?;
+    storage
+        .update_committed_checkpoint("escrow", custody_slot)
+        .await?;
+    let storage = Arc::new(storage);
+    let config = ReconciliationConfig::default();
 
-    let at_200 = storage.get_mint_balances_for_reconciliation(200).await?;
-    assert_eq!(at_200[0].total_deposits, BigDecimal::from(200u64));
-    assert_eq!(at_200[0].total_withdrawals, BigDecimal::from(50u64));
+    // Both deposits back custody and the release has left it, so 150 passes only if the
+    // processing row's release was subtracted.
+    let healthy = mock_escrow_rpc(&instance, &mint, 2 * deposit - release, custody_slot).await;
+    run_manual_reconciliation(
+        &config,
+        &storage,
+        &healthy.url(),
+        Some(&healthy.url()),
+        &instance,
+    )
+    .await?;
+
+    // One deposit is what counting completed rows alone expects, so the deleted script
+    // passed it. The stuck deposit makes it a shortfall.
+    let drained = mock_escrow_rpc(&instance, &mint, deposit, custody_slot).await;
+    let result = run_manual_reconciliation(
+        &config,
+        &storage,
+        &drained.url(),
+        Some(&drained.url()),
+        &instance,
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::MismatchExceedsThreshold { count: 1, .. }
+            ))
+        ),
+        "custody short of the stuck deposit must be reported: {result:?}"
+    );
     Ok(())
 }
 

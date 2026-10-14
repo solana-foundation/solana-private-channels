@@ -27,6 +27,7 @@ package.version = "0.1.0"
 package.edition = "2021"
 
 [workspace.dependencies]
+agave-reserved-account-keys = { version = "4.2", features = ["agave-unstable-api"] }
 anyhow = "1.0.100"
 argon2 = "0.5"
 async-channel = "2"

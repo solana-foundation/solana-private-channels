@@ -1,3 +1,5 @@
+use crate::accounts::precompiles::PRECOMPILES;
+use agave_reserved_account_keys::ReservedAccountKeys;
 use private_channel_withdraw_program_client::{
     instructions::SET_WITHDRAW_CONFIG_DISCRIMINATOR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
@@ -105,20 +107,45 @@ pub fn lists_native_mint(tx: &SanitizedTransaction) -> bool {
 
 /// Rejection reason for a writable key that no instruction is given.
 pub const UNUSED_WRITABLE_ACCOUNT: &str =
-    "Every writable account other than the fee payer must be passed to an instruction";
+    "Every writable account other than the fee payer must be passed to an instruction other than Memo";
 
 /// The scheduler write-locks every writable key, so one no instruction uses would
 /// serialize unrelated transactions on that account. A CPI can only reach accounts
-/// its outer instruction was given, so forwarding still works.
+/// its outer instruction was given, so forwarding still works. Memo never writes, so a
+/// key only a Memo is given counts as unused.
 pub fn has_unused_writable_account(tx: &SanitizedTransaction) -> bool {
     let message = tx.message();
     let used: HashSet<usize> = message
         .program_instructions_iter()
+        .filter(|(program_id, _)| **program_id != spl_memo::id())
         .flat_map(|(_, ix)| ix.accounts.iter().map(|&index| usize::from(index)))
         .collect();
     // Index 0 is the fee payer, writable without being passed to an instruction.
     (1..message.account_keys().len())
         .any(|index| message.is_writable(index) && !used.contains(&index))
+}
+
+/// Every key the runtime reserves: sysvars and builtin programs.
+static RESERVED_KEYS: LazyLock<HashSet<Pubkey>> =
+    LazyLock::new(|| ReservedAccountKeys::all_keys_iter().copied().collect());
+
+/// Rejection reason for a writable program or reserved key.
+pub const WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT: &str =
+    "Program, sysvar and other reserved accounts must not be writable";
+
+/// Honest txs read-lock the programs, system program and sysvars they list, so a write
+/// lock on one serializes all of them. Admission sanitizes with no reserved keys, so
+/// only a program the tx itself calls is demoted to read-only.
+pub fn has_writable_program_or_reserved_account(tx: &SanitizedTransaction) -> bool {
+    let message = tx.message();
+    message
+        .account_keys()
+        .iter()
+        .enumerate()
+        .any(|(index, key)| {
+            message.is_writable(index)
+                && (PRECOMPILES.contains_key(key) || RESERVED_KEYS.contains(key))
+        })
 }
 
 /// Rejection reason shared by every admission path, so clients see one wording.

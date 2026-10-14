@@ -242,7 +242,7 @@ Solana Private Channels restricts which programs can execute in the payment chan
 
 A transaction that lists the spl-token native mint (`So11111111111111111111111111111111111111112`) in its account keys is also rejected. spl-token builds a native (wSOL) account without loading the mint, so refusing the key is what keeps fabricated gasless lamports from becoming wSOL.
 
-A writable account other than the fee payer that no instruction is given is rejected too (`-32602`, "Every writable account other than the fee payer must be passed to an instruction"): the scheduler write-locks every writable key, so an unused one would serialize unrelated transactions on that account.
+A writable account other than the fee payer that no instruction is given, or only a Memo (which never writes), is rejected too (`-32602`, "Every writable account other than the fee payer must be passed to an instruction other than Memo"): the scheduler write-locks every writable key, so an unused one would serialize unrelated transactions on that account. A writable program, sysvar or other reserved key is rejected even when an instruction is given it (`-32602`, "Program, sysvar and other reserved accounts must not be writable"), since honest transactions read-lock those keys and would all serialize behind it.
 
 **Source**: [`is_allowed_program_instruction` in `core/src/transactions.rs`](../core/src/transactions.rs) (predicate), [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs) (enforcement)
 
