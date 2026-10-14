@@ -621,12 +621,15 @@ async fn run_withdraw_preflight(
     .await;
     match verdict {
         // Once the sender lock is lost, report that instead of a read error.
-        // A divergence is still reported as itself.
+        // A verdict is still reported as itself.
         Err(e)
             if cancellation_token.is_cancelled()
                 && !matches!(
                     e,
-                    OperatorError::Program(crate::error::ProgramError::BitmapDivergence { .. })
+                    OperatorError::Program(
+                        crate::error::ProgramError::BitmapDivergence { .. }
+                            | crate::error::ProgramError::NonceFrontierBehindBitmap { .. }
+                    )
                 ) =>
         {
             warn!("Withdrawal bitmap check failed after the sender lock was lost: {e}");
@@ -1373,7 +1376,7 @@ mod tests {
         }
     }
 
-    /// A lost sender lock explains a failed read, but must never hide a real divergence.
+    /// A lost sender lock explains a failed read, but must never hide a real verdict.
     #[tokio::test]
     async fn preflight_lock_loss_outranks_only_a_non_verdict() {
         let lost = CancellationToken::new();
@@ -1398,7 +1401,7 @@ mod tests {
         let (result, _) = run_preflight_capturing(
             Arc::new(Storage::Mock(completed_withdrawal(7))),
             make_rpc_client(&server.url()),
-            lost,
+            lost.clone(),
         )
         .await;
         assert!(
@@ -1409,6 +1412,25 @@ mod tests {
                 ))
             ),
             "a divergence must be reported even after the lock is lost: {result:?}"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let _account = mock_bitmap_account(&mut server, 1, &[]);
+        let (result, _) = run_preflight_capturing(
+            Arc::new(Storage::Mock(MockStorage::new())),
+            make_rpc_client(&server.url()),
+            lost,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::NonceFrontierBehindBitmap { .. }
+                ))
+            ),
+            "a database behind the chain must be reported even after the lock is lost: {result:?}"
         );
     }
 

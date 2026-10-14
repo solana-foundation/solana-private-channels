@@ -72,7 +72,7 @@ async fn read_target_mint_account(
 }
 
 /// A hook read that could not be proven fresh: transient, and counted so lag is visible
-/// apart from a genuinely missing validation account.
+/// apart from a plain RPC outage.
 fn hook_freshness_miss(reason: String) -> OperatorError {
     crate::metrics::OPERATOR_TRANSACTION_ERRORS
         .with_label_values(&["withdraw", "hook_freshness_unproven"])

@@ -7,9 +7,9 @@
 //! the operator's resolution against real account data.
 //!
 //! Two scenarios:
-//! 1. A hook mint with a valid `ExtraAccountMetaList` releases normally. The
-//!    release can only land if the operator resolved and attached the hook
-//!    accounts, since Token-2022 rejects the transfer without them.
+//! 1. A hook mint with a valid `ExtraAccountMetaList` releases normally, and the
+//!    hook logs the six accounts Token-2022 hands it only when the operator
+//!    resolved and attached the list.
 //! 2. A hook mint with no validation account releases with only the hook
 //!    program forwarded, which Token-2022 runs with the four base accounts.
 
@@ -33,12 +33,14 @@ use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 use solana_system_interface::{instruction::create_account, program::ID as SYSTEM_PROGRAM_ID};
+use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
@@ -66,6 +68,10 @@ use uuid::Uuid;
 const INIT_EXTRA_ACCOUNT_METAS_TAG: u8 = 0;
 
 const WITHDRAW_AMOUNT: u64 = 50_000;
+
+/// What the fixture hook logs when Token-2022 hands it the resolved list: source, mint,
+/// destination, authority, the validation PDA, and the one declared extra.
+const HOOK_LOG: &str = "hook accounts: 6";
 
 // ---------------------------------------------------------------------------
 // Local helpers
@@ -407,9 +413,9 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The release lands only if the operator resolved the mint's
-/// `ExtraAccountMetaList` and appended the hook accounts: Token-2022 rejects the
-/// transfer when any of them is missing.
+/// The hook sees its validation account and the declared extra only if the operator
+/// resolved the mint's `ExtraAccountMetaList` and appended them. The fixture accepts
+/// any account count, so the count it logs is the proof, not the release landing.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -463,6 +469,43 @@ async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn 
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // The fixture hook accepts any account count, so only the count it logged proves the
+    // operator attached the resolved list rather than the hook program alone.
+    let release_sig = loop {
+        let recorded = db::get_transaction(&env.pool, &withdrawal_sig)
+            .await?
+            .filter(|row| row.status == "completed")
+            .and_then(|row| row.counterpart_signature);
+        if let Some(signature) = recorded {
+            break signature.parse::<Signature>()?;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("hook-mint withdrawal recorded no release signature within 90s".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let release = env
+        .client
+        .get_transaction_with_config(
+            &release_sig,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Json),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .await?;
+    let logs = release
+        .transaction
+        .meta
+        .and_then(|meta| Option::<Vec<String>>::from(meta.log_messages))
+        .unwrap_or_default();
+    assert_eq!(
+        logs.iter().filter(|log| log.contains(HOOK_LOG)).count(),
+        1,
+        "the hook must run once with the resolved list: {logs:?}"
+    );
 
     operator_handle.shutdown().await;
     Ok(())

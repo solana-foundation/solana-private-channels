@@ -213,11 +213,14 @@ such release would end in manual review.
 
 ### Resolution
 
-1. Confirm `escrow_instance_id` and the Solana `rpc_url` name the instance this
+1. Stop `indexer-private-channel` first. While the operator refuses, it keeps
+   numbering new withdrawals from this database's sequence; once they reach the
+   chain's highest nonce the check passes and those withdrawals land in manual review.
+2. Confirm `escrow_instance_id` and the Solana `rpc_url` name the instance this
    database serves.
-2. If this database replaced the one that served the instance, restore that one. Do
+3. If this database replaced the one that served the instance, restore that one. Do
    not fast-forward `withdrawal_nonce_seq` by hand.
-3. Otherwise follow [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) § "Do not
+4. Otherwise follow [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) § "Do not
    resync; stand up a fresh instance", and [escalate](_escalation.md) (Tier 2).
 
 ---
