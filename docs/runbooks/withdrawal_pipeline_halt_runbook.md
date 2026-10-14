@@ -309,9 +309,12 @@ UPDATE transactions
    Run [`_verify_onchain_release.md`](_verify_onchain_release.md) on that signature and note
    the recipient token account and amount from the transaction. Anything but `LANDED`:
    stop and [escalate](_escalation.md).
-3. Find the burn it paid: the withdrawal row with that recipient and amount whose burn slot
-   is before the release slot and that no other release has been tied to. If no row fits,
-   or more than one fits, **stop and escalate**: guessing pays someone twice.
+3. Find the burn it paid: the withdrawal row with that recipient and amount that no other
+   release has been tied to and whose burn landed before the release. The chains number
+   slots independently, so compare block times, never slots: `getBlockTime(<row slot>)` on
+   the channel RPC against `getBlockTime(<release slot>)` on the Solana RPC. If no row fits,
+   more than one fits, or a block time is unavailable, **stop and escalate**: guessing pays
+   someone twice.
 4. Give the row the released nonce and complete it, in one transaction. Another row may
    hold that nonce after the renumbering, so move it to a fresh nonce first:
 
