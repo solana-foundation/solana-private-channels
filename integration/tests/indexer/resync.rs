@@ -699,7 +699,8 @@ async fn seed_pending_deposit(db_url: &str, signature: &str) {
 }
 
 /// Slot of every seeded row: above any slot a test validator reaches, so a seed never sits
-/// below the genesis a test resyncs from.
+/// below the genesis a test resyncs from. A resync refuses to wipe a row above its tip, so a
+/// test whose resync reaches the wipe moves its seed into the replay range first.
 const SEED_SLOT: i64 = 1_000_000_000;
 
 /// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
@@ -1022,6 +1023,14 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_sig_001'"
+        ),
+    )
+    .await;
 
     seed_withdrawal_side(&db_url).await;
     let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
@@ -2274,6 +2283,15 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         script_channel_floor(&mock);
         let sentinel = format!("rotation_sentinel_{}", &case[..1]);
         seed_pending_deposit(&db_url, &sentinel).await;
+        // Inside the replay range, since a refused case leaves it for the next discovery.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {} WHERE signature = '{sentinel}'",
+                h.genesis
+            ),
+        )
+        .await;
         let rows_before = row_count(&db_url).await;
         let status_before = status_of(&db_url, &dep).await.status;
 
@@ -2679,6 +2697,14 @@ async fn resync_refuses_while_a_worker_holds_the_live_lock(
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_live_lock_seed'"
+        ),
+    )
+    .await;
     let service = make_resync_service(rpc_url, storage);
     run_resync(&service, current_slot)
         .await
@@ -2805,6 +2831,14 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
     // Recent slots only, so every block is retrievable, and one round trip per slot
     // so the fill is long enough to still be running when the lock goes.
     let genesis_slot = current_slot.saturating_sub(BACKFILL_SPAN_SLOTS);
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {genesis_slot} WHERE signature = 'resync_lock_lost_seed'"
+        ),
+    )
+    .await;
 
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_url.clone(),
@@ -2891,13 +2925,10 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         Err(StorageError::UnfinishedResync { .. })
     ));
 
-    // A rerun of the same program finishes the rebuild and clears it.
-    let current_slot = {
-        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
-        client.get_slot()?
-    };
+    // A rerun of the same program finishes the rebuild and clears it. It starts from the same
+    // genesis, since the marker keeps the deleted seed's slot as the lowest a rerun may use.
     let rerun = make_resync_service(rpc_url, new_storage(&db_url).await);
-    run_resync(&rerun, current_slot)
+    run_resync(&rerun, genesis_slot)
         .await
         .expect("a same-program rerun must finish the interrupted resync");
     assert_eq!(marker(&db_url).await, None);

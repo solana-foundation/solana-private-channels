@@ -4417,9 +4417,10 @@ async fn serviced_rows_pages_by_id() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// P1b. The earliest slot is the lowest row of the resync's own type, whatever its status.
+/// P1b. The earliest and latest slots are the lowest and highest row of the resync's own
+/// type, whatever its status.
 #[tokio::test(flavor = "multi_thread")]
-async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn std::error::Error>> {
+async fn resync_blockers_slot_bounds_are_per_program() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
     let earliest = |ty| {
         let storage = &storage;
@@ -4430,11 +4431,16 @@ async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn st
                 .map(|b| b.earliest_slot)
         }
     };
+    let latest = |ty| {
+        let storage = &storage;
+        async move { storage.get_resync_blockers(ty).await.map(|b| b.latest_slot) }
+    };
     assert_eq!(
         earliest(TransactionType::Deposit).await?,
         None,
         "empty table"
     );
+    assert_eq!(latest(TransactionType::Deposit).await?, None, "empty table");
 
     for (sig, ty, status, slot) in [
         ("dep_late", TransactionType::Deposit, "pending", 500),
@@ -4455,6 +4461,8 @@ async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn st
     }
     assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
     assert_eq!(earliest(TransactionType::Withdrawal).await?, Some(7));
+    assert_eq!(latest(TransactionType::Deposit).await?, Some(500));
+    assert_eq!(latest(TransactionType::Withdrawal).await?, Some(7));
 
     sqlx::query("DELETE FROM transactions WHERE transaction_type = 'withdrawal'")
         .execute(&pool)
@@ -4464,11 +4472,17 @@ async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn st
         None,
         "the other program's rows never count"
     );
+    assert_eq!(
+        latest(TransactionType::Withdrawal).await?,
+        None,
+        "the other program's rows never count"
+    );
     assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+    assert_eq!(latest(TransactionType::Deposit).await?, Some(500));
     Ok(())
 }
 
-/// P1c. An interrupted wipe keeps the lowest slot it deleted until the resync completes.
+/// P1c. An interrupted wipe keeps the lowest and highest slot it deleted until the resync completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4494,6 +4508,10 @@ async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
                 .map(|b| b.earliest_slot)
         }
     };
+    let latest = |ty| {
+        let storage = &storage;
+        async move { storage.get_resync_blockers(ty).await.map(|b| b.latest_slot) }
+    };
     seed("dep_early", TransactionType::Deposit, 100).await?;
     seed("dep_late", TransactionType::Deposit, 500).await?;
     seed("wd", TransactionType::Withdrawal, 7).await?;
@@ -4513,14 +4531,20 @@ async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
         Some(100),
         "the deleted rows still bound a rerun"
     );
+    assert_eq!(
+        latest(TransactionType::Deposit).await?,
+        Some(500),
+        "the deleted rows still bound a rerun"
+    );
     assert_eq!(earliest(TransactionType::Withdrawal).await?, Some(7));
 
-    // A partial rebuild above the bound, wiped again by the rerun, must not raise it.
+    // A partial rebuild inside the bounds, wiped again by the rerun, must not narrow them.
     seed("dep_rebuilt", TransactionType::Deposit, 300).await?;
     storage
         .wipe_program_fenced(&guard, ProgramType::Escrow)
         .await?;
     assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+    assert_eq!(latest(TransactionType::Deposit).await?, Some(500));
 
     seed("dep_lower", TransactionType::Deposit, 50).await?;
     assert_eq!(earliest(TransactionType::Deposit).await?, Some(50));
@@ -4533,6 +4557,11 @@ async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
         .await?;
     assert_eq!(
         earliest(TransactionType::Deposit).await?,
+        None,
+        "a completed resync drops the bound with its marker"
+    );
+    assert_eq!(
+        latest(TransactionType::Deposit).await?,
         None,
         "a completed resync drops the bound with its marker"
     );

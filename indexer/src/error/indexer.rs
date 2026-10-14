@@ -208,6 +208,16 @@ pub enum ReconciliationError {
         genesis_slot: u64,
         earliest_slot: i64,
     },
+
+    /// The wipe deletes every row of the program but the rebuild only replays up to its
+    /// top slot, so rows above it would be lost and later caught up as new pending work.
+    #[error(
+        "the rebuild replays only up to slot {to_slot}, below this program's latest row at \
+         slot {latest_slot}; the wipe would delete rows the rebuild never replays. Aborted \
+         before any delete, the database is intact. Rerun once the source RPC's tip reaches \
+         slot {latest_slot}"
+    )]
+    TipBelowExistingRows { to_slot: u64, latest_slot: i64 },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

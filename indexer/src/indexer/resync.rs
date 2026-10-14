@@ -763,13 +763,26 @@ impl ResyncService {
                 }
 
                 // Pre-flight 9: every serviced row must be in the final set. Pre-flight 2
-                // already refused rows below genesis, so every row checked here is one the
-                // rebuild re-creates.
+                // refused rows below genesis and pre-flight 10 refuses rows above to_slot, so
+                // every row checked here is one the rebuild re-creates.
                 self.refuse_if_serviced_rows_missing(&consumed).await?;
                 Some(consumed)
             }
             _ => None,
         };
+
+        // Pre-flight 10: the wipe deletes every own row but the rebuild replays only up to
+        // to_slot, so a row above it would be lost and later caught up as new pending work.
+        if let Some(latest_slot) = blockers.latest_slot {
+            if i128::from(to_slot) < i128::from(latest_slot) {
+                let refusal = ReconciliationError::TipBelowExistingRows {
+                    to_slot,
+                    latest_slot,
+                };
+                error!("Refusing to resync: {}", refusal);
+                return Err(refusal.into());
+            }
+        }
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
         // A loss verdict that was wrong leaves the session alive and holding the lock, so
@@ -1499,6 +1512,7 @@ mod tests {
             failed_withdrawals: true,
             observed_releases: true,
             earliest_slot: Some(1),
+            ..Default::default()
         };
         let rows_from = |slot| ResyncBlockers {
             earliest_slot: Some(slot),
@@ -1891,6 +1905,85 @@ mod tests {
         );
         assert!(mock.unfinished_resync.lock().unwrap().is_none());
         assert!(mock.reconciliation_halt.lock().unwrap().is_none());
+    }
+
+    /// A row above the rebuild's top slot would be wiped and never replayed, so resync refuses
+    /// before the wipe. The marker keeps that bound after an interrupted wipe deleted the row.
+    #[tokio::test]
+    async fn tip_below_latest_row_refuses_before_wipe() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        let _blocks = chain(
+            &mut server,
+            genesis,
+            tip,
+            &[(101, 100), (102, 101), (103, 102)],
+        );
+        let above_tip = 105;
+        // (case, row slot, deleted by an interrupted wipe first, refused)
+        let cases = [
+            ("live row above the tip", above_tip, false, true),
+            ("row an interrupted wipe deleted", above_tip, true, true),
+            ("row at the tip", tip as i64, false, false),
+        ];
+        for (case, row_slot, interrupted, refused) in cases {
+            let mock = MockStorage::new();
+            seed_row(
+                &mock,
+                1,
+                TransactionType::Deposit,
+                TransactionStatus::Pending,
+            );
+            mock.pending_transactions.lock().unwrap()[0].slot = row_slot;
+            if interrupted {
+                mock.wipe_program(ProgramType::Escrow).unwrap();
+            }
+            let wipes_before = mock.calls("wipe_program");
+            let service = ResyncService::new(
+                Arc::new(Storage::Mock(mock.clone())),
+                Arc::new(RpcPoller::new(
+                    server.url(),
+                    UiTransactionEncoding::Json,
+                    CommitmentLevel::Finalized,
+                )),
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: false,
+                    rpc_url: server.url(),
+                    batch_size: 10,
+                    max_gap_slots: 500,
+                    start_slot: None,
+                },
+                Some(Pubkey::new_unique()),
+            )
+            .with_stale_holder_grace(Duration::ZERO);
+
+            let result = service.run(genesis).await;
+            if !refused {
+                assert!(result.is_ok(), "{case}: must be rebuilt, got: {result:?}");
+                continue;
+            }
+            match result {
+                Err(IndexerError::Reconciliation(ReconciliationError::TipBelowExistingRows {
+                    to_slot,
+                    latest_slot,
+                })) => assert_eq!((to_slot, latest_slot), (tip, above_tip), "{case}"),
+                other => panic!("{case}: a row above the tip must refuse, got: {other:?}"),
+            }
+            assert_eq!(mock.calls("wipe_program"), wipes_before, "{case}");
+            if interrupted {
+                assert_eq!(
+                    mock.unfinished_resync.lock().unwrap().as_deref(),
+                    Some("escrow"),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(mock.pending_transactions.lock().unwrap().len(), 1, "{case}");
+            }
+        }
     }
 
     /// A worker whose session just died may still be writing, so nothing is read inside the grace.

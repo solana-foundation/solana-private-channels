@@ -172,6 +172,9 @@ pub struct ResyncBlockers {
     /// Lowest slot among the resync's own rows, or deleted by its unfinished wipe. The wipe
     /// deletes all of them, but the rebuild replays only from genesis.
     pub earliest_slot: Option<i64>,
+    /// Highest slot among the resync's own rows, or deleted by its unfinished wipe. The wipe
+    /// deletes all of them, but the rebuild replays only up to its top slot.
+    pub latest_slot: Option<i64>,
 }
 
 /// A row the channel has already serviced, identified by its source event coordinates.

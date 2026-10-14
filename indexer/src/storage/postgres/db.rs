@@ -1159,10 +1159,14 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
-        // Lowest slot any interrupted wipe deleted, so a rerun cannot pick a genesis above it.
-        sqlx::query("ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT")
-            .execute(&self.pool)
-            .await?;
+        // Lowest and highest slot any interrupted wipe deleted, so a rerun cannot pick a
+        // genesis above the first or rebuild to a tip below the second.
+        sqlx::query(
+            "ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT,
+                                      ADD COLUMN IF NOT EXISTS latest_slot BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("Database schema initialized");
         Ok(())
@@ -1189,12 +1193,15 @@ impl PostgresDb {
         let mut tx = conn.begin().await?;
 
         // The marker commits with the deletes, so an ambiguous COMMIT cannot leave one without the other.
-        // It keeps the lowest slot ever deleted, since a rerun no longer sees those rows.
+        // It keeps the lowest and highest slot ever deleted, since a rerun no longer sees those rows.
         let claimed = sqlx::query(
-            "INSERT INTO resync_state (program_type, earliest_slot)
-             VALUES ($1, (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2))
+            "INSERT INTO resync_state (program_type, earliest_slot, latest_slot)
+             VALUES ($1,
+                     (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2),
+                     (SELECT MAX(slot) FROM transactions WHERE transaction_type = $2))
              ON CONFLICT (id) DO UPDATE
-             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot)
+             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot),
+                 latest_slot = GREATEST(resync_state.latest_slot, EXCLUDED.latest_slot)
              WHERE resync_state.program_type = EXCLUDED.program_type",
         )
         .bind(&key)
@@ -3483,10 +3490,11 @@ impl PostgresDb {
         &self,
         own: TransactionType,
     ) -> Result<ResyncBlockers, sqlx::Error> {
-        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot): (
+        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot, latest_slot): (
             bool,
             bool,
             bool,
+            Option<i64>,
             Option<i64>,
         ) = sqlx::query_as(&format!(
             "SELECT
@@ -3503,7 +3511,9 @@ impl PostgresDb {
                            WHERE transaction_type = 'withdrawal' AND status = 'failed'),
                    EXISTS (SELECT 1 FROM observed_releases),
                    LEAST((SELECT MIN(slot) FROM transactions WHERE transaction_type = $1),
-                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2))"
+                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2)),
+                   GREATEST((SELECT MAX(slot) FROM transactions WHERE transaction_type = $1),
+                            (SELECT latest_slot FROM resync_state WHERE program_type = $2))"
         ))
         .bind(own)
         .bind(program_key(match own {
@@ -3517,6 +3527,7 @@ impl PostgresDb {
             failed_withdrawals,
             observed_releases,
             earliest_slot,
+            latest_slot,
         })
     }
 

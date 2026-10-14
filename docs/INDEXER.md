@@ -149,8 +149,9 @@ if anything fails. It is guarded these ways.
    A resync refuses under any halt except its own next to its own marker.
 7. **The genesis slot may not drop indexed rows.** The delete takes every row of the
    program but the rebuild replays only from the genesis slot, so a genesis above the
-   program's earliest row refuses before anything is deleted. The marker keeps the lowest
-   slot its wipe deleted, so a rerun after an interrupted resync is held to the same bound.
+   program's earliest row refuses before anything is deleted. Likewise a replay tip below
+   the program's latest row refuses. The marker keeps the lowest and highest slot its wipe
+   deleted, so a rerun after an interrupted resync is held to the same bounds.
 8. **The channel history must be complete.** The channel writes its address index after
    each block commits, so its history can briefly miss a mint that is already final.
    Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
