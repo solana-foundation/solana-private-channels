@@ -969,6 +969,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: pending-remint-backlog-unreadable
+        title: "Withdraw sender cannot read the pending remint backlog"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) keeps failing to read the next page of pending remints from the database. Refunds already loaded still run, but rows not yet loaded wait until the read succeeds. The error is in the sender log. Check the operator's database connection and any pending_remint row that fails to decode."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="pending_remint_page_read_failed"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
       - uid: reconciliation-inputs-dark
         title: "Reconciliation cannot read a required input"
         condition: C

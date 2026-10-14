@@ -149,7 +149,7 @@ gauge_vec!(
 gauge_vec!(
     OPERATOR_PENDING_REMINTS,
     "private_channel_operator_pending_remints",
-    "Deferred remints loaded in the withdraw sender after its last tick",
+    "Deferred remints in the withdraw sender after its last tick, including backlog rows not loaded yet",
     &["program_type"]
 );
 
@@ -413,6 +413,7 @@ pub fn init_labels(program_type: &str) {
         "release_claim_lost",
         "halted_before_broadcast",
         "halt_read_error",
+        "pending_remint_page_read_failed",
         "release_missing_claim_lease",
         "jit_missing_claim_lease",
         "malformed_status_response",

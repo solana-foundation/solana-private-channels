@@ -6,6 +6,7 @@ pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
 pub mod close;
+pub mod count_pending_remint_transactions;
 pub mod count_pending_transactions;
 pub mod delete_release_signature;
 pub mod delete_release_signatures;
@@ -471,6 +472,14 @@ impl Storage {
         remint_signature: String,
     ) -> Result<(), StorageError> {
         record_remint_result::record_remint_result(self, transaction_id, remint_signature).await
+    }
+
+    /// Counts PendingRemint withdrawals with `id > after_id`, the backlog not yet loaded.
+    pub async fn count_pending_remint_transactions(
+        &self,
+        after_id: i64,
+    ) -> Result<i64, StorageError> {
+        count_pending_remint_transactions::count_pending_remint_transactions(self, after_id).await
     }
 
     /// Returns one page of PendingRemint withdrawals with `id > after_id`, oldest id first.

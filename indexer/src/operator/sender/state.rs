@@ -97,6 +97,7 @@ impl SenderState {
             pending_remints: Vec::new(),
             remint_backlog_cursor: None,
             remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
@@ -702,6 +703,11 @@ impl SenderState {
         let Some(after_id) = self.remint_backlog_cursor else {
             return Ok(());
         };
+        // Counted first so the remint gauge can still show the whole backlog, not just this page.
+        let waiting = self
+            .storage
+            .count_pending_remint_transactions(after_id)
+            .await?;
         // Paged by id, not deadline: ids never change, so every row is read at most once.
         let transactions = self
             .storage
@@ -712,6 +718,10 @@ impl SenderState {
         self.remint_backlog_cursor = match transactions.last() {
             Some(last) if transactions.len() == REMINT_HYDRATE_PAGE => Some(last.id),
             _ => None,
+        };
+        self.remint_backlog_unloaded = match self.remint_backlog_cursor {
+            Some(_) => (waiting.max(0) as u64).saturating_sub(transactions.len() as u64),
+            None => 0,
         };
         // A runtime handoff may still have its terminal write queued, e.g. a ManualReview.
         // Reloading it could remint a row that then lands in manual review and is refunded again.
@@ -898,6 +908,12 @@ impl SenderState {
             self.remint_runtime_ids.insert(id);
         }
         self.pending_remints.push(entry);
+    }
+
+    /// Queued remints plus backlog rows not loaded yet, the value the remint gauge reports.
+    /// While the backlog drains, a runtime row past the cursor can be counted twice.
+    pub(super) fn remint_backlog_size(&self) -> usize {
+        self.pending_remints.len() + self.remint_backlog_unloaded as usize
     }
 
     /// Backlog entries in the queue, the count the refill threshold uses.
@@ -1684,6 +1700,12 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(1024);
 
         state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.remint_backlog_unloaded, page as u64 + 10);
+        assert_eq!(
+            state.remint_backlog_size(),
+            2 * PAGE + 10,
+            "the gauge sees the whole backlog"
+        );
         process_pending_remints(&mut state, &storage_tx).await;
         assert_eq!(page_reads(&mock), 1, "a full queue must not read");
 
@@ -1695,6 +1717,7 @@ mod tests {
             .filter(|id| !before.contains(id))
             .collect();
         assert_eq!(added, (page + 2..=2 * page).collect::<Vec<_>>());
+        assert_eq!(state.remint_backlog_unloaded, 10);
 
         state.pending_remints.truncate(PAGE - 1);
         let before = queued_ids(&state);
@@ -1705,6 +1728,7 @@ mod tests {
             .collect();
         assert_eq!(added, (2 * page + 1..=2 * page + 10).collect::<Vec<_>>());
         assert_eq!(state.remint_backlog_cursor, None);
+        assert_eq!(state.remint_backlog_unloaded, 0);
         assert_eq!(page_reads(&mock), 3);
         let mut ids = queued_ids(&state);
         ids.sort_unstable();
@@ -1751,10 +1775,21 @@ mod tests {
         state.pending_remints.pop();
 
         mock.set_fail_times(PAGE_READ, 1);
+        let failures = || {
+            crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&["withdraw", "pending_remint_page_read_failed"])
+                .get()
+        };
+        let failed_before = failures();
         let before = queued_ids(&state);
         process_pending_remints(&mut state, &storage_tx).await;
         assert_eq!(state.remint_backlog_cursor, Some(page));
         assert_eq!(queued_ids(&state), before);
+        assert_eq!(
+            failures(),
+            failed_before + 1.0,
+            "a failed page read must be counted"
+        );
 
         process_pending_remints(&mut state, &storage_tx).await;
         let added: Vec<i64> = queued_ids(&state)

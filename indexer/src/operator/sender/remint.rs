@@ -4,7 +4,7 @@ use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
     OPERATOR_ABSENCE_CLASSIFY, OPERATOR_PENDING_REMINTS, OPERATOR_RELEASE_VERIFY,
-    OPERATOR_REMINT_CLAIM_LOST,
+    OPERATOR_REMINT_CLAIM_LOST, OPERATOR_TRANSACTION_ERRORS,
 };
 use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
@@ -845,7 +845,14 @@ async fn process_pending_remints_within(
     // cursor only moves on success, so the next tick retries the same page.
     if state.queued_backlog_remints() < REMINT_HYDRATE_PAGE {
         if let Err(e) = state.hydrate_pending_remints(storage_tx).await {
-            warn!("Pending remint page read failed, retrying next tick: {e}");
+            // Counted so a read that keeps failing raises an alert instead of stalling refunds quietly.
+            OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "pending_remint_page_read_failed",
+                ])
+                .inc();
+            error!("Pending remint page read failed, retrying next tick: {e}");
         }
     }
 
@@ -1016,7 +1023,7 @@ async fn process_pending_remints_within(
     state.pending_remints = remaining;
     OPERATOR_PENDING_REMINTS
         .with_label_values(&[state.program_type.as_label()])
-        .set(state.pending_remints.len() as f64);
+        .set(state.remint_backlog_size() as f64);
 }
 
 /// What the chain can tell us about a nonce at the instant before a remint.
@@ -1507,6 +1514,7 @@ mod tests {
             pending_remints: Vec::new(),
             remint_backlog_cursor: None,
             remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1649,6 +1657,7 @@ mod tests {
             pending_remints: Vec::new(),
             remint_backlog_cursor: None,
             remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1751,6 +1760,7 @@ mod tests {
             pending_remints: Vec::new(),
             remint_backlog_cursor: None,
             remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };

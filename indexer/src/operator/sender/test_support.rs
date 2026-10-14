@@ -101,6 +101,7 @@ pub(super) fn sender_state_with_storage_and_role(
         pending_remints: Vec::new(),
         remint_backlog_cursor: None,
         remint_runtime_ids: HashSet::new(),
+        remint_backlog_unloaded: 0,
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
     }

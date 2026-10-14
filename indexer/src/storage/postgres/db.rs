@@ -1524,6 +1524,26 @@ impl PostgresDb {
         .await
     }
 
+    /// Counts PendingRemint withdrawals with `id > after_id`, the backlog not yet loaded.
+    pub async fn count_pending_remint_transactions_internal(
+        &self,
+        after_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM transactions WHERE {} = $1 AND {} = $2 AND {} > $3",
+            transaction_cols::STATUS,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::ID,
+        ))
+        .bind(TransactionStatus::PendingRemint)
+        .bind(TransactionType::Withdrawal)
+        .bind(after_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
     /// Returns one page of PendingRemint withdrawals with `id > after_id`, oldest id first.
     /// The sender loads its remint queue page by page, so memory stays bounded.
     pub async fn get_pending_remint_transactions_internal(

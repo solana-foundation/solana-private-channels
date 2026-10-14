@@ -998,6 +998,19 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn count_pending_remint_transactions(
+        &self,
+        after_id: i64,
+    ) -> Result<i64, StorageError> {
+        self.check_should_fail("count_pending_remint_transactions")?;
+        let pending = self.pending_remint_transactions.lock().unwrap();
+        let count = pending
+            .iter()
+            .filter(|t| t.status == TransactionStatus::PendingRemint && t.id > after_id)
+            .count();
+        Ok(count as i64)
+    }
+
     pub async fn get_pending_remint_transactions(
         &self,
         after_id: i64,

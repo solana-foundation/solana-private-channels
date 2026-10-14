@@ -2794,9 +2794,15 @@ mod tests {
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
-
-        assert_eq!(state.pending_remints.len(), 1);
         assert!(state.remint_runtime_ids.contains(&10));
+
+        // The handoff copied row 10 into the list pages read from.
+        state.hydrate_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the page must not reload row 10"
+        );
     }
 
     #[tokio::test]

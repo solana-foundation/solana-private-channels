@@ -291,6 +291,12 @@ async fn test_pending_remint_page_is_id_ordered_after_the_cursor() {
     assert_eq!(ids_of(page(0, 2).await.unwrap()), vec![a, b]);
     assert_eq!(ids_of(page(b, 2).await.unwrap()), vec![c]);
     assert!(page(c, 2).await.unwrap().is_empty());
+
+    // The count behind the remint gauge sees the same rows, so it skips the processing one too.
+    let count = |after| db.count_pending_remint_transactions_internal(after);
+    assert_eq!(count(0).await.unwrap(), 3);
+    assert_eq!(count(a).await.unwrap(), 2);
+    assert_eq!(count(c).await.unwrap(), 0);
 }
 
 // ── Case D ──────────────────────────────────────────────────────────────────

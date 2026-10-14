@@ -228,6 +228,8 @@ pub struct SenderState {
     pub remint_backlog_cursor: Option<i64>,
     /// Ids handed off at runtime while the backlog drains; a page must never load them.
     pub remint_runtime_ids: HashSet<i64>,
+    /// Backlog rows still waiting in the database past the cursor, as of the last page read.
+    pub remint_backlog_unloaded: u64,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
     /// Shared with the dedicated poll task via `Arc`; capped at `MAX_IN_FLIGHT`.
     pub in_flight: Arc<InFlightQueue>,
