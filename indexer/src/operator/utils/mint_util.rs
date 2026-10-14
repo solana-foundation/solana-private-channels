@@ -101,8 +101,6 @@ pub struct MintCache {
 pub enum HookExtras {
     /// Accounts to append to the transfer; empty for a mint with no hook.
     Resolved(Vec<AccountMeta>),
-    /// The validation account is absent, so no transfer of the mint resolves.
-    ValidationMissing,
     /// The validation account's `Execute` list does not parse or cannot resolve.
     ValidationInvalid(String),
     /// The list resolves to `extras` accounts, more than a transfer can carry.
@@ -253,7 +251,8 @@ impl MintCache {
 
     /// Accounts a transfer of `mint` must carry for Token-2022 to run its
     /// transfer hook: the hook program, its validation account, and whatever the
-    /// `ExtraAccountMetaList` resolves to. Empty for a mint with no hook.
+    /// `ExtraAccountMetaList` resolves to. Empty for a mint with no hook, and just
+    /// the hook program when the hook has no validation account.
     ///
     /// Any variant other than `Resolved` means no transfer of this mint can
     /// resolve; the caller parks instead of retrying. Each is read at or past
@@ -290,7 +289,7 @@ impl MintCache {
         let floor = seen_at.map_or(min_slot, |seen| seen.max(min_slot));
 
         // Read the validation account first so an absent one is told apart from
-        // an unreachable node: absent is permanent, a failed read is not.
+        // an unreachable node: absent means a hook run without one, a failed read is retried.
         let validation_pda = get_extra_account_metas_address(mint, &hook_program);
         let response = rpc
             .get_account_with_context_min_slot(&validation_pda, commitment, Some(floor))
@@ -305,16 +304,14 @@ impl MintCache {
             })?;
         let validation_slot = response.context.slot;
         let Some(validation_account) = response.value else {
-            // A node behind the account's creation also answers null, so absence is only
-            // final for an account seen before, and only from a node with a fresh tip.
-            if seen_at.is_none() {
-                return Err(hook_freshness_miss(format!(
-                    "validation account {validation_pda} absent at slot {validation_slot} and \
-                     never seen by this operator (freshness unproven)"
-                )));
-            }
+            // A node behind the account's creation also answers null, so absence counts
+            // only from a node with a fresh tip. Token-2022 then runs the hook with the
+            // base accounts alone, so only the hook program is forwarded.
             return match rpc.tip_is_fresh(validation_slot).await {
-                Ok(true) => Ok(HookExtras::ValidationMissing),
+                Ok(true) => Ok(HookExtras::Resolved(vec![AccountMeta::new_readonly(
+                    hook_program,
+                    false,
+                )])),
                 Ok(false) => Err(hook_freshness_miss(format!(
                     "validation account {validation_pda} absent at slot {validation_slot}, but \
                      that node's tip is not recent (freshness unproven)"
@@ -1276,15 +1273,19 @@ mod tests {
     }
 
     /// A validation account seen before and absent now at or past that slot, from a live
-    /// node, is missing.
+    /// node, was closed, so the hook runs without one.
     #[tokio::test]
-    async fn null_after_a_sighting_at_a_fresh_tip_is_missing() {
+    async fn null_after_a_sighting_at_a_fresh_tip_resolves_to_the_hook_program_alone() {
         let (mut server, mint, validation_pda, accounts) = hook_server(&[], Some(60)).await;
         let mut cache = fast_cache(server.url());
         let first = resolve_with(&mut cache, &mint, &accounts, 50)
             .await
             .unwrap();
-        assert!(matches!(first, HookExtras::Resolved(_)), "{first:?}");
+        // With no declared entries the list resolves to the hook program, then the
+        // validation account.
+        let HookExtras::Resolved(first_extras) = first else {
+            panic!("a present list resolves, got {first:?}");
+        };
 
         mock_absent_at(&mut server, &validation_pda, 60).await;
         mock_block_age(&mut server, 1).await;
@@ -1292,34 +1293,40 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            matches!(resolved, HookExtras::ValidationMissing),
-            "{resolved:?}"
-        );
+        let HookExtras::Resolved(extras) = resolved else {
+            panic!("a closed list resolves to the hook program, got {resolved:?}");
+        };
+        assert_eq!(extras, first_extras[..1]);
     }
 
-    /// A live node behind the account's creation looks the same as a missing account, so a
-    /// null for a pair never seen stays retryable and parks only at the requeue cap.
+    /// A null at or past the floor from a live node is a hook with no validation account,
+    /// which Token-2022 runs with the base accounts alone, so only the hook program is
+    /// forwarded.
     #[tokio::test]
-    async fn null_for_a_never_seen_account_is_an_rpc_error() {
+    async fn null_validation_at_a_fresh_tip_resolves_to_the_hook_program_alone() {
         let mint = create_test_mint();
         let hook_program = Pubkey::new_unique();
         let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let gate_slot = 50;
         let mut server = mockito::Server::new_async().await;
-        let _mint =
-            mock_account_at_slot(&mut server, &mint, &hook_mint_data(&hook_program), 50).await;
-        // Created at slot 55 on the canonical chain; this node is live but at 52.
-        mock_absent_at(&mut server, &validation_pda, 52).await;
+        let _mint = mock_account_at_slot(
+            &mut server,
+            &mint,
+            &hook_mint_data(&hook_program),
+            gate_slot,
+        )
+        .await;
+        mock_absent_at(&mut server, &validation_pda, gate_slot).await;
         mock_block_age(&mut server, 1).await;
 
-        let err = resolve_at(&mut fast_cache(server.url()), &mint, 50)
+        let resolved = resolve_at(&mut fast_cache(server.url()), &mint, gate_slot)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(
-            matches!(&err, OperatorError::RpcError(m) if m.contains("freshness")),
-            "{err:?}"
-        );
+        let HookExtras::Resolved(extras) = resolved else {
+            panic!("a base-only hook resolves, got {resolved:?}");
+        };
+        assert_eq!(extras, vec![AccountMeta::new_readonly(hook_program, false)]);
     }
 
     /// A plain outage on the validation or an extra-account read is not labelled as lag.
@@ -1850,8 +1857,8 @@ mod tests {
             .await;
 
         assert!(
-            matches!(&resolved, Err(OperatorError::RpcError(m)) if m.contains("never seen")),
-            "expected an unproven null, got {resolved:?}"
+            matches!(&resolved, Ok(HookExtras::Resolved(extras)) if *extras == [AccountMeta::new_readonly(hook_program, false)]),
+            "expected the hook program alone, got {resolved:?}"
         );
         bound_read.assert_async().await;
     }

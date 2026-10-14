@@ -102,7 +102,6 @@ have prefixes.
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
-| `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
 | `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved | no | processor requeue cap |
 | `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
@@ -303,20 +302,6 @@ would reopen the free retry loop it exists to close.
      re-opening. No operator restart is needed either way: the gate is mirrored onto
      the `mints` row and read on every withdrawal, so a block and a re-open both take
      effect once the indexer has processed that slot. [Escalate](_escalation.md) (Tier 2).
-   - `transfer-hook validation account missing for mint:` - the mint's
-     `TransferHook` points at a hook program whose `ExtraAccountMetaList` does not
-     exist, so Token-2022 can resolve no transfer of it and no release can settle.
-     The escrow still holds the funds and the row is intact. Nothing on our side
-     creates that account: only the hook program can, so contact the mint issuer.
-     Its address is the `["extra-account-metas", mint]` PDA of the hook program the
-     mint names; re-arm the row once `solana account <that address>` shows it
-     exists. The operator reports it missing only for an account it has seen before,
-     read at or past that slot from a node whose newest block is under 120 s old. An
-     account it never saw parks under Path J at the requeue cap instead, since a node
-     behind its creation looks the same. Expect every withdrawal of that mint to park
-     here or under Path J. Deposits of it fail
-     on-chain for the same reason, so consider blocking deposits (`BlockMint` with
-     `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account invalid for mint` - the mint's
      `ExtraAccountMetaList` does not parse or cannot resolve. The escrow still
      holds the funds and the row is intact. Two causes:
@@ -840,14 +825,12 @@ keys.
 `error_message` names `(freshness)` or `freshness unproven`. The hook validation
 account, or an account its list resolves to, could not be read at or past the slot
 the allowlist gate proved, or it read as absent from a node whose newest block is
-older than 120 s, or it read as absent and this operator has never seen it. The row was requeued without a verdict up to the requeue cap
+older than 120 s. The row was requeued without a verdict up to the requeue cap
 (each try restarts the processor task), then parked. Nothing was broadcast.
 
 1. Check the operator's Solana RPC: its finalized slot against a reference node,
    and whether it is load balanced across lagging backends.
-2. Confirm the validation account exists: `solana account <["extra-account-metas", mint] PDA>`.
-3. Once the RPC is current, re-arm the row to `pending` (Path A.non-halting re-arm).
-   If the account is genuinely absent, follow the `validation account missing` entry.
+2. Once the RPC is current, re-arm the row to `pending` (Path A.non-halting re-arm).
 
 ## Path K - release observed at the refund claim
 

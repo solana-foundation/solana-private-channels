@@ -862,8 +862,8 @@ const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 15;
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
 ///
-/// Returns a bail when the mint's validation account is absent, unparseable or
-/// declares more accounts than a release can carry: no transfer of that mint can
+/// Returns a bail when the mint's validation account is unparseable or declares
+/// more accounts than a release can carry: no transfer of that mint can
 /// resolve, so the row parks rather than the task restarting on a transient
 /// forever. A failed read stays an error, since that is a node problem and not a
 /// row problem.
@@ -923,12 +923,6 @@ async fn attach_hook_extras(
         .await?
     {
         HookExtras::Resolved(hook_extras) => hook_extras,
-        HookExtras::ValidationMissing => {
-            return Ok(Some(BailReason::new(
-                metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
-                format!("transfer-hook validation account missing for mint: {mint}"),
-            )));
-        }
         HookExtras::ValidationInvalid(reason) => {
             return Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
@@ -3647,6 +3641,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A hook mint with no validation account is released with the hook program as its
+    /// only trailing account, which Token-2022 runs with the base accounts alone, rather
+    /// than the row being retried or parked.
+    #[tokio::test]
+    async fn base_only_hook_withdrawal_is_released_with_the_hook_program() {
+        let mint = Pubkey::new_unique();
+        let hook_program = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+        let hook_bit = 1u64 << EXTENSION_BIT_TRANSFER_HOOK;
+        let (mut ps, mut server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(hook_bit)).await;
+        mock_account_read(
+            &mut server,
+            &mint,
+            &spl_token_2022::id(),
+            transfer_hook_mint_bytes(&hook_program),
+        );
+        let validation_pda =
+            spl_transfer_hook_interface::get_extra_account_metas_address(&mint, &hook_program);
+        // Absent at the slot the allowlist answered at, from a node whose tip is live.
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(validation_pda.to_string()))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":500},"value":null}}"#)
+            .create();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockTime""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": Utc::now().timestamp()})
+                    .to_string(),
+            )
+            .create();
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(update.is_none(), "a base-only hook is payable");
+        let Some(TransactionBuilder::ReleaseFunds(release)) = builder else {
+            panic!("the withdrawal must be dispatched");
+        };
+        let accounts = release.builder.instruction().accounts;
+        assert_eq!(
+            accounts.last(),
+            Some(&AccountMeta::new_readonly(hook_program, false))
+        );
+        assert!(accounts.iter().all(|meta| meta.pubkey != validation_pda));
     }
 
     /// The rescue is capped on the durable counter the fetched row carries, so

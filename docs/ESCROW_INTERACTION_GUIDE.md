@@ -142,12 +142,12 @@ In every case the safe posture is the same: only whitelist mints whose close/fre
 
 ### Transfer-hook mints
 
-`Deposit` and `ReleaseFunds` hand every account after their fixed list to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. Codama drops trailing accounts, so neither the IDL nor the generated clients list them: append them yourself, in resolver order (the declared extras, then the hook program, then the validation PDA). Omitting one fails the transfer rather than skipping the hook.
+`Deposit` and `ReleaseFunds` hand every account after their fixed list to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. Codama drops trailing accounts, so neither the IDL nor the generated clients list them: append them yourself, in resolver order (the declared extras, then the hook program, then the validation PDA; just the hook program for a hook with no validation PDA). Omitting one fails the transfer rather than skipping the hook.
 
 - TypeScript: resolve with `@solana-program/token-2022`, then append the metas to the instruction's `accounts`.
 - Rust: `spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute` against a scratch instruction whose first four accounts are source, mint, destination and authority, then take everything past them. This is what the withdrawal operator does.
 
-Every forwarded account keeps its writable flag but loses its signer bit, so a hook can never receive a signature from an account that signed the transaction. Withdrawals of a mint whose validation account is missing park for manual review under the `hook_unresolvable` bail reason, since nothing can resolve them. The operator reads the validation account and every resolved extra at or past the slot its allowlist read proved, and never below the slot it last saw that validation account at, and it counts a null as missing only for an account it has seen before, from a node whose newest block is under 120 s old. Anything less, including a null for an account this operator never saw (a node behind its creation looks the same), is retried as a transient (up to the requeue cap, then parked with a reason naming freshness).
+Every forwarded account keeps its writable flag but loses its signer bit, so a hook can never receive a signature from an account that signed the transaction. A hook with no validation account is released with only the hook program forwarded, since Token-2022 then runs it with the four base accounts. The operator reads the validation account and every resolved extra at or past the slot its allowlist read proved, and never below the slot it last saw that validation account at, and treats a null as no validation account only from a node whose newest block is under 120 s old. Anything less is retried as a transient (up to the requeue cap, then parked with a reason naming freshness).
 
 ## BlockMint
 

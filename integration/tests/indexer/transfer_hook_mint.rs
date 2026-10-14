@@ -10,8 +10,8 @@
 //! 1. A hook mint with a valid `ExtraAccountMetaList` releases normally. The
 //!    release can only land if the operator resolved and attached the hook
 //!    accounts, since Token-2022 rejects the transfer without them.
-//! 2. A hook mint whose validation account was never created parks the row.
-//!    Nothing can ever resolve it, so the operator must not spin on it.
+//! 2. A hook mint with no validation account releases with only the hook
+//!    program forwarded, which Token-2022 runs with the four base accounts.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -468,14 +468,14 @@ async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// A hook mint whose validation account was never created looks like a lagging node, so
-/// the row is retried and parks once its requeues are spent, not restarted on forever.
+/// A hook mint whose validation account was never created is a base-only hook, so the
+/// release lands with only the hook program forwarded rather than the row parking.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_withdrawal_parks_when_validation_account_is_missing(
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Transfer-hook Mint: Missing Validation Account → ManualReview ===");
+async fn test_withdrawal_of_base_only_hook_mint_releases() -> Result<(), Box<dyn std::error::Error>>
+{
+    println!("=== Transfer-hook Mint: Base-only Hook Withdrawal Releases ===");
 
-    let env = setup_hook_mint_env("transfer_hook_missing_eaml").await?;
+    let env = setup_hook_mint_env("transfer_hook_base_only").await?;
 
     let withdrawal_sig = Signature::new_unique().to_string();
     env.storage
@@ -486,11 +486,6 @@ async fn test_withdrawal_parks_when_validation_account_is_missing(
             WITHDRAW_AMOUNT,
             0,
         ))
-        .await?;
-    // Start at the requeue cap so the first unproven null parks the row.
-    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE signature = $1")
-        .bind(&withdrawal_sig)
-        .execute(&env.pool)
         .await?;
 
     // The validator has no status snapshot, so the operator reads the channel through this.
@@ -506,22 +501,23 @@ async fn test_withdrawal_parks_when_validation_account_is_missing(
 
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
-        if let Some(row) = db::get_transaction(&env.pool, &withdrawal_sig).await? {
-            if row.status == "manual_review" {
-                break;
-            }
+        let balance =
+            get_token_2022_balance(&env.client, &env.recipient.pubkey(), &env.mint_pubkey).await?;
+        if balance == WITHDRAW_AMOUNT {
+            break;
         }
         if std::time::Instant::now() >= deadline {
-            return Err("withdrawal did not reach manual_review within 90s".into());
+            let status = db::get_transaction(&env.pool, &withdrawal_sig)
+                .await?
+                .map(|row| row.status)
+                .unwrap_or_else(|| "missing".to_string());
+            return Err(format!(
+                "base-only hook withdrawal did not release within 90s (row status: {status})"
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-
-    assert_eq!(
-        get_token_2022_balance(&env.client, &env.recipient.pubkey(), &env.mint_pubkey).await?,
-        0,
-        "nothing may be released for an unresolvable hook",
-    );
 
     operator_handle.shutdown().await;
     Ok(())
