@@ -1687,8 +1687,105 @@ async fn test_delete_wallet_cannot_delete_other_users_wallet() {
     assert_eq!(res.status(), 400);
 }
 
+/// End to end over HTTP: a challenge signed while the wallet was linked, then
+/// submitted after the wallet is unlinked, must not relink it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_challenge_signed_before_unlink_cannot_relink() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey().to_string();
+
+    // Link the wallet.
+    let link_challenge: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let link_nonce: Uuid = link_challenge["nonce"].as_str().unwrap().parse().unwrap();
+    let link_signature =
+        keypair.sign_message(link_challenge["message"].as_str().unwrap().as_bytes());
+
+    let linked = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": pubkey,
+            "nonce": link_nonce,
+            "signature": link_signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(linked.status(), 200);
+
+    // Sign a second challenge while the wallet is linked, and hold it back.
+    let saved_challenge: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let saved_nonce: Uuid = saved_challenge["nonce"].as_str().unwrap().parse().unwrap();
+    let saved_signature =
+        keypair.sign_message(saved_challenge["message"].as_str().unwrap().as_bytes());
+
+    let unlinked = client
+        .delete(format!("{}/auth/wallets/{}", base_url(addr), pubkey))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unlinked.status(), 204);
+
+    // The unlink revoked the saved challenge, so its signature cannot relink.
+    let relinked = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": pubkey,
+            "nonce": saved_nonce,
+            "signature": saved_signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relinked.status(), 400);
+}
+
 /// A challenge signed before an unlink must not relink the wallet, so unlinking
-/// revokes whatever challenge the user holds.
+/// revokes whatever challenge the user holds, and only theirs.
 #[tokio::test(flavor = "multi_thread")]
 async fn unlinking_a_wallet_revokes_the_outstanding_challenge() {
     let (db_url, _container) = start_postgres().await;
@@ -1713,6 +1810,14 @@ async fn unlinking_a_wallet_revokes_the_outstanding_challenge() {
         .await
         .expect("failed to issue challenge");
 
+    let bystander = db::insert_user(&pool, "bystander", "fakehash")
+        .await
+        .expect("failed to insert user");
+    let bystander_nonce = Uuid::new_v4();
+    db::insert_challenge(&pool, bystander.id, bystander_nonce)
+        .await
+        .expect("failed to issue challenge");
+
     let unlinked = db::delete_verified_wallet(&pool, user.id, &wallet.pubkey)
         .await
         .expect("unlink failed");
@@ -1724,6 +1829,14 @@ async fn unlinking_a_wallet_revokes_the_outstanding_challenge() {
     assert!(
         pending.is_none(),
         "a challenge issued before the unlink must not verify"
+    );
+
+    let bystander_pending = db::consume_challenge(&pool, bystander.id, bystander_nonce)
+        .await
+        .expect("consume failed");
+    assert!(
+        bystander_pending.is_some(),
+        "an unlink must not revoke another user's challenge"
     );
 }
 
