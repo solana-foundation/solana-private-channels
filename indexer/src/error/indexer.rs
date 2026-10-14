@@ -218,6 +218,15 @@ pub enum ReconciliationError {
          slot {latest_slot}"
     )]
     TipBelowExistingRows { to_slot: u64, latest_slot: i64 },
+
+    /// Withdrawal rows cannot prove no burn exists below a later genesis, so an empty or
+    /// restored table would let the rebuild drop an unreleased withdrawal for good.
+    #[error(
+        "a withdraw resync must replay from genesis slot 0, not {genesis_slot}: withdrawal \
+         rows cannot prove no burn exists below a later genesis. Aborted before any delete, \
+         the database is intact. Rerun with --genesis-slot 0"
+    )]
+    WithdrawGenesisNotZero { genesis_slot: u64 },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

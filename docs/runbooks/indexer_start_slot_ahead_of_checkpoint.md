@@ -92,7 +92,8 @@ slot under fail-closed channel reconciliation. The other program's rows and chec
 left untouched. Indexed history cannot be abandoned this way: the genesis slot must be at
 or below the program's earliest row, because the delete takes every row and the rebuild
 replays only from genesis. Find that slot with
-`SELECT MIN(slot) FROM transactions WHERE transaction_type = '<deposit|withdrawal>'`:
+`SELECT MIN(slot) FROM transactions WHERE transaction_type = 'deposit'` (a withdraw resync
+must use 0):
 
 ```bash
 # Stop every indexer and operator on this database first; resync refuses otherwise.

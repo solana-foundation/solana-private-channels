@@ -77,7 +77,8 @@ fn first_unserviced(
 }
 
 /// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
-/// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
+/// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent,
+/// and a replay from slot 0.
 fn wipe_blocker(
     program: ProgramType,
     blockers: &ResyncBlockers,
@@ -107,6 +108,10 @@ fn wipe_blocker(
         return Some(ReconciliationError::ReleaseEvidenceRecorded {
             what: "observed releases",
         });
+    }
+    // Rows cannot bound the burns below a later genesis, so only a replay from 0 rebuilds them all.
+    if genesis_slot != 0 {
+        return Some(ReconciliationError::WithdrawGenesisNotZero { genesis_slot });
     }
     None
 }
@@ -1144,7 +1149,8 @@ mod tests {
                 id: n as i64 + 1,
                 signature: solana_sdk::signature::Signature::new_unique().to_string(),
                 trace_id: format!("trace-{n}"),
-                // The genesis these tests resync from, so the pre-genesis guard stays out of their way.
+                // At or above every genesis these tests resync from, so the pre-genesis guard
+                // stays out of their way.
                 slot: 100,
                 initiator: Pubkey::new_unique().to_string(),
                 recipient: Pubkey::new_unique().to_string(),
@@ -1241,7 +1247,7 @@ mod tests {
             Some("http://127.0.0.1:1".to_string()),
         );
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalNoncesReleased {
                 completed,
             })) => assert_eq!(completed, 2),
@@ -1260,7 +1266,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1283,7 +1289,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1306,7 +1312,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
                 generation,
                 set_bits,
@@ -1329,7 +1335,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
                 generation,
                 set_bits,
@@ -1353,7 +1359,7 @@ mod tests {
         let (_mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::DataSource(_)) => {}
             other => {
                 panic!("a fresh bitmap must pass the check and reach the tip fetch, got: {other:?}")
@@ -1373,7 +1379,7 @@ mod tests {
             Some("http://127.0.0.1:1".to_string()),
         );
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1395,7 +1401,7 @@ mod tests {
         ] {
             let (mock, storage) = populated_storage();
             let service = withdraw_service(storage, instance, rpc);
-            match service.run(100).await {
+            match service.run(0).await {
                 Err(IndexerError::Reconciliation(
                     ReconciliationError::WithdrawalBitmapUnverified { .. },
                 )) => {}
@@ -1491,7 +1497,7 @@ mod tests {
     // ── pre-wipe gate ────────────────────────────────────────────────
 
     /// Escrow never touches nonces, so only in-flight work or pre-genesis rows block it; withdraw
-    /// also needs proof no nonce is spent.
+    /// also needs proof no nonce is spent and a replay from slot 0.
     #[test]
     fn wipe_blocker_matrix() {
         use crate::storage::common::models::ResyncBlockers;
@@ -1532,6 +1538,9 @@ mod tests {
                 genesis_slot: 100,
                 earliest_slot: 99,
             }) => "genesis",
+            Some(ReconciliationError::WithdrawGenesisNotZero { genesis_slot: 100 }) => {
+                "withdraw genesis"
+            }
             Some(other) => panic!("unexpected verdict {other:?}"),
         };
 
@@ -1540,7 +1549,12 @@ mod tests {
             (ProgramType::Escrow, unsettled, "unsettled"),
             (ProgramType::Escrow, failed, "none"),
             (ProgramType::Escrow, observed, "none"),
-            (ProgramType::Withdraw, ResyncBlockers::default(), "none"),
+            // An empty table proves nothing about burns below a later genesis.
+            (
+                ProgramType::Withdraw,
+                ResyncBlockers::default(),
+                "withdraw genesis",
+            ),
             (ProgramType::Withdraw, unsettled, "unsettled"),
             (ProgramType::Withdraw, failed, "failed"),
             (ProgramType::Withdraw, observed, "observed"),
@@ -1558,7 +1572,7 @@ mod tests {
             (ProgramType::Escrow, rows_from(100), "none"),
             (ProgramType::Escrow, rows_from(101), "none"),
             (ProgramType::Withdraw, rows_from(99), "genesis"),
-            (ProgramType::Withdraw, rows_from(100), "none"),
+            (ProgramType::Withdraw, rows_from(100), "withdraw genesis"),
             (
                 ProgramType::Escrow,
                 ResyncBlockers {
@@ -1576,6 +1590,15 @@ mod tests {
                 "{program:?} with {blockers:?}"
             );
         }
+        assert_eq!(
+            label(wipe_blocker(
+                ProgramType::Withdraw,
+                &ResyncBlockers::default(),
+                0
+            )),
+            "none",
+            "a withdraw replay from slot 0 rebuilds every burn"
+        );
     }
 
     /// Escrow service with a scope set and every RPC on a dead port, so any network step errors.

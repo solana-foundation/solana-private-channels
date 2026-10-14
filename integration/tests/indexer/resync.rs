@@ -2027,7 +2027,8 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_reminted_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2096,7 +2097,8 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_released_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2349,7 +2351,8 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         program_type: ProgramType::Withdraw,
         instance: Some(env.instance),
         channel_url: mock.url(),
-        genesis,
+        // A withdraw resync replays from slot 0.
+        genesis: 0,
     };
     let wd = keys_of_type(&h.discover().await, "withdrawal")[0].clone();
     let memo = memo_for(&wd.source_event_id(), ConsumedMintKind::Remint);
@@ -4045,7 +4048,8 @@ async fn e2e_interrupted_withdraw_resync_reruns_cleanly() -> Result<(), Box<dyn 
     let (validator, faucet) = start_test_validator_no_geyser().await;
     let rpc_url = validator.rpc_url();
     let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_interrupted_withdraw").await?;
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
     let user = &env.users[0];
