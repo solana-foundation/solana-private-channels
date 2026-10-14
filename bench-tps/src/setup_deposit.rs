@@ -145,7 +145,13 @@ pub async fn ensure_escrow_instance(
     //
     // Both the admin keypair and the instance-seed keypair must sign.
     // ------------------------------------------------------------------
-    if rpc.get_account(&instance_pda).await.is_ok() {
+    // A funded but uninitialized PDA is still a system account; only the escrow program's
+    // own account means the instance exists.
+    if rpc
+        .get_account(&instance_pda)
+        .await
+        .is_ok_and(|a| a.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    {
         info!(%instance_pda, "Escrow instance already exists, skipping creation");
         return Ok(());
     }

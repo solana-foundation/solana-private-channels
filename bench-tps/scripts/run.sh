@@ -4,7 +4,7 @@
 #
 # What this script does (in order):
 #   1.  Parse script-level flags (--rebuild, --clean).
-#   2.  Sanity-check that the bench binary and .env file exist.
+#   2.  Build the bench binary (a no-op when current) and ensure .env exists.
 #   3.  Load environment variables from .env.
 #   4.  Compute CPU affinity splits so services and the bench binary don't
 #       compete for the same cores.
@@ -96,21 +96,14 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 2 — Build bench binary (if needed) and ensure .env exists
+# Step 2 — Build bench binary and ensure .env exists
 #
-# With --rebuild the binary is always recompiled.  On first run (no binary
-# yet) it is built automatically so `run.sh --rebuild` works from scratch.
+# Always run the cached Cargo build: it is a no-op when the binary is current, and
+# a binary older than its sources may lack a subcommand this script calls.
 # The .env file is auto-seeded from .env.sample if it does not exist yet.
 # ---------------------------------------------------------------------------
-if [ "${REBUILD}" -eq 1 ]; then
-    echo "Building bench binary (--rebuild flag set)..."
-    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
-elif [ ! -f "${BENCH_BIN}" ]; then
-    echo "Bench binary not found — building (this may take a few minutes)..."
-    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
-else
-    echo "Bench binary found — skipping build"
-fi
+echo "Building bench binary (a no-op when up to date)..."
+cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
 
 if [ ! -f "${BENCH_ENV}" ]; then
     if [ -f "${BENCH_DIR}/.env.sample" ]; then
