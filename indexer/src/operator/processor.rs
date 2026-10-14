@@ -3561,6 +3561,93 @@ mod tests {
         );
     }
 
+    /// A Token-2022 mint whose `TransferHook` points at `hook_program`.
+    fn transfer_hook_mint_bytes(hook_program: &Pubkey) -> Vec<u8> {
+        use spl_token_2022::extension::transfer_hook::TransferHook;
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&[
+            ExtensionType::TransferHook,
+        ])
+        .expect("a fixed-length extension has a calculable mint length");
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data)
+                .expect("a zeroed buffer holds an uninitialized mint");
+        state
+            .init_extension::<TransferHook>(true)
+            .expect("the extension fits the calculated length")
+            .program_id = Some(*hook_program).try_into().unwrap();
+        state.base = Token2022MintState {
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+        data
+    }
+
+    /// A hook validation account the node can only answer below the gate slot is lag,
+    /// not a missing account: the row takes the transient route (requeued, task
+    /// restarted), and once out of requeues it parks with a reason naming freshness.
+    #[tokio::test]
+    async fn hook_freshness_error_takes_the_transient_route() {
+        for attempts in [0, MAX_RECOVERY_REQUEUE_ATTEMPTS] {
+            let mint = Pubkey::new_unique();
+            let hook_program = Pubkey::new_unique();
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            insert_token_2022_mint_row(&storage, &mint);
+            let hook_bit = 1u64 << EXTENSION_BIT_TRANSFER_HOOK;
+            let (mut ps, mut server) =
+                processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(hook_bit)).await;
+            mock_account_read(
+                &mut server,
+                &mint,
+                &spl_token_2022::id(),
+                transfer_hook_mint_bytes(&hook_program),
+            );
+            let validation_pda =
+                spl_transfer_hook_interface::get_extra_account_metas_address(&mint, &hook_program);
+            // The allowlist answered at 500; this node only knows slot 400.
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(validation_pda.to_string()))
+                .with_status(200)
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":400},"value":null}}"#,
+                )
+                .create();
+            let mut txn = withdrawal_for(&mint, 5);
+            txn.recovery_requeue_attempts = attempts;
+            let misses = metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&["withdraw", "hook_freshness_unproven"]);
+            let misses_before = misses.get();
+
+            let (outcome, update, builder) =
+                run_one_withdrawal(&mut ps, storage.clone(), txn).await;
+
+            assert!(misses.get() > misses_before, "the miss is counted");
+            let err = outcome.expect_err("lag restarts the task");
+            assert!(err.to_string().contains("freshness"), "{err}");
+            assert!(builder.is_none(), "nothing reaches the sender");
+            if attempts == 0 {
+                assert!(update.is_none(), "no terminal verdict on lag");
+                assert_eq!(row_status(&storage, 9), Some(TransactionStatus::Pending));
+            } else {
+                let update = update.expect("out of requeues");
+                assert_eq!(update.status, TransactionStatus::ManualReview);
+                assert!(
+                    update
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("freshness")),
+                    "{update:?}"
+                );
+            }
+        }
+    }
+
     /// The rescue is capped on the durable counter the fetched row carries, so
     /// an error only looking transient cannot loop the operator forever.
     #[tokio::test]

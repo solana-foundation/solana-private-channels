@@ -28,6 +28,8 @@ type EnvelopeBounds = (Option<u64>, Option<u64>);
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
+    /// Checkpoint reads answered in order before the stored value, for a ledger moving mid-test.
+    pub checkpoint_script: std::sync::Arc<Mutex<std::collections::VecDeque<u64>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
@@ -129,6 +131,11 @@ impl MockStorage {
             });
         }
         Ok(())
+    }
+
+    /// Answer the next committed-checkpoint reads with `slots`, in order, for any program.
+    pub fn script_checkpoints(&self, slots: Vec<u64>) {
+        self.checkpoint_script.lock().unwrap().extend(slots);
     }
 
     pub fn set_checkpoint(&self, program_type: &str, slot: u64) {
@@ -348,6 +355,9 @@ impl MockStorage {
         program_type: &str,
     ) -> Result<Option<u64>, StorageError> {
         self.check_should_fail("get_committed_checkpoint")?;
+        if let Some(slot) = self.checkpoint_script.lock().unwrap().pop_front() {
+            return Ok(Some(slot));
+        }
         Ok(self
             .committed_checkpoints
             .lock()
@@ -1654,7 +1664,7 @@ impl MockStorage {
 
     /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
     /// attempts, then take the one live slot the partial unique index allows.
-    /// A moved parent writes nothing at all, supersedes included.
+    /// A moved parent, or a release recorded for the row's nonce, writes nothing at all.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -1664,6 +1674,13 @@ impl MockStorage {
         superseded_signatures: &[String],
     ) -> Result<RemintClaim, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
+        let nonce = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .and_then(|t| t.withdrawal_nonce);
         if self
             .moved_remint_parents
             .lock()
@@ -1671,6 +1688,9 @@ impl MockStorage {
             .contains(&transaction_id)
         {
             return Ok(RemintClaim::RowMoved);
+        }
+        if nonce.is_some_and(|nonce| self.observed_releases.lock().unwrap().contains_key(&nonce)) {
+            return Ok(RemintClaim::ReleaseObserved);
         }
         let mut map = self.remint_signatures.lock().unwrap();
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();

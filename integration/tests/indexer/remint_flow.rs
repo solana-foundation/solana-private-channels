@@ -730,3 +730,120 @@ async fn execute_deferred_remint_defers_when_send_fails() {
     );
     mock.shutdown().await;
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// (f) Coverage bound: the anchored bitmap slot, not a lagging getSlot.
+// ─────────────────────────────────────────────────────────────────────
+// Dead signatures and a clear bitmap read at the anchor's slot 5_000. A `getSlot` lagging
+// at 100 must not let checkpoint 4_000 certify no release; checkpoint 5_000 does.
+#[tokio::test]
+async fn coverage_is_certified_by_the_bitmap_slot_not_a_lagging_get_slot() {
+    use base64::Engine as _;
+    use private_channel_indexer::operator::utils::account_util::bitmap_account_bytes;
+
+    let mock = MockRpcServer::start().await;
+    ensure_admin_signer_env();
+    let storage_mock = MockStorage::new();
+    let storage = Arc::new(Storage::Mock(storage_mock.clone()));
+    let mut state = test_hooks::new_sender_state(
+        &make_config(mock.url(), ProgramType::Withdraw),
+        CommitmentLevel::Confirmed,
+        Some(Pubkey::new_unique()),
+        storage,
+        1,
+        1,
+        None,
+    )
+    .expect("SenderState construction must succeed under Mock storage");
+    let (storage_tx, mut storage_rx) = mpsc::channel(8);
+    seed_pending_remint_row(&storage_mock, 95, 0);
+    storage_mock
+        .update_committed_checkpoint("escrow", 4_000)
+        .await
+        .unwrap();
+
+    let dead = Reply::result(json!({
+        "context": { "slot": 6_000 },
+        "value": [{
+            "slot": 100, "confirmations": null,
+            "err": { "InstructionError": [0, { "Custom": 1 }] },
+            "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
+            "confirmationStatus": "finalized"
+        }]
+    }));
+    mock.enqueue_sequence(
+        "getSignatureStatuses",
+        vec![dead.clone(), dead, confirmed_status_reply()],
+    );
+    mock.enqueue_sequence(
+        "getSlot",
+        std::iter::repeat_n(Reply::result(json!(100)), 16),
+    );
+    mock.enqueue_sequence(
+        "getLatestBlockhash",
+        std::iter::repeat_n(
+            Reply::result(json!({
+                "context": { "slot": 5_000 },
+                "value": {
+                    "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                    "lastValidBlockHeight": 1_000u64
+                }
+            })),
+            16,
+        ),
+    );
+    let bitmap =
+        base64::engine::general_purpose::STANDARD.encode(bitmap_account_bytes(0, &[], 255));
+    mock.enqueue_sequence(
+        "getAccountInfo",
+        std::iter::repeat_n(
+            Reply::dynamic(move |req| {
+                json!({
+                    "context": { "slot": req["params"][1]["minContextSlot"].as_u64().unwrap_or(5_000) },
+                    "value": {
+                        "data": [bitmap, "base64"], "executable": false, "lamports": 1u64,
+                        "owner": Pubkey::new_unique().to_string(), "rentEpoch": 0u64
+                    }
+                })
+            }),
+            16,
+        ),
+    );
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+
+    state.pending_remints.push(make_pending_remint(
+        95,
+        3,
+        vec![Signature::new_unique()],
+        0,
+        make_remint_info(95),
+    ));
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    assert!(storage_rx.try_recv().is_err(), "4_000 does not cover 5_000");
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "no refund on an uncovered window"
+    );
+    assert_eq!(state.pending_remints[0].coverage_slot, Some(5_000));
+
+    storage_mock
+        .update_committed_checkpoint("escrow", 5_000)
+        .await
+        .unwrap();
+    state.pending_remints[0].deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    let update = storage_rx
+        .recv()
+        .await
+        .expect("the covered absence refunds");
+    assert_eq!(update.status, TransactionStatus::FailedReminted);
+    assert_eq!(
+        mock.call_count("getSlot"),
+        0,
+        "the bound never comes from getSlot"
+    );
+    mock.shutdown().await;
+}

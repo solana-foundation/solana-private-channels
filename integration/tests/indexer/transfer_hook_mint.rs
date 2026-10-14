@@ -468,8 +468,8 @@ async fn test_withdrawal_of_transfer_hook_mint_releases() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// A hook mint whose validation account was never created can never resolve, so
-/// the row parks instead of the operator restarting on it forever.
+/// A hook mint whose validation account was never created looks like a lagging node, so
+/// the row is retried and parks once its requeues are spent, not restarted on forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_withdrawal_parks_when_validation_account_is_missing(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -486,6 +486,11 @@ async fn test_withdrawal_parks_when_validation_account_is_missing(
             WITHDRAW_AMOUNT,
             0,
         ))
+        .await?;
+    // Start at the requeue cap so the first unproven null parks the row.
+    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE signature = $1")
+        .bind(&withdrawal_sig)
+        .execute(&env.pool)
         .await?;
 
     // The validator has no status snapshot, so the operator reads the channel through this.

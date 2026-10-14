@@ -63,6 +63,35 @@ fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     }
 }
 
+/// JSON-RPC code a node returns when it cannot answer at the requested `minContextSlot`.
+const MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
+
+/// Whether `e` says the node is behind a requested `minContextSlot`: its own -32016, the
+/// client's AccountNotFound wrapping of it, or our check of an answer below the floor.
+pub fn is_min_context_slot_error(e: &client_error::Error) -> bool {
+    match e.kind() {
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+            *code == MIN_CONTEXT_SLOT_NOT_REACHED
+        }
+        ErrorKind::RpcError(RpcError::ForUser(msg)) => msg.contains(&format!(
+            "RPC response error {MIN_CONTEXT_SLOT_NOT_REACHED}"
+        )),
+        _ => false,
+    }
+}
+
+/// The error for an answer below `min_context_slot`, shaped like the node's own refusal.
+pub fn below_min_context_slot(slot: u64, min_context_slot: u64) -> client_error::Error {
+    client_error::Error::from(ErrorKind::RpcError(RpcError::RpcResponseError {
+        code: MIN_CONTEXT_SLOT_NOT_REACHED,
+        message: format!(
+            "Minimum context slot has not been reached: answered at slot {slot}, below \
+             {min_context_slot}"
+        ),
+        data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+    }))
+}
+
 /// The channel's `getSignatureStatusSnapshot` answer, every field from one committed state.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -219,9 +248,8 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the current slot with retry. The refund gate uses it as the last slot
-    /// a release could have landed in, which is what the indexer's checkpoint
-    /// then has to cover before an absent release record counts as evidence.
+    /// Get the current slot with retry. Unanchored: a lagging node reports its own
+    /// old slot, so it must not bound anything a refund or a verdict depends on.
     pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_slot", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_slot().await
@@ -262,6 +290,16 @@ impl RpcClientWithRetry {
             self.rpc_client.get_block_time(slot).await
         })
         .await
+    }
+
+    /// Whether `slot`'s block time is within `CHANNEL_MAX_AGE_SECS` of our clock, which proves
+    /// the node answering at `slot` is live rather than replaying an old chain.
+    pub async fn tip_is_fresh(&self, slot: u64) -> Result<bool, Box<client_error::Error>> {
+        let max_age = crate::operator::escrow_sweep::CHANNEL_MAX_AGE_SECS;
+        let age = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(self.get_block_time(slot).await?);
+        Ok((-max_age..=max_age).contains(&age))
     }
 
     /// Get the node's lowest retained slot with retry. An absence-based `Dead`
@@ -369,7 +407,8 @@ impl RpcClientWithRetry {
     /// snapshot whose context slot is at least `min_context_slot`. If the node
     /// cannot serve at that slot (a lagging or load-balanced backend) it returns
     /// an RPC error rather than an older snapshot, letting the caller fail closed.
-    /// This binds the returned account to a slot the caller has already proven fresh.
+    /// An answer below the slot is checked here too, so a node ignoring the
+    /// parameter is an error as well. Either error matches `is_min_context_slot_error`.
     pub async fn get_account_with_context_min_slot(
         &self,
         pubkey: &Pubkey,
@@ -392,6 +431,10 @@ impl RpcClientWithRetry {
                     .rpc_client
                     .get_ui_account_with_config(pubkey, config)
                     .await?;
+                // A backend that ignores the parameter is refused here; a retry may reach a fresher one.
+                if let Some(min) = min_context_slot.filter(|&min| response.context.slot < min) {
+                    return Err(below_min_context_slot(response.context.slot, min));
+                }
                 let value = match response.value {
                     None => None,
                     Some(account) => Some(account.to_account().ok_or_else(|| {
@@ -1116,5 +1159,127 @@ mod tests {
             .await;
         let client = make_client_at(&server.url());
         assert!(client.get_genesis_hash().await.is_err());
+    }
+
+    /// Answers `getAccountInfo` with an empty account at each slot in `slots` in turn,
+    /// repeating the last, and counts the calls.
+    async fn mock_account_at_slots(
+        server: &mut mockito::ServerGuard,
+        slots: Vec<u64>,
+    ) -> Arc<AtomicU32> {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let n = counter.fetch_add(1, Ordering::SeqCst) as usize;
+                let slot = slots[n.min(slots.len() - 1)];
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":null}},"id":0}}"#
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        calls
+    }
+
+    /// A backend that ignores `minContextSlot` and answers older is refused, not believed.
+    #[tokio::test]
+    async fn min_slot_answer_below_floor_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        mock_account_at_slots(&mut server, vec![40]).await;
+        let client = make_client_at(&server.url());
+
+        let err = client
+            .get_account_with_context_min_slot(
+                &Pubkey::default(),
+                CommitmentConfig::finalized(),
+                Some(50),
+            )
+            .await
+            .expect_err("an answer below the floor must not be returned");
+
+        assert!(is_min_context_slot_error(&err), "{err}");
+    }
+
+    /// Behind a load balancer the next try can reach a backend at the floor.
+    #[tokio::test]
+    async fn min_slot_check_retries_a_mixed_backend() {
+        let mut server = mockito::Server::new_async().await;
+        let calls = mock_account_at_slots(&mut server, vec![40, 60]).await;
+
+        let resp = make_client_fast_at(&server.url())
+            .get_account_with_context_min_slot(
+                &Pubkey::default(),
+                CommitmentConfig::finalized(),
+                Some(50),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.context.slot, 60);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The node's raw refusal and the client's AccountNotFound wrapping of it both count.
+    #[test]
+    fn min_context_slot_error_is_classified_in_both_shapes() {
+        let raw = client_error::Error::from(ErrorKind::RpcError(RpcError::RpcResponseError {
+            code: -32016,
+            message: "Minimum context slot has not been reached".to_string(),
+            data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+        }));
+        let wrapped = client_error::Error::from(ErrorKind::RpcError(RpcError::ForUser(
+            "AccountNotFound: pubkey=11111111111111111111111111111111: RPC response error \
+             -32016: Minimum context slot has not been reached"
+                .to_string(),
+        )));
+
+        assert!(is_min_context_slot_error(&raw));
+        assert!(is_min_context_slot_error(&wrapped));
+        assert!(!is_min_context_slot_error(&rpc_account_not_found()));
+        assert!(!is_min_context_slot_error(&rpc_method_not_found()));
+        assert!(!is_min_context_slot_error(&rpc_transient()));
+    }
+
+    /// A block time past the limit means the node's tip is old, so its absences prove nothing.
+    #[tokio::test]
+    async fn tip_is_fresh_rejects_an_old_block_time() {
+        for (age, fresh) in [(1, true), (121, false), (-121, false)] {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getBlockTime""#.into(),
+                ))
+                .with_status(200)
+                .with_body(format!(
+                    r#"{{"jsonrpc":"2.0","result":{},"id":0}}"#,
+                    chrono::Utc::now().timestamp() - age
+                ))
+                .create_async()
+                .await;
+
+            let got = make_client_at(&server.url()).tip_is_fresh(9).await.unwrap();
+
+            assert_eq!(got, fresh, "block {age}s old");
+        }
+    }
+
+    fn make_client_fast_at(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 5,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
     }
 }

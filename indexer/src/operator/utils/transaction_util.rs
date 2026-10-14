@@ -25,8 +25,13 @@ pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
 pub enum ConfirmationResult {
     /// Transaction confirmed on-chain
     Confirmed,
-    /// Transaction failed with optional program error from PrivateChannelEscrowProgram
-    Failed(Option<PrivateChannelEscrowProgramError>),
+    /// Transaction failed with optional program error from PrivateChannelEscrowProgram.
+    /// `slot` is where the failed status was recorded, so the chain held the state the
+    /// program judged at or before it.
+    Failed {
+        error: Option<PrivateChannelEscrowProgramError>,
+        slot: u64,
+    },
     /// Mint account not initialized (triggers initialization)
     MintNotInitialized,
     /// Transaction couldn't be confirmed after polling max attempts
@@ -157,7 +162,9 @@ pub async fn check_transaction_status(
                         }
                     }
 
-                    return Ok(classify_failure(&rpc_client, signature, tx_err, kind).await);
+                    return Ok(
+                        classify_failure(&rpc_client, signature, tx_err, kind, status.slot).await,
+                    );
                 }
 
                 debug!("Transaction confirmed: {}", signature);
@@ -234,22 +241,22 @@ pub async fn classify_failure(
     signature: &Signature,
     err: &solana_sdk::transaction::TransactionError,
     kind: TransactionKind,
+    slot: u64,
 ) -> ConfirmationResult {
+    let failed = |error| ConfirmationResult::Failed { error, slot };
     let solana_sdk::transaction::TransactionError::InstructionError(
         _,
         InstructionError::Custom(code),
     ) = err
     else {
-        return ConfirmationResult::Failed(None);
+        return failed(None);
     };
     let Some(escrow_error) = escrow_error_for_code(*code) else {
-        return ConfirmationResult::Failed(None);
+        return failed(None);
     };
     match kind {
-        TransactionKind::Mint | TransactionKind::InitializeMint => {
-            return ConfirmationResult::Failed(None)
-        }
-        TransactionKind::RotateBitmap => return ConfirmationResult::Failed(Some(escrow_error)),
+        TransactionKind::Mint | TransactionKind::InitializeMint => return failed(None),
+        TransactionKind::RotateBitmap => return failed(Some(escrow_error)),
         TransactionKind::ReleaseFunds => {}
     }
 
@@ -264,12 +271,10 @@ pub async fn classify_failure(
         }
     };
     match logs.as_deref().and_then(failing_program) {
-        Some(origin) if origin == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID => {
-            ConfirmationResult::Failed(Some(escrow_error))
-        }
+        Some(origin) if origin == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID => failed(Some(escrow_error)),
         Some(origin) => {
             warn!("Custom error {code} on {signature} raised by {origin}, not the escrow; treating it as a generic failure");
-            ConfirmationResult::Failed(None)
+            failed(None)
         }
         None => {
             // The retry also counts as a confirmation timeout; this label names the cause.
@@ -553,11 +558,12 @@ mod tests {
             &Signature::new_unique(),
             &err,
             TransactionKind::ReleaseFunds,
+            7,
         )
         .await;
 
         assert!(
-            matches!(result, ConfirmationResult::Failed(None)),
+            matches!(result, ConfirmationResult::Failed { error: None, .. }),
             "{result:?}"
         );
     }
@@ -574,15 +580,17 @@ mod tests {
             &Signature::new_unique(),
             &err,
             TransactionKind::ReleaseFunds,
+            7,
         )
         .await;
 
         assert!(
             matches!(
                 result,
-                ConfirmationResult::Failed(Some(
-                    PrivateChannelEscrowProgramError::NonceAlreadyUsed
-                ))
+                ConfirmationResult::Failed {
+                    error: Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                    ..
+                }
             ),
             "{result:?}"
         );
@@ -611,6 +619,7 @@ mod tests {
             &Signature::new_unique(),
             &err,
             TransactionKind::ReleaseFunds,
+            7,
         )
         .await;
 
@@ -641,15 +650,17 @@ mod tests {
             &Signature::new_unique(),
             &err,
             TransactionKind::RotateBitmap,
+            7,
         )
         .await;
 
         assert!(
             matches!(
                 result,
-                ConfirmationResult::Failed(Some(
-                    PrivateChannelEscrowProgramError::UnexpectedGeneration
-                ))
+                ConfirmationResult::Failed {
+                    error: Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+                    ..
+                }
             ),
             "{result:?}"
         );
@@ -675,11 +686,12 @@ mod tests {
             &Signature::new_unique(),
             &err,
             TransactionKind::Mint,
+            7,
         )
         .await;
 
         assert!(
-            matches!(result, ConfirmationResult::Failed(None)),
+            matches!(result, ConfirmationResult::Failed { error: None, .. }),
             "{result:?}"
         );
         logs_read.assert();
@@ -796,10 +808,64 @@ mod tests {
 
         assert!(matches!(
             result,
-            Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap
-            )))
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
+                ..
+            })
         ));
+    }
+
+    /// A refusal carries the slot its status was recorded at, so the handler can read the
+    /// generation from at least that point instead of from an older snapshot.
+    #[tokio::test]
+    async fn confirmation_failed_carries_the_status_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _tx = mock_transaction_logs(&mut server, &escrow_rejection_logs(13), 13);
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 4_300},
+                        "value": [{
+                            "confirmationStatus": "confirmed",
+                            "confirmations": 1,
+                            "err": {"InstructionError": [0, {"Custom": 13}]},
+                            "slot": 4_242,
+                            "status": {"Err": {"InstructionError": [0, {"Custom": 13}]}}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let result = check_transaction_status(
+            make_rpc_client_for_test(server.url()),
+            &Signature::new_unique(),
+            TransactionKind::ReleaseFunds,
+            CommitmentConfig::confirmed(),
+            &ExtraErrorCheckPolicy::None,
+            400,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Ok(ConfirmationResult::Failed {
+                    error: Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                    slot: 4_242,
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     /// An RPC-level error (-32600) must surface as Err(TransactionError::Rpc) so the
