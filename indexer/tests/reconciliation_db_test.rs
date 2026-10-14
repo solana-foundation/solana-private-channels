@@ -86,8 +86,8 @@ async fn insert_transaction(
     sqlx::query(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
-         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, $5::transaction_type, $6::transaction_status, NOW(), NOW())",
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
+         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, $5::transaction_type, $6::transaction_status, NOW(), NOW(), $7)",
     )
     .bind(signature)
     .bind(slot)
@@ -95,6 +95,7 @@ async fn insert_transaction(
     .bind(TokenAmount(amount))
     .bind(transaction_type)
     .bind(status)
+    .bind(landed_remint_for(status))
     .execute(pool)
     .await?;
 
@@ -113,8 +114,8 @@ async fn insert_withdrawal(
     sqlx::query_scalar(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
-         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, 'withdrawal', $5::transaction_status, NOW(), NOW())
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
+         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, 'withdrawal', $5::transaction_status, NOW(), NOW(), $6)
          RETURNING withdrawal_nonce",
     )
     .bind(signature)
@@ -122,8 +123,14 @@ async fn insert_withdrawal(
     .bind(mint)
     .bind(TokenAmount(amount))
     .bind(status)
+    .bind(landed_remint_for(status))
     .fetch_one(pool)
     .await
+}
+
+/// A reminted row must carry its landed remint (table CHECK); no other status does.
+fn landed_remint_for(status: &str) -> Option<String> {
+    (status == "failed_reminted").then(|| "remint-landed".to_string())
 }
 
 /// Record that the escrow indexer saw the release for `nonce` land at `slot`, with no

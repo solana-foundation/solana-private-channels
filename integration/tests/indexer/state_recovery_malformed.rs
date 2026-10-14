@@ -10,7 +10,7 @@
 //!   - invalid `mint` pubkey string (redundant with t12, kept for
 //!     regression anchoring)
 //!   - invalid `initiator` pubkey string
-//!   - invalid withdrawal `remint_signatures[i]` string
+//!   - invalid signature in the release journal (`pending_release_signatures`)
 //!
 //! The former negative-amount shape is gone: `amount` is a `TokenAmount(u64)`,
 //! so a negative value is unconstructable and its rejection lives in the
@@ -29,7 +29,7 @@ use {
         storage::{
             common::{
                 amount::TokenAmount,
-                models::{DbTransaction, TransactionStatus, TransactionType},
+                models::{DbTransaction, StoredSig, TransactionStatus, TransactionType},
                 storage::mock::MockStorage,
             },
             Storage,
@@ -128,25 +128,50 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
         deadline,
     );
 
-    // Row 12 — invalid signature in remint_signatures
+    // Row 12 — invalid signature in the release journal
+    let bad_signature_id = 12;
+    let bad_signature = "this-is-not-a-base58-signature".to_string();
     let bad_sig = make_row(
-        12,
+        bad_signature_id,
         Pubkey::new_unique().to_string(),
         Pubkey::new_unique().to_string(),
-        vec!["this-is-not-a-base58-signature".to_string()],
+        vec![bad_signature.clone()],
         3_000,
         deadline,
     );
 
     // Row 14 — valid, must still be recovered
+    let good_transaction_id = 14;
     let good = make_row(
-        14,
+        good_transaction_id,
         good_mint.to_string(),
         good_initiator.to_string(),
         vec![good_sig.to_string()],
         4_000,
         deadline,
     );
+
+    // Boot rebuilds from the release journal, which the handoff writes with the row.
+    // Rows 10 and 11 fail on their pubkeys before the journal is read.
+    {
+        let mut journal = mock.release_signatures.lock().unwrap();
+        journal.insert(
+            bad_signature_id,
+            vec![StoredSig {
+                signature: bad_signature,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        journal.insert(
+            good_transaction_id,
+            vec![StoredSig {
+                signature: good_sig.to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+    }
 
     mock.pending_remint_transactions.lock().unwrap().extend([
         bad_mint,
@@ -180,7 +205,7 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
         "exactly one row (the valid sibling) must be rehydrated"
     );
     let entry = &state.pending_remints[0];
-    assert_eq!(entry.ctx.transaction_id, Some(14));
+    assert_eq!(entry.ctx.transaction_id, Some(good_transaction_id));
     assert_eq!(entry.remint_info.mint, good_mint);
     assert_eq!(entry.remint_info.user, good_initiator);
     assert_eq!(entry.signatures.len(), 1);
@@ -190,12 +215,19 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
     let mut escalated_ids: Vec<i64> = Vec::new();
     while let Ok(update) = storage_rx.try_recv() {
         assert_eq!(update.status, TransactionStatus::ManualReview);
+        if update.transaction_id == bad_signature_id {
+            let err = update.error_message.as_deref().unwrap_or("");
+            assert!(
+                err.contains("malformed stored release signature"),
+                "row {bad_signature_id} must escalate on its corrupt journal, not an empty one: {err}"
+            );
+        }
         escalated_ids.push(update.transaction_id);
     }
     escalated_ids.sort();
     assert_eq!(
         escalated_ids,
-        vec![10, 11, 12],
+        vec![10, 11, bad_signature_id],
         "every malformed row must escalate exactly once; got {:?}",
         escalated_ids
     );

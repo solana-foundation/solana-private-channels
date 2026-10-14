@@ -291,8 +291,8 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
 
 /// Verifies that a PendingRemint row resolved via FailedReminted is not re-queued.     
 ///                                                                                     
-/// After a successful remint, update_transaction_status transitions the row to
-/// FailedReminted. The recovery query must not return it on the next startup —         
+/// After a successful remint, record_remint_result transitions the row to
+/// FailedReminted. The recovery query must not return it on the next startup —
 /// otherwise the remint would fire again even though tokens were already re-minted.    
 #[tokio::test(flavor = "multi_thread")]
 async fn test_failed_reminted_row_not_returned_by_recovery_query(
@@ -314,17 +314,10 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
     let before = storage.get_pending_remint_transactions().await?;
     assert_eq!(before.len(), 1);
 
-    // 2. Simulate a successful remint: status transitions to FailedReminted.
-    //    (counterpart_signature is None for FailedReminted — the withdrawal never
-    //    landed, so there is no release_funds sig to record.)
+    // 2. Simulate a successful remint: recording it moves the row to
+    //    FailedReminted together with the landed remint signature.
     storage
-        .update_transaction_status(
-            tx_id,
-            TransactionStatus::FailedReminted,
-            None,
-            Utc::now(),
-            None,
-        )
+        .record_remint_result(tx_id, Signature::new_unique().to_string())
         .await?;
 
     // 3. Row must not appear in recovery — a second remint would double-credit the user.
@@ -350,7 +343,7 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
 ///    withdrawal against escrow — the release_funds never landed on-chain, so the
 ///    tokens are still there.
 /// 4. The finality window passes, no withdrawal sig is found finalized, the remint
-///    succeeds, and `update_transaction_status(FailedReminted)` is called.
+///    succeeds, and `record_remint_result` moves the row to FailedReminted.
 /// 5. After resolution:
 ///    - The recovery query returns no rows (no duplicate remint on restart).
 ///    - The balance query still shows the full deposit with zero withdrawals —
@@ -410,13 +403,7 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
 
     // Step 4: finality check passes (no sig finalized), remint succeeds.
     storage
-        .update_transaction_status(
-            tx_id,
-            TransactionStatus::FailedReminted,
-            None,
-            Utc::now(),
-            None,
-        )
+        .record_remint_result(tx_id, Signature::new_unique().to_string())
         .await?;
 
     // Step 5a: resolved row must not surface in recovery — prevents duplicate remint.

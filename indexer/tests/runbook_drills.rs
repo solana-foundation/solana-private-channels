@@ -74,12 +74,14 @@ async fn seed_withdrawal(
         INSERT INTO transactions
             (signature, slot, initiator, recipient, mint, amount,
              transaction_type, status, withdrawal_nonce,
-             trace_id, processed_at, created_at, updated_at)
+             trace_id, processed_at, created_at, updated_at,
+             landed_remint_signature)
         VALUES
             ($1, 100, $2, $3, $4, 1000,
              'withdrawal'::transaction_type,
              $5::transaction_status, $6,
-             $7, $8, NOW(), NOW())
+             $7, $8, NOW(), NOW(),
+             $9)
         RETURNING id
         "#,
     )
@@ -91,6 +93,8 @@ async fn seed_withdrawal(
     .bind(nonce)
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(Utc::now())
+    // A reminted row must carry its landed remint (table CHECK).
+    .bind((status == "failed_reminted").then(|| Signature::new_unique().to_string()))
     .fetch_one(pool)
     .await?
     .get::<i64, _>(0);
@@ -145,12 +149,14 @@ async fn seed_failed_reminted(
         INSERT INTO transactions
             (signature, slot, initiator, recipient, mint, amount,
              transaction_type, status, withdrawal_nonce,
-             remint_signatures, trace_id, processed_at, created_at, updated_at)
+             remint_signatures, trace_id, processed_at, created_at, updated_at,
+             landed_remint_signature)
         VALUES
             ($1, 100, $2, $3, $4, 1000,
              'withdrawal'::transaction_type,
              'failed_reminted'::transaction_status, $5,
-             $6, $7, $8, NOW(), NOW())
+             $6, $7, $8, NOW(), NOW(),
+             $9)
         RETURNING id
         "#,
     )
@@ -162,6 +168,7 @@ async fn seed_failed_reminted(
     .bind(&sigs)
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(Utc::now())
+    .bind(Signature::new_unique().to_string())
     .fetch_one(pool)
     .await?
     .get::<i64, _>(0);
@@ -871,10 +878,13 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
         .bind(&sig)
         .execute(&pool)
         .await?;
-    sqlx::query("UPDATE transactions SET status='failed_reminted' WHERE id=$1")
-        .bind(to_failed_reminted)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status='failed_reminted', landed_remint_signature=$2 WHERE id=$1",
+    )
+    .bind(to_failed_reminted)
+    .bind(Signature::new_unique().to_string())
+    .execute(&pool)
+    .await?;
     sqlx::query("UPDATE transactions SET status='manual_review' WHERE id=$1")
         .bind(to_manual_review)
         .execute(&pool)
