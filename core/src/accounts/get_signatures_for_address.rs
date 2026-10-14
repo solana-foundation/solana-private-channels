@@ -160,9 +160,10 @@ async fn get_signatures_for_address_postgres(
     // LEFT JOIN: a missing transactions row surfaces as NULL data rather than
     // silently dropping the row. We treat a NULL as data corruption below.
     //
-    // Hide rows below the oldest retained block: truncation deletes their transactions,
-    // not their index rows. Same floor as getFirstAvailableBlock, in this snapshot; the
-    // metadata row goes first because MIN(slot) walks dead index entries until VACUUM.
+    // Hide rows below the oldest retained block. Truncation deletes them with their
+    // transactions; this keeps an orphan left below the floor from reading as corruption.
+    // Same floor as getFirstAvailableBlock, in this snapshot; the metadata row goes first
+    // because MIN(slot) walks dead index entries until VACUUM.
     let rows = sqlx::query(
         "SELECT address_signatures.signature,
                 address_signatures.slot,

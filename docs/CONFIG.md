@@ -185,7 +185,9 @@ accepted as proof.
 
 Truncation deletes in batches, and each batch commits the new retention floor
 (`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or
-aborted run therefore never advertises history it has already removed.
+aborted run therefore never advertises history it has already removed. Each batch
+also deletes the `address_signatures` rows of the transactions it removes; they are
+derived from those rows, which the proof covers.
 
 **`--keep-slots` is a slot span, not a block count.** Blocks are sparse relative
 to slots: an idle node ticks `1000 / blocktime_ms` slots per block it produces

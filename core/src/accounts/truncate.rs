@@ -241,7 +241,7 @@ async fn truncate_slots_inner(
         set_first_available_block_metadata(pool, query_first_available_slot(pool).await?).await?;
 
     if blocks_deleted > 0 || transactions_deleted > 0 {
-        run_vacuum(pool, &["blocks", "transactions"]).await?;
+        run_vacuum(pool, &["blocks", "transactions", "address_signatures"]).await?;
     }
     if account_history_rows_deleted > 0 {
         run_vacuum(pool, &[ACCOUNT_HISTORY_TABLE]).await?;
@@ -343,6 +343,16 @@ async fn process_block_batches(
                     .execute(&mut *tx)
                     .await
                     .context("Failed to delete old transactions")?;
+
+                // Index rows are derived from the transactions deleted above, so they go with them.
+                sqlx::query(
+                    "DELETE FROM address_signatures WHERE signature = ANY($1) AND slot < $2",
+                )
+                .bind(chunk)
+                .bind(truncate_before_slot as i64)
+                .execute(&mut *tx)
+                .await
+                .context("Failed to delete old address_signatures rows")?;
             }
         }
 
@@ -655,6 +665,7 @@ async fn query_first_available_slot(pool: &PgPool) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::sync::Arc;
 
     #[test]
@@ -1372,7 +1383,34 @@ mod tests {
         signatures
     }
 
-    /// History reads after keeping slots 7 to 9 of 0..10: pruned rows end history, never error.
+    /// Index rows below `slot`, then at or above it.
+    async fn index_rows_split_at(pool: &PgPool, slot: u64) -> (i64, i64) {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*) FILTER (WHERE slot < $1), COUNT(*) FILTER (WHERE slot >= $1)
+             FROM address_signatures",
+        )
+        .bind(slot as i64)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An index row with no transaction behind it, below the floor.
+    async fn insert_orphan_index_row(pool: &PgPool, address: &Pubkey, slot: u64) {
+        let signature = Signature::new_unique();
+        sqlx::query(
+            "INSERT INTO address_signatures (address, slot, signature) VALUES ($1, $2, $3)",
+        )
+        .bind(address.as_ref())
+        .bind(slot as i64)
+        .bind(signature.as_ref())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// History reads after keeping slots 7 to 9 of 0..10: history ends at the floor, and a
+    /// cursor naming a pruned signature is refused.
     async fn assert_history_ends_at_the_floor(
         db: &PostgresAccountsDB,
         address: &solana_sdk::pubkey::Pubkey,
@@ -1407,23 +1445,30 @@ mod tests {
             names(&[7]),
             "next page"
         );
-        assert!(
-            read(10, Some(&sigs[3]), None, None).await.is_empty(),
-            "before a pruned row"
-        );
-        assert_eq!(
-            read(10, None, Some(&sigs[3]), None).await,
-            names(&[9, 8, 7]),
-            "until a pruned row"
-        );
         assert_eq!(
             read(10, None, None, Some(vec![(5, 8)])).await,
             names(&[8, 7]),
             "scope spanning the floor"
         );
+        // Truncation deletes a pruned row's index entry, so it reads as an unknown cursor.
+        let pruned = &sigs[3];
+        for (label, before, until) in [
+            ("before", Some(pruned), None),
+            ("until", None, Some(pruned)),
+        ] {
+            let err = db
+                .get_signatures_for_address(address, 10, before, until, None)
+                .await
+                .expect_err("a cursor naming a pruned signature must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{label}' is unavailable")),
+                "{label}: {err}"
+            );
+        }
     }
 
-    /// Regression: truncation leaves index rows behind, and a read reaching them failed.
+    /// History ends cleanly at the floor, even with an orphan index row below it.
     #[tokio::test(flavor = "multi_thread")]
     async fn history_survives_truncation() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
@@ -1435,6 +1480,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_floor_metadata(&db.pool).await, Some(7));
+        insert_orphan_index_row(&db.pool, &address, 3).await;
 
         assert_history_ends_at_the_floor(&db, &address, &sigs).await;
     }
@@ -1454,7 +1500,40 @@ mod tests {
             .execute(db.pool.as_ref())
             .await
             .unwrap();
+        insert_orphan_index_row(&db.pool, &address, 3).await;
 
         assert_history_ends_at_the_floor(&db, &address, &sigs).await;
+    }
+
+    /// Truncation deletes the index rows of the transactions it removes, and only those.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncation_prunes_the_address_index_below_the_floor() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let address = Pubkey::new_unique();
+        write_address_history(&db, &address, 0..10).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        // Keeping 3 slots of 0..=9 puts the floor at 7.
+        let opts = apply_opts(3, 4, dump.path(), &restore);
+        let floor = 7;
+        let (pruned_before, retained_before) = index_rows_split_at(&db.pool, floor).await;
+        assert!(pruned_before > 0, "the history must reach below the floor");
+
+        let mut dry = opts.clone();
+        dry.dry_run = true;
+        truncate_on_fresh_pool(&url, &dry, &db.pool).await.unwrap();
+        assert_eq!(
+            index_rows_split_at(&db.pool, floor).await,
+            (pruned_before, retained_before),
+            "a dry run must not delete index rows"
+        );
+
+        truncate_on_fresh_pool(&url, &opts, &db.pool).await.unwrap();
+        assert_eq!(read_floor_metadata(&db.pool).await, Some(floor));
+        assert_eq!(
+            index_rows_split_at(&db.pool, floor).await,
+            (0, retained_before),
+            "rows below the floor go, rows at or above it stay"
+        );
     }
 }
