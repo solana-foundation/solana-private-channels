@@ -438,6 +438,8 @@ pub async fn run_sender(
         }
     }
 
+    // A graceful stop leaves in-progress sends running, as before; only an abort kills them.
+    state.send_tasks.detach_all();
     info!("Sender stopped gracefully");
     Ok(())
 }

@@ -1932,7 +1932,7 @@ pub(super) async fn fire_and_store(
 /// cycle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fire_and_store(
-    state: &SenderState,
+    state: &mut SenderState,
     instruction: InstructionWithSigners,
     compute_unit_price: Option<u64>,
     ctx: TransactionContext,
@@ -1961,7 +1961,9 @@ pub(super) fn spawn_fire_and_store(
     let program_type = state.program_type;
     let storage = state.storage.clone();
 
-    tokio::spawn(fire_and_store_task(
+    // Reap finished sends so the set only holds live ones.
+    while state.send_tasks.try_join_next().is_some() {}
+    state.send_tasks.spawn(fire_and_store_task(
         rpc_client,
         storage,
         in_flight,
@@ -6400,6 +6402,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6493,6 +6496,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6601,6 +6605,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6653,6 +6658,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6701,6 +6707,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6763,6 +6770,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6843,6 +6851,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -8108,7 +8117,7 @@ mod tests {
     /// fetcher can re-emit the transaction on the next poll cycle.
     #[tokio::test]
     async fn spawn_fire_and_store_cap_exhausted_returns_false() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
 
         // Hold all permits — simulates MAX_IN_FLIGHT tasks in-flight.
         let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
@@ -8126,7 +8135,7 @@ mod tests {
         };
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             ctx,
@@ -8149,13 +8158,13 @@ mod tests {
     /// so back-pressure is applied as soon as the task starts, not after it finishes.
     #[tokio::test]
     async fn spawn_fire_and_store_available_capacity_returns_true_and_consumes_permit() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
         assert_eq!(state.semaphore.available_permits(), MAX_IN_FLIGHT);
 
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             TransactionContext {
@@ -8179,6 +8188,62 @@ mod tests {
             MAX_IN_FLIGHT - 1,
             "one permit must be held by the spawned task"
         );
+    }
+
+    /// A lost live-state lock aborts the sender, and a mint send it spawned must stop with it
+    /// rather than broadcast after the operator has given the lock up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_sender_aborts_its_spawned_mint_sends() {
+        // Accepts and never answers, so the send task parks on its first RPC call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let state = make_sender_state_with_server(&url);
+        let semaphore = state.semaphore.clone();
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+
+        let sender = tokio::spawn(async move {
+            let mut state = state;
+            let (storage_tx, _storage_rx) = mpsc::channel(10);
+            assert!(spawn_fire_and_store(
+                &mut state,
+                dummy_instruction(),
+                None,
+                TransactionContext {
+                    kind: TransactionKind::Mint,
+                    transaction_id: Some(1),
+                    withdrawal_nonce: None,
+                    trace_id: None,
+                    deposit_claim_lease: None,
+                },
+                RetryPolicy::None,
+                ExtraErrorCheckPolicy::None,
+                storage_tx,
+                SendDurability::Terminal,
+            ));
+            let _ = spawned_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        spawned_rx.await.unwrap();
+        assert_eq!(semaphore.available_permits(), MAX_IN_FLIGHT - 1);
+
+        sender.abort();
+        let _ = sender.await;
+
+        // The send task releases its permit only once it has stopped.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while semaphore.available_permits() < MAX_IN_FLIGHT {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawned mint send outlived the aborted sender"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     // ── run_poll_task: cancellation ───────────────────────────────────
