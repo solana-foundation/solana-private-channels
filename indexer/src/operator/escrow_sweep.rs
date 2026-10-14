@@ -272,8 +272,10 @@ pub async fn allowed_mint_token_programs(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     mints: &[Pubkey],
-) -> Result<HashMap<Pubkey, Pubkey>, EscrowSweepError> {
-    let anchor = newest_block_anchor(rpc_client, "Solana").await?;
+) -> Result<HashMap<Pubkey, Pubkey>, SweepFailure> {
+    let anchor = newest_block_anchor(rpc_client, "Solana")
+        .await
+        .map_err(|e| e.into_sweep_failure(0))?;
     let pdas: Vec<Pubkey> = mints
         .iter()
         .map(|mint| find_allowed_mint_pda(&escrow_instance_id, mint))

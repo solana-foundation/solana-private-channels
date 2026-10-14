@@ -80,8 +80,8 @@ that has `mint_status_history` or deposit rows but no `mints` row. That happens 
 the indexer started after the mint's `AllowMint`: a later `BlockMint` writes only
 history. Such an unlisted mint takes its token program from its on-chain
 `AllowedMint` account, read by address; if that account is absent or unreadable the
-mint is left out of both checks for the tick (its custody was never read) and the
-tick counts as dark. The tick logs `Mints with history or deposits but no mints row`
+mint gets no verdict from either check for the tick (its custody was never read),
+both checks hold its breach streak rather than reset it, and the tick counts as dark. The tick logs `Mints with history or deposits but no mints row`
 with their count, naming any it could not resolve; resyncing the escrow indexer from the `AllowMint` slot restores the
 rows. Custody is read from
 the escrow instance's associated token account (ATA) for each of those mints,

@@ -542,7 +542,19 @@ async fn check_invariants(
         fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
     // The ledger values an unresolved mint too, but its custody was never read and would count
-    // as 0, so both arms skip it and the tick is reported missing instead.
+    // as 0, so both arms skip it and the tick is reported missing. The counters are rebuilt
+    // from the set each tick, so its streaks are carried over by hand: no verdict, no reset.
+    let held: Vec<(Pubkey, Option<u32>, Option<u32>)> = universe
+        .unresolved
+        .iter()
+        .map(|mint| {
+            (
+                *mint,
+                breach_counters.supply.get(mint).copied(),
+                breach_counters.liability.get(mint).copied(),
+            )
+        })
+        .collect();
     for mint in &universe.unresolved {
         mints.remove(mint);
     }
@@ -571,6 +583,14 @@ async fn check_invariants(
         fence,
     )
     .await;
+    for (mint, supply_streak, liability_streak) in held {
+        if let Some(n) = supply_streak {
+            breach_counters.supply.insert(mint, n);
+        }
+        if let Some(n) = liability_streak {
+            breach_counters.liability.insert(mint, n);
+        }
+    }
     for masked_breach in masked {
         masked_alerts.send(masked_breach);
     }
@@ -5490,8 +5510,8 @@ mod tests {
         assert_eq!(requested.lock().unwrap().len(), 1, "custody only");
     }
 
-    /// An unlisted mint whose `AllowedMint` cannot be read has no custody reading, so it is held
-    /// out of both arms (its custody would read as 0) and the tick counts as dark.
+    /// An unlisted mint whose `AllowedMint` cannot be read has no custody reading, so both arms
+    /// hold its streak (its custody would otherwise read as 0) and the tick counts as dark.
     #[tokio::test]
     async fn an_unlisted_mint_without_a_pda_marks_the_tick_missing() {
         let (listed, unlisted) = (Pubkey::new_unique(), Pubkey::new_unique());
@@ -5504,15 +5524,22 @@ mod tests {
         ]);
         let config = recon_config_zero_tolerance();
         let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        // Streaks from earlier readable ticks: an unreadable tick is no evidence either way.
+        counters.supply.insert(unlisted, 2);
+        counters.liability.insert(unlisted, 2);
 
         one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
 
         assert_eq!(input_dark, 1, "the tick is missing an input");
-        assert_eq!(counters.supply.get(&unlisted), None);
         assert_eq!(
-            counters.liability.get(&unlisted),
-            None,
-            "no custody, no liability verdict"
+            counters.supply.get(&unlisted).copied(),
+            Some(2),
+            "no supply verdict: streak held"
+        );
+        assert_eq!(
+            counters.liability.get(&unlisted).copied(),
+            Some(2),
+            "no custody, no liability verdict: streak held"
         );
         assert_eq!(
             counters.liability.get(&listed).copied(),
