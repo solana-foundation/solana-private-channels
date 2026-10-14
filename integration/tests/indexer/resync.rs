@@ -3234,7 +3234,7 @@ impl Stack {
             let (rpc, db) = (rpc.clone(), db.clone());
             workers.push(
                 Worker::spawn(move || async move {
-                    start_private_channel_indexer(None, rpc, db)
+                    start_private_channel_indexer(rpc, db)
                         .await
                         .expect("start the withdraw indexer");
                 })

@@ -309,7 +309,6 @@ async fn setup(
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
     let (private_channel_indexer_result, solana_indexer_result) = tokio::join!(
         start_private_channel_indexer(
-            None,
             private_channel_rpc_url.clone(),
             private_channel_indexer_db_url.clone()
         ),
