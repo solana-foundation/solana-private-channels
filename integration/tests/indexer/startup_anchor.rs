@@ -667,3 +667,76 @@ async fn failed_startup_fill_exits_and_restart_refills_yellowstone() {
     failed_startup_fill_exits_and_restart_refills(DatasourceType::Yellowstone, "failed_fill_ys")
         .await;
 }
+
+/// A live source that never finishes a slot must read as stalled once it has started,
+/// whether it never connects or connects and stays silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_reports_stalled_when_the_live_source_never_delivers() {
+    init_tracing();
+    for never_connects in [true, false] {
+        let db = if never_connects {
+            "stalled_never_connects"
+        } else {
+            "stalled_silent_stream"
+        };
+        let (_pg, pool, postgres) = start_postgres(db).await;
+        let mut rpc = MockitoServer::new_async().await;
+        let _slot = mock_get_slot(&mut rpc, TIP).await;
+        let ys = if never_connects {
+            None
+        } else {
+            Some(MockYellowstoneServer::start().await)
+        };
+        let endpoint = ys
+            .as_ref()
+            .map_or_else(|| "http://127.0.0.1:1".to_string(), |ys| ys.url());
+
+        let backfill = BackfillConfig {
+            enabled: false,
+            exit_after_backfill: false,
+            rpc_url: rpc.url(),
+            batch_size: 100,
+            max_gap_slots: 1_000,
+            start_slot: None,
+        };
+        let indexer = indexer_config(endpoint, backfill);
+        let common = common_config(postgres, rpc.url());
+        let health =
+            private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig {
+                max_pending: 50,
+                stale_threshold_secs: 1,
+                require_continuous_progress: true,
+            });
+        let run_health = health.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run(common, indexer, Some(run_health)).await {
+                eprintln!("indexer run exited: {e}");
+            }
+        });
+
+        wait_for_anchor(&pool, "withdraw", 60).await;
+        let stalled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    health.check(),
+                    private_channel_metrics::HealthOutcome::Stalled { pending: 0, .. }
+                ) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            stalled.is_ok(),
+            "never connects: {never_connects}: a live source that never delivers must read \
+             as stalled, got {:?}",
+            health.check()
+        );
+
+        handle.abort();
+        if let Some(ys) = ys {
+            ys.shutdown().await;
+        }
+    }
+}

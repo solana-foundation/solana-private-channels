@@ -727,7 +727,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} has proven that a block exists at a slot the datasource RPC will not serve, so the checkpoint cannot advance past it. This is a positive proof from a later block's parentSlot link, not a guess: the slot is not a skip. Repoint COMMON_RPC_URL (or COMMON_FALLBACK_RPC_URL) at a full-history archival endpoint and restart. This keys off the error counter rather than the checkpoint frontier-lag gauge, because an ungated RPC-polling indexer reports zero lag while wedged. See docs/runbooks/indexer_block_unavailable.md."
+          summary: "Indexer {{ $labels.program_type }} has proven that a block exists at a slot the datasource RPC will not serve, so the checkpoint cannot advance past it. This is a positive proof from a later block's parentSlot link, not a guess: the slot is not a skip. Repoint the endpoint that refused the slot at a full-history archival endpoint and restart: COMMON_RPC_URL for live polling (log 'Slot N is unavailable'), INDEXER_BACKFILL_RPC_URL (or [indexer.backfill] rpc_url) for the startup backfill and Yellowstone gap-fill (log 'Backfill slot N is unavailable'). COMMON_FALLBACK_RPC_URL is never asked for such a slot, so it does not clear this. This keys off the error counter rather than the checkpoint frontier-lag gauge, because an ungated RPC-polling indexer reports zero lag while wedged. See docs/runbooks/indexer_block_unavailable.md."
         labels:
           severity: critical
         data:

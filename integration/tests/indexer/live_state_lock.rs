@@ -14,7 +14,7 @@ use {
         config::{
             BackfillConfig, IndexerConfig, OperatorConfig, PostgresConfig,
             PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig,
-            StorageType, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+            StorageType, YellowstoneConfig, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         error::{IndexerError, OperatorError, StorageError},
         indexer::{datasource::rpc_polling::rpc::RpcPoller, resync::ResyncService},
@@ -26,6 +26,7 @@ use {
         },
         DatasourceType,
     },
+    private_channel_metrics::{HealthConfig, HealthState},
     solana_commitment_config::CommitmentLevel,
     sqlx::Connection,
     std::{
@@ -476,5 +477,87 @@ async fn resync_stops_when_its_lock_is_lost_while_waiting_out_stale_workers() {
     assert_eq!(
         table, None,
         "nothing, not even the schema, may be touched inside the grace"
+    );
+}
+
+/// Withdraw indexer on Yellowstone with backfill off, so startup goes straight to the
+/// datasource build, whose anchor read goes to `backfill_rpc`. Withdraw skips reconciliation.
+fn yellowstone_withdraw_configs(
+    postgres: PostgresConfig,
+    backfill_rpc: &str,
+) -> (PrivateChannelIndexerConfig, IndexerConfig) {
+    let mut common = common_config(postgres);
+    common.program_type = ProgramType::Withdraw;
+    common.source_rpc_url = None;
+    common.escrow_instance_id = None;
+    let mut indexer = indexer_config();
+    indexer.datasource_type = DatasourceType::Yellowstone;
+    indexer.rpc_polling = None;
+    indexer.yellowstone = Some(YellowstoneConfig {
+        endpoint: DEAD_RPC.to_string(),
+        x_token: None,
+        commitment: "confirmed".to_string(),
+    });
+    indexer.backfill.rpc_url = backfill_rpc.to_string();
+    (common, indexer)
+}
+
+/// I17. A lock lost while the datasource is being built must stop the indexer before it
+/// writes the startup anchor. The anchor read hangs on a black hole, so the build stays parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexer_stops_when_the_live_lock_is_lost_while_building_the_datasource() {
+    let (url, _container) = start_postgres("live_lock_lost_datasource_build").await;
+    let (backfill_rpc, accepts) = black_hole_rpc().await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+    let (common, indexer) = yellowstone_withdraw_configs(postgres, &backfill_rpc);
+    let health = HealthState::new(HealthConfig::indexer());
+    let run = tokio::spawn(private_channel_indexer::indexer::run(
+        common,
+        indexer,
+        Some(health.clone()),
+    ));
+
+    // The lock is taken before the build, so a first accept means run is parked in it.
+    wait_until(
+        "the anchor read to reach RPC",
+        Duration::from_secs(30),
+        || async { accepts.load(Ordering::SeqCst) >= 1 },
+    )
+    .await;
+    assert_eq!(
+        health.last_progress_at().load(Ordering::SeqCst),
+        0,
+        "the stall clock must not start before the live source does"
+    );
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    let result = tokio::time::timeout(LOCK_LOST_STOP_BOUND, run)
+        .await
+        .expect("the indexer must stop soon after losing the live-state lock")
+        .expect("indexer task must not panic");
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "the indexer must stop on the lost lock, got: {result:?}"
+    );
+
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("admin connect");
+    let anchor: Option<i64> = sqlx::query_scalar(
+        "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
+    )
+    .fetch_optional(&mut conn)
+    .await
+    .expect("read the checkpoint")
+    .flatten();
+    assert_eq!(
+        anchor, None,
+        "no anchor may be written after the lock is lost"
     );
 }

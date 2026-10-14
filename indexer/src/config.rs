@@ -298,8 +298,9 @@ pub struct PrivateChannelIndexerConfig {
     /// node, not a load-balanced pool: finality proofs assume every answer comes from one
     /// state that only moves forward.
     pub rpc_url: String,
-    /// Optional archival fallback RPC for `rpc_url`, used by the operator to
-    /// re-check a `Dead` verdict and by the poller for missing-block failover.
+    /// Optional archival fallback RPC for `rpc_url`. The operator re-checks a `Dead` verdict
+    /// on it; the indexer re-fetches a block the primary served but could not decode. It is
+    /// never asked for a block the primary will not serve.
     #[serde(default)]
     pub fallback_rpc_url: Option<String>,
     /// Second-chain RPC, role-dependent. Required (fatal if unset) for the escrow operator
