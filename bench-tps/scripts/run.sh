@@ -14,7 +14,8 @@
 #   7.  Build Docker service images if missing or --rebuild was passed.
 #   8.  Optionally wipe data volumes (--clean) to start from a clean state.
 #   9.  Fix WAL archive volume permissions that Docker creates as root.
-#   10. Start all Docker Compose services.
+#   10. Start all Docker Compose services except the workers, which start in step 12
+#       once the escrow instance exists.
 #   11. Pin all private_channel containers to the service CPU set.
 #   12. Wait for every service to reach a stable/healthy state before
 #       proceeding — this prevents the bench from hitting a half-started node.
@@ -426,8 +427,12 @@ done
 # above) which makes startup faster and avoids redundant layer checks.
 # Services run in detached mode (-d); logs are not tailed here.
 # ---------------------------------------------------------------------------
-echo "Starting all services..."
-"${COMPOSE[@]}" up -d --no-build
+# The workers refuse to start until the escrow instance exists, so they start after the
+# validator is up and the instance is created (Step 12).
+WORKERS=(indexer-solana operator-solana operator-private-channel)
+mapfile -t CORE_SERVICES < <("${COMPOSE[@]}" config --services | grep -vxF -f <(printf '%s\n' "${WORKERS[@]}"))
+echo "Starting all services except the workers..."
+"${COMPOSE[@]}" up -d --no-build "${CORE_SERVICES[@]}"
 
 # ---------------------------------------------------------------------------
 # Step 10b — Detect Docker gateway IP and refresh Prometheus + Grafana
@@ -665,6 +670,20 @@ wait_rpc "read-node"  "http://localhost:${READ_PORT}"  "private-channel-read-nod
 
 # Gateway: check its own /health endpoint (not a proxied backend call).
 wait_http_health "gateway" "http://localhost:${GATEWAY_PORT}/health"
+
+# Create the instance the workers watch, then start them.
+"${BENCH_BIN}" create-instance \
+    --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
+    --solana-rpc-url "${BENCH_SOLANA_RPC_URL:-http://localhost:${PRIVATE_CHANNEL_VALIDATOR_PORT:-18899}}" \
+    --instance-seed-keypair "${INSTANCE_SEED_FILE}"
+"${COMPOSE[@]}" up -d --no-build "${WORKERS[@]}"
+# Step 11 ran before the workers existed, so pin them here.
+if [ -n "${SERVICE_CPUSET}" ]; then
+    for worker in "${WORKERS[@]}"; do
+        docker update --cpuset-cpus="${SERVICE_CPUSET}" "private-channel-${worker}" >/dev/null \
+            || echo "  WARNING: could not pin private-channel-${worker}"
+    done
+fi
 
 # Remaining services have no healthcheck or RPC endpoint; just confirm they
 # are running and haven't crashed immediately on startup.
