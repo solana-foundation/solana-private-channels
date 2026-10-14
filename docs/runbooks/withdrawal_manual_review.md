@@ -375,9 +375,12 @@ still land. For this message, replace the balance check in step 2 with:
   error or no status. Do not rely on the ATA balance here, because an unrelated
   transfer to the user would mislead it. If any one finalized successfully,
   [escalate](_escalation.md) (Tier 2): the classifier has a defect.
-- Before restoring, also scan the user ATA's history after `processed_at` for
-  a `MintTo` carrying this withdrawal's `private_channel:remint:` memo. A
-  second sender could have sent one that is not in the list.
+- Before restoring, also scan the user ATA's history from the row's `slot`
+  (the burn) for a `MintTo` carrying this withdrawal's `private_channel:remint:`
+  memo. A second sender could have sent one that is not in the list. Do not
+  start at `processed_at`: it is the escalation time, after every attempt. If
+  the read node's history does not reach back to that slot, or a matching
+  `MintTo` succeeded, do not restore; [escalate](_escalation.md) (Tier 2).
 - Find why the channel rejected the mint (operator logs for the transaction,
   or the `InstructionError` from the confirm above) and fix it before any
   restoration. A frozen ATA, a rotated mint authority or a supply limit
