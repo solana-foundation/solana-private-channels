@@ -456,6 +456,20 @@ pub(super) async fn claim_and_persist_or_abort(
         )
         .await
     {
+        // A trip that landed during the write is caught here, the last point before the send.
+        // The signature is persisted and never broadcast, so the row is left for recovery.
+        Ok(Some(_)) if !fence.is_open() => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "solvency_fence_closed"])
+                .inc();
+            warn!(
+                transaction_id,
+                signature = %signature,
+                state = ?fence.state(),
+                "Solvency fence tripped during the claim; leaving row Processing for recovery"
+            );
+            SignatureClaim::Lost
+        }
         Ok(Some(lease)) => SignatureClaim::Owned(lease),
         Ok(None) => {
             // The send is already refused; this read only picks the label, so an error falls back to lost.
@@ -7652,6 +7666,67 @@ mod tests {
             "open fence claims"
         );
         assert_eq!(mock.calls("requeue_unclaimed"), 0);
+    }
+
+    /// A trip that lands while the claim write is in flight still stops the send. The row keeps
+    /// its persisted signature and stays Processing, so recovery settles it; nothing is requeued.
+    #[tokio::test(start_paused = true)]
+    async fn claim_refuses_when_the_fence_trips_during_the_write() {
+        let fence = SolvencyFence::open_from_start();
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, 79);
+        let lease = row_updated_at(&mock, 79).expect("seeded row present");
+        mock.set_delay(
+            "claim_and_persist_signature",
+            std::time::Duration::from_secs(1),
+        );
+        let label = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["escrow", "solvency_fence_closed"]);
+        let before = label.get();
+
+        let claim = {
+            let (storage, fence) = (Storage::Mock(mock.clone()), fence.clone());
+            tokio::spawn(async move {
+                claim_and_persist_or_abort(
+                    &storage,
+                    &fence,
+                    "escrow",
+                    79,
+                    lease,
+                    &Signature::default(),
+                    100,
+                    1,
+                    "deposit_ownership_lost",
+                )
+                .await
+            })
+        };
+        // Let the claim run up to its storage write, then trip the fence underneath it.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            mock.calls("claim_and_persist_signature"),
+            0,
+            "write still in flight"
+        );
+        fence.trip();
+        let claim = claim.await.unwrap();
+
+        assert!(matches!(claim, SignatureClaim::Lost));
+        assert_eq!(mock.calls("claim_and_persist_signature"), 1);
+        assert_eq!(
+            mock.calls("requeue_unclaimed"),
+            0,
+            "a claimed row is never requeued"
+        );
+        assert_eq!(
+            row_status(&mock, 79),
+            Some(crate::storage::common::models::TransactionStatus::Processing),
+            "the claimed row is left for recovery"
+        );
+        assert_eq!(mock.get_release_signatures(79).await.unwrap().len(), 1);
+        assert!(label.get() > before, "counted");
     }
 
     /// The deposit mint path carries the sender's fence to its claim: closed means no broadcast.

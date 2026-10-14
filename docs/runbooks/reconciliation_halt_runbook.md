@@ -110,11 +110,12 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 
 1. Trips its in-process solvency fence (below), so this process moves nothing
    more even if the next step fails.
-2. Sets the durable `reconciliation_halt` flag (reason recorded).
-3. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
+2. Forces its `/health` to 503 (pages orchestration) before any database write,
+   so a flag write stuck behind a lock cannot keep the service green: the breach
+   is proven either way.
+3. Sets the durable `reconciliation_halt` flag (reason recorded).
+4. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
    `manual_review`.
-4. Forces its `/health` to 503 (pages orchestration), whether or not the flag
-   write landed: the breach is proven either way.
 5. Posts the halt webhook. This webhook is the only alert - there is no separate
    sensitive alert layer; the alert fires together with the halt.
 
@@ -133,7 +134,10 @@ slot). A confirmed breach **trips** the fence before the flag write is attempted
 so a failing write cannot leave this process minting; a tripped fence never
 reopens until the process restarts. A builder refused by the fence is counted as
 `private_channel_operator_transaction_errors_total{error_reason="solvency_fence_closed"}`
-and its row goes back to `pending` without using a requeue attempt. The state is
+and its row goes back to `pending` without using a requeue attempt. The fence is
+checked once more after the claim write, so a trip that lands mid-claim still
+stops the send; that row keeps its persisted, never-broadcast signature in
+`processing` and recovery settles it. The state is
 exported as `private_channel_operator_solvency_fence_state` (0 closed, 1 open,
 2 tripped). A closed fence counts as progress for `/health` for the first three
 ticks only; after that, with deposits waiting, `/health` reports the stall. The

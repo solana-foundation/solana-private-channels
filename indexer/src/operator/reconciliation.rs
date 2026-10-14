@@ -1121,6 +1121,11 @@ async fn freeze_pipelines(
     reason: &str,
     kind: HaltKind,
 ) -> Option<HaltKind> {
+    // A proven breach latches before any write: a halt write stuck behind a lock must not
+    // keep /health green. An outage latches below, once its flag is known to be set.
+    if let (HaltKind::Insolvency, Some(h)) = (kind, health) {
+        h.force_unhealthy(reason.to_string());
+    }
     let mut in_force = None;
     for attempt in 1..=HALT_WRITE_ATTEMPTS {
         let written = match kind {
@@ -1155,16 +1160,9 @@ async fn freeze_pipelines(
             Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
         }
     }
-    // An outage latch waits for a flag that is really set, since nothing is proven. A proven
-    // breach latches either way: a restarted process starts closed and holds while it persists.
-    if let Some(h) = health {
-        match (kind, in_force) {
-            (HaltKind::Insolvency, _) => h.force_unhealthy(reason.to_string()),
-            (HaltKind::Outage, Some(HaltKind::Outage)) => {
-                h.force_unhealthy_provisional(reason.to_string())
-            }
-            _ => {}
-        }
+    // An outage latch waits for a flag that is really set, since nothing is proven.
+    if let (HaltKind::Outage, Some(HaltKind::Outage), Some(h)) = (kind, in_force, health) {
+        h.force_unhealthy_provisional(reason.to_string());
     }
     in_force
 }
@@ -5627,6 +5625,39 @@ mod tests {
         )
         .await;
         assert_eq!(reason(&health).as_deref(), Some("insolvent"));
+    }
+
+    /// A confirmed insolvency latches /health before any storage write is awaited, so a halt
+    /// write stuck behind a lock cannot keep the service green.
+    #[tokio::test(start_paused = true)]
+    async fn insolvency_forces_unhealthy_before_the_halt_write() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        let mock = MockStorage::new();
+        mock.set_delay(
+            "set_reconciliation_halt",
+            std::time::Duration::from_secs(60),
+        );
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let health = HealthState::new(HealthConfig::operator());
+
+        let freeze = {
+            let (storage, health) = (storage.clone(), health.clone());
+            tokio::spawn(async move {
+                freeze_pipelines(&storage, &Some(health), "insolvent", HaltKind::Insolvency).await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mock.reconciliation_halt.lock().unwrap().is_none(),
+            "the halt write is still in flight"
+        );
+        assert!(
+            matches!(health.check(), HealthOutcome::ForcedUnhealthy { .. }),
+            "/health must be red before the write lands"
+        );
+        assert_eq!(freeze.await.unwrap(), Some(HaltKind::Insolvency));
     }
 
     /// The flag write is retried within the tick, and a write that never lands is reported.

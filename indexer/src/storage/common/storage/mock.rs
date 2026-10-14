@@ -1581,6 +1581,15 @@ impl MockStorage {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("claim_and_persist_signature")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("claim_and_persist_signature")?;
         // Mirrors the SQL halt predicate; read before the row lock so the guards never nest.
         if self.reconciliation_halt.lock().unwrap().is_some() {
