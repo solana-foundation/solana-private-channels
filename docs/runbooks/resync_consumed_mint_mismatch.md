@@ -89,8 +89,8 @@ take every row of that source transaction out of reach:
     WHERE transaction_id IN (SELECT id FROM transactions WHERE signature = :source_signature);
    ```
 2. Quarantine every state the operators resume on their own. The sender
-   restores `pending_remint` rows on startup and recovery requeues `parked`
-   ones.
+   loads `pending_remint` rows a page at a time after a restart and recovery
+   requeues `parked` ones.
    ```sql
    UPDATE transactions SET status = 'manual_review', updated_at = NOW()
     WHERE signature = :source_signature

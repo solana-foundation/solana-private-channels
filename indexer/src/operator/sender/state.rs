@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
-use super::remint::FinalityRpc;
+use super::remint::{FinalityRpc, REMINT_HYDRATE_PAGE};
 use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
 use super::{classify_signatures, SigFinality};
 
@@ -95,6 +95,8 @@ impl SenderState {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
@@ -686,8 +688,40 @@ impl SenderState {
         if self.program_type != ProgramType::Withdraw {
             return Ok(());
         }
+        // Armed only at boot, so a sender that never recovered never pages rows behind its queue.
+        // Ids are BIGSERIAL, so 0 is below every row.
+        self.remint_backlog_cursor = Some(0);
+        self.hydrate_pending_remints(storage_tx).await
+    }
 
-        let transactions = self.storage.get_pending_remint_transactions().await?;
+    /// Load the next page of durable pending remints; a no-op once the backlog is drained.
+    pub(super) async fn hydrate_pending_remints(
+        &mut self,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) -> Result<(), OperatorError> {
+        let Some(after_id) = self.remint_backlog_cursor else {
+            return Ok(());
+        };
+        // Paged by id, not deadline: ids never change, so every row is read at most once.
+        let transactions = self
+            .storage
+            .get_pending_remint_transactions(after_id, REMINT_HYDRATE_PAGE as i64)
+            .await?;
+
+        // A short page means no unread row is left; ids are ascending, so the last is the max.
+        self.remint_backlog_cursor = match transactions.last() {
+            Some(last) if transactions.len() == REMINT_HYDRATE_PAGE => Some(last.id),
+            _ => None,
+        };
+        // A runtime handoff may still have its terminal write queued, e.g. a ManualReview.
+        // Reloading it could remint a row that then lands in manual review and is refunded again.
+        let transactions: Vec<_> = transactions
+            .into_iter()
+            .filter(|tx| !self.remint_runtime_ids.contains(&tx.id))
+            .collect();
+        if self.remint_backlog_cursor.is_none() {
+            self.remint_runtime_ids.clear();
+        }
 
         if transactions.is_empty() {
             return Ok(());
@@ -857,6 +891,26 @@ impl SenderState {
 
         Ok(())
     }
+
+    /// Queue a remint handed off at runtime; while the backlog drains, paging must never reload it.
+    pub(super) fn queue_runtime_remint(&mut self, entry: PendingRemint) {
+        if let (Some(_), Some(id)) = (self.remint_backlog_cursor, entry.ctx.transaction_id) {
+            self.remint_runtime_ids.insert(id);
+        }
+        self.pending_remints.push(entry);
+    }
+
+    /// Backlog entries in the queue, the count the refill threshold uses.
+    pub(super) fn queued_backlog_remints(&self) -> usize {
+        self.pending_remints
+            .iter()
+            .filter(|e| {
+                e.ctx
+                    .transaction_id
+                    .is_none_or(|id| !self.remint_runtime_ids.contains(&id))
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -926,7 +980,7 @@ mod tests {
 
     // ── recover_pending_remints: happy path ──────────────────────────
 
-    /// On startup, all PendingRemint rows from the database must be fully
+    /// On startup, the first page of PendingRemint rows must be fully
     /// reconstructed into the in-memory `pending_remints` queue so the
     /// operator can continue where it left off before the crash.
     ///
@@ -1467,6 +1521,247 @@ mod tests {
 
         // No ManualReview sent — missing deadline is handled gracefully.
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    // ── pending remint backlog paging ────────────────────────────────
+
+    use crate::operator::sender::remint::{process_pending_remints, REMINT_HYDRATE_PAGE as PAGE};
+
+    const PAGE_READ: &str = "get_pending_remint_transactions";
+
+    /// Seed parseable PendingRemint rows with the given ids, due an hour from now.
+    fn seed_backlog(mock: &MockStorage, ids: impl IntoIterator<Item = i64>) {
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let mut rows = mock.pending_remint_transactions.lock().unwrap();
+        for id in ids {
+            rows.push(make_pending_remint_row(
+                id,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Signature::new_unique(),
+                deadline,
+            ));
+        }
+    }
+
+    /// A remint handed off at runtime, due an hour from now so no tick dials RPC.
+    fn runtime_entry(id: i64) -> PendingRemint {
+        PendingRemint {
+            ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(id),
+                withdrawal_nonce: Some(id as u64),
+                trace_id: Some(format!("trace-{id}")),
+                deposit_claim_lease: None,
+            },
+            remint_info: WithdrawalRemintInfo {
+                transaction_id: id,
+                source_event_id: SourceEventId::new(&format!("sig-{id}"), 0, None),
+                trace_id: format!("trace-{id}"),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+            signatures: Vec::new(),
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() + chrono::Duration::hours(1),
+            finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
+        }
+    }
+
+    fn queued_ids(state: &SenderState) -> Vec<i64> {
+        state
+            .pending_remints
+            .iter()
+            .map(|e| e.ctx.transaction_id.unwrap())
+            .collect()
+    }
+
+    fn page_reads(mock: &MockStorage) -> usize {
+        mock.call_counts
+            .lock()
+            .unwrap()
+            .get(PAGE_READ)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Boot must load at most one page, however large the durable backlog, and
+    /// arm the cursor only when a full page says more rows may follow.
+    #[tokio::test]
+    async fn recover_loads_one_page_and_arms_the_cursor() {
+        for n in [0, 3, PAGE, PAGE + 1] {
+            let mock = MockStorage::new();
+            seed_backlog(&mock, 1..=n as i64);
+            let mut state = make_sender_state(mock.clone());
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            state.recover_pending_remints(&storage_tx).await.unwrap();
+
+            let expected: Vec<i64> = (1..=n.min(PAGE) as i64).collect();
+            assert_eq!(queued_ids(&state), expected, "n = {n}");
+            let cursor = (n >= PAGE).then_some(PAGE as i64);
+            assert_eq!(state.remint_backlog_cursor, cursor, "n = {n}");
+            assert!(storage_rx.try_recv().is_err(), "n = {n}");
+            assert_eq!(page_reads(&mock), 1, "n = {n}");
+        }
+
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=PAGE as i64 + 1);
+        let mut state = make_sender_state_with_role(mock.clone(), ProgramType::Escrow);
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(page_reads(&mock), 0, "Escrow must never read the backlog");
+        assert_eq!(state.remint_backlog_cursor, None);
+    }
+
+    /// A runtime handoff whose terminal write may still be queued must never be
+    /// reloaded by a page, and runtime entries must not hold back the refill.
+    #[tokio::test]
+    async fn runtime_handoffs_are_never_paged_and_do_not_hold_the_refill() {
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=page + 5);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        // Two ids a page would see, plus memory-only fillers so the next page stays short.
+        state.queue_runtime_remint(runtime_entry(page + 2));
+        state.queue_runtime_remint(runtime_entry(page + 4));
+        for id in 10_000..10_000 + page - 2 {
+            state.queue_runtime_remint(runtime_entry(id));
+        }
+        // Resolved with its ManualReview still queued: gone from memory,
+        // still pending_remint in the DB.
+        state
+            .pending_remints
+            .retain(|e| e.ctx.transaction_id != Some(page + 2));
+        state
+            .pending_remints
+            .retain(|e| e.ctx.transaction_id != Some(1));
+        assert!(state.pending_remints.len() > PAGE);
+
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, vec![page + 1, page + 3, page + 5]);
+        let copies = |id| queued_ids(&state).iter().filter(|&&q| q == id).count();
+        assert_eq!(
+            copies(page + 2),
+            0,
+            "a resolved runtime row must not come back"
+        );
+        assert_eq!(
+            copies(page + 4),
+            1,
+            "a queued runtime row must not be loaded twice"
+        );
+        assert_eq!(state.remint_backlog_cursor, None);
+        assert!(state.remint_runtime_ids.is_empty());
+    }
+
+    /// Ticks load the rest of the backlog one full page at a time, only once
+    /// fewer than a page is queued, each row once, and stop reading when drained.
+    #[tokio::test]
+    async fn ticks_drain_the_backlog_page_by_page() {
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=2 * page + 10);
+        mock.pending_remint_transactions.lock().unwrap()[PAGE].mint = "bad-mint".to_string();
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(1024);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(page_reads(&mock), 1, "a full queue must not read");
+
+        state.pending_remints.pop();
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (page + 2..=2 * page).collect::<Vec<_>>());
+
+        state.pending_remints.truncate(PAGE - 1);
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (2 * page + 1..=2 * page + 10).collect::<Vec<_>>());
+        assert_eq!(state.remint_backlog_cursor, None);
+        assert_eq!(page_reads(&mock), 3);
+        let mut ids = queued_ids(&state);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            state.pending_remints.len(),
+            "no row is queued twice"
+        );
+
+        state.pending_remints.clear();
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(
+            page_reads(&mock),
+            3,
+            "a drained backlog must not be read again"
+        );
+
+        let update = storage_rx.try_recv().expect("the bad row escalates");
+        assert_eq!(update.transaction_id, page + 1);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(storage_rx.try_recv().is_err(), "it escalates exactly once");
+    }
+
+    /// A page read error at boot fails boot; on a tick it only delays the page.
+    #[tokio::test]
+    async fn page_read_failure_fails_boot_but_only_delays_a_tick() {
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=3);
+        mock.set_fail_times(PAGE_READ, 1);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        let err = state
+            .recover_pending_remints(&storage_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::Storage(_)), "{err:?}");
+
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=page + 5);
+        let mut state = make_sender_state(mock.clone());
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        state.pending_remints.pop();
+
+        mock.set_fail_times(PAGE_READ, 1);
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(state.remint_backlog_cursor, Some(page));
+        assert_eq!(queued_ids(&state), before);
+
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (page + 1..=page + 5).collect::<Vec<_>>());
     }
 
     // ── SenderState construction tests ───────────────────────────────

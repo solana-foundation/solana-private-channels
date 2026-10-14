@@ -1817,7 +1817,7 @@ async fn defer_remint_after_failure(
         ctx.withdrawal_nonce,
     );
 
-    state.pending_remints.push(PendingRemint {
+    state.queue_runtime_remint(PendingRemint {
         ctx: ctx.clone(),
         remint_info: info,
         signatures,
@@ -2762,6 +2762,41 @@ mod tests {
         // remint_cache and pending_signatures should be drained
         assert!(!state.remint_cache.contains_key(&5));
         assert!(!state.pending_signatures.contains_key(&5));
+    }
+
+    /// A handoff made while the durable backlog still drains must be recorded,
+    /// so a later page never reloads the row while its terminal write is queued.
+    #[tokio::test]
+    async fn permanent_failure_handoff_during_backlog_drain_is_never_paged() {
+        let mock = mock_with_processing_row(10);
+        let sig = Signature::new_unique();
+        mock.insert_release_signature(10, sig.to_string(), 0, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
+        state.remint_backlog_cursor = Some(0);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(5, make_remint_info(10));
+        state.pending_signatures.insert(
+            5,
+            vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert_eq!(state.pending_remints.len(), 1);
+        assert!(state.remint_runtime_ids.contains(&10));
     }
 
     #[tokio::test]

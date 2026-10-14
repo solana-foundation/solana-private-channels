@@ -224,6 +224,10 @@ pub struct SenderState {
     pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
+    /// Last row id read from the durable remint backlog; `None` once it is drained or never armed.
+    pub remint_backlog_cursor: Option<i64>,
+    /// Ids handed off at runtime while the backlog drains; a page must never load them.
+    pub remint_runtime_ids: HashSet<i64>,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
     /// Shared with the dedicated poll task via `Arc`; capped at `MAX_IN_FLIGHT`.
     pub in_flight: Arc<InFlightQueue>,

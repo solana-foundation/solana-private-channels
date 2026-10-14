@@ -149,7 +149,7 @@ gauge_vec!(
 gauge_vec!(
     OPERATOR_PENDING_REMINTS,
     "private_channel_operator_pending_remints",
-    "Deferred remints queued in the withdraw sender after its last tick",
+    "Deferred remints loaded in the withdraw sender after its last tick",
     &["program_type"]
 );
 

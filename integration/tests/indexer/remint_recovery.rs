@@ -1,10 +1,10 @@
 //! Pending-remint recovery across operator restart.
 //!
 //! Verifies the integration-level contract of
-//! `SenderState::recover_pending_remints`: on startup, every PendingRemint
-//! row in the database must be fully reconstructed into the in-memory
-//! `pending_remints` queue so the finality-check tick can pick up where
-//! the crashed operator left off. Critically:
+//! `SenderState::recover_pending_remints`: on startup, the first page of
+//! PendingRemint rows in the database must be fully reconstructed into the
+//! in-memory `pending_remints` queue so the finality-check tick can pick up
+//! where the crashed operator left off. Critically:
 //!
 //!   - valid rows are silently re-queued (no ManualReview side effects)
 //!   - the *original* deadline is restored (not a fresh window — the

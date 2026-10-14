@@ -881,7 +881,7 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
         .await?;
 
     // Recovery query returns only the unresolved row.
-    let pending = storage.get_pending_remint_transactions().await?;
+    let pending = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(
         pending.len(),
         1,

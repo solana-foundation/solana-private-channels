@@ -301,9 +301,8 @@ pub async fn run_sender(
     // release query. Moving it above `state` would invert that and must not be done.
     let _sender_lock = sender_lock;
 
-    // Re-hydrate the deferred remint queue from any PendingRemint rows written
-    // before a crash. These will be picked up by process_pending_remints on the
-    // next tick
+    // Hydrate the first page of PendingRemint rows written before a crash. The
+    // rest load page by page in process_pending_remints as the queue drains.
     state.recover_pending_remints(&storage_tx).await?;
 
     let mut rotation_check_interval = interval(ROTATION_CHECK_INTERVAL);

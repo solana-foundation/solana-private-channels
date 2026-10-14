@@ -586,7 +586,7 @@ async fn run_withdraw_preflight(
     }
 
     // Boot is the only safe window for the pending_remint pass. Once run_sender
-    // starts it rehydrates every such row into its in-memory queue and may put a
+    // starts it owns every such row, loads them in pages into its queue and may put a
     // remint in flight; completing one from underneath it would pay the
     // withdrawal and remint the burn. This returns before our sender is spawned,
     // and the sender lock held since startup keeps any other operator's out. The

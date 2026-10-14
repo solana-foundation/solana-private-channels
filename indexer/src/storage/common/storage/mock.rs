@@ -1000,16 +1000,22 @@ impl MockStorage {
 
     pub async fn get_pending_remint_transactions(
         &self,
+        after_id: i64,
+        limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_pending_remint_transactions")?;
         // Match the Postgres query's status filter: a row that already moved to
         // FailedReminted (via record_remint_result) is not re-hydrated, so a
         // landed remint cannot be replayed on restart.
         let pending = self.pending_remint_transactions.lock().unwrap();
-        Ok(pending
+        let mut page: Vec<DbTransaction> = pending
             .iter()
-            .filter(|t| t.status == TransactionStatus::PendingRemint)
+            .filter(|t| t.status == TransactionStatus::PendingRemint && t.id > after_id)
             .cloned()
-            .collect())
+            .collect();
+        page.sort_by_key(|t| t.id);
+        page.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(page)
     }
 
     pub async fn unreleased_withdrawal_nonce_bounds(

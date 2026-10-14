@@ -1524,10 +1524,12 @@ impl PostgresDb {
         .await
     }
 
-    /// Returns all withdrawal transactions currently in PendingRemint status.
-    /// Called on startup to re-hydrate the in-memory remint queue after a crash.
+    /// Returns one page of PendingRemint withdrawals with `id > after_id`, oldest id first.
+    /// The sender loads its remint queue page by page, so memory stays bounded.
     pub async fn get_pending_remint_transactions_internal(
         &self,
+        after_id: i64,
+        limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
@@ -1536,8 +1538,9 @@ impl PostgresDb {
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}
             FROM transactions
-            WHERE {} = $1 AND {} = $2
+            WHERE {} = $1 AND {} = $2 AND {} > $3
             ORDER BY {} ASC
+            LIMIT $4
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1567,11 +1570,14 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::ID,
             // Ordering (FIFO)
             transaction_cols::ID,
         ))
         .bind(TransactionStatus::PendingRemint)
         .bind(TransactionType::Withdrawal)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
     }

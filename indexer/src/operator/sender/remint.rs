@@ -47,6 +47,9 @@ const MAX_REMINTS_PER_TICK: usize = 16;
 /// Time after which a tick starts no new entry, so slow RPC cannot hold the sender loop for long.
 const REMINT_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Rows loaded per page of the durable backlog, so memory stays bounded at boot and after.
+pub(super) const REMINT_HYDRATE_PAGE: usize = 256;
+
 /// Outcome of a single `attempt_remint` call.
 enum RemintAttempt {
     /// A remint landed on-chain (a prior attempt or the one just sent).
@@ -838,6 +841,14 @@ async fn process_pending_remints_within(
         return;
     }
 
+    // Top up from the durable backlog. A read error must not stop the sender loop, and the
+    // cursor only moves on success, so the next tick retries the same page.
+    if state.queued_backlog_remints() < REMINT_HYDRATE_PAGE {
+        if let Err(e) = state.hydrate_pending_remints(storage_tx).await {
+            warn!("Pending remint page read failed, retrying next tick: {e}");
+        }
+    }
+
     let now = Utc::now();
 
     // Drain the queue and split: due now vs. wait longer, then cap the due set.
@@ -1494,6 +1505,8 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1634,6 +1647,8 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
@@ -1734,6 +1749,8 @@ mod tests {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };

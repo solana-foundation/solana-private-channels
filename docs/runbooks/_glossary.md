@@ -14,7 +14,7 @@ DB type `transaction_status`.
 |---|---|---|---|
 | `pending` | no | no | Inserted by indexer, not yet picked up by operator. |
 | `processing` | no | no | Fetcher locked it; processor or sender is acting on it. |
-| `pending_remint` | no | no | **Withdrawal-only.** Failed but signatures were stashed; finality check queued. Recovery query (`get_pending_remint_transactions`) re-loads these on restart. Deposits never enter this state. |
+| `pending_remint` | no | no | **Withdrawal-only.** Failed but signatures were stashed; finality check queued. Recovery query (`get_pending_remint_transactions`) loads these a page at a time after a restart. Deposits never enter this state. |
 | `completed` | yes | no | Withdrawal release or deposit mint finalized on-chain. A released withdrawal stays `processing` until one of its journaled release signatures is finalized, usually seconds, at worst about 6 minutes (recovery). |
 | `failed` | yes | yes | Terminal failure with no on-chain proof. **Primary alert for deposits** (sender-side failures terminate here since there is no remint path). Rare for withdrawals - those go through `pending_remint`. |
 | `failed_reminted` | yes | yes | **Withdrawal-only.** Original withdrawal failed, remint of burned private channel tokens succeeded. Deposits do not have a remint path. |
