@@ -423,22 +423,38 @@ pub async fn insert_verified_wallet<'e, E: PgExecutor<'e>>(
     })
 }
 
-/// Delete a verified wallet for the given user. Returns `true` if the wallet was found
-/// and deleted, `false` if it was not associated with the user.
+/// Unlink a verified wallet from the given user, revoking the user's outstanding
+/// challenge with it so a proof signed before the unlink cannot relink the wallet.
+/// Returns `true` if the wallet was found and deleted, `false` if it was not
+/// associated with the user, in which case nothing changes.
 pub async fn delete_verified_wallet(
     pool: &PgPool,
     user_id: Uuid,
     pubkey: &str,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // Challenge before wallet, the order verify-wallet locks them in, so the two cannot deadlock.
+    sqlx::query(r#"DELETE FROM private_channel_auth.challenges WHERE user_id = $1"#)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
     let result = sqlx::query(
         r#"DELETE FROM private_channel_auth.verified_wallets WHERE user_id = $1 AND pubkey = $2"#,
     )
     .bind(user_id)
     .bind(pubkey)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    // Dropping the transaction rolls it back, so a miss leaves the challenge usable.
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Delete challenges that are expired or already used.

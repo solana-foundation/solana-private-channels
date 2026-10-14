@@ -1687,6 +1687,86 @@ async fn test_delete_wallet_cannot_delete_other_users_wallet() {
     assert_eq!(res.status(), 400);
 }
 
+/// A challenge signed before an unlink must not relink the wallet, so unlinking
+/// revokes whatever challenge the user holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlinking_a_wallet_revokes_the_outstanding_challenge() {
+    let (db_url, _container) = start_postgres().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    db::init_schema(&pool).await.expect("failed to init schema");
+
+    let user = db::insert_user(&pool, "unlinkuser", "fakehash")
+        .await
+        .expect("failed to insert user");
+    let wallet = db::insert_verified_wallet(&pool, user.id, "linked-wallet")
+        .await
+        .expect("failed to link wallet");
+
+    let pending_nonce = Uuid::new_v4();
+    db::insert_challenge(&pool, user.id, pending_nonce)
+        .await
+        .expect("failed to issue challenge");
+
+    let unlinked = db::delete_verified_wallet(&pool, user.id, &wallet.pubkey)
+        .await
+        .expect("unlink failed");
+    assert!(unlinked, "the linked wallet must be removed");
+
+    let pending = db::consume_challenge(&pool, user.id, pending_nonce)
+        .await
+        .expect("consume failed");
+    assert!(
+        pending.is_none(),
+        "a challenge issued before the unlink must not verify"
+    );
+}
+
+/// An unlink that matches no wallet changes nothing, so a challenge the user is
+/// partway through signing still verifies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_unlink_keeps_the_outstanding_challenge() {
+    let (db_url, _container) = start_postgres().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    db::init_schema(&pool).await.expect("failed to init schema");
+
+    let user = db::insert_user(&pool, "keepuser", "fakehash")
+        .await
+        .expect("failed to insert user");
+
+    let pending_nonce = Uuid::new_v4();
+    db::insert_challenge(&pool, user.id, pending_nonce)
+        .await
+        .expect("failed to issue challenge");
+
+    let unlinked = db::delete_verified_wallet(&pool, user.id, "never-linked-wallet")
+        .await
+        .expect("unlink failed");
+    assert!(
+        !unlinked,
+        "a wallet that was never linked cannot be removed"
+    );
+
+    let pending = db::consume_challenge(&pool, user.id, pending_nonce)
+        .await
+        .expect("consume failed");
+    assert!(
+        pending.is_some(),
+        "a failed unlink must not revoke the challenge"
+    );
+}
+
 /// The login the service runs as is what a compromise of the service yields. It
 /// must not be able to promote a user or touch the audit trail, while every path
 /// it actually serves keeps working.
