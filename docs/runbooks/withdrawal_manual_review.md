@@ -454,8 +454,10 @@ still land. For this message, replace the balance check in step 2 with:
   restoration. A frozen ATA, a rotated mint authority or a supply limit
   rejects every retry the same way.
 - If the rejection is `InvalidOwner` on the idempotent ATA create, the user
-  moved their token account to another owner. Restore with a bare `MintTo`
-  to that account, without the ATA create, as part of the step 3 escalation.
+  moved their token account to another owner, so minting there would credit
+  that owner. As part of the step 3 escalation, restore only to a token account
+  whose current owner is the row's `initiator`, or reconcile an agreed manual
+  release instead.
 
 ## Path C - ambiguous on-chain state
 
