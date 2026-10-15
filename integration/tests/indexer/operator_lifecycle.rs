@@ -800,14 +800,17 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     // The fence opens only on a tick whose custody slot the checkpoint covers, and the withdraw
     // processor later anchors its allowlist read at the checkpoint, so it can sit neither
     // behind the chain nor far ahead of it: keep it a few slots ahead until the mint is claimed.
+    let last_seeded = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let reseed = {
         let storage = storage.clone();
+        let last_seeded = last_seeded.clone();
         let client =
             RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
         tokio::spawn(async move {
             loop {
                 if let Ok(slot) = client.get_slot().await {
                     let _ = seed_escrow_checkpoint(&storage, slot + 5).await;
+                    last_seeded.store(slot + 5, std::sync::atomic::Ordering::SeqCst);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -819,6 +822,11 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     // persisted signature, so it journals its signature and never reaches Failed.
     wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
     reseed.abort();
+    // The withdraw processor anchors its allowlist read at the checkpoint with a few quick
+    // retries, so let the chain pass the last seed before any withdrawal is offered.
+    while client.get_slot().await? < last_seeded.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let mint_row = db::get_transaction(&pool, &mint_fail_sig)
         .await?
         .expect("the deposit row must exist");
