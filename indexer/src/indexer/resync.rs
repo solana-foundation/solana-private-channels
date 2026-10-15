@@ -775,6 +775,23 @@ impl ResyncService {
             .fixed_range(genesis_slot, current_slot)
             .await?;
 
+        // Pre-flight 5a: an empty range rebuilds nothing and records no checkpoint, so the
+        // check after the wipe would fail with the marker and halt set.
+        if to_slot <= from_slot {
+            error!(
+                "Invalid genesis_slot {}: no block produced after slot {} up to current_slot {}",
+                genesis_slot, from_slot, current_slot
+            );
+            return Err(IndexerError::from(DataSourceError::InvalidConfig {
+                reason: format!(
+                    "no block was produced after slot {from_slot} up to current_slot \
+                     {current_slot}, so the rebuild would record nothing. Aborted before any \
+                     delete, the database is intact. Rerun once the chain produces a block at \
+                     or above genesis_slot {genesis_slot}"
+                ),
+            }));
+        }
+
         // Pre-flight 5b: the rebuild stops at to_slot, so it must be recent.
         self.refuse_if_tip_stale(to_slot, tip_read_at).await?;
 
@@ -991,7 +1008,7 @@ mod tests {
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use crate::test_utils::rpc_mocks::{chain, mock_get_slot};
+    use crate::test_utils::rpc_mocks::{chain, mock_get_blocks, mock_get_slot};
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use std::sync::Arc;
@@ -2170,6 +2187,58 @@ mod tests {
             .run(genesis)
             .await
             .expect("a tip fresh when read must pass, however long resync takes after");
+    }
+
+    /// A range with no block above genesis rebuilds nothing and records no checkpoint, so the
+    /// check after the wipe would fail with the marker and halt set. Resync refuses first.
+    #[tokio::test]
+    async fn empty_replay_range_refuses_before_wipe() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        // Only the slot below genesis holds a block, so the range above it is empty.
+        let _blocks = mock_get_blocks(&mut server, genesis - 1, tip, &[genesis - 1]);
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
+        let mock = MockStorage::new();
+        let checkpoint = 50;
+        mock.committed_checkpoints
+            .lock()
+            .unwrap()
+            .insert("escrow".to_string(), checkpoint);
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )),
+            ProgramType::Escrow,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: server.url(),
+                batch_size: 10,
+                max_gap_slots: 500,
+                start_slot: None,
+            },
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO);
+
+        match service.run(genesis).await {
+            Err(IndexerError::DataSource(DataSourceError::InvalidConfig { reason })) => {
+                assert!(reason.contains("no block"), "{reason}")
+            }
+            other => panic!("an empty replay range must refuse before the wipe, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
+        assert!(mock.reconciliation_halt.lock().unwrap().is_none());
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("escrow"),
+            Some(&checkpoint)
+        );
     }
 
     /// A worker whose session just died may still be writing, so nothing is read inside the grace.
