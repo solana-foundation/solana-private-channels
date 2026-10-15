@@ -207,8 +207,8 @@ persists after correcting the named rows and restarting.
 
 Nonces come from the database's own sequence. A bitmap that has rotated past, or set
 bits above, every nonce the database holds was advanced by a database that is not this
-one: a fresh or replaced database, or one restored from an old backup. Its next
-withdrawal would be numbered into a closed generation or onto a spent bit, and every
+withdrawal would be numbered into a closed generation or onto a spent bit (manual review),
+or onto a clear bit, where a replayed withdrawal the old database already paid is paid again.
 such release would end in manual review.
 
 ### Resolution
