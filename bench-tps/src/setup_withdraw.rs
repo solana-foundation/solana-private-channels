@@ -26,7 +26,7 @@ use solana_commitment_config::CommitmentConfig;
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
-        setup_deposit::{find_instance_pda, find_withdrawal_bitmap_pda},
+        setup_deposit::{ensure_escrow_instance, find_instance_pda},
         types::{
             BenchState, WithdrawConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
             BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
@@ -39,7 +39,6 @@ use {
     private_channel_escrow_program_client::{
         instructions::{
             AddOperator, AddOperatorInstructionArgs, AllowMint, AllowMintInstructionArgs,
-            CreateInstance, CreateInstanceInstructionArgs,
         },
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
@@ -61,12 +60,6 @@ use {
 const ALLOWED_MINT_SEED_PREFIX: &[u8] = b"allowed_mint";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const OPERATOR_SEED: &[u8] = b"operator";
-
-/// 10 SOL minimum on Solana (covers CreateInstance + AddOperator + AllowMint fees
-/// plus seed ATA mint-to fees).
-const MIN_ADMIN_LAMPORTS: u64 = 10_000_000_000;
-/// 100 SOL top-up
-const AIRDROP_LAMPORTS: u64 = 100_000_000_000;
 
 fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -142,8 +135,7 @@ pub async fn run_setup_withdraw_phase(
         None => Keypair::new(),
     };
     let instance_seed_pubkey = instance_seed_keypair.pubkey();
-    let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
-    let (bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
+    let (instance_pda, _) = find_instance_pda(&instance_seed_pubkey);
     let (event_authority, _) = find_event_authority();
     let (operator_pda, operator_bump) = find_operator_pda(&instance_pda, &admin_keypair.pubkey());
     info!(
@@ -160,101 +152,7 @@ pub async fn run_setup_withdraw_phase(
     ));
     let send_retry_delays: &[u64] = &[1, 2, 4, 8, 16, 30];
 
-    // ------------------------------------------------------------------
-    // Task 2b: Ensure admin has SOL on Solana
-    // ------------------------------------------------------------------
-    let balance = solana_rpc
-        .get_balance(&admin_keypair.pubkey())
-        .await
-        .context("get_balance for admin on Solana")?;
-    if balance < MIN_ADMIN_LAMPORTS {
-        let sig = solana_rpc
-            .request_airdrop(&admin_keypair.pubkey(), AIRDROP_LAMPORTS)
-            .await
-            .context("airdrop to admin on Solana")?;
-        for _ in 0..60u32 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if solana_rpc
-                .get_balance(&admin_keypair.pubkey())
-                .await
-                .unwrap_or(0)
-                >= AIRDROP_LAMPORTS
-            {
-                break;
-            }
-        }
-        if solana_rpc
-            .get_balance(&admin_keypair.pubkey())
-            .await
-            .unwrap_or(0)
-            < MIN_ADMIN_LAMPORTS
-        {
-            return Err(anyhow::anyhow!(
-                "airdrop timed out: admin balance still below minimum after 60 attempts"
-            ));
-        }
-        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on Solana");
-    } else {
-        info!(balance, "Admin already funded on Solana, skipping airdrop");
-    }
-
-    // ------------------------------------------------------------------
-    // Task 3: CreateInstance on Solana
-    // ------------------------------------------------------------------
-    let t3 = Instant::now();
-    let create_sig = 'send: {
-        let mut last_err = String::new();
-        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match solana_rpc.get_latest_blockhash().await {
-                Err(e) => {
-                    warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (create_instance), retrying in {delay_secs}s");
-                    last_err = e.to_string();
-                }
-                Ok(blockhash) => {
-                    let create_ix = CreateInstance {
-                        payer: admin_keypair.pubkey(),
-                        admin: admin_keypair.pubkey(),
-                        instance_seed: instance_seed_pubkey,
-                        instance: instance_pda,
-                        withdrawal_bitmap: bitmap_pda,
-                        system_program: program::id(),
-                        event_authority,
-                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-                    }
-                    .instruction(CreateInstanceInstructionArgs {
-                        bump: instance_bump,
-                        bitmap_bump,
-                    });
-                    let tx = Transaction::new_signed_with_payer(
-                        &[create_ix],
-                        Some(&admin_keypair.pubkey()),
-                        &[admin_keypair.as_ref(), &instance_seed_keypair],
-                        blockhash,
-                    );
-                    match solana_rpc.send_transaction(&tx).await {
-                        Ok(sig) => break 'send sig,
-                        Err(e) => {
-                            warn!(attempt, err = %e, "create_instance send failed, retrying");
-                            last_err = e.to_string();
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-        return Err(anyhow::anyhow!(
-            "create_instance: all retries exhausted: {last_err}"
-        ));
-    };
-    let retry =
-        poll_confirmations(&solana_rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
-    if !retry.is_empty() {
-        return Err(anyhow::anyhow!(
-            "create_instance failed to confirm on-chain"
-        ));
-    }
-    info!(%instance_pda, elapsed_ms = t3.elapsed().as_millis(), "Escrow instance created on Solana");
+    ensure_escrow_instance(&solana_rpc, &admin_keypair, &instance_seed_keypair).await?;
 
     // ------------------------------------------------------------------
     // Task 4: AddOperator on Solana

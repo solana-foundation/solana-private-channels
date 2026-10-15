@@ -8,7 +8,6 @@ use solana_transaction_status::UiTransactionEncoding;
 use crate::indexer::datasource::common::parser::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
-use crate::operator::SignerUtil;
 use crate::storage::common::models::TransactionType;
 
 /// Program type to index
@@ -209,6 +208,7 @@ pub fn validate_operator_startup(
                 .to_string(),
         );
     }
+    reject_placeholder_instance(common.escrow_instance_id)?;
     let zero_checks = [
         (
             config.db_poll_interval.is_zero(),
@@ -313,6 +313,29 @@ pub struct PrivateChannelIndexerConfig {
     pub escrow_instance_id: Option<Pubkey>,
 }
 
+/// Parse `common.escrow_instance_id`. Blank is unset; the all-ones system program, the old
+/// rendered placeholder, is refused because no worker can do anything useful against it.
+pub fn parse_escrow_instance_id(raw: Option<String>) -> Result<Option<Pubkey>, String> {
+    let Some(raw) = raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let id = Pubkey::from_str(raw).map_err(|e| format!("Invalid escrow instance ID: {}", e))?;
+    reject_placeholder_instance(Some(id))?;
+    Ok(Some(id))
+}
+
+/// The all-ones id is `Pubkey::default()`, the system program.
+pub fn reject_placeholder_instance(id: Option<Pubkey>) -> Result<(), String> {
+    if id == Some(Pubkey::default()) {
+        return Err(
+            "escrow instance ID is the all-ones placeholder; create the instance and set \
+             COMMON_ESCROW_INSTANCE_ID"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Trim an optional config string, treating blank/whitespace as unset.
 fn normalized(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -325,7 +348,9 @@ impl PrivateChannelIndexerConfig {
         self.postgres.validate()?;
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {
-                return Err("--escrow-instance-id required when program_type is Escrow".to_string())
+                return Err("--escrow-instance-id required when program_type is Escrow \
+                            (env: COMMON_ESCROW_INSTANCE_ID)"
+                    .to_string())
             }
             (ProgramType::Withdraw, Some(_)) => {
                 return Err(
@@ -334,6 +359,7 @@ impl PrivateChannelIndexerConfig {
             }
             _ => {}
         }
+        reject_placeholder_instance(self.escrow_instance_id)?;
         // Escrow reconciliation always reads the second-chain RPC, so require it (blank counts as unset).
         if self.program_type == ProgramType::Escrow && normalized(&self.source_rpc_url).is_none() {
             return Err("source_rpc_url required when program_type is Escrow".to_string());
@@ -521,8 +547,10 @@ impl IndexerConfig {
 /// - `ADMIN_SIGNER`: Signer type (memory|vault|turnkey|privy)
 /// - `ADMIN_PRIVATE_KEY`: Private key or key identifier
 ///
-/// ## Optional (falls back to admin if not set):
-/// - `OPERATOR_SIGNER`: Signer type for operator-specific operations
+/// ## Operator role (`OPERATOR_SIGNER`):
+/// - Unset or blank, with no other `OPERATOR_*` signer var: the operator role signs with admin.
+/// - Set: it must load, or the operator refuses to start. Never falls back to admin.
+/// - `OPERATOR_*` key vars without `OPERATOR_SIGNER`: refused as a half-written config.
 /// - `OPERATOR_PRIVATE_KEY`: Private key or key identifier for operator
 ///
 /// ## Type-specific variables (required based on signer type):
@@ -539,6 +567,9 @@ impl IndexerConfig {
 /// ### Privy signers:
 /// - `ADMIN_PRIVY_APP_ID`, `ADMIN_PRIVY_APP_SECRET`, `ADMIN_PRIVY_WALLET_ID`
 /// - `OPERATOR_PRIVY_*` (same pattern)
+///
+/// Signers are loaded by `operator::init_signers`, which startup awaits before opening
+/// the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorConfig {
     /// How often to poll the database for pending transactions
@@ -599,20 +630,6 @@ fn default_confirmation_poll_interval_ms() -> u64 {
     DEFAULT_CONFIRMATION_POLL_INTERVAL_MS
 }
 
-impl OperatorConfig {
-    /// Validate that required signers are configured
-    ///
-    /// This triggers lazy initialization of signers and will fail fast
-    /// if required environment variables are missing or invalid.
-    pub fn validate_signers() -> Result<(), String> {
-        let _ = SignerUtil::get_admin_pubkey();
-
-        let _ = SignerUtil::get_operator_pubkey();
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,7 +639,6 @@ mod tests {
     // ============================================================================
 
     fn create_common_config() -> PrivateChannelIndexerConfig {
-        use std::str::FromStr;
         PrivateChannelIndexerConfig {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
@@ -633,7 +649,7 @@ mod tests {
                 database_url: "postgresql://localhost/test".to_string(),
                 max_connections: 10,
             },
-            escrow_instance_id: Some(Pubkey::from_str("11111111111111111111111111111111").unwrap()),
+            escrow_instance_id: Some(Pubkey::new_unique()),
         }
     }
 
@@ -777,14 +793,47 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
         assert!(err_msg.contains("--escrow-instance-id required"));
+        assert!(
+            err_msg.contains("COMMON_ESCROW_INSTANCE_ID"),
+            "got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn parse_escrow_instance_id_rules() {
+        let valid = Pubkey::new_unique();
+        assert_eq!(parse_escrow_instance_id(None), Ok(None));
+        for blank in ["", "   "] {
+            assert_eq!(parse_escrow_instance_id(Some(blank.to_string())), Ok(None));
+        }
+        let err = parse_escrow_instance_id(Some(Pubkey::default().to_string())).unwrap_err();
+        assert!(
+            err.contains("placeholder") && err.contains("COMMON_ESCROW_INSTANCE_ID"),
+            "got: {err}"
+        );
+        let err = parse_escrow_instance_id(Some("not-a-pubkey".to_string())).unwrap_err();
+        assert!(err.contains("Invalid escrow instance ID"), "got: {err}");
+        assert_eq!(
+            parse_escrow_instance_id(Some(format!(" {valid} "))),
+            Ok(Some(valid))
+        );
+    }
+
+    #[test]
+    fn indexer_validate_refuses_the_placeholder_instance() {
+        let config = PrivateChannelIndexerConfig {
+            escrow_instance_id: Some(Pubkey::default()),
+            ..create_common_config()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("placeholder"), "got: {err}");
     }
 
     #[test]
     fn test_validate_common_config_withdraw_with_instance_id() {
-        use std::str::FromStr;
         let config = PrivateChannelIndexerConfig {
             program_type: ProgramType::Withdraw,
-            escrow_instance_id: Some(Pubkey::from_str("11111111111111111111111111111111").unwrap()),
+            escrow_instance_id: Some(Pubkey::new_unique()),
             ..create_common_config()
         };
 
@@ -1249,6 +1298,11 @@ mod tests {
             let err = validate_operator_startup(&common, &operator)
                 .expect_err("every operator is bound to an instance");
             assert!(err.contains("escrow_instance_id"), "got: {err}");
+
+            common.escrow_instance_id = Some(Pubkey::default());
+            let err = validate_operator_startup(&common, &operator)
+                .expect_err("the all-ones placeholder is not an instance");
+            assert!(err.contains("placeholder"), "got: {err}");
         }
     }
 

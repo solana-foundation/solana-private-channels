@@ -32,6 +32,30 @@ pub enum SubCommand {
     /// pre-compute the instance PDA before starting Docker services so that
     /// indexer-solana and operator-solana can be configured to watch it.
     DerivePda(DerivePdaArgs),
+    /// Create the escrow instance for an instance-seed keypair, unless it already exists.
+    ///
+    /// Used by run.sh before starting the workers, which refuse a missing instance.
+    CreateInstance(CreateInstanceArgs),
+}
+
+/// Arguments for the create-instance subcommand.
+#[derive(Parser, Debug)]
+pub struct CreateInstanceArgs {
+    /// Path to the admin keypair JSON file; it pays for and administers the instance.
+    #[arg(long, env = "BENCH_ADMIN_KEYPAIR")]
+    pub admin_keypair: PathBuf,
+
+    /// JSON-RPC endpoint of the Solana validator.
+    #[arg(
+        long,
+        default_value = "http://localhost:18899",
+        env = "BENCH_SOLANA_RPC_URL"
+    )]
+    pub solana_rpc_url: String,
+
+    /// Path to the instance-seed keypair JSON file.
+    #[arg(long, env = "BENCH_INSTANCE_SEED_KEYPAIR")]
+    pub instance_seed_keypair: PathBuf,
 }
 
 /// Arguments for the derive-pda subcommand.
