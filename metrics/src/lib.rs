@@ -79,9 +79,7 @@ pub fn start_metrics_server_with_health_from_listener(
     listener.set_nonblocking(true).expect("set_nonblocking");
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("Metrics server error: {}", e);
-        }
+        serve_bounded(listener, app, LIMITS).await;
     });
 }
 
@@ -128,14 +126,135 @@ fn spawn_server(port: u16, app: axum::Router) {
 
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                if let Err(e) = axum::serve(listener, app).await {
-                    tracing::error!("Metrics server error: {}", e);
-                }
-            }
+            Ok(listener) => serve_bounded(listener, app, LIMITS).await,
             Err(e) => {
                 tracing::error!("Failed to bind metrics server on {}: {}", addr, e);
             }
         }
     });
+}
+
+/// Bounds on the metrics listener. Prometheus is the only scraper, so 64 is ample.
+#[derive(Clone, Copy)]
+struct Limits {
+    max_connections: usize,
+    header_read_timeout: std::time::Duration,
+}
+
+const LIMITS: Limits = Limits {
+    max_connections: 64,
+    header_read_timeout: std::time::Duration::from_secs(10),
+};
+
+/// Replaces `axum::serve`, which accepts without bound and never times out a header, so
+/// trickled requests could hold sockets until the process ran out of file descriptors.
+async fn serve_bounded(listener: tokio::net::TcpListener, app: axum::Router, limits: Limits) {
+    use tower::ServiceExt;
+
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                // Usually fd exhaustion; pause instead of spinning on the error.
+                tracing::debug!("Metrics accept failed: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        // At the cap the socket is dropped at once rather than queued.
+        let Ok(permit) = std::sync::Arc::clone(&slots).try_acquire_owned() else {
+            continue;
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    app.clone().oneshot(req.map(axum::body::Body::new))
+                });
+            // The timer is what makes header_read_timeout take effect.
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            if let Err(e) = conn.await {
+                tracing::debug!("Metrics connection closed: {}", e);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    async fn boot(limits: Limits) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_health_app(HealthState::new(HealthConfig::operator()));
+        tokio::spawn(serve_bounded(listener, app, limits));
+        addr
+    }
+
+    /// True if the server closes the socket (EOF or reset) within `within`.
+    async fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+        let mut buf = [0u8; 64];
+        matches!(
+            tokio::time::timeout(within, stream.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    async fn health_ok(addr: std::net::SocketAddr) -> bool {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut out)).await;
+        matches!(read, Ok(Ok(_))) && out.starts_with("HTTP/1.1 200")
+    }
+
+    /// A client that trickles its headers is closed after the header timeout, and a
+    /// complete request is still served meanwhile.
+    #[tokio::test]
+    async fn header_trickle_is_closed_after_the_timeout() {
+        let addr = boot(Limits {
+            max_connections: 8,
+            header_read_timeout: Duration::from_millis(500),
+        })
+        .await;
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        slow.write_all(b"GET /hea").await.unwrap();
+        assert!(health_ok(addr).await);
+        assert!(
+            closed_within(&mut slow, Duration::from_secs(3)).await,
+            "a trickled header must be closed after the timeout"
+        );
+    }
+
+    /// Connections past the cap are dropped at once; a freed slot is reused.
+    #[tokio::test]
+    async fn connections_past_the_cap_are_dropped_and_slots_recycle() {
+        let addr = boot(Limits {
+            max_connections: 2,
+            header_read_timeout: Duration::from_secs(30),
+        })
+        .await;
+        let first = TcpStream::connect(addr).await.unwrap();
+        let _second = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            closed_within(&mut over, Duration::from_secs(2)).await,
+            "a connection past the cap must be dropped"
+        );
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(health_ok(addr).await, "a freed slot must serve again");
+    }
 }

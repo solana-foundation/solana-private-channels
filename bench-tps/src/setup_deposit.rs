@@ -92,6 +92,128 @@ fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
 fn find_event_authority() -> (Pubkey, u8) {
     Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
 }
+/// Fund the admin if it is low, then create the escrow instance unless it already exists.
+/// run.sh calls this before starting the workers, which refuse a missing instance.
+pub async fn ensure_escrow_instance(
+    rpc: &RpcClient,
+    admin_keypair: &Keypair,
+    instance_seed_keypair: &Keypair,
+) -> Result<()> {
+    let instance_seed_pubkey = instance_seed_keypair.pubkey();
+    let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
+    let (bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
+    let (event_authority, _) = find_event_authority();
+    let send_retry_delays: &[u64] = &[1, 2, 4, 8, 16, 30];
+
+    // ------------------------------------------------------------------
+    // Task 2b: Ensure admin has SOL on Solana
+    //
+    // The Solana local validator does not pre-fund the bench admin keypair.
+    // We need enough lamports to cover: CreateInstance + AllowMint fees
+    // + N depositor SOL transfers + ATA creation fees.
+    // Only airdrop if the current balance is below the threshold so that
+    // repeated runs don't hit the validator's airdrop rate limit.
+    // ------------------------------------------------------------------
+    let balance = rpc
+        .get_balance(&admin_keypair.pubkey())
+        .await
+        .context("get_balance for admin on Solana")?;
+
+    if balance < MIN_ADMIN_LAMPORTS {
+        let sig = rpc
+            .request_airdrop(&admin_keypair.pubkey(), AIRDROP_LAMPORTS)
+            .await
+            .context("airdrop to admin on Solana")?;
+        for _ in 0..60u32 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) >= AIRDROP_LAMPORTS {
+                break;
+            }
+        }
+        if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) < MIN_ADMIN_LAMPORTS {
+            return Err(anyhow::anyhow!(
+                "airdrop timed out: admin balance still below minimum after 60 attempts"
+            ));
+        }
+        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on Solana");
+    } else {
+        info!(balance, "Admin already funded on Solana, skipping airdrop");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 3: Create the escrow instance on Solana
+    //
+    // Both the admin keypair and the instance-seed keypair must sign.
+    // ------------------------------------------------------------------
+    // A funded but uninitialized PDA is still a system account; only the escrow program's
+    // own account means the instance exists.
+    if rpc
+        .get_account(&instance_pda)
+        .await
+        .is_ok_and(|a| a.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    {
+        info!(%instance_pda, "Escrow instance already exists, skipping creation");
+        return Ok(());
+    }
+    let t3 = Instant::now();
+    let create_sig = 'send: {
+        let mut last_err = String::new();
+        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
+            match rpc.get_latest_blockhash().await {
+                Err(e) => {
+                    warn!(attempt, err = %e,
+                        "get_latest_blockhash failed (create_instance), retrying in {delay_secs}s");
+                    last_err = e.to_string();
+                }
+                Ok(blockhash) => {
+                    let create_ix = CreateInstance {
+                        payer: admin_keypair.pubkey(),
+                        admin: admin_keypair.pubkey(),
+                        instance_seed: instance_seed_pubkey,
+                        instance: instance_pda,
+                        withdrawal_bitmap: bitmap_pda,
+                        system_program: program::id(),
+                        event_authority,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                    }
+                    .instruction(CreateInstanceInstructionArgs {
+                        bump: instance_bump,
+                        bitmap_bump,
+                    });
+                    let tx = Transaction::new_signed_with_payer(
+                        &[create_ix],
+                        Some(&admin_keypair.pubkey()),
+                        &[admin_keypair, instance_seed_keypair],
+                        blockhash,
+                    );
+                    match rpc.send_transaction(&tx).await {
+                        Ok(sig) => break 'send sig,
+                        Err(e) => {
+                            warn!(attempt, err = %e, "create_instance send failed, retrying");
+                            last_err = e.to_string();
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        return Err(anyhow::anyhow!(
+            "create_instance: all retries exhausted: {last_err}"
+        ));
+    };
+    let retry = poll_confirmations(rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!(
+            "create_instance failed to confirm on-chain"
+        ));
+    }
+    info!(
+        %instance_pda,
+        elapsed_ms = t3.elapsed().as_millis(),
+        "Escrow instance created on Solana",
+    );
+    Ok(())
+}
 
 /// Run all deposit setup tasks and return the `DepositConfig` needed by the
 /// deposit load phase.
@@ -145,8 +267,7 @@ pub async fn run_setup_deposit_phase(
         None => Keypair::new(),
     };
     let instance_seed_pubkey = instance_seed_keypair.pubkey();
-    let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
-    let (bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
+    let (instance_pda, _) = find_instance_pda(&instance_seed_pubkey);
     let (event_authority, _) = find_event_authority();
     info!(
         %instance_seed_pubkey,
@@ -164,103 +285,7 @@ pub async fn run_setup_deposit_phase(
     ));
     let send_retry_delays: &[u64] = &[1, 2, 4, 8, 16, 30];
 
-    // ------------------------------------------------------------------
-    // Task 2b: Ensure admin has SOL on Solana
-    //
-    // The Solana local validator does not pre-fund the bench admin keypair.
-    // We need enough lamports to cover: CreateInstance + AllowMint fees
-    // + N depositor SOL transfers + ATA creation fees.
-    // Only airdrop if the current balance is below the threshold so that
-    // repeated runs don't hit the validator's airdrop rate limit.
-    // ------------------------------------------------------------------
-    let balance = rpc
-        .get_balance(&admin_keypair.pubkey())
-        .await
-        .context("get_balance for admin on Solana")?;
-
-    if balance < MIN_ADMIN_LAMPORTS {
-        let sig = rpc
-            .request_airdrop(&admin_keypair.pubkey(), AIRDROP_LAMPORTS)
-            .await
-            .context("airdrop to admin on Solana")?;
-        for _ in 0..60u32 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) >= AIRDROP_LAMPORTS {
-                break;
-            }
-        }
-        if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) < MIN_ADMIN_LAMPORTS {
-            return Err(anyhow::anyhow!(
-                "airdrop timed out: admin balance still below minimum after 60 attempts"
-            ));
-        }
-        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on Solana");
-    } else {
-        info!(balance, "Admin already funded on Solana, skipping airdrop");
-    }
-
-    // ------------------------------------------------------------------
-    // Task 3: Create the escrow instance on Solana
-    //
-    // Both the admin keypair and the instance-seed keypair must sign.
-    // ------------------------------------------------------------------
-    let t3 = Instant::now();
-    let create_sig = 'send: {
-        let mut last_err = String::new();
-        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match rpc.get_latest_blockhash().await {
-                Err(e) => {
-                    warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (create_instance), retrying in {delay_secs}s");
-                    last_err = e.to_string();
-                }
-                Ok(blockhash) => {
-                    let create_ix = CreateInstance {
-                        payer: admin_keypair.pubkey(),
-                        admin: admin_keypair.pubkey(),
-                        instance_seed: instance_seed_pubkey,
-                        instance: instance_pda,
-                        withdrawal_bitmap: bitmap_pda,
-                        system_program: program::id(),
-                        event_authority,
-                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-                    }
-                    .instruction(CreateInstanceInstructionArgs {
-                        bump: instance_bump,
-                        bitmap_bump,
-                    });
-                    let tx = Transaction::new_signed_with_payer(
-                        &[create_ix],
-                        Some(&admin_keypair.pubkey()),
-                        &[admin_keypair.as_ref(), &instance_seed_keypair],
-                        blockhash,
-                    );
-                    match rpc.send_transaction(&tx).await {
-                        Ok(sig) => break 'send sig,
-                        Err(e) => {
-                            warn!(attempt, err = %e, "create_instance send failed, retrying");
-                            last_err = e.to_string();
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-        return Err(anyhow::anyhow!(
-            "create_instance: all retries exhausted: {last_err}"
-        ));
-    };
-    let retry = poll_confirmations(&rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
-    if !retry.is_empty() {
-        return Err(anyhow::anyhow!(
-            "create_instance failed to confirm on-chain"
-        ));
-    }
-    info!(
-        %instance_pda,
-        elapsed_ms = t3.elapsed().as_millis(),
-        "Escrow instance created on Solana",
-    );
+    ensure_escrow_instance(&rpc, &admin_keypair, &instance_seed_keypair).await?;
 
     // ------------------------------------------------------------------
     // Task 4: Generate N depositor keypairs (parallel)

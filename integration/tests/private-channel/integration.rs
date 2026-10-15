@@ -304,6 +304,15 @@ async fn setup(
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
 
+    setup_solana_escrow_instance(
+        &test_validator.rpc_url(),
+        &faucet_keypair,
+        &operator_key,
+        &escrow_instance,
+    )
+    .await
+    .expect("Failed to set up the escrow instance");
+
     // Start both indexers in parallel — each has its own DB and datasource
     println!("\n=== Starting PrivateChannel Indexer and Solana Indexer in parallel ===");
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
@@ -334,6 +343,7 @@ async fn setup(
     let (solana_to_private_channel_result, private_channel_to_solana_result) = tokio::join!(
         start_solana_to_private_channel_operator(
             private_channel_rpc_url.clone(),
+            test_validator.rpc_url(),
             solana_indexer_db_url.clone(),
             operator_key_solana_to_private_channel,
             instance_pda,

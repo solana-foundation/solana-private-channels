@@ -69,7 +69,7 @@ pub use test_non_admin::run_non_admin_sending_admin_instruction_test;
 pub use test_performance_samples::run_performance_samples_test;
 pub use test_precompile_accounts::run_precompile_accounts_test;
 pub use test_signature_status_snapshot::run_signature_status_snapshot_test;
-pub use test_spl_token::run_spl_token_test;
+pub use test_spl_token::{run_spl_token_test, setup_solana_escrow_instance};
 pub use test_swap::run_swap_clock_tests;
 pub use test_transaction_count::run_transaction_count_test;
 pub use test_tx_replay::run_tx_replay_test;
