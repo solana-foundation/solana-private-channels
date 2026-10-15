@@ -1,7 +1,10 @@
 use crate::metrics;
-use crate::{config::ProgramType, error::CheckpointError, storage::Storage};
+use crate::{
+    config::ProgramType, error::CheckpointError, storage::common::models::ChannelFence,
+    storage::Storage,
+};
 use private_channel_metrics::MetricLabel;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -18,6 +21,8 @@ const STALL_WARN_TICKS: u32 = 3;
 pub struct CheckpointUpdate {
     pub program_type: ProgramType,
     pub slot: u64,
+    /// The slot's blockhash when it held a block; `None` for a skipped slot.
+    pub blockhash: Option<String>,
 }
 
 /// In-band message on the checkpoint channel. `Slot` advances the durable frontier;
@@ -53,6 +58,10 @@ struct CheckpointState {
     dirty: bool,
     // Consecutive gated ticks with no frontier advance, for the stall warning.
     stalled_ticks: u32,
+    // Present blocks above the frontier, waiting for it to reach them.
+    blocks: BTreeMap<u64, String>,
+    // Newest present block at or below the frontier, flushed with it as the channel fence.
+    fence: Option<ChannelFence>,
 }
 
 impl CheckpointState {
@@ -63,6 +72,8 @@ impl CheckpointState {
             gate: None,
             dirty: false,
             stalled_ticks: 0,
+            blocks: BTreeMap::new(),
+            fence: None,
         }
     }
 
@@ -77,6 +88,8 @@ impl CheckpointState {
             gate: Some(target),
             dirty: false,
             stalled_ticks: 0,
+            blocks: BTreeMap::new(),
+            fence: None,
         }
     }
 
@@ -86,7 +99,31 @@ impl CheckpointState {
     /// When ungated, or after a backfill gap has been filled, `frontier` just tracks
     /// the highest slot seen. While a gap is still open it advances only across
     /// contiguous slots, so a slot that hasn't arrived yet can never be skipped.
+    #[cfg(test)]
     fn apply(&mut self, slot: u64) -> bool {
+        self.apply_block(slot, None)
+    }
+
+    /// `apply` for a slot that may carry a block. The fence follows the frontier but only
+    /// lands on a present block, since a skipped slot has no hash to check later.
+    fn apply_block(&mut self, slot: u64, blockhash: Option<&str>) -> bool {
+        if let Some(hash) = blockhash {
+            if self.fence.as_ref().is_none_or(|fence| slot > fence.slot) {
+                self.blocks.insert(slot, hash.to_string());
+            }
+        }
+        let advanced = self.advance(slot);
+        if let Some((&slot, hash)) = self.blocks.range(..=self.frontier).next_back() {
+            self.fence = Some(ChannelFence {
+                slot,
+                blockhash: hash.clone(),
+            });
+            self.blocks = self.blocks.split_off(&(self.frontier + 1));
+        }
+        advanced
+    }
+
+    fn advance(&mut self, slot: u64) -> bool {
         let before = self.frontier;
 
         match self.gate {
@@ -248,7 +285,7 @@ impl CheckpointWriter {
         let state = states
             .entry(update.program_type)
             .or_insert_with(|| self.new_state());
-        state.apply(update.slot);
+        state.apply_block(update.slot, update.blockhash.as_deref());
         metrics::INDEXER_CHECKPOINT_FRONTIER_LAG
             .with_label_values(&[update.program_type.as_label()])
             .set(state.lag() as f64);
@@ -306,7 +343,11 @@ impl CheckpointWriter {
             }
             match self
                 .storage
-                .update_committed_checkpoint(&program_key(program_type), state.frontier)
+                .update_committed_checkpoint_with_fence(
+                    &program_key(program_type),
+                    state.frontier,
+                    state.fence.as_ref(),
+                )
                 .await
             {
                 Ok(_) => {
@@ -724,6 +765,7 @@ mod tests {
             CheckpointUpdate {
                 program_type: ProgramType::Escrow,
                 slot: 100,
+                blockhash: None,
             },
         );
         writer.record_regate(&mut states, ProgramType::Escrow, 100, 110);
@@ -734,6 +776,7 @@ mod tests {
             CheckpointUpdate {
                 program_type: ProgramType::Escrow,
                 slot: 105,
+                blockhash: None,
             },
         );
         writer.record_update(
@@ -741,12 +784,58 @@ mod tests {
             CheckpointUpdate {
                 program_type: ProgramType::Escrow,
                 slot: 2_000_000,
+                blockhash: None,
             },
         );
 
         let state = states.get(&ProgramType::Escrow).unwrap();
         assert_eq!(state.frontier, 100);
         assert_eq!(state.lag(), 10);
+    }
+
+    /// The fence is the newest present block at or below the frontier. A skipped slot
+    /// moves the frontier but not the fence, and a block above the frontier waits.
+    #[tokio::test]
+    async fn checkpoint_state_tracks_newest_present_block() {
+        let fence = |state: &CheckpointState| state.fence.clone();
+        let block = |slot: u64, hash: &str| {
+            Some(ChannelFence {
+                slot,
+                blockhash: hash.to_string(),
+            })
+        };
+
+        let mut ungated = CheckpointState::ungated();
+        ungated.apply_block(10, Some("h10"));
+        assert_eq!(fence(&ungated), block(10, "h10"));
+        ungated.apply_block(11, None);
+        assert_eq!(ungated.frontier, 11);
+        assert_eq!(fence(&ungated), block(10, "h10"));
+
+        let mut gated = CheckpointState::gated(FROM, T0);
+        gated.apply_block(FROM + 2, Some("h102"));
+        assert_eq!(gated.frontier, FROM, "an out-of-order block must wait");
+        assert_eq!(fence(&gated), None);
+        gated.apply_block(FROM + 1, Some("h101"));
+        assert_eq!(gated.frontier, FROM + 2);
+        assert_eq!(fence(&gated), block(FROM + 2, "h102"));
+        gated.apply_block(FROM + 3, None);
+        assert_eq!(gated.frontier, FROM + 3);
+        assert_eq!(fence(&gated), block(FROM + 2, "h102"));
+
+        // The flush writes the fence in the same upsert as the checkpoint.
+        let mock = MockStorage::new();
+        let writer = CheckpointWriter::new(Arc::new(Storage::Mock(mock.clone())));
+        let mut states = HashMap::from([(ProgramType::Withdraw, gated)]);
+        writer.flush_checkpoints(&mut states).await;
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("withdraw"),
+            Some(&(FROM + 3))
+        );
+        assert_eq!(
+            mock.channel_fences.lock().unwrap().get("withdraw").cloned(),
+            block(FROM + 2, "h102")
+        );
     }
 
     // ============================================================================
@@ -1193,6 +1282,7 @@ mod tests {
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 500,
+            blockhash: None,
         }))
         .await
         .unwrap();
@@ -1223,12 +1313,14 @@ mod tests {
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100,
+            blockhash: None,
         }))
         .await
         .unwrap();
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 200,
+            blockhash: None,
         }))
         .await
         .unwrap();
@@ -1259,12 +1351,14 @@ mod tests {
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 300,
+            blockhash: None,
         }))
         .await
         .unwrap();
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100, // lower slot, should be ignored
+            blockhash: None,
         }))
         .await
         .unwrap();
@@ -1290,6 +1384,7 @@ mod tests {
         tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Withdraw,
             slot: 42,
+            blockhash: None,
         }))
         .await
         .unwrap();

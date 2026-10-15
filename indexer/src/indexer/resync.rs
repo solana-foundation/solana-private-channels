@@ -7,8 +7,8 @@ use crate::{
     },
     operator::{
         enumerate_consumed_mints, extend_with_mint_history, fetch_consumed_nonces,
-        find_withdrawal_bitmap_pda, ConsumedMintKind, ConsumedSet, RetryConfig, RpcClientWithRetry,
-        SourceEventId, CONSUMED_SET_PAGE_SIZE,
+        find_withdrawal_bitmap_pda, sender::wait_for_address_index, ConsumedMintKind, ConsumedSet,
+        RetryConfig, RpcClientWithRetry, SourceEventId, CONSUMED_SET_PAGE_SIZE,
     },
     shutdown_utils::WRITER_STOP_TIMEOUT,
     storage::common::models::{ResyncBlockers, ServicedRow},
@@ -143,53 +143,16 @@ async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), Indexer
 }
 
 /// Refuse unless the channel address index covers the block that was newest at the first
-/// read, so its history holds every mint landed before resync took the lock. A pinned
-/// target, not `getSlot` or a moving tip, so idle ticks and live traffic cannot outrun it.
-async fn ensure_index_caught_up(
+/// read, so its history holds every mint landed before resync took the lock.
+pub(crate) async fn ensure_index_caught_up(
     channel_rpc: &RpcClientWithRetry,
     budget: Duration,
 ) -> Result<(), IndexerError> {
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut target = None;
-    loop {
-        // One poll interval at least, so a zero budget still gets a real read.
-        let remaining = deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .max(INDEX_CATCH_UP_POLL);
-        let reply =
-            match tokio::time::timeout(remaining, channel_rpc.get_address_index_slot()).await {
-                Ok(reply) => reply.map_err(|e| e.to_string()),
-                Err(_) => Err(format!("no reply within {remaining:?}")),
-            };
-        let (watermark, latest_block) = reply.map_err(|e| {
-            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
-                reason: format!(
-                    "channel address index progress unreadable: {e}. The channel RPC must be \
-                     the operators' read node running a core that serves getAddressIndexSlot; \
-                     see docs/runbooks/resync_consumed_mint_mismatch.md"
-                ),
-            })
-        })?;
-        let target = *target.get_or_insert(latest_block);
-        if watermark >= target {
-            info!(watermark, target, "Channel address index is caught up");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(IndexerError::Reconciliation(
-                ReconciliationError::ConsumedSetUnavailable {
-                    reason: format!(
-                        "channel address index is at slot {watermark}, behind block {target}, \
-                         the newest when resync started waiting, so its history may miss serviced mints. The write \
-                         node must be running and the channel RPC must be the operators' read \
-                         node; rerun once it catches up, see \
-                         docs/runbooks/resync_consumed_mint_mismatch.md"
-                    ),
-                },
-            ));
-        }
-        tokio::time::sleep(INDEX_CATCH_UP_POLL).await;
-    }
+    wait_for_address_index(channel_rpc, budget, INDEX_CATCH_UP_POLL)
+        .await
+        .map_err(|reason| {
+            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable { reason })
+        })
 }
 
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.

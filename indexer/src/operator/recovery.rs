@@ -2970,14 +2970,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -3023,14 +3017,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             matches!(
                 validated,

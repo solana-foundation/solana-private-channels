@@ -242,6 +242,8 @@ pub struct SenderState {
     /// Spawned mint sends. The drain waits for them and dropping the state aborts the rest,
     /// so none outlives the sender task.
     pub send_tasks: tokio::task::JoinSet<()>,
+    /// Channel mints the DB may have forgotten, checked before every remint.
+    pub(crate) consumed: Option<super::ConsumedClaims>,
 }
 
 impl SenderState {

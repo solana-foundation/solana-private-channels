@@ -3,6 +3,7 @@ use crate::error::{
     CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
 };
 use crate::{
+    channel_fence::{verify_channel_fence, FenceVerdict, FenceWait},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
         datasource::common::{datasource::DataSource, types::ProcessorMessage},
@@ -11,6 +12,7 @@ use crate::{
         },
         transaction_processor::TransactionProcessor,
     },
+    operator::{RetryConfig, RpcClientWithRetry},
     shutdown_utils::{
         cleanup_after_backfill, drain_unless_lock_lost, shutdown_indexer, stop_signal, StopReason,
     },
@@ -20,6 +22,9 @@ use crate::{
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
+use private_channel_metrics::MetricLabel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use std::time::Duration;
 
 #[cfg(feature = "datasource-rpc")]
 use crate::{
@@ -34,10 +39,6 @@ use crate::{
     },
     operator::escrow_sweep::CustodySnapshot,
 };
-#[cfg(feature = "datasource-rpc")]
-use private_channel_metrics::MetricLabel;
-#[cfg(feature = "datasource-rpc")]
-use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
@@ -69,6 +70,49 @@ enum Supervision {
     ShutdownSignalled(std::io::Result<StopReason>),
     /// The startup fill failed, so its range stays unfilled until a restart refills it.
     BackfillFailed(IndexerError),
+}
+
+/// How long boot waits for a restored or lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: Duration::from_secs(1),
+    budget: Duration::from_secs(600),
+};
+
+/// Withdraw role: refuse to start on a channel that no longer holds the block this DB's
+/// checkpoint was built on.
+async fn verify_fence_at_boot(
+    storage: &Storage,
+    common_config: &PrivateChannelIndexerConfig,
+    indexer_config: &IndexerConfig,
+) -> Result<(), IndexerError> {
+    let fence = storage.get_channel_fence().await?;
+    let commitment = indexer_config
+        .rpc_polling
+        .as_ref()
+        .map(|c| c.commitment)
+        .unwrap_or(CommitmentLevel::Confirmed);
+    let rpc = RpcClientWithRetry::with_retry_config(
+        common_config.rpc_url.clone(),
+        RetryConfig::default(),
+        CommitmentConfig { commitment },
+    );
+    match verify_channel_fence(&rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(())
+        }
+        FenceVerdict::Mismatch(reason) => {
+            crate::metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[ProgramType::Withdraw.as_label()])
+                .inc();
+            error!("Indexer refusing to start: {reason}");
+            Err(IndexerError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Indexer refusing to start, channel fence unchecked: {reason}");
+            Err(IndexerError::ChannelFenceUnchecked { reason })
+        }
+    }
 }
 
 /// Wind the checkpoint writer down once the processor has ended.
@@ -546,6 +590,8 @@ pub async fn run(
     indexer_config
         .validate()
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::validate_withdraw_datasource(&common_config, &indexer_config)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // 1. Initialize storage
     let storage: Arc<Storage> = match common_config.storage_type {
@@ -585,6 +631,16 @@ pub async fn run(
         .await
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
+
+    // The withdraw indexer DB must never be ahead of the channel. Checked once, before any
+    // block is read. A restore done while it runs is not caught: every service must be stopped.
+    if common_config.program_type == ProgramType::Withdraw {
+        under_live_lock(
+            &live_lock_lost,
+            verify_fence_at_boot(&storage, &common_config, &indexer_config),
+        )
+        .await?;
+    }
 
     // 2. Validate the escrow reconciliation wiring before doing any work.
     //

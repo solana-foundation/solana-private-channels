@@ -104,6 +104,7 @@ pub(super) fn sender_state_with_storage_and_role(
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         send_tasks: tokio::task::JoinSet::new(),
+        consumed: None,
     }
 }
 

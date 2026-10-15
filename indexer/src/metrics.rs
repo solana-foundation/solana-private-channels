@@ -46,6 +46,27 @@ counter_vec!(
     &["program_type", "error_type"]
 );
 
+counter_vec!(
+    CHANNEL_FENCE_MISMATCH,
+    "private_channel_channel_fence_mismatch_total",
+    "Times the channel no longer held the block the withdraw checkpoint was built on",
+    &["program_type"]
+);
+
+counter_vec!(
+    CONSUMED_SET_HITS,
+    "private_channel_consumed_set_hits_total",
+    "Claimed rows the channel had already minted, by kind and outcome",
+    &["program_type", "kind", "outcome"]
+);
+
+counter_vec!(
+    BITMAP_UNEXPLAINED_NONCE,
+    "private_channel_bitmap_unexplained_nonce_total",
+    "Consumed withdrawal nonces no landed journaled release explains",
+    &["program_type"]
+);
+
 gauge_vec!(
     INDEXER_CHAIN_TIP_SLOT,
     "private_channel_indexer_chain_tip_slot",
@@ -346,6 +367,8 @@ pub fn init_labels(program_type: &str) {
     INDEXER_BACKFILL_SLOTS_REMAINING.with_label_values(&[program_type]);
     INDEXER_CHECKPOINT_FRONTIER_LAG.with_label_values(&[program_type]);
     INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
+    CHANNEL_FENCE_MISMATCH.with_label_values(&[program_type]);
+    BITMAP_UNEXPLAINED_NONCE.with_label_values(&[program_type]);
 
     for error_type in &[
         "stream",
