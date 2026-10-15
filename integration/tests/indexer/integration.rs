@@ -904,6 +904,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
         channel_shim.url(),
+        test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,

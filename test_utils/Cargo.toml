@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+base64.workspace = true
+borsh.workspace = true
 solana-commitment-config = { workspace = true }
 bs58.workspace = true
 chrono.workspace = true

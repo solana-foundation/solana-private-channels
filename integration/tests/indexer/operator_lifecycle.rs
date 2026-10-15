@@ -412,6 +412,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     // rpc_url (mint target) = PC node; the escrow instance stays on Solana.
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -513,6 +514,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -895,6 +897,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
     let pc_client = RpcClient::new(pc_node.url.clone());
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -968,6 +971,7 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_solana_to_private_channel_operator(
+        test_validator.rpc_url(),
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,

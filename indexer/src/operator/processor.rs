@@ -262,9 +262,10 @@ async fn halt_withdrawal_pipeline(
     }
 
     // Sweep the rest of the pipeline: any row at or above the poison's nonce
-    // still `Pending` (never fetched), `Processing` (locked but unsent) or
-    // `Parked` is flipped to `ManualReview`. A poison row with no nonce
-    // yields no floor, so the sweep stays unbounded.
+    // still `Pending` (never fetched), `Processing` (fetched, and possibly
+    // claimed and sent by the sender mid-sweep) or `Parked` is flipped to
+    // `ManualReview`. A poison row with no nonce yields no floor, so the sweep
+    // stays unbounded.
     let poison_id = poison.map(|txn| txn.id);
     let min_nonce = poison.and_then(|txn| txn.withdrawal_nonce);
     match storage

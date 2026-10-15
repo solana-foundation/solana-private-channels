@@ -4,10 +4,12 @@ use super::types::SenderState;
 use crate::config::ProgramType;
 use crate::metrics::{
     OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+    OPERATOR_TRANSACTION_ERRORS,
 };
 use crate::operator::sender::{
     release_seen_at_confirmed, verify_release_landed_at, ReleaseVerdict,
 };
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
@@ -328,63 +330,83 @@ pub async fn execute_deferred_remint(
                 return DeferredRemintOutcome::Resolved;
             };
 
-            // Durably record the landed remint before the async channel send.
-            // This flips status to FailedReminted now, so a crash in the window
-            // before the writer runs can no longer leave the row PendingRemint
-            // for restart recovery to pick up and remint a second time.
-            match state
-                .storage
-                .record_remint_result(transaction_id, signature.to_string())
-                .await
+            // Durably record the landed remint. This is the only write that sets
+            // FailedReminted, and it stores the signature with it, so a crash
+            // before the alert below cannot leave the row PendingRemint for
+            // restart recovery to remint a second time.
+            // Retried in place, so a blip resolves here rather than on a later pass.
+            if let Err(persist_err) = with_storage_backoff("remint record", transaction_id, || {
+                state
+                    .storage
+                    .record_remint_result(transaction_id, signature.to_string())
+            })
+            .await
             {
-                // The row is durably terminal, so the journal has nothing left to prove.
-                Ok(()) => {
-                    if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
-                        warn!(
-                            "Failed to clear remint signatures for txn {}: {}; GC will sweep",
-                            transaction_id, e
+                // The write may still have committed, so read the row back.
+                let observed = with_storage_backoff("remint status read", transaction_id, || {
+                    state.storage.get_transaction_status(transaction_id)
+                })
+                .await;
+                match observed {
+                    // Committed; only the acknowledgement was lost.
+                    Ok(Some(TransactionStatus::FailedReminted)) => {}
+                    // Still ours, or unknown. The row and its journal stay. A later
+                    // pass re-checks the release first, then finds this signature
+                    // landed and records it, never resending.
+                    Ok(Some(TransactionStatus::PendingRemint)) | Err(_) => {
+                        error!(
+                            "Remint sig {} confirmed but durable persist failed for txn {}: {}; \
+                             keeping the journal and retrying",
+                            signature, transaction_id, persist_err
+                        );
+                        OPERATOR_TRANSACTION_ERRORS
+                            .with_label_values(&[
+                                state.program_type.as_label(),
+                                "remint_record_failed",
+                            ])
+                            .inc();
+                        return DeferredRemintOutcome::DeferInFlight(
+                            Box::new(entry),
+                            format!(
+                                "remint {} landed but recording it failed for transaction {}: {}",
+                                signature, transaction_id, persist_err
+                            ),
                         );
                     }
-                }
-                // The row stays PendingRemint, so the journal MUST be kept: a crash
-                // before the async writer commits leaves restart recovery to classify
-                // this landed signature rather than broadcast a duplicate.
-                Err(persist_err) => {
-                    error!(
-                        "Remint sig {} confirmed but durable persist failed for txn {}: {}; \
-                         keeping the journal, falling back to async status writer",
-                        signature, transaction_id, persist_err
-                    );
+                    // Another writer moved the row and owns it. Keep the journal,
+                    // but still page the landed remint.
+                    Ok(status) => {
+                        error!(
+                            "Remint sig {} confirmed but txn {} is {:?}; leaving it to its owner",
+                            signature, transaction_id, status
+                        );
+                        let error_message = format!(
+                            "{} | remint landed but the row is no longer pending_remint ({:?})",
+                            entry.original_error, status
+                        );
+                        send_reminted_alert(
+                            storage_tx,
+                            &entry,
+                            transaction_id,
+                            signature,
+                            error_message,
+                        )
+                        .await;
+                        return DeferredRemintOutcome::Resolved;
+                    }
                 }
             }
 
-            // Drives the webhook alert, and is the fallback status write when the
-            // durable persist above errored. Its UPDATE only touches
-            // processing/pending_remint rows, so once the row is FailedReminted
-            // this is a no-op.
-            if let Err(e) = send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
-                    transaction_id,
-                    trace_id: entry.ctx.trace_id.clone(),
-                    status: TransactionStatus::FailedReminted,
-                    counterpart_signature: None,
-                    processed_at: Some(Utc::now()),
-                    error_message: Some(entry.original_error.clone()),
-                    remint_signature: Some(signature.to_string()),
-                    remint_attempted: true,
-                    alert_only: false,
-                },
-                "transaction status update",
-            )
-            .await
-            {
-                error!(
-                    "Failed to send FailedReminted status for txn {}: {}. \
-                     Remint sig {} confirmed on-chain.",
-                    transaction_id, e, signature
+            // The row is durably terminal, so the journal has nothing left to prove.
+            if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
+                warn!(
+                    "Failed to clear remint signatures for txn {}: {}; GC will sweep",
+                    transaction_id, e
                 );
             }
+
+            let error_message = entry.original_error.clone();
+            send_reminted_alert(storage_tx, &entry, transaction_id, signature, error_message).await;
             DeferredRemintOutcome::Resolved
         }
         RemintAttempt::DeferPreBroadcast(reason) => {
@@ -1256,6 +1278,40 @@ async fn send_manual_review(
     .ok();
 }
 
+/// Page a landed remint. The row is already written, or another writer owns it,
+/// so this only drives the webhook alert.
+async fn send_reminted_alert(
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    entry: &PendingRemint,
+    transaction_id: i64,
+    signature: Signature,
+    error_message: String,
+) {
+    if let Err(e) = send_guaranteed(
+        storage_tx,
+        TransactionStatusUpdate {
+            transaction_id,
+            trace_id: entry.ctx.trace_id.clone(),
+            status: TransactionStatus::FailedReminted,
+            counterpart_signature: None,
+            processed_at: Some(Utc::now()),
+            error_message: Some(error_message),
+            remint_signature: Some(signature.to_string()),
+            remint_attempted: true,
+            alert_only: true,
+        },
+        "transaction status update",
+    )
+    .await
+    {
+        error!(
+            "Failed to send FailedReminted status for txn {}: {}. \
+             Remint sig {} confirmed on-chain.",
+            transaction_id, e, signature
+        );
+    }
+}
+
 /// Report a pending-remint entry as Completed because one of its withdrawal
 /// signatures finalized on Solana.
 async fn send_completed(
@@ -1436,6 +1492,7 @@ mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
         mock_bitmap_account, mock_bitmap_at_commitment, mock_bitmap_read_failure,
+        push_withdrawal_with_nonce,
     };
     use crate::operator::sender::types::{
         PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
@@ -1547,12 +1604,22 @@ mod tests {
     }
 
     /// A stored PendingRemint row for a release the program refused: real
-    /// signatures so the finality check can classify them, a deadline that has
-    /// already matured so the entry is due on the first pass, and the refusal
-    /// recorded on the row rather than only in the queue.
+    /// signatures so the finality check can classify them, journaled as the
+    /// handoff does, a deadline that has already matured so the entry is due on
+    /// the first pass, and the refusal recorded on the row rather than only in
+    /// the queue.
     fn seed_refused_pending_remint_row(mock: &MockStorage, id: i64, nonce: i64) {
         use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
         let now = Utc::now();
+        let release_signature = Signature::new_unique().to_string();
+        mock.release_signatures.lock().unwrap().insert(
+            id,
+            vec![StoredSig {
+                signature: release_signature.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         mock.pending_remint_transactions
             .lock()
             .unwrap()
@@ -1573,7 +1640,7 @@ mod tests {
                 updated_at: now,
                 processed_at: None,
                 counterpart_signature: None,
-                remint_signatures: Some(vec![Signature::new_unique().to_string()]),
+                remint_signatures: Some(vec![release_signature]),
                 remint_last_valid_block_heights: Some(vec![0]),
                 pending_remint_deadline_at: Some(now - chrono::Duration::seconds(1)),
                 finality_check_attempts: 0,
@@ -2967,15 +3034,25 @@ mod tests {
         mock.update_committed_checkpoint("escrow", 8_970)
             .await
             .unwrap();
-        seed_pending_remint_row(&mock, 99, 2);
+        let transaction_id = 99;
+        seed_pending_remint_row(&mock, transaction_id, 2);
+        let release_signature = Signature::new_unique().to_string();
         {
             let mut rows = mock.pending_remint_transactions.lock().unwrap();
             let row = &mut rows[0];
             row.withdrawal_nonce = Some(3);
-            row.remint_signatures = Some(vec![Signature::new_unique().to_string()]);
+            row.remint_signatures = Some(vec![release_signature.clone()]);
             row.remint_last_valid_block_heights = Some(vec![0]);
             row.pending_remint_deadline_at = Some(Utc::now() - chrono::Duration::seconds(1));
         }
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: release_signature,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.recover_pending_remints(&storage_tx).await.unwrap();
@@ -2989,7 +3066,7 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 2);
-        assert_eq!(persisted_attempts(&mock, 99).0, 2);
+        assert_eq!(persisted_attempts(&mock, transaction_id).0, 2);
     }
 
     /// Once the checkpoint reaches the bound, the absence is real evidence and
@@ -3370,6 +3447,65 @@ mod tests {
         );
     }
 
+    /// A restart must keep each release attempt's journaled blockhash slot. On a
+    /// pruned endpoint that slot is the only proof the attempt's window is still
+    /// retained, so without it an expired release reads as Uncertain, not Dead.
+    #[tokio::test]
+    async fn a_recovered_release_is_proven_dead_by_its_journaled_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+
+        let transaction_id = 98;
+        let release_signature = Signature::new_unique().to_string();
+        let last_valid_block_height = 1_000;
+        // At or above the floor below, while the height bound (lvbh - 150) is under it.
+        let blockhash_slot = 1_200;
+        let ledger_floor = 1_100;
+        seed_pending_remint_row(&mock, transaction_id, 0);
+        {
+            let mut rows = mock.pending_remint_transactions.lock().unwrap();
+            let row = &mut rows[0];
+            row.remint_signatures = Some(vec![release_signature.clone()]);
+            row.remint_last_valid_block_heights = Some(vec![last_valid_block_height]);
+        }
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: release_signature,
+                last_valid_block_height,
+                blockhash_slot: Some(blockhash_slot),
+            }],
+        );
+
+        // The release expired unseen, on a pruned endpoint with no fallback.
+        let _status = mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":2000},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _height = mock_rpc(
+            &mut server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":2000,"id":0}"#,
+        )
+        .await;
+        let _floor = mock_ledger_floor(&mut server, ledger_floor).await;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.pending_remints.len(), 1, "the row must re-hydrate");
+
+        assert!(
+            matches!(
+                classify_signatures(&state.dest_finality(), &state.pending_remints[0].signatures)
+                    .await,
+                SigFinality::Dead
+            ),
+            "the journaled slot proves the pruned endpoint still retains the attempt's window"
+        );
+    }
+
     // ── execute_deferred_remint paths ───────────────────────────────
 
     /// A journaled attempt that landed is the whole point of the write-ahead
@@ -3382,15 +3518,17 @@ mod tests {
         let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
+        let transaction_id = 710;
         let journaled = Signature::new_unique();
         mock.remint_signatures.lock().unwrap().insert(
-            710,
+            transaction_id,
             vec![StoredSig {
                 signature: journaled.to_string(),
                 last_valid_block_height: 0,
                 blockhash_slot: None,
             }],
         );
+        seed_pending_remint_row(&mock, transaction_id, 0);
 
         // The journaled attempt finalized successfully on the source chain.
         let _status = mock_status_snapshot(
@@ -3411,7 +3549,7 @@ mod tests {
             .create_async()
             .await;
 
-        let entry = make_matured_remint(710, 71);
+        let entry = make_matured_remint(transaction_id, 71);
         let _outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
 
         let update = storage_rx
@@ -3424,6 +3562,164 @@ mod tests {
             "the recorded remint must be the journaled attempt, not a fresh one"
         );
         no_send.assert_async().await;
+    }
+
+    /// A failed record may still have committed, so the row is read back to see
+    /// who owns it. Only the durable write may set FailedReminted: a failure never
+    /// falls back to a status write that would drop the landed signature.
+    #[tokio::test]
+    async fn a_failed_remint_record_is_resolved_by_reading_the_row_back() {
+        ensure_test_signer();
+        // (row status, read-back fails, requeued in flight, alerted, journal kept)
+        let cases = [
+            (TransactionStatus::PendingRemint, false, true, false, true),
+            // One DB blip can fail both the record and the read-back.
+            (TransactionStatus::PendingRemint, true, true, false, true),
+            // Committed, with only the acknowledgement lost.
+            (TransactionStatus::FailedReminted, false, false, true, false),
+            // Another writer moved the row, but the landed remint still pages.
+            (TransactionStatus::ManualReview, false, false, true, true),
+        ];
+
+        for (status, read_fails, requeued, alerted, journal_kept) in cases {
+            let case = format!("{status:?} (read-back fails: {read_fails})");
+            let mut rpc_server = mockito::Server::new_async().await;
+            let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            let transaction_id = 716;
+            let nonce: u64 = 77;
+            let journaled = Signature::new_unique().to_string();
+            mock.remint_signatures.lock().unwrap().insert(
+                transaction_id,
+                vec![StoredSig {
+                    signature: journaled.clone(),
+                    last_valid_block_height: 0,
+                    blockhash_slot: None,
+                }],
+            );
+            push_withdrawal_with_nonce(&mock, transaction_id, nonce as i64, status);
+            mock.set_should_fail("record_remint_result", true);
+            mock.set_should_fail("get_transaction_status", read_fails);
+
+            let _status = mock_status_snapshot(
+                &mut rpc_server,
+                r#"{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+                200,
+                0,
+            )
+            .await;
+            let no_send = rpc_server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"sendTransaction""#.into(),
+                ))
+                .with_status(200)
+                .expect(0)
+                .create_async()
+                .await;
+
+            let entry = make_matured_remint(transaction_id, nonce);
+            let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+            if requeued {
+                assert!(
+                    matches!(outcome, DeferredRemintOutcome::DeferInFlight(..)),
+                    "{case}: a row still in pending_remint is retried"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, DeferredRemintOutcome::Resolved),
+                    "{case}: a row that left pending_remint resolves"
+                );
+            }
+            let update = storage_rx.try_recv().ok();
+            assert_eq!(
+                update.is_some(),
+                alerted,
+                "{case}: only a row that left pending_remint alerts"
+            );
+            if let Some(update) = update {
+                assert!(update.alert_only, "{case}: the update only alerts");
+                assert_eq!(
+                    update.remint_signature.as_deref(),
+                    Some(journaled.as_str()),
+                    "{case}: the alert carries the landed remint"
+                );
+            }
+            assert_eq!(
+                !mock
+                    .get_remint_signatures(transaction_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                journal_kept,
+                "{case}: the journal goes only once this sender recorded the remint"
+            );
+            no_send.assert_async().await;
+        }
+    }
+
+    /// A single failed record is retried in place, so a blip records the remint
+    /// on this pass instead of sending the entry back through the release checks.
+    #[tokio::test]
+    async fn a_single_failed_remint_record_is_retried_in_place() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let transaction_id = 717;
+        let journaled = Signature::new_unique().to_string();
+        mock.remint_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: journaled.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        seed_pending_remint_row(&mock, transaction_id, 0);
+        mock.set_fail_times("record_remint_result", 1);
+
+        let _status = mock_status_snapshot(
+            &mut rpc_server,
+            r#"{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#,
+            200,
+            0,
+        )
+        .await;
+
+        let entry = make_matured_remint(transaction_id, 78);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "a blip is absorbed on this pass"
+        );
+        let row = mock
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.id == transaction_id)
+            .cloned()
+            .expect("row present");
+        assert_eq!(row.status, TransactionStatus::FailedReminted);
+        assert_eq!(
+            row.landed_remint_signature.as_deref(),
+            Some(journaled.as_str())
+        );
+        assert!(
+            mock.get_remint_signatures(transaction_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the journal is cleared once the remint is recorded"
+        );
+        let update = storage_rx.try_recv().expect("the landed remint pages");
+        assert!(update.alert_only);
+        assert!(storage_rx.try_recv().is_err(), "exactly one alert");
     }
 
     /// Answers sendTransaction with the signature the request actually carries.
@@ -3544,6 +3840,10 @@ mod tests {
             .try_recv()
             .expect("a finalized remint must resolve the row");
         assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert!(
+            update.alert_only,
+            "the durable record is the only FailedReminted write, so the update only alerts"
+        );
         assert_eq!(
             mock.remint_signatures
                 .lock()
@@ -3831,6 +4131,63 @@ mod tests {
         assert!(
             err.contains("release_funds failed"),
             "must preserve the original withdrawal error: {err}"
+        );
+    }
+
+    /// An unclassifiable attempt may still land, so its journal must outlive the
+    /// ManualReview hand-off for the operator to rule it out.
+    #[tokio::test]
+    async fn unclassifiable_remint_keeps_its_journal_through_manual_review() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let transaction_id = 714;
+        let nonce = 75;
+        let journaled = Signature::new_unique().to_string();
+        mock.remint_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: journaled.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        let _statuses = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatusSnapshot",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
+        )
+        .await;
+
+        let entry = make_matured_remint(transaction_id, nonce);
+        execute_deferred_remint(&state, entry, &storage_tx).await;
+        let update = storage_rx
+            .try_recv()
+            .expect("an unclassifiable attempt must escalate");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("classification unavailable"),
+            "must escalate from the Uncertain arm: {err}"
+        );
+        // Apply the update as the async writer would.
+        push_withdrawal_with_nonce(&mock, transaction_id, nonce as i64, update.status);
+
+        state.storage.gc_stale_remint_signatures().await.unwrap();
+
+        let kept: Vec<String> = mock
+            .get_remint_signatures(transaction_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stored| stored.signature)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![journaled],
+            "a ManualReview row must keep its remint journal"
         );
     }
 

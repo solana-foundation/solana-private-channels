@@ -186,8 +186,8 @@ async fn recover_once(
     threshold: Duration,
     reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
-    // Best-effort GC of release and remint signatures whose parent left its
-    // live status; a failure here must not block recovery.
+    // Best-effort GC of release and remint signatures whose parent is
+    // terminal; a failure here must not block recovery.
     match storage.gc_stale_release_signatures().await {
         Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
@@ -805,9 +805,17 @@ pub(crate) async fn load_pending_sigs(
         let signature = Signature::from_str(sig_str).map_err(|e| {
             JournalError::Corrupt(format!("malformed stored release signature {sig_str}: {e}"))
         })?;
+        // A negative height is corrupt; cast, it would wrap into one no chain reaches
+        // and read as Live forever.
+        let lvbh = entry.last_valid_block_height;
+        let last_valid_block_height = u64::try_from(lvbh).map_err(|_| {
+            JournalError::Corrupt(format!(
+                "malformed stored release signature {sig_str}: negative last_valid_block_height {lvbh}"
+            ))
+        })?;
         pending.push(PendingSig {
             signature,
-            last_valid_block_height: entry.last_valid_block_height as u64,
+            last_valid_block_height,
             blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
         });
     }
@@ -819,9 +827,8 @@ pub(crate) async fn load_pending_sigs(
 /// recording, which leaves the columns untouched.
 ///
 /// An outer `None` means the read failed and the caller must defer. Quarantining
-/// blind is irreversible: the journal is GC'd as soon as the row leaves
-/// `Processing`, so a transient read error would otherwise destroy the row's only
-/// evidence and make it permanently unreconcilable.
+/// blind would leave the row without the copied signatures, and the stalled-row
+/// sweep only fetches rows that carry them, so the row could never self-clear.
 async fn stored_release_signatures(
     storage: &Storage,
     id: i64,
