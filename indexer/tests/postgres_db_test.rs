@@ -15,7 +15,8 @@ use private_channel_indexer::{
     storage::{
         common::amount::TokenAmount,
         common::models::{
-            ChannelFence, DbMint, DbMintStatus, DbObservedRelease, MintStatusAtSlot, StoredSig,
+            ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease,
+            MintStatusAtSlot, StoredSig,
         },
         common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
         common::storage::resync_state::resync_halt_reason,
@@ -5399,12 +5400,32 @@ fn fence(slot: u64, blockhash: &str) -> ChannelFence {
     }
 }
 
+/// A walked channel mint is recorded once per source event; a second walk never rewrites it.
+#[tokio::test(flavor = "multi_thread")]
+async fn consumed_mints_round_trip_first_write_wins() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let walked = |signature: &str| DbConsumedMint {
+        source_event_id: "event".to_string(),
+        signature: signature.to_string(),
+        kind: "deposit".to_string(),
+        mint: "mint".to_string(),
+        recipient_ata: "ata".to_string(),
+        token_program: "token".to_string(),
+        amount: TokenAmount(u64::MAX),
+    };
+    assert!(storage.get_consumed_mints().await?.is_empty());
+    storage.insert_consumed_mints(&[walked("first")]).await?;
+    storage.insert_consumed_mints(&[walked("second")]).await?;
+    assert_eq!(storage.get_consumed_mints().await?, vec![walked("first")]);
+    Ok(())
+}
+
 /// The fence rides the checkpoint upsert and only ever moves forward, so it can never
 /// name a block above the checkpoint or step back onto an older one.
 #[tokio::test(flavor = "multi_thread")]
 async fn fence_written_with_checkpoint_and_monotonic() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
-    assert_eq!(storage.get_channel_fence().await?, None);
+    assert_eq!(storage.get_channel_fence().await?.map(|r| r.fence), None);
 
     storage
         .update_committed_checkpoint_with_fence("withdraw", 100, Some(&fence(98, "H98")))
@@ -5413,7 +5434,15 @@ async fn fence_written_with_checkpoint_and_monotonic() -> Result<(), Box<dyn std
         storage.get_committed_checkpoint("withdraw").await?,
         Some(100)
     );
-    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.checkpoint),
+        Some(100),
+        "the checkpoint is read with the fence"
+    );
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.fence),
+        Some(fence(98, "H98"))
+    );
 
     // A lower fence leaves both columns alone even when the checkpoint rises.
     storage
@@ -5423,25 +5452,37 @@ async fn fence_written_with_checkpoint_and_monotonic() -> Result<(), Box<dyn std
         storage.get_committed_checkpoint("withdraw").await?,
         Some(120)
     );
-    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.fence),
+        Some(fence(98, "H98"))
+    );
 
     // No block in the batch keeps the fence where it was.
     storage
         .update_committed_checkpoint_with_fence("withdraw", 130, None)
         .await?;
     storage.update_committed_checkpoint("withdraw", 140).await?;
-    assert_eq!(storage.get_channel_fence().await?, Some(fence(98, "H98")));
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.fence),
+        Some(fence(98, "H98"))
+    );
 
     storage
         .update_committed_checkpoint_with_fence("withdraw", 150, Some(&fence(149, "H149")))
         .await?;
-    assert_eq!(storage.get_channel_fence().await?, Some(fence(149, "H149")));
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.fence),
+        Some(fence(149, "H149"))
+    );
 
     // Only the withdraw row carries the fence both operators read.
     storage
         .update_committed_checkpoint_with_fence("escrow", 500, Some(&fence(500, "E500")))
         .await?;
-    assert_eq!(storage.get_channel_fence().await?, Some(fence(149, "H149")));
+    assert_eq!(
+        storage.get_channel_fence().await?.map(|r| r.fence),
+        Some(fence(149, "H149"))
+    );
     Ok(())
 }
 

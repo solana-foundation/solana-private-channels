@@ -29,6 +29,13 @@ pub struct ChannelFence {
     pub blockhash: String,
 }
 
+/// The fence with the checkpoint flushed beside it, read in one statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceRecord {
+    pub fence: ChannelFence,
+    pub checkpoint: u64,
+}
+
 /// Status of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "transaction_status", rename_all = "lowercase")]
@@ -283,6 +290,20 @@ pub struct DbObservedRelease {
     /// Raw tokens the release instruction moved. `None` on rows written before the
     /// column existed, where the withdrawal row's own amount is the only figure there is.
     pub amount: Option<TokenAmount>,
+}
+
+/// A channel mint a consumed-set walk authenticated, kept so a later boot whose walk stops
+/// higher still knows it. Rolls back with the DB, like the rows it explains.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DbConsumedMint {
+    pub source_event_id: String,
+    pub signature: String,
+    /// `deposit` or `remint`.
+    pub kind: String,
+    pub mint: String,
+    pub recipient_ata: String,
+    pub token_program: String,
+    pub amount: TokenAmount,
 }
 
 /// Resolved mint status at a particular slot, derived from `mint_status_history`.

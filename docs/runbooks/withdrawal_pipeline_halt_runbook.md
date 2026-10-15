@@ -359,7 +359,9 @@ These `UPDATE`s are bookkeeping only. They record releases the chain already mad
 
 - The withdraw indexer or an operator exits at boot with `channel fence mismatch: ...`,
   followed by the proof: `channel block <slot> has hash <hash>, the indexer recorded <hash>`,
-  or `the channel skips fence slot <slot>: its block <later> follows block <parent>`.
+  `the channel skips fence slot <slot>: its block <later> follows block <parent>`, or
+  `the channel has block <slot> between fence block <slot> and checkpoint <slot>, where the
+  indexer found none`.
 - `private_channel_channel_fence_mismatch_total` increases.
 
 ### Why it refuses
@@ -431,6 +433,6 @@ second time for a burn the user repeats on the restored channel.
    Then restart the withdraw operator.
 
 If the log reads `channel fence not checked yet`, there is no verdict: the RPC failed, the
-tip stayed below the fence slot, the node does not serve the fence block yet, or the fence
-block was pruned. Fix the node or wait and restart. For a pruned fence block, follow
+tip stayed below the fence slot, the node does not serve the fence block yet, or a block
+after it yet, or the fence block was pruned. Fix the node or wait and restart. For a pruned fence block, follow
 [`../PITR.md`](../PITR.md#what-a-refusal-after-a-restore-means).

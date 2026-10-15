@@ -373,7 +373,7 @@ pub(crate) async fn validate_bitmap_consistency(
     let mut unexplained = Vec::new();
     for nonce in &chain_only {
         match resolve_chain_ahead_nonce(storage, &finality, *nonce).await {
-            ChainAheadOutcome::Repaired => {}
+            ChainAheadOutcome::Repaired | ChainAheadOutcome::Explained => {}
             ChainAheadOutcome::Unexplained => unexplained.push(*nonce),
             ChainAheadOutcome::DoublePayout => paid_twice.push(*nonce),
         }
@@ -545,6 +545,8 @@ pub(super) async fn load_persisted_release_signatures(
 enum ChainAheadOutcome {
     /// The row was still open, so the repair write lands and closes the gap.
     Repaired,
+    /// A landed journaled release on a row the repair cannot write; nothing is written.
+    Explained,
     /// No landed journaled signature ties the payout to a row, so boot refuses.
     Unexplained,
     /// The user was refunded and the chain released the nonce as well.
@@ -682,13 +684,25 @@ async fn resolve_chain_ahead_nonce(
         };
     }
 
+    // The row's own landed release pays this nonce, so a re-indexed burn cannot reuse it.
+    // The ManualReview sweep or a human closes the row.
+    if let Some(sig) = verdict {
+        warn!(
+            nonce,
+            transaction_id = row.id,
+            status = ?row.status,
+            %sig,
+            "Consumed nonce is explained by this row's landed release; the row is left as it is"
+        );
+        return ChainAheadOutcome::Explained;
+    }
+
     // No row is written: boot refuses, and a status write here would turn an RPC blip
     // into a permanent manual review. The runbook completes rows from observed releases.
     error!(
         nonce,
         transaction_id = row.id,
         status = ?row.status,
-        attributed = verdict.is_some(),
         repairable,
         "Consumed nonce cannot be tied to this row's landed release"
     );
@@ -2101,7 +2115,14 @@ mod tests {
                 Some(TransactionStatus::Failed),
                 landed,
                 Some("landed"),
-                false,
+                true,
+            ),
+            (
+                "manual review, landed",
+                Some(TransactionStatus::ManualReview),
+                landed,
+                Some("landed"),
+                true,
             ),
         ];
         for (case, status, signature, statuses, ok) in cases {
@@ -2503,74 +2524,69 @@ mod tests {
         }
     }
 
-    /// The repair only writes rows the operator still owns, so a chain-ahead
-    /// nonce on an already-terminal row cannot be closed here. It refuses boot instead
-    /// of being logged as though it had been fixed, which is the shape a real
-    /// divergence takes when it disappears.
+    /// A row the repair cannot write is still explained by its own landed release, so
+    /// boot goes on and the row is left as it is for the sweep or a human.
     #[tokio::test]
-    async fn validate_bitmap_consistency_chain_ahead_on_terminal_row_refuses() {
-        let mut server = mockito::Server::new_async().await;
-        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
-        let landed = Signature::new_unique();
-        let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
-        let _statuses = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "method": "getSignatureStatuses"
-            })))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "context": {"slot": 100},
-                        "value": [{
-                            "slot": 10,
-                            "confirmations": null,
-                            "err": null,
-                            "status": {"Ok": null},
-                            "confirmationStatus": "finalized"
-                        }]
-                    }
-                })
-                .to_string(),
+    async fn validate_bitmap_consistency_chain_ahead_on_unwritable_row_is_explained() {
+        for status in [TransactionStatus::Failed, TransactionStatus::ManualReview] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+            let landed = Signature::new_unique();
+            let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
+            let _statuses = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                    "method": "getSignatureStatuses"
+                })))
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "context": {"slot": 100},
+                            "value": [{
+                                "slot": 10,
+                                "confirmations": null,
+                                "err": null,
+                                "status": {"Ok": null},
+                                "confirmationStatus": "finalized"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let mock = MockStorage::new();
+            seed_withdrawal(&mock, 7, 2, status, Some(landed));
+
+            let state = sender_state_with_storage(&server.url(), mock);
+
+            let result = super::validate_bitmap_consistency(
+                &state.storage,
+                &state.rpc_client,
+                None,
+                Some(Pubkey::new_unique()),
             )
-            .create();
+            .await;
 
-        let mock = MockStorage::new();
-        seed_withdrawal(&mock, 7, 2, TransactionStatus::Failed, Some(landed));
-
-        let state = sender_state_with_storage(&server.url(), mock);
-
-        let result = super::validate_bitmap_consistency(
-            &state.storage,
-            &state.rpc_client,
-            None,
-            Some(Pubkey::new_unique()),
-        )
-        .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(OperatorError::Program(
-                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
-                ))
-            ),
-            "a set bit on a terminal row must refuse boot: {result:?}"
-        );
-        assert_eq!(
-            state
-                .storage
-                .get_withdrawal_by_nonce(2)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            TransactionStatus::Failed,
-            "a Completed write to a terminal row is dropped, so it must not be claimed"
-        );
+            assert!(
+                result.is_ok(),
+                "a landed release on the row explains the nonce: {result:?}"
+            );
+            assert_eq!(
+                state
+                    .storage
+                    .get_withdrawal_by_nonce(2)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                status,
+                "the row is not written"
+            );
+        }
     }
 
     /// The re-read exists to fail closed on the one divergence that matters, so

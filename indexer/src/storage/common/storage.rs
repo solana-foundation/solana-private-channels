@@ -18,6 +18,7 @@ pub mod get_and_lock_pending_transactions;
 pub mod get_channel_fence;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
+pub mod get_consumed_mints;
 pub mod get_in_flight_amounts_by_mint;
 pub mod get_max_withdrawal_nonce;
 pub mod get_mint;
@@ -40,6 +41,7 @@ pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
 pub mod get_withdrawal_by_nonce;
 pub mod init_schema;
+pub mod insert_consumed_mints;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
@@ -213,7 +215,7 @@ impl Storage {
     }
 
     /// The channel fence on the withdraw checkpoint row, or `None` when never written.
-    pub async fn get_channel_fence(&self) -> Result<Option<ChannelFence>, StorageError> {
+    pub async fn get_channel_fence(&self) -> Result<Option<FenceRecord>, StorageError> {
         get_channel_fence::get_channel_fence(self).await
     }
 
@@ -225,6 +227,19 @@ impl Storage {
         kind: TransactionType,
     ) -> Result<Vec<String>, StorageError> {
         get_newest_known_mint_signatures::get_newest_known_mint_signatures(self, mint, kind).await
+    }
+
+    /// Record walked channel mints. Idempotent on the source event.
+    pub async fn insert_consumed_mints(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), StorageError> {
+        insert_consumed_mints::insert_consumed_mints(self, mints).await
+    }
+
+    /// Every channel mint an earlier walk recorded.
+    pub async fn get_consumed_mints(&self) -> Result<Vec<DbConsumedMint>, StorageError> {
+        get_consumed_mints::get_consumed_mints(self).await
     }
 
     /// Highest withdrawal nonce any row holds, or `None` with no withdrawal.

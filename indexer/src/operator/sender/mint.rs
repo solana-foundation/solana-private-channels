@@ -8,6 +8,8 @@ use crate::operator::{
     sign_and_send_transaction, RpcClientWithRetry, SignerUtil, SourceEventId,
     MINT_IDEMPOTENCY_MEMO_PREFIX, REMINT_IDEMPOTENCY_MEMO_PREFIX,
 };
+use crate::storage::common::amount::TokenAmount;
+use crate::storage::common::models::DbConsumedMint;
 use crate::storage::{DbTransaction, Storage, TransactionType};
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
@@ -472,6 +474,7 @@ pub async fn enumerate_consumed_mints(
         Scope::Signer(*authority),
         page_limit,
         &HashSet::new(),
+        None,
         &mut set,
     )
     .await?;
@@ -487,9 +490,16 @@ pub async fn extend_with_mint_history(
     page_limit: usize,
     set: &mut ConsumedSet,
 ) -> Result<usize, String> {
-    collect(rpc, Scope::Mint(*mint), page_limit, &HashSet::new(), set)
-        .await
-        .map(|(added, _)| added)
+    collect(
+        rpc,
+        Scope::Mint(*mint),
+        page_limit,
+        &HashSet::new(),
+        None,
+        set,
+    )
+    .await
+    .map(|(added, _)| added)
 }
 
 /// Wait for the channel address index unless the node indexes addresses with the block.
@@ -598,6 +608,14 @@ impl ConsumedSetCache {
             page_limit,
             role,
         };
+        let recorded = storage
+            .get_consumed_mints()
+            .await
+            .map_err(|e| format!("recorded channel mints unreadable: {e}"))?;
+        for row in &recorded {
+            let (event, consumed) = consumed_from_db(row)?;
+            cache.set.insert(event, consumed);
+        }
         let mints = storage
             .get_mint_addresses()
             .await
@@ -640,6 +658,7 @@ impl ConsumedSetCache {
     /// Walk `mint`'s history newest first, down to the newest mint the DB already knows.
     /// A restore to time T leaves every mint before T known to the DB, so that range is
     /// exactly what the DB can have forgotten, and it is empty in normal operation.
+    /// What the walk finds is recorded: closing a forgotten mint moves that bound above it.
     async fn walk_mint(
         &mut self,
         rpc: &RpcClientWithRetry,
@@ -669,11 +688,24 @@ impl ConsumedSetCache {
             Scope::Mint(*mint),
             self.page_limit,
             &stop_at,
+            Some(match self.role {
+                TransactionType::Deposit => ConsumedMintKind::Deposit,
+                TransactionType::Withdrawal => ConsumedMintKind::Remint,
+            }),
             &mut found,
         )
         .await?;
         if !stop_at.is_empty() && !met {
             self.accept_pruned_walk(rpc, mint, &stop_at).await?;
+        }
+        if !found.is_empty() {
+            let rows: Vec<_> = found
+                .iter()
+                .map(|(event, consumed)| consumed_to_db(event, consumed))
+                .collect();
+            storage.insert_consumed_mints(&rows).await.map_err(|e| {
+                format!("channel mints walked on {mint} could not be recorded: {e}")
+            })?;
         }
         for (event, consumed) in found {
             match self.set.entry(event) {
@@ -755,6 +787,41 @@ impl ConsumedSetCache {
     }
 }
 
+fn consumed_to_db(event: &SourceEventId, consumed: &ConsumedMint) -> DbConsumedMint {
+    DbConsumedMint {
+        source_event_id: event.to_string(),
+        signature: consumed.signature.to_string(),
+        kind: match consumed.kind {
+            ConsumedMintKind::Deposit => "deposit",
+            ConsumedMintKind::Remint => "remint",
+        }
+        .to_string(),
+        mint: consumed.mint.to_string(),
+        recipient_ata: consumed.recipient_ata.to_string(),
+        token_program: consumed.token_program.to_string(),
+        amount: TokenAmount(consumed.amount),
+    }
+}
+
+fn consumed_from_db(row: &DbConsumedMint) -> Result<(SourceEventId, ConsumedMint), String> {
+    let bad = |field: &str| format!("recorded channel mint {} has a bad {field}", row.signature);
+    let event = SourceEventId::from_encoded(&row.source_event_id).ok_or_else(|| bad("event"))?;
+    let key = |value: &str, field: &str| Pubkey::from_str(value).map_err(|_| bad(field));
+    let consumed = ConsumedMint {
+        signature: Signature::from_str(&row.signature).map_err(|_| bad("signature"))?,
+        kind: match row.kind.as_str() {
+            "deposit" => ConsumedMintKind::Deposit,
+            "remint" => ConsumedMintKind::Remint,
+            _ => return Err(bad("kind")),
+        },
+        mint: key(&row.mint, "mint")?,
+        recipient_ata: key(&row.recipient_ata, "recipient")?,
+        token_program: key(&row.token_program, "token program")?,
+        amount: row.amount.0,
+    };
+    Ok((event, consumed))
+}
+
 /// The boot-built consumed set shared by the processor and the remint worker, with the
 /// channel endpoint a lazy walk reads from.
 #[derive(Clone)]
@@ -821,21 +888,24 @@ impl ConsumedClaims {
 
 /// Walk the history of `scope`'s address and add each authenticated channel mint to `set`.
 /// Stops at the first page holding a `stop_at` signature and reports whether it met one.
+/// With `only`, entries carrying no marker of that kind are skipped before any fetch.
 async fn collect(
     rpc: &RpcClientWithRetry,
     scope: Scope,
     page_limit: usize,
     stop_at: &HashSet<Signature>,
+    only: Option<ConsumedMintKind>,
     set: &mut ConsumedSet,
 ) -> Result<(usize, bool), String> {
     let address = scope.address();
     let (signatures, met) = rpc
         .get_signatures_for_address_paginated(address, page_limit, stop_at, |status| {
             status.err.is_none()
-                && status
-                    .memo
-                    .as_deref()
-                    .is_some_and(|m| !memo_markers(m).is_empty())
+                && status.memo.as_deref().is_some_and(|m| {
+                    memo_markers(m)
+                        .iter()
+                        .any(|(kind, _)| only.is_none_or(|only| *kind == only))
+                })
         })
         .await
         .map_err(|e| {
@@ -3046,6 +3116,94 @@ mod consumed_set_tests {
             ),
             "the forgotten deposit mint below the newer remint must be found"
         );
+    }
+
+    /// Closing a forgotten deposit after a restore makes it the newest known mint. A second
+    /// boot then stops there, so an older forgotten mint is only known from the first walk.
+    #[tokio::test]
+    async fn consumed_set_survives_a_restart_mid_recovery() {
+        let owner = Pubkey::new_unique();
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        let memo = |tag: &str| mint_idempotency_memo(&SourceEventId::new(tag, 0, None));
+        let (a, b, known) = (
+            Signature::new_unique().to_string(),
+            Signature::new_unique().to_string(),
+            Signature::new_unique().to_string(),
+        );
+        let _h = history_for(
+            &mut server,
+            &mint,
+            &[
+                sig_entry(&a, &memo("a")),
+                sig_entry(&b, &memo("b")),
+                sig_entry(&known, &memo("kept")),
+            ],
+        )
+        .await;
+        let _a = deposit_tx(&mut server, &a, &memo("a"), &mint, &owner).await;
+        let _b = deposit_tx(&mut server, &b, &memo("b"), &mint, &owner).await;
+        let mock = MockStorage::new();
+        allow(&mock, &mint);
+        known_deposit(&mock, &mint, &known);
+        let storage = Storage::Mock(mock.clone());
+        let rpc = fast_rpc(&server.url());
+        ConsumedSetCache::build_at_boot(&rpc, &storage, WALK_PAGE, TransactionType::Deposit)
+            .await
+            .expect("first boot");
+
+        // The operator closes A from the set, then restarts before B is claimed.
+        known_deposit(&mock, &mint, &a);
+        let mut cache =
+            ConsumedSetCache::build_at_boot(&rpc, &storage, WALK_PAGE, TransactionType::Deposit)
+                .await
+                .expect("second boot");
+        let forgotten = row("b", &mint, &owner, TransactionType::Deposit);
+        assert!(
+            matches!(
+                cache.lookup(&rpc, &storage, &forgotten).await,
+                Ok(ConsumedLookup::Hit(_))
+            ),
+            "the forgotten mint found by the first walk must still be known"
+        );
+    }
+
+    /// The withdraw operator settles remints only, so its walk must not fetch the deposit
+    /// mints that make up nearly all of a mint's history. None is served here.
+    #[tokio::test]
+    async fn withdraw_walk_fetches_remints_only() {
+        let owner = Pubkey::new_unique();
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        let deposit_memo = mint_idempotency_memo(&SourceEventId::new("dep", 0, None));
+        let remint_memo = remint_idempotency_memo(&SourceEventId::new("burn", 0, None));
+        let (remint, deposit) = (
+            Signature::new_unique().to_string(),
+            Signature::new_unique().to_string(),
+        );
+        let _h = history_for(
+            &mut server,
+            &mint,
+            &[
+                sig_entry(&remint, &remint_memo),
+                sig_entry(&deposit, &deposit_memo),
+            ],
+        )
+        .await;
+        let _r = deposit_tx(&mut server, &remint, &remint_memo, &mint, &owner).await;
+        let mock = MockStorage::new();
+        allow(&mock, &mint);
+        let storage = Storage::Mock(mock);
+        let rpc = fast_rpc(&server.url());
+        let mut cache =
+            ConsumedSetCache::build_at_boot(&rpc, &storage, WALK_PAGE, TransactionType::Withdrawal)
+                .await
+                .expect("boot must not fetch the deposit mint");
+        let burn = row("burn", &mint, &owner, TransactionType::Withdrawal);
+        assert!(matches!(
+            cache.lookup(&rpc, &storage, &burn).await,
+            Ok(ConsumedLookup::Hit(_))
+        ));
     }
 
     /// `admin truncate` prunes old channel history, so an idle mint's newest known mint can

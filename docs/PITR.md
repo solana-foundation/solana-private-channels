@@ -81,11 +81,11 @@ So:
   safe by order alone; the margin covers clock skew between the two database hosts. Do not
   shrink it.
 - **Primary only is forbidden.** In most cases the withdraw indexer and both operators
-  refuse to start on it (the channel fence, below), but not always: the fence is the
-  newest block the withdraw indexer had flushed, normally a few seconds behind the channel
-  and longer if that indexer was lagging. A primary target newer than the fence passes
-  every check, and anything the channel did between the fence and the target is then lost
-  without a refusal. Always restore the indexer DB too.
+  refuse to start on it (the channel fence, below), but not always: the fence covers the
+  channel up to the withdraw indexer's last flushed checkpoint, normally a few seconds
+  behind the channel and longer if that indexer was lagging. A primary target newer than
+  that checkpoint passes every check, and anything the channel did between the checkpoint
+  and the target is then lost without a refusal. Always restore the indexer DB too.
 - **Indexer targets must lie inside the channel's retained history.** After
   `private-channel-admin truncate`, the channel no longer serves history below its floor
   (`getFirstAvailableBlock`). The operators find forgotten mints only in the history the
@@ -275,8 +275,9 @@ At boot the withdraw indexer and both operators wait until the channel tip reach
 slot and then compare the block. The check is at boot only: a service left running across
 a primary restore may never be detected: a running withdraw indexer moves its fence onto
 the restored chain. That is why Step 1 stops everything first. It refuses only on proof that the channel no longer has the fence block: the slot
-holds a block with another hash, or the node serves a later block whose parent is below
-the fence slot (its chain skips the slot). A block a node does not serve yet is never
+holds a block with another hash, the node serves a later block whose parent is below
+the fence slot (its chain skips the slot), or the node serves a block between the fence
+slot and the checkpoint, where the indexer proved every slot empty. A block a node does not serve yet is never
 proof, because a read node's cached tip can be ahead of its replica. The log reads
 `channel fence mismatch: ...` with the proof, and the metric
 `private_channel_channel_fence_mismatch_total` increases.
@@ -313,7 +314,9 @@ the chain has. See
 channel history could not be read, or it ends before the newest mint the DB knows, or it
 holds a memo in the retired scheme. History that ends early is accepted when `truncate`
 pruned it (a warning is logged); a channel serving its whole history that lacks the known
-mint was rewound. Otherwise fix the RPC.
+mint was rewound. Otherwise fix the RPC. Every mint a walk finds is kept in
+`consumed_channel_mints`, so a restart in the middle of a recovery still knows the older
+forgotten mints; never clear that table by hand.
 
 ## Backup Verification
 

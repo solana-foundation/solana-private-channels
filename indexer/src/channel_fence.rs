@@ -1,5 +1,5 @@
 use crate::operator::RpcClientWithRetry;
-use crate::storage::common::models::ChannelFence;
+use crate::storage::common::models::{ChannelFence, FenceRecord};
 use std::time::Duration;
 use tracing::info;
 
@@ -8,8 +8,9 @@ use tracing::info;
 pub enum FenceVerdict {
     /// The channel still has the fence block, or there is no fence yet.
     Ok,
-    /// The channel proved it no longer has the fence block: another hash, or a chain that
-    /// skips the slot. Nothing else counts, so this never fires without a restore.
+    /// The channel proved it no longer has the fence block: another hash, a chain that
+    /// skips the slot, or a block where the indexer proved slots empty. Nothing else counts,
+    /// so this never fires without a restore.
     Mismatch(String),
     /// No verdict yet: a lagging or pruned node, or an RPC error. Never read as a restore.
     Unavailable(String),
@@ -32,16 +33,16 @@ enum Probe {
 /// with a different hash, or skips it, without anyone having to record the restore.
 pub async fn verify_channel_fence(
     rpc: &RpcClientWithRetry,
-    fence: Option<&ChannelFence>,
+    record: Option<&FenceRecord>,
     wait: FenceWait,
 ) -> FenceVerdict {
-    let Some(fence) = fence else {
+    let Some(FenceRecord { fence, checkpoint }) = record else {
         return FenceVerdict::Ok;
     };
     let FenceWait::UntilTip { poll, budget } = wait;
     let started = tokio::time::Instant::now();
     loop {
-        let reason = match probe(rpc, fence).await {
+        let reason = match probe(rpc, fence, *checkpoint).await {
             Probe::Final(verdict) => return verdict,
             Probe::Retry(reason) => reason,
         };
@@ -56,7 +57,7 @@ pub async fn verify_channel_fence(
     }
 }
 
-async fn probe(rpc: &RpcClientWithRetry, fence: &ChannelFence) -> Probe {
+async fn probe(rpc: &RpcClientWithRetry, fence: &ChannelFence, checkpoint: u64) -> Probe {
     let tip = match rpc.get_slot().await {
         Ok(tip) => tip,
         Err(e) => {
@@ -72,7 +73,7 @@ async fn probe(rpc: &RpcClientWithRetry, fence: &ChannelFence) -> Probe {
         ));
     }
     match rpc.get_block_summary(fence.slot).await {
-        Ok(Some((hash, _))) if hash == fence.blockhash => Probe::Final(FenceVerdict::Ok),
+        Ok(Some((hash, _))) if hash == fence.blockhash => probe_gap(rpc, fence, checkpoint).await,
         Ok(Some((hash, _))) => Probe::Final(FenceVerdict::Mismatch(format!(
             "channel block {} has hash {hash}, the indexer recorded {}",
             fence.slot, fence.blockhash
@@ -81,6 +82,33 @@ async fn probe(rpc: &RpcClientWithRetry, fence: &ChannelFence) -> Probe {
         Err(e) => Probe::Final(FenceVerdict::Unavailable(format!(
             "channel block {} unreadable: {e}",
             fence.slot
+        ))),
+    }
+}
+
+/// The indexer proved every slot between the fence block and its checkpoint empty, and
+/// resumes after the checkpoint. A channel block there now was produced by a restored
+/// chain; a later block from the same node proves the range still empty.
+async fn probe_gap(rpc: &RpcClientWithRetry, fence: &ChannelFence, checkpoint: u64) -> Probe {
+    if checkpoint <= fence.slot {
+        return Probe::Final(FenceVerdict::Ok);
+    }
+    match rpc.get_blocks_with_limit(fence.slot + 1, 1).await {
+        Ok(slots) => match slots.first() {
+            Some(&next) if next <= checkpoint => Probe::Final(FenceVerdict::Mismatch(format!(
+                "the channel has block {next} between fence block {} and checkpoint \
+                 {checkpoint}, where the indexer found none",
+                fence.slot
+            ))),
+            Some(_) => Probe::Final(FenceVerdict::Ok),
+            None => Probe::Retry(format!(
+                "channel serves no block after fence slot {} yet, so slots up to checkpoint \
+                 {checkpoint} cannot be checked",
+                fence.slot
+            )),
+        },
+        Err(e) => Probe::Final(FenceVerdict::Unavailable(format!(
+            "channel block list unreadable: {e}"
         ))),
     }
 }
@@ -154,10 +182,14 @@ mod tests {
         )
     }
 
-    fn fence(slot: u64, hash: &str) -> ChannelFence {
-        ChannelFence {
-            slot,
-            blockhash: hash.to_string(),
+    /// A fence whose checkpoint sits on the fence block.
+    fn fence(slot: u64, hash: &str) -> FenceRecord {
+        FenceRecord {
+            fence: ChannelFence {
+                slot,
+                blockhash: hash.to_string(),
+            },
+            checkpoint: slot,
         }
     }
 
@@ -326,6 +358,29 @@ mod tests {
             let _later_block = later_block.map(|body| mock_block(&mut server, later[0], body));
             let verdict =
                 verify_channel_fence(&fast_rpc(&server.url()), Some(&fence(100, "H")), BOOT).await;
+            assert_eq!(label(&verdict), want, "{case}: {verdict:?}");
+        }
+    }
+
+    /// Slots between the fence block and the checkpoint were proven empty when indexed, so
+    /// a channel block there now proves a restore the indexer would resume past. Only a
+    /// later block from the same node proves the range still empty.
+    #[tokio::test]
+    async fn fence_verify_gap_to_checkpoint() {
+        // (case, first block after the fence, want)
+        let cases: [(&str, Vec<u64>, &str); 3] = [
+            ("restored chain fills the gap", vec![103], "mismatch"),
+            ("next block is past the checkpoint", vec![110], "ok"),
+            ("no later block yet", vec![], "unavailable"),
+        ];
+        for (case, later, want) in cases {
+            let mut server = Server::new_async().await;
+            let _slot = mock_slot(&mut server, 150);
+            let _block = mock_block(&mut server, 100, block_body("H", 99));
+            let _later = mock_later_blocks(&mut server, &later);
+            let mut record = fence(100, "H");
+            record.checkpoint = 105;
+            let verdict = verify_channel_fence(&fast_rpc(&server.url()), Some(&record), BOOT).await;
             assert_eq!(label(&verdict), want, "{case}: {verdict:?}");
         }
     }

@@ -1,8 +1,8 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    ChannelFence, DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
-    StoredSig, TransactionStatus, TransactionType,
+    ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease, DbTransaction,
+    FenceRecord, HaltInfo, MintDbBalance, MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal,
+    ResyncBlockers, ServicedRow, StoredSig, TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
@@ -65,6 +65,8 @@ pub struct MockStorage {
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `consumed_channel_mints` table, keyed by source event.
+    pub consumed_mints: Arc<Mutex<HashMap<String, DbConsumedMint>>>,
     /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
     pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
     /// Nonce floors the rotation gate has asked for, oldest first. Tests read
@@ -892,9 +894,23 @@ impl MockStorage {
         Ok(nonces)
     }
 
-    pub async fn get_channel_fence(&self) -> Result<Option<ChannelFence>, StorageError> {
+    pub async fn get_channel_fence(&self) -> Result<Option<FenceRecord>, StorageError> {
         self.check_should_fail("get_channel_fence")?;
-        Ok(self.channel_fences.lock().unwrap().get("withdraw").cloned())
+        let checkpoint = self
+            .committed_checkpoints
+            .lock()
+            .unwrap()
+            .get("withdraw")
+            .copied();
+        Ok(self
+            .channel_fences
+            .lock()
+            .unwrap()
+            .get("withdraw")
+            .map(|fence| FenceRecord {
+                checkpoint: checkpoint.unwrap_or(fence.slot).max(fence.slot),
+                fence: fence.clone(),
+            }))
     }
 
     pub async fn get_newest_known_mint_signatures(
@@ -917,6 +933,31 @@ impl MockStorage {
             })
             .next_back()
             .into_iter()
+            .collect())
+    }
+
+    pub async fn insert_consumed_mints(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_consumed_mints")?;
+        let mut store = self.consumed_mints.lock().unwrap();
+        for mint in mints {
+            store
+                .entry(mint.source_event_id.clone())
+                .or_insert_with(|| mint.clone());
+        }
+        Ok(())
+    }
+
+    pub async fn get_consumed_mints(&self) -> Result<Vec<DbConsumedMint>, StorageError> {
+        self.check_should_fail("get_consumed_mints")?;
+        Ok(self
+            .consumed_mints
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
             .collect())
     }
 

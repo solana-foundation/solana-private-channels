@@ -9,9 +9,10 @@ use crate::{
     error::StorageError,
     indexer::checkpoint::program_key,
     storage::common::models::{
-        ChannelFence, DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo,
-        MintDbBalance, MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers,
-        ServicedRow, StoredSig, TransactionStatus, TransactionType,
+        ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease, DbTransaction,
+        FenceRecord, HaltInfo, MintDbBalance, MintInFlightAmount, MintStatusAtSlot,
+        ReleasedWithdrawal, ResyncBlockers, ServicedRow, StoredSig, TransactionStatus,
+        TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::resync_state::resync_halt_reason,
@@ -1026,6 +1027,26 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Channel mints a consumed-set walk authenticated. A later walk stops at the newest
+        // mint the DB knows, which recovery itself moves, so what an earlier walk found
+        // below that point is kept here. Restored with the rows it explains.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS consumed_channel_mints (
+                source_event_id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                recipient_ata TEXT NOT NULL,
+                token_program TEXT NOT NULL,
+                amount NUMERIC(20,0) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source
         // (PrivateChannel) chain and are classified against source_rpc_client,
@@ -1823,17 +1844,21 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub async fn get_channel_fence_internal(&self) -> Result<Option<ChannelFence>, sqlx::Error> {
-        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT fence_slot, fence_blockhash FROM indexer_state WHERE program_type = $1",
+    pub async fn get_channel_fence_internal(&self) -> Result<Option<FenceRecord>, sqlx::Error> {
+        let row: Option<(Option<i64>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT fence_slot, fence_blockhash, last_committed_slot FROM indexer_state \
+             WHERE program_type = $1",
         )
         .bind(program_key(ProgramType::Withdraw))
         .fetch_optional(&self.pool)
         .await?;
         Ok(match row {
-            Some((Some(slot), Some(blockhash))) => Some(ChannelFence {
-                slot: slot as u64,
-                blockhash,
+            Some((Some(slot), Some(blockhash), checkpoint)) => Some(FenceRecord {
+                fence: ChannelFence {
+                    slot: slot as u64,
+                    blockhash,
+                },
+                checkpoint: checkpoint.map_or(slot, |c| c.max(slot)) as u64,
             }),
             _ => None,
         })
@@ -1866,6 +1891,41 @@ impl PostgresDb {
             .bind(mint)
             .fetch_all(&self.pool)
             .await
+    }
+
+    pub async fn insert_consumed_mints_internal(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), sqlx::Error> {
+        for mint in mints {
+            sqlx::query(
+                r#"
+                INSERT INTO consumed_channel_mints
+                    (source_event_id, signature, kind, mint, recipient_ata, token_program, amount)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (source_event_id) DO NOTHING
+                "#,
+            )
+            .bind(&mint.source_event_id)
+            .bind(&mint.signature)
+            .bind(&mint.kind)
+            .bind(&mint.mint)
+            .bind(&mint.recipient_ata)
+            .bind(&mint.token_program)
+            .bind(mint.amount)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_consumed_mints_internal(&self) -> Result<Vec<DbConsumedMint>, sqlx::Error> {
+        sqlx::query_as::<_, DbConsumedMint>(
+            "SELECT source_event_id, signature, kind, mint, recipient_ata, token_program, amount \
+             FROM consumed_channel_mints",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_max_withdrawal_nonce_internal(&self) -> Result<Option<u64>, sqlx::Error> {
