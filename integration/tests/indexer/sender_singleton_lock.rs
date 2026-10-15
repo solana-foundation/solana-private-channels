@@ -11,6 +11,7 @@
 //! sender that stays pending has acquired the lock; one that resolves to `Err`
 //! was refused.
 
+use crate::helpers::{mock_instance_account, test_instance};
 use solana_commitment_config::CommitmentLevel;
 use {
     chrono::{Duration as ChronoDuration, Utc},
@@ -125,6 +126,7 @@ fn spawn_sender(
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             sender_lock,
+            None,
         )
         .await
     });
@@ -339,6 +341,7 @@ pub(super) fn withdraw_operator_configs(
     rpc_url: &str,
     source_rpc_url: Option<String>,
 ) -> (PrivateChannelIndexerConfig, OperatorConfig) {
+    test_utils::operator_helper::set_operator_env_vars(&solana_sdk::signature::Keypair::new());
     let common = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
@@ -349,7 +352,7 @@ pub(super) fn withdraw_operator_configs(
             database_url: url.to_string(),
             max_connections: 5,
         },
-        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        escrow_instance_id: Some(test_instance()),
     };
     let operator = OperatorConfig {
         db_poll_interval: Duration::from_secs(60),
@@ -507,6 +510,7 @@ async fn lock_lost_during_the_boot_preflight(bitmap_check_passes: bool) {
             .create_async()
             .await
     };
+    let _instance = mock_instance_account(&mut rpc).await;
     // An absent bitmap at the anchor is an empty generation 0, a clean diff for this row.
     let _bitmap_reads = if bitmap_check_passes {
         vec![

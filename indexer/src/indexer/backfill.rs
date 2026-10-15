@@ -235,6 +235,7 @@ pub async fn fill_slot_range(
         };
 
         for (slot, block_fetch) in blocks {
+            let mut blockhash = None;
             match block_fetch {
                 BlockFetch::Present(block) => {
                     // A block with incomplete meta, or holding a supported instruction that
@@ -301,6 +302,7 @@ pub async fn fill_slot_range(
                         .map_err(BackfillError::ChannelSend)?;
                     }
                     last_block = Some(slot);
+                    blockhash = Some(block.blockhash);
                     processed_count += 1;
                 }
                 BlockFetch::Skipped => {
@@ -320,7 +322,11 @@ pub async fn fill_slot_range(
 
             send_guaranteed(
                 instruction_tx,
-                ProcessorMessage::SlotComplete { slot, program_type },
+                ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type,
+                    blockhash,
+                },
                 "SlotComplete marker (backfill)",
             )
             .await

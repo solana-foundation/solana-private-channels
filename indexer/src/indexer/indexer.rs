@@ -3,6 +3,7 @@ use crate::error::{
     CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
 };
 use crate::{
+    channel_fence::{verify_channel_fence, FenceVerdict, FenceWait},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
         datasource::common::{datasource::DataSource, types::ProcessorMessage},
@@ -11,6 +12,7 @@ use crate::{
         },
         transaction_processor::TransactionProcessor,
     },
+    operator::{RetryConfig, RpcClientWithRetry},
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
     storage::common::storage::live_lock::{
         under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
@@ -18,6 +20,9 @@ use crate::{
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
+use private_channel_metrics::MetricLabel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use std::time::Duration;
 
 #[cfg(feature = "datasource-rpc")]
 use crate::{
@@ -32,10 +37,6 @@ use crate::{
     },
     operator::escrow_sweep::CustodySnapshot,
 };
-#[cfg(feature = "datasource-rpc")]
-use private_channel_metrics::MetricLabel;
-#[cfg(feature = "datasource-rpc")]
-use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
@@ -67,6 +68,49 @@ enum Supervision {
     ShutdownSignalled(std::io::Result<StopReason>),
     /// The startup fill failed, so its range stays unfilled until a restart refills it.
     BackfillFailed(IndexerError),
+}
+
+/// How long boot waits for a restored or lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: Duration::from_secs(1),
+    budget: Duration::from_secs(600),
+};
+
+/// Withdraw role: refuse to start on a channel that no longer holds the block this DB's
+/// checkpoint was built on.
+async fn verify_fence_at_boot(
+    storage: &Storage,
+    common_config: &PrivateChannelIndexerConfig,
+    indexer_config: &IndexerConfig,
+) -> Result<(), IndexerError> {
+    let fence = storage.get_channel_fence().await?;
+    let commitment = indexer_config
+        .rpc_polling
+        .as_ref()
+        .map(|c| c.commitment)
+        .unwrap_or(CommitmentLevel::Confirmed);
+    let rpc = RpcClientWithRetry::with_retry_config(
+        common_config.rpc_url.clone(),
+        RetryConfig::default(),
+        CommitmentConfig { commitment },
+    );
+    match verify_channel_fence(&rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(())
+        }
+        FenceVerdict::Mismatch(reason) => {
+            crate::metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[ProgramType::Withdraw.as_label()])
+                .inc();
+            error!("Indexer refusing to start: {reason}");
+            Err(IndexerError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Indexer refusing to start, channel fence unchecked: {reason}");
+            Err(IndexerError::ChannelFenceUnchecked { reason })
+        }
+    }
 }
 
 /// Wind the checkpoint writer down once the processor has ended.
@@ -559,6 +603,8 @@ pub async fn run(
     // `common`, the block source it must differ from depends on the datasource.
     crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::reject_placeholder_instance(common_config.escrow_instance_id)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // The binary validates too; repeated so embedders get the same refusal before storage opens.
     common_config
@@ -567,6 +613,8 @@ pub async fn run(
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
     indexer_config
         .validate()
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::validate_withdraw_datasource(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // 1. Initialize storage
@@ -608,6 +656,16 @@ pub async fn run(
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
 
+    // The withdraw indexer DB must never be ahead of the channel. Checked once, before any
+    // block is read. A restore done while it runs is not caught: every service must be stopped.
+    if common_config.program_type == ProgramType::Withdraw {
+        under_live_lock(
+            &live_lock_lost,
+            verify_fence_at_boot(&storage, &common_config, &indexer_config),
+        )
+        .await?;
+    }
+
     // 2. Validate the escrow reconciliation wiring before doing any work.
     //
     // Only the config check runs here. The reconciliation itself compares on-chain
@@ -627,7 +685,32 @@ pub async fn run(
                 },
             ));
         }
-        (ProgramType::Escrow, Some(_)) => {}
+        // rpc_url is Solana for the escrow indexer, where the instance lives.
+        (ProgramType::Escrow, Some(instance)) => {
+            let solana_rpc = crate::operator::utils::RpcClientWithRetry::with_retry_config(
+                common_config.rpc_url.clone(),
+                crate::operator::utils::RetryConfig::default(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            );
+            under_live_lock(&live_lock_lost, async {
+                use crate::operator::utils::InstanceCheckError;
+                crate::operator::utils::verify_escrow_instance(&solana_rpc, &instance)
+                    .await
+                    .map_err(|e| {
+                        IndexerError::from(match e {
+                            InstanceCheckError::Unreadable(reason) => {
+                                DataSourceError::Rpc(crate::error::DataSourceRpcError::Protocol {
+                                    reason,
+                                })
+                            }
+                            InstanceCheckError::Invalid(reason) => {
+                                DataSourceError::InvalidConfig { reason }
+                            }
+                        })
+                    })
+            })
+            .await?;
+        }
         _ => {
             info!("Startup reconciliation skipped (non-escrow program)");
         }
@@ -1282,6 +1365,45 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Embedders that call run() directly get the same placeholder refusal as the binary.
+    #[tokio::test]
+    async fn run_refuses_the_placeholder_instance() {
+        let common = PrivateChannelIndexerConfig {
+            program_type: crate::config::ProgramType::Escrow,
+            storage_type: crate::config::StorageType::Postgres,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            postgres: crate::config::PostgresConfig {
+                database_url: "postgres://127.0.0.1:1/none".to_string(),
+                max_connections: 1,
+            },
+            escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::default()),
+        };
+        let indexer = IndexerConfig {
+            datasource_type: crate::config::DatasourceType::RpcPolling,
+            rpc_polling: None,
+            yellowstone: None,
+            backfill: crate::config::BackfillConfig {
+                enabled: false,
+                batch_size: 10,
+                max_gap_slots: 10,
+                start_slot: None,
+                exit_after_backfill: false,
+                rpc_url: "http://127.0.0.2:1".to_string(),
+            },
+            reconciliation: crate::config::ReconciliationConfig::default(),
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(common, indexer, None),
+        )
+        .await
+        .expect("must refuse before connecting")
+        .unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "got: {err}");
+    }
 
     /// Only a balance mismatch earns another fill. Retrying the rest would repeat the
     /// whole range resolution and fill twice over before failing with the same error,

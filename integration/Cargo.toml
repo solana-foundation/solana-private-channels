@@ -148,6 +148,11 @@ path = "tests/indexer/rpc_polling_fail_closed.rs"
 name = "startup_anchor"
 path = "tests/indexer/startup_anchor.rs"
 
+# Channel fence: the withdraw indexer refuses a channel restored behind its DB.
+[[test]]
+name = "channel_fence_integration"
+path = "tests/indexer/channel_fence.rs"
+
 # One-shot backfill repair: records its range, verifies it, fails closed on write errors.
 [[test]]
 name = "backfill_only_e2e"
@@ -170,6 +175,12 @@ path = "tests/indexer/yellowstone_inner_and_unknown.rs"
 [[test]]
 name = "harness_sanity"
 path = "tests/indexer/harness_sanity.rs"
+
+# Operator refuses to start when a configured operator signer will not load. Own binary:
+# the installed signers are process-global and first-wins.
+[[test]]
+name = "test_operator_signer_refusal"
+path = "tests/indexer/test_operator_signer_refusal.rs"
 
 # RPC-error + storage-failure fault-injection tests.
 [[test]]

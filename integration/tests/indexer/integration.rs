@@ -816,7 +816,6 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
         "Solana test validator started on {}",
         test_validator.rpc_url()
     );
-    let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
     println!("Geyser plugin running on port {}", geyser_port);
 
     let client =
@@ -869,16 +868,12 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     println!("{}{}", CYAN, "=".repeat(40));
     println!("{}PHASE 1: Start Indexers and Operators{}", BOLD, ORANGE);
     println!("{}{}", CYAN, "=".repeat(40));
-    // Start PrivateChannel indexer (Yellowstone) in background
-    println!("\n=== Starting PrivateChannel Indexer (Yellowstone) ===");
+    // Start PrivateChannel indexer (RPC polling) in background
+    println!("\n=== Starting PrivateChannel Indexer (RPC polling) ===");
     let (_private_channel_indexer_handle, _private_channel_indexer_storage) =
-        start_private_channel_indexer(
-            Some(geyser_endpoint.clone()),
-            test_validator.rpc_url(),
-            indexer_db_url.clone(),
-        )
-        .await
-        .expect("Failed to start PrivateChannel indexer");
+        start_private_channel_indexer(test_validator.rpc_url(), indexer_db_url.clone())
+            .await
+            .expect("Failed to start PrivateChannel indexer");
 
     println!("PrivateChannel Indexer started successfully");
 
@@ -904,6 +899,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
     let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
         channel_shim.url(),
+        test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,

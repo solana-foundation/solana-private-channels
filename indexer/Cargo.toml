@@ -65,7 +65,6 @@ private-channel-core = { workspace = true }
 private-channel-escrow-program-client = { workspace = true }
 private-channel-metrics = { workspace = true }
 private-channel-withdraw-program-client = { workspace = true }
-once_cell = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }

@@ -13,7 +13,7 @@ use {
 };
 
 #[cfg(feature = "test-mock-storage")]
-use crate::mock_rpc::MockRpcServer;
+use crate::mock_rpc::{MockRpcServer, Reply};
 #[cfg(feature = "test-mock-storage")]
 use private_channel_indexer::storage::common::storage::mock::MockStorage;
 
@@ -47,7 +47,8 @@ pub fn default_operator_config() -> OperatorConfig {
     }
 }
 
-fn set_operator_env_vars(keypair: &Keypair) {
+/// Memory signer env for both roles; `operator::run` loads signers from env before anything else.
+pub fn set_operator_env_vars(keypair: &Keypair) {
     let private_key_base58 = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &private_key_base58);
@@ -58,12 +59,14 @@ fn set_operator_env_vars(keypair: &Keypair) {
 /// Start the operator that reads from Solana indexer and mints tokens on PrivateChannel.
 pub async fn start_solana_to_private_channel_operator(
     private_channel_rpc_url: String,
+    solana_rpc_url: String,
     solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     start_solana_to_private_channel_operator_with_config(
         private_channel_rpc_url,
+        solana_rpc_url,
         solana_indexer_db_url,
         operator_keypair,
         escrow_instance_id,
@@ -75,6 +78,7 @@ pub async fn start_solana_to_private_channel_operator(
 /// Same as `start_solana_to_private_channel_operator`, with a caller-supplied operator config.
 pub async fn start_solana_to_private_channel_operator_with_config(
     private_channel_rpc_url: String,
+    solana_rpc_url: String,
     solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
@@ -90,8 +94,8 @@ pub async fn start_solana_to_private_channel_operator_with_config(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
-        // Single-validator harness: Solana custody and the channel share one node.
-        source_rpc_url: Some(private_channel_rpc_url.clone()),
+        // Solana holds the instance and custody; tests may mint on a separate channel node.
+        source_rpc_url: Some(solana_rpc_url),
         rpc_url: private_channel_rpc_url,
         fallback_rpc_url: None,
         postgres: postgres_config,
@@ -245,10 +249,24 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
 /// type is `Escrow`.
 #[cfg(feature = "test-mock-storage")]
 pub async fn start_solana_to_private_channel_operator_with_mocks(
-    escrow_instance_id: Pubkey,
     operator_keypair: Keypair,
 ) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
     let rpc = MockRpcServer::start().await;
+    // Queued before the operator starts, since its startup instance check reads it first.
+    rpc.enqueue(
+        "getAccountInfo",
+        Reply::result(serde_json::json!({
+            "context": {"slot": 1},
+            "value": crate::instance_helper::test_instance_account(),
+        })),
+    );
+    // Boot waits for the channel's address index before reading mint history; report it caught up.
+    for _ in 0..4 {
+        rpc.enqueue(
+            "getAddressIndexSlot",
+            crate::mock_rpc::Reply::result(serde_json::json!({"watermark": 1, "latestBlock": 1})),
+        );
+    }
     let mock_storage = MockStorage::new();
     let storage = Arc::new(Storage::Mock(mock_storage.clone()));
 
@@ -265,7 +283,7 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
         rpc_url: rpc.url(),
         fallback_rpc_url: None,
         postgres: postgres_config,
-        escrow_instance_id: Some(escrow_instance_id),
+        escrow_instance_id: Some(crate::instance_helper::test_instance()),
     };
 
     let operator_config = mock_operator_config();

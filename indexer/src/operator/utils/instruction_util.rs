@@ -248,8 +248,8 @@ impl TransactionBuilder {
     ///
     /// # Retry Policies by Transaction Type
     /// - **InitializeMint**: Idempotent retry - Safe to retry if mint already initialized.
-    /// - **Mint**: No sender-level retry - retries happen only after memo-based idempotency
-    ///   verification to prevent duplicate issuance.
+    /// - **Mint**: No sender-level retry - a resend happens only after its journaled
+    ///   signatures are proven dead, which prevents duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
     /// - **RotateBitmap**: Idempotent retry - carries expected_generation, so a replay

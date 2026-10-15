@@ -15,13 +15,17 @@ pub mod gc_stale_release_signatures;
 pub mod gc_stale_remint_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
+pub mod get_channel_fence;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
+pub mod get_consumed_mints;
 pub mod get_in_flight_amounts_by_mint;
+pub mod get_max_withdrawal_nonce;
 pub mod get_mint;
 pub mod get_mint_addresses;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
+pub mod get_newest_known_mint_signatures;
 pub mod get_observed_release;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
@@ -36,8 +40,8 @@ pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
 pub mod get_withdrawal_by_nonce;
-pub mod highest_withdrawal_nonce;
 pub mod init_schema;
+pub mod insert_consumed_mints;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
@@ -55,6 +59,7 @@ pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_complete_stalled_withdrawal;
 pub mod try_fail_processing;
+pub mod try_mark_reminted;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -193,7 +198,69 @@ impl Storage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
-        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, None)
+            .await
+    }
+
+    /// Update a checkpoint and, when `fence` is newer than the stored one, the channel
+    /// fence with it, in one statement.
+    pub async fn update_committed_checkpoint_with_fence(
+        &self,
+        program_type: &str,
+        slot: u64,
+        fence: Option<&ChannelFence>,
+    ) -> Result<(), StorageError> {
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, fence)
+            .await
+    }
+
+    /// The channel fence on the withdraw checkpoint row, or `None` when never written.
+    pub async fn get_channel_fence(&self) -> Result<Option<FenceRecord>, StorageError> {
+        get_channel_fence::get_channel_fence(self).await
+    }
+
+    /// The channel mint signature of the newest `completed` deposit (`Deposit`) or the newest
+    /// `failed_reminted` withdrawal (`Withdrawal`) on `mint`, if any.
+    pub async fn get_newest_known_mint_signatures(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, StorageError> {
+        get_newest_known_mint_signatures::get_newest_known_mint_signatures(self, mint, kind).await
+    }
+
+    /// Record walked channel mints. Idempotent on the source event.
+    pub async fn insert_consumed_mints(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), StorageError> {
+        insert_consumed_mints::insert_consumed_mints(self, mints).await
+    }
+
+    /// Every channel mint an earlier walk recorded.
+    pub async fn get_consumed_mints(&self) -> Result<Vec<DbConsumedMint>, StorageError> {
+        get_consumed_mints::get_consumed_mints(self).await
+    }
+
+    /// Highest withdrawal nonce any row holds, or `None` with no withdrawal.
+    pub async fn get_max_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        get_max_withdrawal_nonce::get_max_withdrawal_nonce(self).await
+    }
+
+    /// CAS a claimed withdrawal to `FailedReminted` with its landed remint signature.
+    pub async fn try_mark_reminted(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signature: String,
+    ) -> Result<bool, StorageError> {
+        try_mark_reminted::try_mark_reminted(
+            self,
+            transaction_id,
+            expected_updated_at,
+            remint_signature,
+        )
+        .await
     }
 
     /// Terminal status write; `Ok(false)` if row already off Processing.
@@ -418,11 +485,6 @@ impl Storage {
         nonce: u64,
     ) -> Result<Option<DbTransaction>, StorageError> {
         get_withdrawal_by_nonce::get_withdrawal_by_nonce(self, nonce).await
-    }
-
-    /// Highest nonce any withdrawal row holds, whatever its status, or `None` when none does.
-    pub async fn highest_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
-        highest_withdrawal_nonce::highest_withdrawal_nonce(self).await
     }
 
     /// Transitions a withdrawal to PendingRemint, storing the withdrawal

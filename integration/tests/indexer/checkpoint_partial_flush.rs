@@ -61,10 +61,12 @@ async fn partial_flush_keeps_failed_program_pending_for_retry() {
             CheckpointUpdate {
                 program_type: ProgramType::Escrow,
                 slot: 100,
+                blockhash: None,
             },
             CheckpointUpdate {
                 program_type: ProgramType::Withdraw,
                 slot: 200,
+                blockhash: None,
             },
         ],
         Duration::from_millis(1_500),
@@ -95,6 +97,7 @@ async fn partial_flush_keeps_failed_program_pending_for_retry() {
         vec![CheckpointUpdate {
             program_type: ProgramType::Withdraw,
             slot: 250,
+            blockhash: None,
         }],
         Duration::from_millis(1_500),
     )
@@ -129,10 +132,12 @@ async fn both_programs_succeed_when_no_failure_injected() {
             CheckpointUpdate {
                 program_type: ProgramType::Escrow,
                 slot: 10,
+                blockhash: None,
             },
             CheckpointUpdate {
                 program_type: ProgramType::Withdraw,
                 slot: 20,
+                blockhash: None,
             },
         ],
         Duration::from_millis(1_500),

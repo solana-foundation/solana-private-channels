@@ -46,10 +46,16 @@ pub enum ProgramError {
         chain_only: Vec<u64>,
     },
 
-    #[error("Withdrawal database is behind the chain's nonces: the bitmap on generation {generation} has issued nonces up to at least {issued_floor}, but the database's highest withdrawal nonce is {highest_db_nonce:?}. See docs/runbooks/withdrawal_pipeline_halt_runbook.md")]
-    NonceFrontierBehindBitmap {
-        generation: u64,
-        issued_floor: u64,
-        highest_db_nonce: Option<u64>,
+    /// Released on chain, and no row proves which burn they paid. After an indexer
+    /// restore the re-indexed burns are renumbered, so servicing any row could pay twice.
+    #[error("Withdrawal nonces {nonces:?} are consumed on-chain but no row's landed release signature explains them; refusing to start, see docs/runbooks/withdrawal_pipeline_halt_runbook.md")]
+    UnexplainedConsumedNonces { nonces: Vec<u64> },
+
+    /// The DB numbers withdrawals in a generation the chain already rotated past, so it
+    /// was restored to before the rotation and the bits that would show it are gone.
+    #[error("The database's highest withdrawal nonce is in generation {db_generation:?} but the chain is on generation {chain_generation}; the indexer database was restored behind the chain, see docs/runbooks/withdrawal_pipeline_halt_runbook.md")]
+    NonceGenerationBehindChain {
+        db_generation: Option<u64>,
+        chain_generation: u64,
     },
 }
