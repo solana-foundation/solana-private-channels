@@ -213,9 +213,10 @@ such release would end in manual review.
 
 ### Resolution
 
-1. Stop `indexer-private-channel` first. While the operator refuses, it keeps
-   numbering new withdrawals from this database's sequence; once they reach the
-   chain's highest nonce the check passes and those withdrawals land in manual review.
+1. **Required:** stop `indexer-private-channel` before anything else, and keep it stopped
+   until the operator passes this check. While it runs it keeps numbering withdrawals from
+   this database's sequence; once they reach the chain's highest nonce the check passes,
+   and a replay landing on a clear bit is paid a second time.
 2. Confirm `escrow_instance_id` and the Solana `rpc_url` name the instance this
    database serves.
 3. If this database replaced the one that served the instance, restore that one. Do
