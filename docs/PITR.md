@@ -85,7 +85,9 @@ So:
   channel up to the withdraw indexer's last flushed checkpoint, normally a few seconds
   behind the channel and longer if that indexer was lagging. A primary target newer than
   that checkpoint passes every check, and anything the channel did between the checkpoint
-  and the target is then lost without a refusal. Always restore the indexer DB too.
+  and the target is then lost without a refusal. After a `truncate`, the operators'
+  consumed walk does not catch such a restore either, one more reason it is forbidden.
+  Always restore the indexer DB too.
 - **Indexer targets must lie inside the channel's retained history.** After
   `private-channel-admin truncate`, the channel no longer serves history below its floor
   (`getFirstAvailableBlock`). The operators find forgotten mints only in the history the
