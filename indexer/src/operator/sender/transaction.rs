@@ -4,7 +4,9 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
-use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS};
+use crate::operator::recovery::{
+    load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
+};
 use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::utils::instruction_util::{
     mint_extra_error_checks_policy, TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
@@ -318,7 +320,7 @@ pub(super) async fn route_builder_error(
                         nonce, "Could not read chain state to build the transaction: {e}"
                     );
                     let reason = format!(
-                        "chain state unreadable after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                        "{PREBROADCAST_CAP_REACHED}, chain state unreadable after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
                     );
                     requeue_or_fail_prebroadcast(
                         state,
@@ -635,40 +637,44 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height, blockhash_slot) =
-        match build_and_sign(&state.rpc_client, instruction.clone()).await {
-            Ok(signed) => signed,
-            Err(e) => {
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[pt, "error"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "build_sign_error"])
-                    .inc();
-                error!("Failed to build/sign transaction: {}", e);
-                // The failure came before a signature existed, so a withdrawal
-                // with nothing stashed from an earlier attempt provably never
-                // broadcast and can simply be retried.
-                match prebroadcast_requeue_target(state, ctx) {
-                    Some((nonce, transaction_id)) => {
-                        let reason = format!(
-                            "build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+    let (transaction, signature, last_valid_block_height, blockhash_slot) = match build_and_sign(
+        &state.rpc_client,
+        instruction.clone(),
+    )
+    .await
+    {
+        Ok(signed) => signed,
+        Err(e) => {
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "build_sign_error"])
+                .inc();
+            error!("Failed to build/sign transaction: {}", e);
+            // The failure came before a signature existed, so a withdrawal
+            // with nothing stashed from an earlier attempt provably never
+            // broadcast and can simply be retried.
+            match prebroadcast_requeue_target(state, ctx) {
+                Some((nonce, transaction_id)) => {
+                    let reason = format!(
+                            "{PREBROADCAST_CAP_REACHED}, build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
                         );
-                        requeue_or_fail_prebroadcast(
-                            state,
-                            ctx,
-                            storage_tx,
-                            nonce,
-                            transaction_id,
-                            &reason,
-                        )
-                        .await;
-                    }
-                    None => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
+                    requeue_or_fail_prebroadcast(
+                        state,
+                        ctx,
+                        storage_tx,
+                        nonce,
+                        transaction_id,
+                        &reason,
+                    )
+                    .await;
                 }
-                return;
+                None => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
             }
-        };
+            return;
+        }
+    };
 
     // A withdrawal nonce is consumed on broadcast, so a release that lands must already
     // have a durable signature record for crash recovery to reconcile against, and this
@@ -3479,44 +3485,71 @@ mod tests {
         );
     }
 
-    /// The cap lives in the same write that requeues, so a row that has spent
-    /// its budget escalates rather than cycling between Pending and Processing.
-    /// The capped write still bumps `updated_at`, so the escalation has to
-    /// present the lease that write returned or it would park nothing.
+    /// The cap lives in the requeue write, so a spent row escalates instead of cycling, presenting
+    /// the lease that write returned or it would park nothing. Covers both pre-broadcast
+    /// triggers: a build/sign failure and an unreadable chain or database.
     #[tokio::test]
     async fn build_failure_at_the_requeue_cap_escalates_to_manual_review() {
-        let txn_id = 11;
-        let nonce = 8;
-        let mock = mock_with_processing_row(txn_id);
-        mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
-            MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
-        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
-        state.release_leases.insert(nonce, lease);
-        state.remint_cache.insert(nonce, make_remint_info(txn_id));
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        for trigger in ["build/sign failure", "chain state unreadable"] {
+            let txn_id = 11;
+            let nonce = 8;
+            let mock = mock_with_processing_row(txn_id);
+            mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
+                MAX_RECOVERY_REQUEUE_ATTEMPTS;
+            let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+            let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+            state.release_leases.insert(nonce, lease);
+            state.remint_cache.insert(nonce, make_remint_info(txn_id));
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        send_and_confirm(
-            &mut state,
-            dummy_instruction(),
-            None,
-            &withdrawal_ctx(txn_id, nonce),
-            RetryPolicy::Idempotent,
-            &ExtraErrorCheckPolicy::None,
-            &storage_tx,
-        )
-        .await;
+            if trigger == "build/sign failure" {
+                send_and_confirm(
+                    &mut state,
+                    dummy_instruction(),
+                    None,
+                    &withdrawal_ctx(txn_id, nonce),
+                    RetryPolicy::Idempotent,
+                    &ExtraErrorCheckPolicy::None,
+                    &storage_tx,
+                )
+                .await;
+            } else {
+                route_builder_error(
+                    &mut state,
+                    &withdrawal_ctx(txn_id, nonce),
+                    &storage_tx,
+                    crate::error::StorageError::DatabaseError {
+                        message: "transient".to_string(),
+                    }
+                    .into(),
+                )
+                .await;
+            }
 
-        let update = storage_rx
-            .try_recv()
-            .expect("a row out of requeues must be escalated");
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        assert!(update.alert_only, "the fenced write already parked the row");
-        assert_eq!(
-            row_status(&mock, txn_id),
-            Some(TransactionStatus::ManualReview),
-            "the escalation must park the row, not requeue it"
-        );
+            let update = storage_rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{trigger}: a row out of requeues must be escalated"));
+            assert_eq!(update.status, TransactionStatus::ManualReview, "{trigger}");
+            assert!(
+                update.alert_only,
+                "{trigger}: the fenced write already parked the row"
+            );
+            assert_eq!(
+                row_status(&mock, txn_id),
+                Some(TransactionStatus::ManualReview),
+                "{trigger}: the escalation must park the row, not requeue it"
+            );
+            // The runbook needs both phrases to route this to the nothing-broadcast path.
+            let message = update.error_message.expect("escalation carries a message");
+            assert!(
+                message.contains(PREBROADCAST_CAP_REACHED),
+                "{trigger}: {message}"
+            );
+            assert!(
+                message.contains("no signatures to verify"),
+                "{trigger}: {message}"
+            );
+        }
     }
 
     /// An attempt that reaches the cap after recovery requeued its row and the

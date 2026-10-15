@@ -282,6 +282,28 @@ fn drill_1_error_message_contracts_present_in_source() {
             "no signatures to verify, remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
         ),
+        (
+            "remint attempt cap reached",
+            "indexer/src/operator/sender/remint.rs",
+        ),
+        // Pre-broadcast requeue cap (Path I). The marker text lives in
+        // recovery.rs; both escalation sites must keep using it.
+        (
+            "requeue cap reached before this attempt broadcast",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, build/sign failed",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, chain state unreadable",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, never handed to the sender",
+            "indexer/src/operator/processor.rs",
+        ),
         // Withdrawal, recovery worker. The signatureless-row verdicts; the
         // proof-gated requeue never reaches manual review, so only the two
         // terminal ones are dispatchable.
@@ -361,6 +383,11 @@ fn drill_1_error_message_contracts_present_in_source() {
         let content = join_continuations(
             &std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}")),
         );
+        // Production code only: a test asserting on the text must not satisfy the contract.
+        let content = content
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or_default();
         if content.contains(substr) {
             eprintln!("OK   {path}: {substr:?}");
         } else {
@@ -2064,4 +2091,34 @@ async fn drill_18_halt_sweep_respects_nonce_floor() -> Result<(), Box<dyn std::e
 
     eprintln!("Nonce floor verified: sub-poison rows survive, poison and above are quarantined.");
     Ok(())
+}
+
+// ── Drill 19: a freshness miss at the processor requeue cap dispatches to J ──
+//
+// The processor's cap message carries the freshness error and also matches the
+// Path I row, so the J row must say it outranks I or triage loses J's steps.
+
+#[test]
+#[ignore]
+fn drill_19_freshness_cap_message_dispatches_to_path_j() {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Triage - freshness row outranks Path I",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let runbook = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root")
+        .join("docs/runbooks/withdrawal_manual_review.md");
+    let text = std::fs::read_to_string(&runbook).expect("read withdrawal_manual_review.md");
+
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("| `(freshness)`"))
+        .expect("the triage table must have a freshness row");
+    assert!(
+        row.contains("use this, not I"),
+        "the freshness row must outrank Path I: {row}"
+    );
 }
