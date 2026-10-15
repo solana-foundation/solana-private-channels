@@ -127,6 +127,7 @@ fn spawn_sender(
             None,
             sender_lock,
             private_channel_indexer::operator::solvency_fence::SolvencyFence::open_from_start(),
+            None,
         )
         .await
     });

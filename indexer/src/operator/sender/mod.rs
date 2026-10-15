@@ -7,6 +7,11 @@ pub(crate) mod test_support;
 mod transaction;
 pub mod types;
 
+pub use mint::ConsumedClaims;
+pub(crate) use mint::{
+    check_consumed_mint, ensure_address_index, wait_for_address_index, ConsumedLookup,
+    ConsumedSetCache,
+};
 pub use mint::{
     enumerate_consumed_mints, extend_with_mint_history, ConsumedMint, ConsumedMintKind,
     ConsumedSet, JitOutcome,
@@ -277,6 +282,7 @@ pub async fn run_sender(
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
     sender_lock: SenderLockGuard,
     solvency_fence: crate::operator::solvency_fence::SolvencyFence,
+    consumed: Option<ConsumedClaims>,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -295,6 +301,7 @@ pub async fn run_sender(
         source_rpc_client,
         solvency_fence,
     )?;
+    state.consumed = consumed;
 
     // Taken by the caller via `acquire_sender_lock`, held for the rest of
     // run_sender, released on drop or process crash.
@@ -586,8 +593,8 @@ async fn hold_queued_release(
 ///
 /// If the timeout expires with entries still in-flight, a warning is logged and
 /// the operator exits anyway — on restart the processor will re-emit any transactions
-/// that lack a terminal DB status, and the idempotency memo check will prevent
-/// duplicate mints if the original tx did land.
+/// that lack a terminal DB status. The journaled signatures, and the channel mint history
+/// consulted at claim time, keep a landed original from being minted again.
 async fn drain_in_flight(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -722,6 +729,7 @@ mod tests {
             None,
             SenderLockGuard::Noop,
             crate::operator::solvency_fence::SolvencyFence::open_from_start(),
+            None,
         )
         .await;
 
@@ -757,6 +765,7 @@ mod tests {
             None,
             SenderLockGuard::Noop,
             crate::operator::solvency_fence::SolvencyFence::open_from_start(),
+            None,
         )
         .await;
 

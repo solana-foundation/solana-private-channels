@@ -31,7 +31,8 @@ max_connections = 10
 # Example: export DATABASE_URL="postgresql://user:pass@localhost:5434/indexer"
 
 [indexer]
-# Datasource type: "rpc_polling" or "yellowstone"
+# Datasource type: "rpc_polling" or "yellowstone". The withdraw indexer requires
+# "rpc_polling": only it records the channel fence (see docs/PITR.md).
 datasource_type = "rpc_polling"
 
 # === RPC Polling Configuration ===

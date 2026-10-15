@@ -205,6 +205,7 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
             ProcessorMessage::SlotComplete {
                 slot: 7,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             },
         ],
     )
@@ -274,6 +275,7 @@ async fn top_level_and_cpi_deposit_persist_as_distinct_rows() {
             ProcessorMessage::SlotComplete {
                 slot: 7,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             },
         ]
     };
@@ -333,6 +335,7 @@ async fn two_same_signature_withdrawals_persist_with_distinct_nonces() {
             ProcessorMessage::SlotComplete {
                 slot: 7,
                 program_type: ProgramType::Withdraw,
+                blockhash: None,
             },
         ],
     )
@@ -410,6 +413,7 @@ async fn replayed_slot_is_idempotent_on_composite_key() {
             ProcessorMessage::SlotComplete {
                 slot: 9,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             },
         ]
     };

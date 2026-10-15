@@ -184,6 +184,34 @@ the same constraint the sender's singleton lock already carries.
 rebuild [`resync.rs`](../indexer/src/indexer/resync.rs); runbook
 [`live_state_lock_runbook.md`](runbooks/live_state_lock_runbook.md).
 
+### Channel fence and database restores
+
+The channel primary and the indexer DB are restored separately, so the indexer DB must
+never describe channel history the channel no longer has. The withdraw indexer stores the
+newest channel block at or below its checkpoint, slot and hash, on its `indexer_state` row
+(`fence_slot`, `fence_blockhash`), in the same statement as the checkpoint. A block hash
+is used, not a counter, because the channel produces it and a restored channel re-produces
+the same slots with new hashes. At boot the withdraw indexer and both operators wait for
+the channel tip to reach the fence slot and refuse to start only on proof: the slot holds
+a block with another hash, or the node serves a later block whose parent is below the
+fence slot. A block the node does not serve yet only makes boot wait, since a read node's
+cached tip can be ahead of its replica. The check runs at boot only, and a withdraw indexer
+left running moves its fence onto a restored chain, so every service must be stopped before
+a restore. Because only the RPC poller sees block hashes, the withdraw
+indexer requires the `rpc_polling` datasource.
+
+An indexer DB restored to an earlier point is allowed. At boot each operator walks every
+receipt mint's channel history, newest first, down to the newest mint of its own kind the
+DB already knows (a completed deposit for the escrow operator, a landed remint for the
+withdraw operator, since the other operator may already be running), and keeps every operator mint it finds by source event. A claimed deposit or
+withdrawal whose mint is already there is closed with that signature and nothing is sent.
+The walk refuses boot if it never reaches the known mint while the channel still serves its
+whole history (a rewound channel). History pruned by `truncate` is accepted, so indexer
+restore targets must stay inside the retained history. The
+withdraw operator's bitmap check refuses on any released nonce that no row's landed,
+journaled release explains, because re-indexed burns are renumbered and a release names no
+burn. The restore procedure and what each refusal means are in [PITR.md](PITR.md).
+
 ### Transaction Identity & CPI Indexing
 
 Each indexed instruction is keyed on the triple **`(signature, instruction_index, inner_index)`**:

@@ -296,6 +296,13 @@ async fn start_escrow_mock_harness(
             "value": crate::instance_helper::test_instance_account(),
         })),
     );
+    // Boot waits for the channel's address index before reading mint history; report it caught up.
+    for _ in 0..4 {
+        rpc.enqueue(
+            "getAddressIndexSlot",
+            crate::mock_rpc::Reply::result(serde_json::json!({"watermark": 1, "latestBlock": 1})),
+        );
+    }
     // With no mints the first tick reads only the custody slot, then opens the fence.
     // Scripted before the operator starts, since that tick runs at once.
     if clean_first_tick {
