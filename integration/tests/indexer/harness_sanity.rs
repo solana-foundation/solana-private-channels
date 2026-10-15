@@ -249,6 +249,17 @@ async fn escrow_operator_moves_nothing_until_its_first_clean_tick() {
     let harness = start_solana_to_private_channel_operator_with_mocks_dark(Keypair::new())
         .await
         .expect("harness start");
+    // Boot enumerates the channel mints it knows, so the rows go in once the first tick has
+    // run dark and the fence is still closed.
+    let custody = harness.custody_rpc.as_ref().expect("escrow harness");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while custody.call_count("getSlot") == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        custody.call_count("getSlot") >= 1,
+        "the first reconciliation tick ran and found custody dark"
+    );
     let mint_pk = Pubkey::new_unique();
     harness.storage.mints.lock().unwrap().insert(
         mint_pk.to_string(),
@@ -285,11 +296,6 @@ async fn escrow_operator_moves_nothing_until_its_first_clean_tick() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let custody = harness.custody_rpc.as_ref().expect("escrow harness");
-    assert!(
-        custody.call_count("getSlot") >= 1,
-        "the first reconciliation tick ran and found custody dark"
-    );
     assert_eq!(
         harness.storage.calls("get_and_lock_pending_transactions"),
         0,

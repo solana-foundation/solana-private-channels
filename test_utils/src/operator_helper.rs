@@ -303,6 +303,11 @@ async fn start_escrow_mock_harness(
             crate::mock_rpc::Reply::result(serde_json::json!({"watermark": 1, "latestBlock": 1})),
         );
     }
+    // Boot lists every known mint's channel signatures for the consumed set; none exist here.
+    rpc.enqueue_sequence(
+        "getSignaturesForAddress",
+        std::iter::repeat_n(crate::mock_rpc::Reply::result(serde_json::json!([])), 16),
+    );
     // With no mints the first tick reads only the custody slot, then opens the fence.
     // Scripted before the operator starts, since that tick runs at once.
     if clean_first_tick {
