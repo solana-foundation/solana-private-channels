@@ -148,6 +148,11 @@ path = "tests/indexer/rpc_polling_fail_closed.rs"
 name = "startup_anchor"
 path = "tests/indexer/startup_anchor.rs"
 
+# Channel fence: the withdraw indexer refuses a channel restored behind its DB.
+[[test]]
+name = "channel_fence_integration"
+path = "tests/indexer/channel_fence.rs"
+
 # One-shot backfill repair: records its range, verifies it, fails closed on write errors.
 [[test]]
 name = "backfill_only_e2e"

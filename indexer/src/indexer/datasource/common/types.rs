@@ -71,6 +71,8 @@ pub enum ProcessorMessage {
     SlotComplete {
         slot: u64,
         program_type: ProgramType,
+        /// The slot's blockhash when it held a block, so the checkpoint can carry a fence.
+        blockhash: Option<String>,
     },
     /// Re-arm the checkpoint gate on reconnect over the durable range `(from, target]`.
     /// Rides the same FIFO pipeline as the slots it protects, so the gate is set before

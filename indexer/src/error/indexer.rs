@@ -21,6 +21,16 @@ pub enum IndexerError {
 
     #[error("Startup backfill task panicked")]
     BackfillPanicked,
+    /// The channel proved it no longer holds the block this indexer DB was built on.
+    #[error(
+        "channel fence mismatch: {reason}. The channel no longer has the history this indexer \
+         database was built on; see docs/PITR.md"
+    )]
+    ChannelFence { reason: String },
+
+    /// The fence check could not reach a verdict yet, so the indexer refuses rather than guess.
+    #[error("channel fence not checked yet: {reason}")]
+    ChannelFenceUnchecked { reason: String },
 
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),

@@ -206,8 +206,10 @@ services:
     depends_on:
       postgres-replica:
         condition: service_healthy
+      # After a primary restore the write node purges stale Redis blocks as it starts;
+      # docs/PITR.md has the read node wait for that ("Redis cache aligned with Postgres").
       write-node:
-        condition: service_started
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - PRIVATE_CHANNEL_PORT=${PRIVATE_CHANNEL_READ_PORT}
