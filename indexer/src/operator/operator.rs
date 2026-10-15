@@ -438,24 +438,28 @@ pub async fn run(
     // branch, so a task ending at the same instant cannot turn a deliberate stop into a
     // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
     // an interrupt, which is what stop_signal settles.
-    let exited = tokio::select! {
+    let cause = tokio::select! {
         biased;
         reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
             // A lost lock needs nothing here: the stop path sees it before any drain starts.
             if reason.map_err(|_| OperatorError::ShutdownChannelSend)? == StopReason::Interrupted {
                 info!("Shutdown signal received, initiating graceful shutdown...");
             }
-            None
+            StopCause::Requested
         }
-        _ = &mut workers.fetcher => Some(Worker::Fetcher),
-        _ = &mut workers.processor => Some(Worker::Processor),
-        _ = &mut workers.sender => Some(Worker::Sender),
-        _ = &mut workers.storage_writer => Some(Worker::StorageWriter),
-        _ = &mut workers.recovery => Some(Worker::Recovery),
-        _ = &mut workers.promotion, if watch_promotion => Some(Worker::Promotion),
-        _ = &mut workers.reconciliation, if watch_reconciliation => Some(Worker::Reconciliation),
+        // Only a lost sender lock cancels this token while running; every task then exits on it.
+        _ = cancellation_token.cancelled() => StopCause::SenderLockLost(program_type),
+        _ = &mut workers.fetcher => StopCause::Exited(Worker::Fetcher),
+        _ = &mut workers.processor => StopCause::Exited(Worker::Processor),
+        _ = &mut workers.sender => StopCause::Exited(Worker::Sender),
+        _ = &mut workers.storage_writer => StopCause::Exited(Worker::StorageWriter),
+        _ = &mut workers.recovery => StopCause::Exited(Worker::Recovery),
+        _ = &mut workers.promotion, if watch_promotion => StopCause::Exited(Worker::Promotion),
+        _ = &mut workers.reconciliation, if watch_reconciliation => {
+            StopCause::Exited(Worker::Reconciliation)
+        }
     };
-    if let Some(task) = exited {
+    if let StopCause::Exited(task) = cause {
         critical_exit(program_type.as_label(), task.label());
     }
 
@@ -464,7 +468,7 @@ pub async fn run(
         cancellation_token,
         storage,
         workers,
-        exited,
+        cause,
         config.batch_size,
         config.db_poll_interval,
     )
@@ -484,6 +488,15 @@ struct OperatorWorkers {
     promotion: JoinHandle<()>,
     reconciliation: JoinHandle<()>,
     feepayer: JoinHandle<()>,
+}
+
+/// Why the running operator is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    /// An interrupt, or a lost live-state lock that the stop path itself handles.
+    Requested,
+    SenderLockLost(crate::config::ProgramType),
+    Exited(Worker),
 }
 
 /// A supervised operator task, named for the exit metric and error.
@@ -553,11 +566,11 @@ async fn shutdown_unless_lock_lost(
     cancellation_token: CancellationToken,
     storage: Arc<Storage>,
     mut workers: OperatorWorkers,
-    exited: Option<Worker>,
+    cause: StopCause,
     batch_size: u16,
     db_poll_interval: Duration,
 ) -> Result<(), OperatorError> {
-    if let Some(task) = exited {
+    if let StopCause::Exited(task) = cause {
         workers.replace_joined(task);
     }
     let aborts = workers.abort_handles();
@@ -601,9 +614,12 @@ async fn shutdown_unless_lock_lost(
     drained??;
 
     // Still an error after a clean drain, so the supervisor restarts the operator.
-    match exited {
-        Some(task) => Err(OperatorError::CriticalTaskExited { task: task.label() }),
-        None => Ok(()),
+    match cause {
+        StopCause::Exited(task) => Err(OperatorError::CriticalTaskExited { task: task.label() }),
+        StopCause::SenderLockLost(program_type) => {
+            Err(OperatorError::SenderLockLost { program_type })
+        }
+        StopCause::Requested => Ok(()),
     }
 }
 
@@ -905,7 +921,7 @@ mod tests {
         lock_lost: &CancellationToken,
         token: CancellationToken,
         workers: OperatorWorkers,
-        exited: Option<Worker>,
+        cause: StopCause,
     ) -> Result<(), OperatorError> {
         tokio::time::timeout(
             Duration::from_secs(60),
@@ -914,7 +930,7 @@ mod tests {
                 token,
                 Arc::new(Storage::Mock(MockStorage::new())),
                 workers,
-                exited,
+                cause,
                 1,
                 Duration::ZERO,
             ),
@@ -930,7 +946,13 @@ mod tests {
         let (workers, submitted) = operator_workers(&token, SenderStub::Drains(3));
         let aborts = workers.abort_handles();
 
-        let result = stop_within_bound(&CancellationToken::new(), token, workers, None).await;
+        let result = stop_within_bound(
+            &CancellationToken::new(),
+            token,
+            workers,
+            StopCause::Requested,
+        )
+        .await;
 
         assert!(result.is_ok(), "a held lock must stop cleanly: {result:?}");
         assert_eq!(
@@ -962,7 +984,7 @@ mod tests {
                 });
             }
 
-            let result = stop_within_bound(&lock_lost, token, workers, None).await;
+            let result = stop_within_bound(&lock_lost, token, workers, StopCause::Requested).await;
 
             assert!(
                 matches!(
@@ -1009,8 +1031,13 @@ mod tests {
             let _ = (&mut *exited).await;
             let aborts = workers.abort_handles();
 
-            let result =
-                stop_within_bound(&CancellationToken::new(), token, workers, Some(task)).await;
+            let result = stop_within_bound(
+                &CancellationToken::new(),
+                token,
+                workers,
+                StopCause::Exited(task),
+            )
+            .await;
 
             assert!(
                 matches!(result, Err(OperatorError::CriticalTaskExited { task: t }) if t == task.label()),

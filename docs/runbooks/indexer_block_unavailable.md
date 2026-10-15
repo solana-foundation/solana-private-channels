@@ -135,8 +135,10 @@ inconsistent (cause 2 above) and repointing at a single archival node fixes it.
 
    `COMMON_FALLBACK_RPC_URL` does not clear this wedge. The indexer asks it only
    for a block the primary served but could not decode, never for a block the
-   primary will not serve. If the loop above shows the fallback has the block,
-   point the variable above at that endpoint instead.
+   primary will not serve. If the loop above shows only the fallback has the
+   block, point the variable above at that endpoint and, in the same change,
+   point `COMMON_FALLBACK_RPC_URL` at a different archival endpoint or unset it.
+   The indexer refuses to start when a block source equals the fallback.
 
    All of these are read once at startup, so the process must be restarted.
 3. Watch the counter go quiet and the checkpoint resume:

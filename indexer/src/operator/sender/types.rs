@@ -239,7 +239,8 @@ pub struct SenderState {
     /// (confirmed, permanent failure, or transfer to a retry), so
     /// `available_permits()` accurately reflects remaining capacity at all times.
     pub semaphore: Arc<Semaphore>,
-    /// Spawned mint sends. Dropping the state aborts them, so they die with an aborted sender.
+    /// Spawned mint sends. The drain waits for them and dropping the state aborts the rest,
+    /// so none outlives the sender task.
     pub send_tasks: tokio::task::JoinSet<()>,
 }
 

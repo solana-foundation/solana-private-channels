@@ -2635,11 +2635,11 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
-        ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
-        mock_bitmap_read_failure, mock_finalized_anchor, mock_initialized_mint,
-        mock_with_processing_row, push_processing_deposit_row, push_processing_row,
-        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
-        sender_state as make_sender_state_with_server, sender_state_with_storage,
+        black_hole_rpc, dummy_instruction, ensure_test_signer, mock_bitmap_account,
+        mock_bitmap_account_counted, mock_bitmap_read_failure, mock_finalized_anchor,
+        mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
+        push_processing_row, push_withdrawal_with_nonce, requeue_attempts, row_status,
+        row_updated_at, sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
@@ -2649,21 +2649,10 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use solana_commitment_config::CommitmentConfig;
-    use solana_keychain::Signer;
     use solana_sdk::pubkey::Pubkey;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
-
-    fn dummy_instruction() -> InstructionWithSigners {
-        InstructionWithSigners {
-            instructions: vec![],
-            fee_payer: Pubkey::default(),
-            signers: Vec::<&'static Signer>::new(),
-            compute_unit_price: None,
-            compute_budget: None,
-        }
-    }
 
     fn make_sender_state() -> SenderState {
         make_sender_state_with_server("http://localhost:8899")
@@ -8194,16 +8183,7 @@ mod tests {
     /// rather than broadcast after the operator has given the lock up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborting_the_sender_aborts_its_spawned_mint_sends() {
-        // Accepts and never answers, so the send task parks on its first RPC call.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                held.push(socket);
-            }
-        });
-        let state = make_sender_state_with_server(&url);
+        let state = make_sender_state_with_server(&black_hole_rpc().await);
         let semaphore = state.semaphore.clone();
         let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
 

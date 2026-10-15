@@ -438,8 +438,6 @@ pub async fn run_sender(
         }
     }
 
-    // A graceful stop leaves in-progress sends running, as before; only an abort kills them.
-    state.send_tasks.detach_all();
     info!("Sender stopped gracefully");
     Ok(())
 }
@@ -591,6 +589,13 @@ async fn drain_in_flight(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    // A spawned send joins in_flight only once it lands, so wait for those first.
+    while let Ok(Some(_)) = tokio::time::timeout_at(timeout_at, state.send_tasks.join_next()).await
+    {
+    }
+
     if state.in_flight.is_empty() {
         return;
     }
@@ -599,8 +604,6 @@ async fn drain_in_flight(
         count = state.in_flight.len(),
         "Draining in-flight transactions before shutdown"
     );
-
-    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(30);
 
     while !state.in_flight.is_empty() {
         if tokio::time::Instant::now() >= timeout_at {
@@ -629,11 +632,12 @@ mod tests {
     use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::sender::test_support::{
-        mock_rejection_logs, mock_with_parked_row, mock_with_processing_row, row_status,
-        row_updated_at, sender_state as make_sender_state, sender_state_with_storage,
+        black_hole_rpc, dummy_instruction, mock_rejection_logs, mock_with_parked_row,
+        mock_with_processing_row, row_status, row_updated_at, sender_state as make_sender_state,
+        sender_state_with_storage,
     };
     use crate::operator::sender::types::{
-        InFlightTx, InstructionWithSigners, TransactionContext, MAX_IN_FLIGHT,
+        InFlightTx, InstructionWithSigners, SendDurability, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
         ExtraErrorCheckPolicy, RetryPolicy, SourceEventId, TransactionKind, WithdrawalRemintInfo,
@@ -1367,6 +1371,52 @@ mod tests {
 
         assert!(state.in_flight.is_empty());
         assert!(storage_rx.try_recv().is_err(), "no storage update expected");
+    }
+
+    /// A graceful drain must wait for the mint sends it spawned, so a lock lost after the
+    /// sender's own stage still reaches them through the sender task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_drain_waits_for_spawned_mint_sends() {
+        let state = make_sender_state(&black_hole_rpc().await);
+        let semaphore = state.semaphore.clone();
+        let sender = tokio::spawn(async move {
+            let mut state = state;
+            let (storage_tx, _storage_rx) = mpsc::channel(10);
+            assert!(transaction::spawn_fire_and_store(
+                &mut state,
+                dummy_instruction(),
+                None,
+                TransactionContext {
+                    kind: TransactionKind::Mint,
+                    transaction_id: Some(1),
+                    withdrawal_nonce: None,
+                    trace_id: None,
+                    deposit_claim_lease: None,
+                },
+                RetryPolicy::None,
+                ExtraErrorCheckPolicy::None,
+                storage_tx.clone(),
+                SendDurability::Terminal,
+            ));
+            drain_in_flight(&mut state, &storage_tx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !sender.is_finished(),
+            "the drain returned while a spawned mint send was still running"
+        );
+        sender.abort();
+        let _ = sender.await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while semaphore.available_permits() < MAX_IN_FLIGHT {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "aborting the sender must stop the send it was waiting on"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// When in-flight entries never confirm, drain_in_flight must stop after the

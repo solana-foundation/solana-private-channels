@@ -561,3 +561,46 @@ async fn indexer_stops_when_the_live_lock_is_lost_while_building_the_datasource(
         "no anchor may be written after the lock is lost"
     );
 }
+
+/// I18. A sender lock lost while the operator runs must be reported as that loss, not as a
+/// crash of whichever task happened to exit first on the shared cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_reports_a_running_sender_lock_loss_as_such() {
+    // The running workers sign, and the admin signer is read once per process.
+    static SIGNER: std::sync::Once = std::sync::Once::new();
+    SIGNER.call_once(|| {
+        let key = bs58::encode(solana_sdk::signature::Keypair::new().to_bytes()).into_string();
+        std::env::set_var("ADMIN_SIGNER", "memory");
+        std::env::set_var("ADMIN_PRIVATE_KEY", key);
+    });
+    let (url, _container) = start_postgres("sender_lock_lost_running").await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+    let sender_key =
+        private_channel_indexer::operator::sender::sender_lock_key(ProgramType::Escrow);
+    let run = tokio::spawn(operator::run(
+        connect(&url).await,
+        common_config(postgres),
+        operator_config(),
+        None,
+    ));
+    wait_until(
+        "the operator to take the sender lock",
+        Duration::from_secs(30),
+        || async { advisory_sessions(&url, sender_key, true).await == 1 },
+    )
+    .await;
+
+    terminate_advisory_lock_holder(&url, sender_key).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .expect("the operator must stop after losing the sender lock")
+        .expect("operator task must not panic");
+    assert!(
+        matches!(result, Err(OperatorError::SenderLockLost { .. })),
+        "a running sender-lock loss must be reported as such, got: {result:?}"
+    );
+}

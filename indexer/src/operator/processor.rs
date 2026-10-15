@@ -128,6 +128,7 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         | OperatorError::SenderAlreadyRunning { .. }
         | OperatorError::SenderLockLostAtBoot { .. }
         | OperatorError::CriticalTaskExited { .. }
+        | OperatorError::SenderLockLost { .. }
         | OperatorError::InvalidConfig(_) => ErrorDisposition::Fatal,
         // A dead downstream channel means the sender or storage writer died; the
         // supervisor handles this by aborting the whole operator.
