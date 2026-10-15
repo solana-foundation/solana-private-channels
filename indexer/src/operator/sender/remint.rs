@@ -1650,6 +1650,7 @@ mod tests {
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
+            send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
         };
         (state, mock)
@@ -1852,6 +1853,7 @@ mod tests {
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
+            send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
         };
         (state, mock)
@@ -1923,6 +1925,7 @@ mod tests {
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
+            send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
         };
         (state, mock)

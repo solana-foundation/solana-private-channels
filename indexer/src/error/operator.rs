@@ -70,4 +70,10 @@ pub enum OperatorError {
         "The {program_type:?} sender lock was lost during the boot pre-flight; refusing to start"
     )]
     SenderLockLostAtBoot { program_type: crate::ProgramType },
+
+    #[error("Critical operator task {task} exited unexpectedly")]
+    CriticalTaskExited { task: &'static str },
+
+    #[error("The {program_type:?} sender lock was lost while running; stopped after the drain")]
+    SenderLockLost { program_type: crate::ProgramType },
 }

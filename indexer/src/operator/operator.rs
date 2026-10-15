@@ -1,13 +1,13 @@
 use crate::channel_fence::{verify_channel_fence, FenceVerdict, FenceWait};
 use crate::config::OperatorConfig;
-use crate::error::{OperatorError, StorageError};
+use crate::error::OperatorError;
 use crate::metrics;
 use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, release_promotion, sender,
     DbTransactionWriter, RetryConfig, RpcClientWithRetry,
 };
-use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
+use crate::shutdown_utils::{drain_unless_lock_lost, shutdown_operator, stop_signal, StopReason};
 use crate::storage::common::storage::live_lock::{
     under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
 };
@@ -16,8 +16,9 @@ use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_commitment_config::CommitmentConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -474,8 +475,9 @@ pub async fn run(
 
     // Task supervision.
     //
-    // We race ctrl-c against each critical task's JoinHandle — whichever
-    // fires first wins — and fall through to the shutdown path either way.
+    // We race ctrl-c against each critical task's JoinHandle; whichever
+    // fires first wins, and every arm except a failed ctrl-c listener falls
+    // through to the one stop path below.
     // A task exit increments the OPERATOR_TASK_EXIT metric with a task
     // label so dashboards can tell which one failed without tailing logs.
     //
@@ -485,138 +487,209 @@ pub async fn run(
     // withdraw role, and reconciliation on the escrow role: a dead loop silently
     // stops every solvency check. The feepayer monitor is not watched.
     //
-    // Handles are polled by mutable reference so ownership stays here and
-    // they can still be moved into `shutdown_operator` below — awaiting an
-    // already-completed JoinHandle is a no-op.
-    let mut fetcher_handle = fetcher_handle;
-    let mut processor_handle = processor_handle;
-    let mut sender_handle = sender_handle;
-    let mut storage_writer_handle = storage_writer_handle;
-    let mut recovery_handle = recovery_handle;
-    let mut promotion_handle = promotion_handle;
-    // A JoinHandle panics if polled again after it completed, so remember when select did.
-    let mut promotion_joined = false;
-    let mut reconciliation_handle = reconciliation_handle;
+    // Handles are polled by mutable reference so ownership stays here and they
+    // can still be moved into the stop path below.
+    let mut workers = OperatorWorkers {
+        fetcher: fetcher_handle,
+        processor: processor_handle,
+        sender: sender_handle,
+        storage_writer: storage_writer_handle,
+        recovery: recovery_handle,
+        promotion: promotion_handle,
+        reconciliation: reconciliation_handle,
+        feepayer: feepayer_monitor_handle,
+    };
     // The withdraw role's placeholder finishes at once, so only escrow watches it.
     let watch_reconciliation = program_type == crate::config::ProgramType::Escrow;
-    let mut reconciliation_joined = false;
-    let pt_label = program_type.as_label();
+    let watch_promotion = program_type == crate::config::ProgramType::Withdraw;
 
     // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
     // branch, so a task ending at the same instant cannot turn a deliberate stop into a
     // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
     // an interrupt, which is what stop_signal settles.
-    tokio::select! {
+    let cause = tokio::select! {
         biased;
         reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
-            match reason.map_err(|_| OperatorError::ShutdownChannelSend)? {
-                // A lost live-state lock skips the graceful path entirely. Postgres frees
-                // the lock the instant our session dies, so a resync may already be
-                // dropping these tables; draining would broadcast and write into them.
-                // Stopping outright costs no more than an abrupt kill, which the recovery
-                // worker already handles.
-                StopReason::LiveLockLost => {
-                    stop_without_draining(
-                        &cancellation_token,
-                        &[
-                            fetcher_handle.abort_handle(),
-                            processor_handle.abort_handle(),
-                            sender_handle.abort_handle(),
-                            storage_writer_handle.abort_handle(),
-                            recovery_handle.abort_handle(),
-                            promotion_handle.abort_handle(),
-                            reconciliation_handle.abort_handle(),
-                            feepayer_monitor_handle.abort_handle(),
-                        ],
-                    )
-                    .await;
-                    return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
-                }
-                StopReason::Interrupted => {
-                    info!("Shutdown signal received, initiating graceful shutdown...");
-                }
+            // A lost lock needs nothing here: the stop path sees it before any drain starts.
+            if reason.map_err(|_| OperatorError::ShutdownChannelSend)? == StopReason::Interrupted {
+                info!("Shutdown signal received, initiating graceful shutdown...");
             }
+            StopCause::Requested
         }
-        _ = &mut fetcher_handle => {
-            critical_exit(pt_label, "fetcher");
+        // Only a lost sender lock cancels this token while running; every task then exits on it.
+        _ = cancellation_token.cancelled() => StopCause::SenderLockLost(program_type),
+        _ = &mut workers.fetcher => StopCause::Exited(Worker::Fetcher),
+        _ = &mut workers.processor => StopCause::Exited(Worker::Processor),
+        _ = &mut workers.sender => StopCause::Exited(Worker::Sender),
+        _ = &mut workers.storage_writer => StopCause::Exited(Worker::StorageWriter),
+        _ = &mut workers.recovery => StopCause::Exited(Worker::Recovery),
+        _ = &mut workers.promotion, if watch_promotion => StopCause::Exited(Worker::Promotion),
+        _ = &mut workers.reconciliation, if watch_reconciliation => {
+            StopCause::Exited(Worker::Reconciliation)
         }
-        _ = &mut processor_handle => {
-            critical_exit(pt_label, "processor");
-        }
-        _ = &mut sender_handle => {
-            critical_exit(pt_label, "sender");
-        }
-        _ = &mut storage_writer_handle => {
-            critical_exit(pt_label, "storage_writer");
-        }
-        _ = &mut recovery_handle => {
-            critical_exit(pt_label, "recovery");
-        }
-        _ = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
-            promotion_joined = true;
-            critical_exit(pt_label, "release_promotion");
-        }
-        _ = &mut reconciliation_handle, if watch_reconciliation => {
-            reconciliation_joined = true;
-            critical_exit(pt_label, "reconciliation");
-        }
-    }
-
-    // A critical task dying and the lock going are one failure when the database is what
-    // went away, so the exit path has to ask the same question the signal path did.
-    // Draining here would broadcast and flush into tables a resync may already be dropping.
-    if live_lock_lost.is_cancelled() {
-        stop_without_draining(
-            &cancellation_token,
-            &[
-                fetcher_handle.abort_handle(),
-                processor_handle.abort_handle(),
-                sender_handle.abort_handle(),
-                storage_writer_handle.abort_handle(),
-                recovery_handle.abort_handle(),
-                promotion_handle.abort_handle(),
-                reconciliation_handle.abort_handle(),
-                feepayer_monitor_handle.abort_handle(),
-            ],
-        )
-        .await;
-        return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
-    }
-
-    // shutdown_operator awaits this handle, so hand it a finished stand-in once select joined it.
-    let reconciliation_handle = if reconciliation_joined {
-        tokio::spawn(async {})
-    } else {
-        reconciliation_handle
     };
+    if let StopCause::Exited(task) = cause {
+        critical_exit(program_type.as_label(), task.label());
+    }
 
-    // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
-    // exit path.  On the exit path, the handle that tripped the select is
-    // already completed; shutdown_operator will wait on the others.
-    shutdown_operator(
+    shutdown_unless_lock_lost(
+        &live_lock_lost,
         cancellation_token,
         storage,
-        fetcher_handle,
-        processor_handle,
-        sender_handle,
-        storage_writer_handle,
-        reconciliation_handle,
-        feepayer_monitor_handle,
-        recovery_handle,
+        workers,
+        cause,
         config.batch_size,
         config.db_poll_interval,
     )
-    .await
-    .map_err(|_| OperatorError::ShutdownChannelSend)?;
-    // Already cancelled by shutdown_operator; this only waits out the pass in progress.
-    if !promotion_joined {
-        if let Err(e) = promotion_handle.await {
-            error!("Release promotion join error during shutdown: {}", e);
-        }
-    }
+    .await?;
 
     info!("Operator shutdown complete");
     Ok(())
+}
+
+/// The operator's long-running tasks, kept together so every stop path handles the same set.
+struct OperatorWorkers {
+    fetcher: JoinHandle<()>,
+    processor: JoinHandle<()>,
+    sender: JoinHandle<()>,
+    storage_writer: JoinHandle<()>,
+    recovery: JoinHandle<()>,
+    promotion: JoinHandle<()>,
+    reconciliation: JoinHandle<()>,
+    feepayer: JoinHandle<()>,
+}
+
+/// Why the running operator is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    /// An interrupt, or a lost live-state lock that the stop path itself handles.
+    Requested,
+    SenderLockLost(crate::config::ProgramType),
+    Exited(Worker),
+}
+
+/// A supervised operator task, named for the exit metric and error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Worker {
+    Fetcher,
+    Processor,
+    Sender,
+    StorageWriter,
+    Recovery,
+    Promotion,
+    Reconciliation,
+}
+
+impl Worker {
+    fn label(self) -> &'static str {
+        match self {
+            Worker::Fetcher => "fetcher",
+            Worker::Processor => "processor",
+            Worker::Sender => "sender",
+            Worker::StorageWriter => "storage_writer",
+            Worker::Recovery => "recovery",
+            Worker::Promotion => "release_promotion",
+            Worker::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+impl OperatorWorkers {
+    fn abort_handles(&self) -> [AbortHandle; 8] {
+        [
+            self.fetcher.abort_handle(),
+            self.processor.abort_handle(),
+            self.sender.abort_handle(),
+            self.storage_writer.abort_handle(),
+            self.recovery.abort_handle(),
+            self.promotion.abort_handle(),
+            self.reconciliation.abort_handle(),
+            self.feepayer.abort_handle(),
+        ]
+    }
+
+    fn handle_mut(&mut self, task: Worker) -> &mut JoinHandle<()> {
+        match task {
+            Worker::Fetcher => &mut self.fetcher,
+            Worker::Processor => &mut self.processor,
+            Worker::Sender => &mut self.sender,
+            Worker::StorageWriter => &mut self.storage_writer,
+            Worker::Recovery => &mut self.recovery,
+            Worker::Promotion => &mut self.promotion,
+            Worker::Reconciliation => &mut self.reconciliation,
+        }
+    }
+
+    /// Polling a JoinHandle again after it completed panics, and the stop path awaits
+    /// every handle, so the one select already joined is swapped for a finished stand-in.
+    fn replace_joined(&mut self, joined: Worker) {
+        *self.handle_mut(joined) = tokio::spawn(async {});
+    }
+}
+
+/// The one stop path for the running operator, whatever ended the select. It drains only
+/// while the lock is held; once lost, a resync may be dropping the tables the drain writes
+/// to, so every worker is aborted and awaited instead.
+async fn shutdown_unless_lock_lost(
+    lock_lost: &CancellationToken,
+    cancellation_token: CancellationToken,
+    storage: Arc<Storage>,
+    mut workers: OperatorWorkers,
+    cause: StopCause,
+    batch_size: u16,
+    db_poll_interval: Duration,
+) -> Result<(), OperatorError> {
+    if let StopCause::Exited(task) = cause {
+        workers.replace_joined(task);
+    }
+    let aborts = workers.abort_handles();
+    let token = cancellation_token.clone();
+    let OperatorWorkers {
+        fetcher,
+        processor,
+        sender,
+        storage_writer,
+        recovery,
+        promotion,
+        reconciliation,
+        feepayer,
+    } = workers;
+
+    let drained = drain_unless_lock_lost(lock_lost, &token, &aborts, async move {
+        shutdown_operator(
+            cancellation_token,
+            storage,
+            fetcher,
+            processor,
+            sender,
+            storage_writer,
+            reconciliation,
+            feepayer,
+            recovery,
+            batch_size,
+            db_poll_interval,
+        )
+        .await
+        .map_err(|_| OperatorError::ShutdownChannelSend)?;
+        // Already cancelled by shutdown_operator; this only waits out the pass in progress.
+        if let Err(e) = promotion.await {
+            error!("Release promotion join error during shutdown: {}", e);
+        }
+        Ok::<(), OperatorError>(())
+    })
+    .await;
+    // A stage that timed out only detached its task, so stop it before the lock guard drops.
+    crate::shutdown_utils::abort_and_await_writers(&aborts).await;
+    drained??;
+
+    // Still an error after a clean drain, so the supervisor restarts the operator.
+    match cause {
+        StopCause::Exited(task) => Err(OperatorError::CriticalTaskExited { task: task.label() }),
+        StopCause::SenderLockLost(program_type) => {
+            Err(OperatorError::SenderLockLost { program_type })
+        }
+        StopCause::Requested => Ok(()),
+    }
 }
 
 /// The channel endpoint for `program_type`: `rpc_url` for escrow, `source_rpc_url` for withdraw.
@@ -855,12 +928,6 @@ async fn validate_withdraw_fallback(
     Ok(())
 }
 
-/// Log + metric for a critical task that exited before cancellation.
-///
-/// We don't abort the process here — the caller falls through to
-/// `shutdown_operator` so the remaining tasks get the usual graceful-shutdown
-/// treatment.  The process will exit naturally once `shutdown_operator`
-/// returns, and the supervisor will restart the operator.
 /// Stop every worker outright, for a lost live-state lock.
 ///
 /// Nothing may drain: Postgres frees the lock the instant our session dies, so a resync may
@@ -906,6 +973,8 @@ async fn stop_boot_writer(
     }
 }
 
+/// Log + metric for a critical task that exited before cancellation. The caller still runs
+/// the stop path for the others, then returns an error so the supervisor restarts it.
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -1002,6 +1071,184 @@ mod tests {
                 worker.await.unwrap_err().is_cancelled(),
                 "a worker that was only signalled, not aborted, could still write"
             );
+        }
+    }
+
+    /// How the sender stand-in behaves once cancelled.
+    #[derive(Clone, Copy)]
+    enum SenderStub {
+        /// Submits `n` queued items, then exits.
+        Drains(usize),
+        /// Keeps submitting until it is aborted.
+        DrainsForever,
+    }
+
+    /// Workers that exit on cancel, except the sender, which keeps "submitting" queued work.
+    /// Returns the workers and the count of submissions the sender made after the cancel.
+    fn operator_workers(
+        token: &CancellationToken,
+        sender: SenderStub,
+    ) -> (OperatorWorkers, Arc<std::sync::atomic::AtomicUsize>) {
+        let stub = || {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancelled().await })
+        };
+        let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sender_token = token.clone();
+        let sender_submitted = Arc::clone(&submitted);
+        let sender = tokio::spawn(async move {
+            sender_token.cancelled().await;
+            let mut left = match sender {
+                SenderStub::Drains(n) => n,
+                SenderStub::DrainsForever => usize::MAX,
+            };
+            while left > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sender_submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                left -= 1;
+            }
+        });
+        let workers = OperatorWorkers {
+            fetcher: stub(),
+            processor: stub(),
+            sender,
+            storage_writer: stub(),
+            recovery: stub(),
+            promotion: stub(),
+            reconciliation: stub(),
+            feepayer: stub(),
+        };
+        (workers, submitted)
+    }
+
+    /// Bounds a stop path well below shutdown_operator's own 90 s process exit.
+    async fn stop_within_bound(
+        lock_lost: &CancellationToken,
+        token: CancellationToken,
+        workers: OperatorWorkers,
+        cause: StopCause,
+    ) -> Result<(), OperatorError> {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            shutdown_unless_lock_lost(
+                lock_lost,
+                token,
+                Arc::new(Storage::Mock(MockStorage::new())),
+                workers,
+                cause,
+                1,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("the stop path must finish")
+    }
+
+    /// With the lock held, an interrupt still gets the full drain.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_drains_while_the_lock_is_held() {
+        let token = CancellationToken::new();
+        let (workers, submitted) = operator_workers(&token, SenderStub::Drains(3));
+        let aborts = workers.abort_handles();
+
+        let result = stop_within_bound(
+            &CancellationToken::new(),
+            token,
+            workers,
+            StopCause::Requested,
+        )
+        .await;
+
+        assert!(result.is_ok(), "a held lock must stop cleanly: {result:?}");
+        assert_eq!(
+            submitted.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the sender must finish its drain"
+        );
+        assert!(aborts.iter().all(|a| a.is_finished()));
+    }
+
+    /// Once the lock is lost, before or during the stop, nothing may keep draining.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_does_not_drain_after_the_lock_is_lost() {
+        for lost_before_the_call in [true, false] {
+            let token = CancellationToken::new();
+            let lock_lost = CancellationToken::new();
+            let (workers, submitted) = operator_workers(&token, SenderStub::DrainsForever);
+            let aborts = workers.abort_handles();
+            if lost_before_the_call {
+                lock_lost.cancel();
+            } else {
+                let canceller = lock_lost.clone();
+                let seen = Arc::clone(&submitted);
+                tokio::spawn(async move {
+                    while seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    canceller.cancel();
+                });
+            }
+
+            let result = stop_within_bound(&lock_lost, token, workers, StopCause::Requested).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(OperatorError::Storage(
+                        crate::error::StorageError::LiveStateLockLost
+                    ))
+                ),
+                "lost before the call: {lost_before_the_call}: {result:?}"
+            );
+            assert!(
+                aborts.iter().all(|a| a.is_finished()),
+                "every worker must be stopped before the lock guard can drop"
+            );
+            let at_return = submitted.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                submitted.load(std::sync::atomic::Ordering::SeqCst),
+                at_return,
+                "the sender kept submitting after the stop returned"
+            );
+            if lost_before_the_call {
+                assert_eq!(at_return, 0, "a lock lost first must never start the drain");
+            }
+        }
+    }
+
+    /// A worker that select already joined must not be polled again, and the exit stays an error.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_survives_a_worker_that_already_exited() {
+        for task in [
+            Worker::Fetcher,
+            Worker::Processor,
+            Worker::Sender,
+            Worker::StorageWriter,
+            Worker::Recovery,
+            Worker::Promotion,
+            Worker::Reconciliation,
+        ] {
+            let token = CancellationToken::new();
+            let (mut workers, _) = operator_workers(&token, SenderStub::Drains(1));
+            let exited = workers.handle_mut(task);
+            exited.abort();
+            let _ = (&mut *exited).await;
+            let aborts = workers.abort_handles();
+
+            let result = stop_within_bound(
+                &CancellationToken::new(),
+                token,
+                workers,
+                StopCause::Exited(task),
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(OperatorError::CriticalTaskExited { task: t }) if t == task.label()),
+                "{task:?}: {result:?}"
+            );
+            assert!(aborts.iter().all(|a| a.is_finished()), "{task:?}");
         }
     }
 

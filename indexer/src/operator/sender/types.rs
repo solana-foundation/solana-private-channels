@@ -242,6 +242,9 @@ pub struct SenderState {
     pub semaphore: Arc<Semaphore>,
     /// Escrow solvency gate; a refused claim never broadcasts. Always open for the withdraw role.
     pub solvency_fence: SolvencyFence,
+    /// Spawned mint sends. The drain waits for them and dropping the state aborts the rest,
+    /// so none outlives the sender task.
+    pub send_tasks: tokio::task::JoinSet<()>,
     /// Channel mints the DB may have forgotten, checked before every remint.
     pub(crate) consumed: Option<super::ConsumedClaims>,
 }

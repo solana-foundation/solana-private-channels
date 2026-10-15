@@ -104,6 +104,7 @@ impl SenderState {
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             solvency_fence,
+            send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
         })
     }

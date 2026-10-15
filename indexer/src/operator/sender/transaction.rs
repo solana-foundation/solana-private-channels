@@ -1982,7 +1982,7 @@ pub(super) async fn fire_and_store(
 /// cycle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fire_and_store(
-    state: &SenderState,
+    state: &mut SenderState,
     instruction: InstructionWithSigners,
     compute_unit_price: Option<u64>,
     ctx: TransactionContext,
@@ -2011,7 +2011,9 @@ pub(super) fn spawn_fire_and_store(
     let program_type = state.program_type;
     let storage = state.storage.clone();
 
-    tokio::spawn(fire_and_store_task(
+    // Reap finished sends so the set only holds live ones.
+    while state.send_tasks.try_join_next().is_some() {}
+    state.send_tasks.spawn(fire_and_store_task(
         rpc_client,
         storage,
         in_flight,
@@ -2686,11 +2688,11 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
-        ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
-        mock_bitmap_read_failure, mock_finalized_anchor, mock_initialized_mint,
-        mock_with_processing_row, push_processing_deposit_row, push_processing_row,
-        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
-        sender_state as make_sender_state_with_server, sender_state_with_storage,
+        black_hole_rpc, dummy_instruction, ensure_test_signer, mock_bitmap_account,
+        mock_bitmap_account_counted, mock_bitmap_read_failure, mock_finalized_anchor,
+        mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
+        push_processing_row, push_withdrawal_with_nonce, requeue_attempts, row_status,
+        row_updated_at, sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
@@ -2700,21 +2702,10 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use solana_commitment_config::CommitmentConfig;
-    use solana_keychain::Signer;
     use solana_sdk::pubkey::Pubkey;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
-
-    fn dummy_instruction() -> InstructionWithSigners {
-        InstructionWithSigners {
-            instructions: vec![],
-            fee_payer: Pubkey::default(),
-            signers: Vec::<&'static Signer>::new(),
-            compute_unit_price: None,
-            compute_budget: None,
-        }
-    }
 
     fn make_sender_state() -> SenderState {
         make_sender_state_with_server("http://localhost:8899")
@@ -6480,6 +6471,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6573,6 +6565,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6681,6 +6674,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6733,6 +6727,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6781,6 +6776,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6843,6 +6839,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6923,6 +6920,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -8368,7 +8366,7 @@ mod tests {
     /// fetcher can re-emit the transaction on the next poll cycle.
     #[tokio::test]
     async fn spawn_fire_and_store_cap_exhausted_returns_false() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
 
         // Hold all permits — simulates MAX_IN_FLIGHT tasks in-flight.
         let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
@@ -8386,7 +8384,7 @@ mod tests {
         };
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             ctx,
@@ -8409,13 +8407,13 @@ mod tests {
     /// so back-pressure is applied as soon as the task starts, not after it finishes.
     #[tokio::test]
     async fn spawn_fire_and_store_available_capacity_returns_true_and_consumes_permit() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
         assert_eq!(state.semaphore.available_permits(), MAX_IN_FLIGHT);
 
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             TransactionContext {
@@ -8439,6 +8437,53 @@ mod tests {
             MAX_IN_FLIGHT - 1,
             "one permit must be held by the spawned task"
         );
+    }
+
+    /// A lost live-state lock aborts the sender, and a mint send it spawned must stop with it
+    /// rather than broadcast after the operator has given the lock up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_sender_aborts_its_spawned_mint_sends() {
+        let state = make_sender_state_with_server(&black_hole_rpc().await);
+        let semaphore = state.semaphore.clone();
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+
+        let sender = tokio::spawn(async move {
+            let mut state = state;
+            let (storage_tx, _storage_rx) = mpsc::channel(10);
+            assert!(spawn_fire_and_store(
+                &mut state,
+                dummy_instruction(),
+                None,
+                TransactionContext {
+                    kind: TransactionKind::Mint,
+                    transaction_id: Some(1),
+                    withdrawal_nonce: None,
+                    trace_id: None,
+                    deposit_claim_lease: None,
+                },
+                RetryPolicy::None,
+                ExtraErrorCheckPolicy::None,
+                storage_tx,
+                SendDurability::Terminal,
+            ));
+            let _ = spawned_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        spawned_rx.await.unwrap();
+        assert_eq!(semaphore.available_permits(), MAX_IN_FLIGHT - 1);
+
+        sender.abort();
+        let _ = sender.await;
+
+        // The send task releases its permit only once it has stopped.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while semaphore.available_permits() < MAX_IN_FLIGHT {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawned mint send outlived the aborted sender"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     // ── run_poll_task: cancellation ───────────────────────────────────
