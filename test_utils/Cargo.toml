@@ -11,6 +11,7 @@ private-channel-escrow-program-client.workspace = true
 private-channel-withdraw-program-client.workspace = true
 private-channel-indexer = { path = "../indexer" }
 serde_json.workspace = true
+base64 = { workspace = true }
 solana-address.workspace = true
 solana-client.workspace = true
 solana-net-utils = "4.2"

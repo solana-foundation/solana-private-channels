@@ -3261,7 +3261,9 @@ impl Stack {
     /// updated"), which is a startup artefact of this harness, not of the resync.
     async fn start(rpc_url: &str, db_url: &str, instance: Pubkey) -> Self {
         let (rpc, db) = (rpc_url.to_string(), db_url.to_string());
-        let channel = ChannelShim::start(rpc_url).await;
+        // The channel is this validator, so every token outside custody would read as unbacked
+        // channel supply; mirror custody so the escrow operator's solvency fence can open.
+        let channel = ChannelShim::start_mirroring_custody(rpc_url, instance).await;
         let mut workers = Vec::new();
         {
             let (rpc, db) = (rpc.clone(), db.clone());

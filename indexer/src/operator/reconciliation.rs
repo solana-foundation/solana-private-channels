@@ -61,6 +61,13 @@ const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_millis(500);
 /// so this has to keep firing rather than notify once.
 const LIABILITY_DARK_ALERT_TICKS: u32 = 3;
 
+/// How soon a closed fence is probed again. A probe re-runs the check without counting it,
+/// so a blip on the first tick costs seconds, not a whole interval.
+#[cfg(not(test))]
+const FENCE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Checkpoint poll interval while waiting for the ledger to cover the custody slot.
 #[cfg(not(test))]
 const LEDGER_CATCHUP_POLL_MS: u64 = 500;
@@ -69,7 +76,7 @@ const LEDGER_CATCHUP_POLL_MS: u64 = 5;
 
 /// Per-mint consecutive breach counts, one map per invariant.
 /// Two maps so an unknown or clean reading of one invariant never resets the other's evidence.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct BreachCounters {
     supply: HashMap<Pubkey, u32>,
     liability: HashMap<Pubkey, u32>,
@@ -160,11 +167,20 @@ pub async fn run_reconciliation(
     let mut halted = seeded.is_some();
     breach_counters.insolvency_halted = seeded.is_some_and(|flag| flag.insolvency);
 
+    // Counted ticks keep the configured cadence; a closed fence is probed in between. A probe
+    // pages nothing and counts nothing, so it is held back whenever one more tick could
+    // cross a threshold, leaving every halt and alert to a counted tick.
+    let quiet_alerts = MaskedAlerts::default();
+    let mut next_counted = tokio::time::Instant::now();
     loop {
         // Check for cancellation
         if cancellation_token.is_cancelled() {
             info!("Reconciliation received cancellation signal, stopping...");
             break;
+        }
+        let probe = tokio::time::Instant::now() < next_counted;
+        if !probe {
+            next_counted = tokio::time::Instant::now() + config.reconciliation_interval;
         }
 
         // Perform reconciliation check
@@ -175,7 +191,7 @@ pub async fn run_reconciliation(
             &channel_rpc,
             escrow_instance_id,
             &webhook_client,
-            &masked_alerts,
+            if probe { &quiet_alerts } else { &masked_alerts },
             &health,
             &mut previously_alerted_orphans,
             &mut breach_counters,
@@ -184,6 +200,7 @@ pub async fn run_reconciliation(
             &mut input_dark_ticks,
             &cancellation_token,
             &fence,
+            probe,
         )
         .await
         {
@@ -195,9 +212,16 @@ pub async fn run_reconciliation(
             }
         }
 
+        let can_probe = fence.state() == FenceState::Closed
+            && one_more_tick_is_safe(&breach_counters, liability_dark_ticks, input_dark_ticks);
+        let next_tick = if can_probe {
+            next_counted.min(tokio::time::Instant::now() + FENCE_PROBE_INTERVAL)
+        } else {
+            next_counted
+        };
         // Sleep between checks, but break immediately when cancellation is signaled.
         tokio::select! {
-            _ = tokio::time::sleep(config.reconciliation_interval) => {},
+            _ = tokio::time::sleep_until(next_tick) => {},
             _ = cancellation_token.cancelled() => {
                 info!("Reconciliation received cancellation signal during sleep, stopping...");
                 break;
@@ -207,6 +231,24 @@ pub async fn run_reconciliation(
 
     info!("Reconciliation stopped gracefully");
     Ok(())
+}
+
+/// Whether an extra tick can reach no halt, trip or alert threshold from these counters.
+fn one_more_tick_is_safe(
+    breach_counters: &BreachCounters,
+    liability_dark_ticks: u32,
+    input_dark_ticks: u32,
+) -> bool {
+    let streak = breach_counters
+        .supply
+        .values()
+        .chain(breach_counters.liability.values())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    streak + 1 < HALT_CONFIRM_TICKS
+        && input_dark_ticks + 1 < INPUT_DARK_HALT_TICKS
+        && liability_dark_ticks + 1 < LIABILITY_DARK_ALERT_TICKS
 }
 
 /// A per-mint proven insolvency: channel supply exceeds escrow custody by more
@@ -316,13 +358,15 @@ fn insolvency_delta_bps(custody: u64, gap: u64) -> u64 {
 /// Whether a tick read every input the invariants need.
 #[derive(Debug, PartialEq, Eq)]
 enum TickInputs {
-    Complete,
+    /// Every input read; `ledger_covered` says the liability arm ran at the custody slot.
+    Complete { ledger_covered: bool },
     /// Something required could not be read; carries the reason.
     Missing(String),
 }
 
 /// Performs a single reconciliation check, then counts a tick that could not read
-/// every required input toward the input-dark halt.
+/// every required input toward the input-dark halt. A `probe` may open the fence but
+/// leaves every counter as it found it.
 #[allow(clippy::too_many_arguments)]
 async fn perform_reconciliation_check(
     storage: &Arc<Storage>,
@@ -340,7 +384,15 @@ async fn perform_reconciliation_check(
     input_dark_ticks: &mut u32,
     cancellation_token: &CancellationToken,
     fence: &SolvencyFence,
+    probe: bool,
 ) -> Result<(), OperatorError> {
+    let saved = probe.then(|| {
+        (
+            breach_counters.clone(),
+            *liability_dark_ticks,
+            *input_dark_ticks,
+        )
+    });
     let result = check_invariants(
         storage,
         config,
@@ -363,7 +415,7 @@ async fn perform_reconciliation_check(
         return result.map(|_| ());
     }
     let missing = match &result {
-        Ok(TickInputs::Complete) => None,
+        Ok(TickInputs::Complete { .. }) => None,
         Ok(TickInputs::Missing(reason)) => Some(reason.clone()),
         Err(e) => Some(e.to_string()),
     };
@@ -382,15 +434,27 @@ async fn perform_reconciliation_check(
     if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
         breach_counters.clear_announced();
     }
-    // Opens on a tick that read every input, under no halt, with no breach even suspected.
-    let clean = matches!(result, Ok(TickInputs::Complete))
-        && !*halted
+    // Opens on a tick that read every input and ran both arms, under no halt, with no breach
+    // even suspected. A supply-only tick is not proof: a drained pending deposit passes it.
+    let clean = matches!(
+        result,
+        Ok(TickInputs::Complete {
+            ledger_covered: true
+        })
+    ) && !*halted
         && breach_counters.supply.is_empty()
         && breach_counters.liability.is_empty();
     if clean && fence.open() {
         info!("Solvency fence open after a clean reconciliation tick");
     }
-    if fence.state() == FenceState::Closed {
+    if let Some((counters, liability, dark)) = saved {
+        *breach_counters = counters;
+        *liability_dark_ticks = liability;
+        *input_dark_ticks = dark;
+        OPERATOR_RECONCILIATION_INPUT_DARK_TICKS
+            .with_label_values(&[ProgramType::Escrow.as_label()])
+            .set(dark as f64);
+    } else if fence.state() == FenceState::Closed {
         fence.note_closed_tick();
     }
     result.map(|_| ())
@@ -531,7 +595,11 @@ async fn check_invariants(
             false
         }
         // Never counted: the caller skips input accounting once cancelled.
-        LedgerWait::Cancelled => return Ok(TickInputs::Complete),
+        LedgerWait::Cancelled => {
+            return Ok(TickInputs::Complete {
+                ledger_covered: false,
+            })
+        }
     };
     report_liability_arm_state(*liability_dark_ticks, config, webhook_client).await;
 
@@ -598,7 +666,9 @@ async fn check_invariants(
     Ok(
         match supply_missing.or(ledger_missing).or(unresolved_missing) {
             Some(reason) => TickInputs::Missing(reason),
-            None => TickInputs::Complete,
+            None => TickInputs::Complete {
+                ledger_covered: covered,
+            },
         },
     )
 }
@@ -2998,6 +3068,7 @@ mod tests {
             input_dark_ticks,
             token,
             &env.fence,
+            false,
         )
         .await
     }
@@ -3718,6 +3789,7 @@ mod tests {
             &mut 0,
             &CancellationToken::new(),
             &SolvencyFence::closed(),
+            false,
         )
         .await;
         assert!(res.is_ok(), "tick should complete: {res:?}");
@@ -3775,6 +3847,7 @@ mod tests {
             &mut 0,
             &CancellationToken::new(),
             &SolvencyFence::closed(),
+            false,
         )
         .await;
         assert!(halted, "a set durable flag must raise the in-memory guard");
@@ -3798,6 +3871,7 @@ mod tests {
             &mut 0,
             &CancellationToken::new(),
             &SolvencyFence::closed(),
+            false,
         )
         .await;
         assert!(
@@ -5000,6 +5074,7 @@ mod tests {
             input_dark,
             &CancellationToken::new(),
             &env.fence,
+            false,
         )
         .await;
     }
@@ -5228,6 +5303,7 @@ mod tests {
     async fn fence_opens_after_the_first_clean_complete_tick() {
         let mint = Pubkey::new_unique();
         let mut env = tick_env(mint, 1_000, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
         let label = "fence_opens_test";
         env.fence = SolvencyFence::closed().reporting_as(label);
         let (mut counters, mut halted) = (BreachCounters::default(), false);
@@ -5244,10 +5320,74 @@ mod tests {
         );
     }
 
+    /// The fence opens only once the liability arm has run. No checkpoint and a checkpoint
+    /// behind the custody slot both leave it closed; a covering checkpoint opens it.
+    #[tokio::test]
+    async fn fence_waits_for_a_covered_ledger() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_000).await;
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert_eq!(env.fence.state(), FenceState::Closed, "no checkpoint");
+
+        seed_checkpoint(&env.mock, 0);
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert_eq!(
+            env.fence.state(),
+            FenceState::Closed,
+            "checkpoint behind the custody slot"
+        );
+
+        seed_checkpoint(&env.mock, 1);
+        fence_tick(&env, &mut counters, &mut halted).await;
+        assert!(env.fence.is_open(), "a covered ledger opens the fence");
+    }
+
+    /// A first tick that fails leaves the fence closed, but the loop probes again well inside
+    /// the interval, so one blip at boot costs seconds rather than a full interval. The probe
+    /// is not a counted tick.
+    #[tokio::test]
+    async fn a_closed_fence_is_probed_before_the_next_interval() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_fail_times("get_mint_addresses", 1);
+        let config = OperatorConfig {
+            reconciliation_interval: Duration::from_secs(3600),
+            ..recon_config_zero_tolerance()
+        };
+        let token = CancellationToken::new();
+        let fence = env.fence.clone();
+        let task = tokio::spawn(run_reconciliation(
+            env.storage.clone(),
+            config,
+            fast_rpc(env.custody.url()),
+            fast_rpc(env.channel.url()),
+            test_instance(),
+            None,
+            token.clone(),
+            fence.clone(),
+        ));
+        let started = std::time::Instant::now();
+        while !fence.is_open() && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        token.cancel();
+        task.await.unwrap().unwrap();
+
+        assert!(
+            fence.is_open(),
+            "a probe opened the fence inside the interval"
+        );
+        assert_eq!(fence.closed_ticks(), 1, "only the counted tick closed");
+    }
+
     #[tokio::test]
     async fn fence_stays_closed_while_a_breach_is_suspected() {
         let mint = Pubkey::new_unique();
         let mut env = tick_env(mint, 900, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
         let (mut counters, mut halted) = (BreachCounters::default(), false);
 
         fence_tick(&env, &mut counters, &mut halted).await;
@@ -5279,6 +5419,7 @@ mod tests {
     async fn fence_stays_closed_while_the_halt_row_is_set() {
         let mint = Pubkey::new_unique();
         let env = tick_env(mint, 1_000, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
         env.storage
             .set_reconciliation_halt("prior halt")
             .await
@@ -5498,6 +5639,7 @@ mod tests {
         use crate::operator::escrow_sweep::tests::{mock_channel_clock, mock_multiple_accounts};
         let mint = Pubkey::new_unique();
         let mut env = tick_env(mint, 1_000, 1_000).await;
+        seed_checkpoint(&env.mock, 1);
         env.custody.reset();
         mock_channel_clock(&mut env.custody, 1, vec![1], Some(1)).await;
         let requested = Arc::default();

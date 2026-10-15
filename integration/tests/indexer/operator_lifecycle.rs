@@ -83,7 +83,10 @@ async fn seed_mint_status_allowed(
     Ok(())
 }
 
-/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the operator claims it.
+/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the
+/// operator claims it and the custody slot before its solvency fence opens. A test that also
+/// runs a withdraw processor keeps it within reach of the chain, since that processor anchors
+/// its allowlist read at the checkpoint.
 async fn seed_escrow_checkpoint(
     storage: &Storage,
     slot: u64,
@@ -400,7 +403,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .build();
 
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // 3. Start a PrivateChannel core node as the mint target. It reports every
     // found transaction as `finalized` instantly, so the operator's finalized
@@ -497,7 +500,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .transaction_type(TransactionType::Deposit)
         .build();
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
@@ -738,7 +741,17 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     .transaction_type(TransactionType::Deposit)
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        bad_mint.pubkey(),
+        env.instance,
+        &bad_authority,
+        10_000,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, client.get_slot().await? + 5).await?;
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
     // error leaves the row Processing for recovery to reconcile against the
@@ -887,7 +900,18 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         storage.insert_db_transaction(&txn).await?;
         signatures.push(sig);
     }
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The rows stand in for deposits, so custody must hold what they say was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        DEPOSIT_AMOUNT * NUM_USERS as u64,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
     // The mint target is a PrivateChannel node (instant finality), so balances

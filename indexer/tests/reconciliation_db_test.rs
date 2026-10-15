@@ -436,13 +436,14 @@ async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dy
 /// (`BlockMint` writes only that) and deposits (the program needs an `AllowedMint` for one).
 /// The mock-side twin uses the same rows.
 #[tokio::test(flavor = "multi_thread")]
-async fn unlisted_mints_come_from_history_and_deposits_only(
+async fn unlisted_mints_come_from_history_deposits_and_observed_releases(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
     let listed = Pubkey::new_unique().to_string();
     let history_only = Pubkey::new_unique().to_string();
     let deposit_only = Pubkey::new_unique().to_string();
     let withdrawal_only = Pubkey::new_unique().to_string();
+    let released_only = Pubkey::new_unique().to_string();
     insert_mint(&pool, &listed, 6, &spl_token::id().to_string()).await?;
     insert_history(&storage, &listed).await?;
     insert_transaction(&pool, "d_listed", &listed, 1, "deposit", "completed", 1).await?;
@@ -460,12 +461,29 @@ async fn unlisted_mints_come_from_history_and_deposits_only(
     )
     .await?;
     insert_withdrawal(&pool, "w_only", &withdrawal_only, 1, "completed", 1).await?;
+    // A release the escrow indexer saw is program-vetted, unlike a withdrawal row on its own.
+    let nonce = insert_withdrawal(&pool, "w_released", &released_only, 1, "completed", 1).await?;
+    observe_release(&storage, nonce, 2).await?;
 
     let mut unlisted = storage.get_unlisted_mints().await?;
     unlisted.sort();
-    let mut expected = vec![history_only, deposit_only];
+    let mut expected = vec![history_only, deposit_only, released_only];
     expected.sort();
     assert_eq!(unlisted, expected);
+    Ok(())
+}
+
+/// The mint universe and every ledger read join on `transactions.mint`, so it is indexed.
+#[tokio::test(flavor = "multi_thread")]
+async fn transactions_mint_is_indexed() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, _storage, _pg) = start_postgres().await?;
+    let indexed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = 'transactions' \
+         AND indexdef LIKE '%(mint)%')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(indexed, "transactions(mint) has no index");
     Ok(())
 }
 

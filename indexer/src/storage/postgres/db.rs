@@ -255,10 +255,14 @@ const RELEASED_BY_OBSERVATION: &str = "r.withdrawal_nonce IS NOT NULL";
 const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
     "(t.status = 'completed' OR r.withdrawal_nonce IS NOT NULL)";
 
-/// Mint sources besides `mints` that only the admin can create: status history and deposits,
-/// which the program takes only for a mint with an `AllowedMint`. Withdrawal rows are channel-side.
+/// Mint sources besides `mints` that the escrow program has vetted: status history, deposits,
+/// and withdrawals with an observed release, since `ReleaseFunds` checks the `AllowedMint`.
+/// A withdrawal row on its own is channel-side, where anyone can burn a mint of their own.
 const UNLISTED_MINT_SOURCES: &str = "SELECT mint_address FROM mint_status_history \
-     UNION SELECT mint AS mint_address FROM transactions WHERE transaction_type = 'deposit'";
+     UNION SELECT mint AS mint_address FROM transactions WHERE transaction_type = 'deposit' \
+     UNION SELECT t.mint AS mint_address FROM transactions t \
+       JOIN observed_releases r ON r.withdrawal_nonce = t.withdrawal_nonce \
+       WHERE t.transaction_type = 'withdrawal'";
 
 /// The per-mint reconciliation aggregate. Only the test for a released withdrawal varies, so
 /// both reads share one shape and one mint universe: `mints` plus the unlisted mints.
@@ -497,6 +501,11 @@ impl PostgresDb {
         .await?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_slot ON transactions (slot)")
+            .execute(&self.pool)
+            .await?;
+
+        // The reconciliation mint universe and every ledger read join on mint.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_mint ON transactions (mint)")
             .execute(&self.pool)
             .await?;
 
@@ -3367,8 +3376,9 @@ impl PostgresDb {
             .await
     }
 
-    /// Mints with status history or deposit rows but no `mints` row. A `BlockMint` in range
-    /// writes only history, and an indexer that started after the `AllowMint` has no row.
+    /// Mints with status history, deposit rows or released withdrawals but no `mints` row. A
+    /// `BlockMint` in range writes only history, and an indexer that started after the
+    /// `AllowMint` has no row.
     pub async fn get_unlisted_mints_internal(&self) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar(&format!(
             "SELECT mint_address FROM ({UNLISTED_MINT_SOURCES}) u \

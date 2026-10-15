@@ -79,7 +79,10 @@ every `mints` row (so a blocked or not-held mint is still checked) plus every mi
 that has `mint_status_history` or deposit rows but no `mints` row. That happens when
 the indexer started after the mint's `AllowMint`: a later `BlockMint` writes only
 history. Such an unlisted mint takes its token program from its on-chain
-`AllowedMint` account, read by address; if that account is absent or unreadable the
+`AllowedMint` account, read by address. Withdrawal rows join this set only once the
+escrow indexer has observed their release, because `ReleaseFunds` checks the
+`AllowedMint` while a burn on the channel can name any mint. If that account is
+absent or unreadable the
 mint gets no verdict from either check for the tick (its custody was never read),
 both checks hold its breach streak rather than reset it, and the tick counts as dark. The tick logs `Mints with history or deposits but no mints row`
 with their count, naming any it could not resolve; resyncing the escrow indexer from the `AllowMint` slot restores the
@@ -123,14 +126,20 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 
 Besides the durable flag, the escrow operator holds an in-memory solvency fence
 that its fetcher and its pre-broadcast claim both check. It starts **closed** at
-every boot and opens only after the first reconciliation tick that read every
-required input, found no breach even suspected, and saw no halt flag. As on every
-tick, a ledger the escrow indexer has not caught up to leaves the liability check
-unarmed (alerted, not blocking), so a boot during indexer lag opens on the supply
-check alone. Until then no deposit
-is fetched or minted; the first tick runs at startup, so a healthy boot waits a few
-seconds (up to about 30 s if the escrow indexer's checkpoint lags the custody
-slot). A confirmed breach **trips** the fence before the flag write is attempted,
+every boot and opens only after a reconciliation tick that read every required
+input, ran both checks with the ledger pinned at the custody slot, found no breach
+even suspected, and saw no halt flag. A tick whose liability check could not run
+(no escrow indexer checkpoint, or one behind the custody slot) is not proof and
+leaves the fence closed: a drained pending deposit passes the supply check alone.
+Until it opens no deposit is fetched or minted. The first tick runs at startup, and
+while the fence is closed the check is probed again every 15 s between the
+configured ticks, so a healthy boot waits seconds (up to about 30 s per tick while
+the escrow indexer's checkpoint lags the custody slot) and one failed first tick
+costs a probe, not a whole interval. A probe can open the fence but counts for
+nothing else: it never advances a breach or dark streak, never halts and never
+pages, and it is skipped whenever one more tick could cross a threshold, so every
+halt and alert still comes from a tick on the configured cadence.
+A confirmed breach **trips** the fence before the flag write is attempted,
 so a failing write cannot leave this process minting; a tripped fence never
 reopens until the process restarts. A builder refused by the fence is counted as
 `private_channel_operator_transaction_errors_total{error_reason="solvency_fence_closed"}`
@@ -143,7 +152,9 @@ exported as `private_channel_operator_solvency_fence_state` (0 closed, 1 open,
 ticks only; after that, with deposits waiting, `/health` reports the stall. The
 withdraw operator runs no reconciliation, so its fence is always open and the
 durable flag stays its only gate; while an insolvency write keeps failing it keeps
-releasing, so treat a confirmed-breach page with the flag still unset as urgent.
+releasing, so treat a confirmed-breach page with the flag still unset as urgent and
+stop the withdraw process by hand; a withdraw-side fence fed by the escrow operator's
+health is a tracked follow-up.
 
 ### Inputs-dark halt
 

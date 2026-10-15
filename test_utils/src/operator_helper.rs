@@ -298,6 +298,10 @@ async fn start_escrow_mock_harness(
         );
     }
     let mock_storage = MockStorage::new();
+    // The fence opens only once the ledger is pinned at the custody slot the mock answers.
+    if clean_first_tick {
+        mock_storage.set_checkpoint("escrow", 100);
+    }
     let storage = Arc::new(Storage::Mock(mock_storage.clone()));
 
     let postgres_config = PostgresConfig {

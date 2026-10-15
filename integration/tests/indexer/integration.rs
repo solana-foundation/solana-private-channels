@@ -901,7 +901,10 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     println!("\n=== Starting Solana -> PrivateChannel Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     // The validator plays the channel but has no status snapshot, so the shim serves it.
-    let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
+    // Users hold test-minted tokens on the same validator, which the operator would read as
+    // unbacked channel supply; mirror custody so its solvency fence can open.
+    let channel_shim =
+        ChannelShim::start_mirroring_custody(&test_validator.rpc_url(), instance_pda).await;
     let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
         channel_shim.url(),
         test_validator.rpc_url(),
