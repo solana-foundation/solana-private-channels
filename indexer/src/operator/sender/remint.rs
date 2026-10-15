@@ -44,9 +44,26 @@ const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
 /// lag, but a wait that never clears still ends in ManualReview.
 const MAX_FREE_WAITS: u32 = 20;
 
-/// Cap on remint `MintTo` attempts per row, counted by journal rows (superseded ones
-/// included). Checked only once every attempt is proven dead, so none can still land.
+/// Cap on remint `MintTo` attempts the channel executed and rejected. Checked only once
+/// every journaled attempt is proven dead; a send that never reached the chain is not counted.
 const MAX_REMINT_ATTEMPTS: usize = 3;
+
+/// How many of `sigs` the chain executed and rejected, read from one status snapshot.
+async fn count_rejected(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> Result<usize, String> {
+    let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
+    let snapshot = rpc
+        .get_signature_status_snapshot(&flat)
+        .await
+        .map_err(|e| format!("signature status snapshot RPC failed: {e}"))?;
+    Ok(snapshot
+        .value
+        .iter()
+        .flatten()
+        .filter(|status| {
+            status.err.is_some() && status.satisfies_commitment(CommitmentConfig::finalized())
+        })
+        .count())
+}
 
 /// Outcome of a single `attempt_remint` call.
 enum RemintAttempt {
@@ -58,7 +75,7 @@ enum RemintAttempt {
     DeferPreBroadcast(String),
     /// A signature is persisted, or we cannot prove one isn't, so a transaction
     /// may land. Reconcile it; never terminalize on a counter. Caller re-queues
-    /// without a cap; resends after dead attempts are capped by `MAX_REMINT_ATTEMPTS`.
+    /// without a cap; resends the channel keeps rejecting are capped by `MAX_REMINT_ATTEMPTS`.
     DeferInFlight(String),
     /// Cannot reconcile and cannot proceed safely; escalate to ManualReview.
     Failed(String),
@@ -146,15 +163,28 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
             // All prior attempts finalized-failed or expired: resend, unless the attempt cap is spent.
             SigFinality::Dead => {
                 proven_dead = stored.iter().map(|s| s.signature.clone()).collect();
-                // None of these can land, so stopping here cannot strand a mint. Expired
-                // attempts count too, since a preflight rejection also ends as an expiry.
+                // None of these can land, so stopping here cannot strand a mint. The channel
+                // does not simulate sends, so a rejection lands as a finalized error.
                 if stored.len() >= MAX_REMINT_ATTEMPTS {
-                    return RemintAttempt::Failed(format!(
-                        "remint attempt cap reached for transaction {}: all {} attempts finalized-failed or expired ({}); refusing to send another",
-                        info.transaction_id,
-                        stored.len(),
-                        proven_dead.join(", ")
-                    ));
+                    match count_rejected(&state.source_rpc_client, &prior_attempts).await {
+                        Ok(rejected) if rejected >= MAX_REMINT_ATTEMPTS => {
+                            return RemintAttempt::Failed(format!(
+                                "remint attempt cap reached for transaction {}: the channel rejected {} of {} attempts on chain ({}); refusing to send another",
+                                info.transaction_id,
+                                rejected,
+                                stored.len(),
+                                proven_dead.join(", ")
+                            ));
+                        }
+                        Ok(_) => {}
+                        // Nothing is sent, so waiting a tick costs nothing.
+                        Err(e) => {
+                            return RemintAttempt::DeferInFlight(format!(
+                                "could not count rejected remint attempts for transaction {}: {}; will retry",
+                                info.transaction_id, e
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1461,7 +1491,7 @@ async fn defer_or_escalate(
 
 /// Re-queue an in-flight remint (a sig is, or might be, journaled). Never terminalizes and
 /// never bumps the counter, since terminalizing a live sig risks a double mint. The loop
-/// still ends: `attempt_remint` escalates once `MAX_REMINT_ATTEMPTS` attempts are proven dead.
+/// still ends: `attempt_remint` escalates once the channel has rejected `MAX_REMINT_ATTEMPTS` attempts.
 fn requeue_in_flight(
     remaining: &mut Vec<PendingRemint>,
     entry: PendingRemint,
@@ -3926,16 +3956,11 @@ mod tests {
         );
     }
 
-    /// Once the cap's worth of attempts are all proven dead, another MintTo would be
-    /// rejected the same way, so the row goes to a human instead. Covers both ways an
-    /// attempt dies: finalized with an error, and expired without landing.
+    /// Once the channel has rejected the cap's worth of attempts on chain, another MintTo
+    /// would be rejected the same way, so the row goes to a human instead.
     #[tokio::test]
     async fn execute_deferred_remint_escalates_once_every_capped_attempt_is_dead() {
-        // Expired: height 200 past lvbh 100, floor 10 at or below the journaled slot 50.
-        for (shape, status) in [
-            ("finalized-failed", FINALIZED_FAILED_STATUS),
-            ("expired", "null"),
-        ] {
+        for (shape, status) in [("finalized-failed", FINALIZED_FAILED_STATUS)] {
             ensure_test_signer();
             let mut rpc_server = mockito::Server::new_async().await;
             let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
@@ -3992,6 +4017,99 @@ mod tests {
                 "{shape}: no claim was made, so nothing is retired"
             );
         }
+    }
+
+    /// A send that never reached the chain (the RPC refused it) expires without a status.
+    /// Only on-chain rejections count, so the row keeps retrying through an RPC outage.
+    #[tokio::test]
+    async fn execute_deferred_remint_keeps_resending_while_attempts_only_expired() {
+        // Expired: height 200 past lvbh 100, floor 10 at or below the journaled slot 50.
+        let mut one_expired = vec![FINALIZED_FAILED_STATUS; MAX_REMINT_ATTEMPTS - 1];
+        one_expired.push("null");
+        for (shape, statuses) in [
+            ("all expired", ["null"; MAX_REMINT_ATTEMPTS].join(",")),
+            ("one expired", one_expired.join(",")),
+        ] {
+            ensure_test_signer();
+            let mut rpc_server = mockito::Server::new_async().await;
+            let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+            state.confirmation_poll_interval_ms = 1;
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            seed_dead_journal(&mock, 719, MAX_REMINT_ATTEMPTS, 100, 50);
+            let _snapshot = mock_status_snapshot(&mut rpc_server, &statuses, 200, 10).await;
+            let _blockhash = mock_remint_blockhash(&mut rpc_server).await;
+            let send = mock_send_echoing_signature(&mut rpc_server).await.expect(1);
+            let _status = mock_rpc(
+                &mut rpc_server,
+                "getSignatureStatuses",
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":null,"err":null,
+                    "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+            )
+            .await;
+            seed_pending_remint_row(&mock, 719, 0);
+
+            let outcome =
+                execute_deferred_remint(&state, make_matured_remint(719, 79), &storage_tx).await;
+
+            send.assert_async().await;
+            assert!(
+                matches!(outcome, DeferredRemintOutcome::Resolved),
+                "{shape}: the fresh remint landed"
+            );
+            let update = storage_rx
+                .try_recv()
+                .expect("the fresh remint resolves the row");
+            assert_eq!(update.status, TransactionStatus::FailedReminted, "{shape}");
+        }
+    }
+
+    /// The cap needs the rejection count, so a failed count read waits a tick. It sends
+    /// nothing and escalates nothing, since every journaled attempt is already dead.
+    #[tokio::test]
+    async fn execute_deferred_remint_at_the_cap_waits_when_the_rejection_count_is_unreadable() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_dead_journal(&mock, 720, MAX_REMINT_ATTEMPTS, 100, 50);
+        // The first snapshot proves every attempt dead; every read after it fails.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let statuses = [FINALIZED_FAILED_STATUS; MAX_REMINT_ATTEMPTS].join(",");
+        let _snapshot = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatusSnapshot""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    format!(
+                        r#"{{"jsonrpc":"2.0","result":{{"blockHeight":200,"firstAvailableBlock":10,"value":[{statuses}]}},"id":1}}"#
+                    )
+                    .into_bytes()
+                } else {
+                    br#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#
+                        .to_vec()
+                }
+            })
+            .create_async()
+            .await;
+        let no_send = mock_send_echoing_signature(&mut rpc_server).await.expect(0);
+        seed_pending_remint_row(&mock, 720, 0);
+
+        let outcome =
+            execute_deferred_remint(&state, make_matured_remint(720, 80), &storage_tx).await;
+
+        no_send.assert_async().await;
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::DeferInFlight(..)),
+            "an unreadable count must wait, not escalate or resend"
+        );
+        assert!(storage_rx.try_recv().is_err(), "no status may be written");
     }
 
     /// A full journal whose last attempt is still in a block waits for it. The cap only

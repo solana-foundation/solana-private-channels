@@ -857,8 +857,8 @@ async fn coverage_is_certified_by_the_bitmap_slot_not_a_lagging_get_slot() {
 // ─────────────────────────────────────────────────────────────────────
 //
 // Each call sends a fresh MintTo that finalizes with an error. The next call
-// proves it dead and would resend forever; after `MAX` dead attempts the next
-// call must page a human instead of sending again.
+// proves it dead and would resend forever; after `MAX` on-chain rejections the
+// next call must page a human instead of sending again.
 #[tokio::test]
 async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
     // Mirrors the private cap in `sender/remint.rs`.
@@ -876,6 +876,21 @@ async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
         "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
         "confirmationStatus": "finalized"
     });
+    // One snapshot per classification, plus the rejection count read at the cap.
+    let failed_snapshot = |status: serde_json::Value| {
+        Reply::dynamic(move |req| {
+            let requested = req["params"][0].as_array().map_or(0, Vec::len);
+            json!({
+                "blockHeight": 200,
+                "firstAvailableBlock": 0,
+                "value": vec![status.clone(); requested],
+            })
+        })
+    };
+    mock.enqueue(
+        "getSignatureStatusSnapshot",
+        failed_snapshot(failed_status.clone()),
+    );
     for _ in 0..MAX {
         // A repeated blockhash would sign the same bytes, so every attempt would share one signature.
         mock.enqueue(
@@ -893,17 +908,9 @@ async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
             "getSignatureStatuses",
             Reply::result(json!({ "context": { "slot": 42 }, "value": [failed_status] })),
         );
-        let status = failed_status.clone();
         mock.enqueue(
             "getSignatureStatusSnapshot",
-            Reply::dynamic(move |req| {
-                let requested = req["params"][0].as_array().map_or(0, Vec::len);
-                json!({
-                    "blockHeight": 200,
-                    "firstAvailableBlock": 0,
-                    "value": vec![status.clone(); requested],
-                })
-            }),
+            failed_snapshot(failed_status.clone()),
         );
     }
 
@@ -962,9 +969,9 @@ async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
         "getLatestBlockhash",
         "sendTransaction",
         "getSignatureStatuses",
-        "getSignatureStatusSnapshot",
     ] {
         assert_eq!(mock.call_count(method), MAX, "{method}");
     }
+    assert_eq!(mock.call_count("getSignatureStatusSnapshot"), MAX + 1);
     mock.shutdown().await;
 }

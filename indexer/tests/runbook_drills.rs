@@ -2092,3 +2092,33 @@ async fn drill_18_halt_sweep_respects_nonce_floor() -> Result<(), Box<dyn std::e
     eprintln!("Nonce floor verified: sub-poison rows survive, poison and above are quarantined.");
     Ok(())
 }
+
+// ── Drill 19: a freshness miss at the processor requeue cap dispatches to J ──
+//
+// The processor's cap message carries the freshness error and also matches the
+// Path I row, so the J row must say it outranks I or triage loses J's steps.
+
+#[test]
+#[ignore]
+fn drill_19_freshness_cap_message_dispatches_to_path_j() {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Triage - freshness row outranks Path I",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let runbook = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root")
+        .join("docs/runbooks/withdrawal_manual_review.md");
+    let text = std::fs::read_to_string(&runbook).expect("read withdrawal_manual_review.md");
+
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("| `(freshness)`"))
+        .expect("the triage table must have a freshness row");
+    assert!(
+        row.contains("use this, not I"),
+        "the freshness row must outrank Path I: {row}"
+    );
+}

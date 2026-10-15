@@ -103,7 +103,7 @@ have prefixes.
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
-| `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved | no | processor requeue cap |
+| `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved (use this, not I) | no | processor requeue cap |
 | `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
@@ -432,17 +432,15 @@ release and the channel-side remint may have left partial state.
      row's status until restoration is reconciled - the alert state
      preserves the trail.
 
-**`remint failed: remint attempt cap reached`.** The operator stopped after
-at least 3 remint attempts that all finalized with an error or expired without
-landing. Expiry also counts, so a channel RPC outage during the sends can
-reach the cap with no permanent rejection. Every listed `MintTo` signature is proven dead, so none of them can
-still land. For this message, replace the balance check in step 2 with:
+**`remint failed: remint attempt cap reached`.** The channel rejected at
+least 3 remint attempts on chain (each finalized with an error), and every
+listed `MintTo` is proven dead. A send the RPC refused only expires and does
+not count, so an RPC outage keeps retrying instead of reaching this. For this
+message, replace the balance check in step 2 with:
 
-- Confirm each listed signature on the channel read node
-  (`solana confirm -v <signature> --url <channel-rpc-url>`): each must show an
-  error or no status. Do not rely on the ATA balance here, because an unrelated
-  transfer to the user would mislead it. If any one finalized successfully,
-  [escalate](_escalation.md) (Tier 2): the classifier has a defect.
+- Use the remint journal check at the top of this page, which classifies
+  every listed signature from one snapshot. Do not rely on the ATA balance
+  here, because an unrelated transfer to the user would mislead it.
 - Before restoring, also scan the user ATA's history from the row's `slot`
   (the burn) for a `MintTo` carrying this withdrawal's `private_channel:remint:`
   memo. A second sender could have sent one that is not in the list. Do not
@@ -450,7 +448,7 @@ still land. For this message, replace the balance check in step 2 with:
   the read node's history does not reach back to that slot, or a matching
   `MintTo` succeeded, do not restore; [escalate](_escalation.md) (Tier 2).
 - Find why the channel rejected the mint (operator logs for the transaction,
-  or the `InstructionError` from the confirm above) and fix it before any
+  or the `err` of each signature in that snapshot) and fix it before any
   restoration. A frozen ATA, a rotated mint authority or a supply limit
   rejects every retry the same way.
 - If the rejection is `InvalidOwner` on the idempotent ATA create, the user
