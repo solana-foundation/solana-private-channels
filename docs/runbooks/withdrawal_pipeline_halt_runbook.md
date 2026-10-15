@@ -65,9 +65,13 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    before it rotates into that generation.
 4. **Repairs chain-ahead nonces it can prove.** For each nonce whose bit is set
    with no `completed` row, the operator loads that withdrawal's stored broadcast
-   signatures and classifies them on-chain. A landed signature marks the row
-   `completed` against it. Anything else (no row, no signature, a signature that
-   is not proven landed, a row already terminal) writes nothing and refuses boot
+   signatures and classifies them on-chain. A landed signature marks a
+   `processing` or `pending_remint` row `completed` against it. On any other row
+   (`manual_review`, `failed`, `pending`) a landed signature still explains the
+   nonce: boot goes on, the row is left as it is, and the log reads `Consumed nonce
+   is explained by this row's landed release; the row is left as it is`. The
+   `manual_review` sweep or a human closes that row. Anything else (no row, no
+   signature, a signature that is not proven landed) writes nothing and refuses boot
    once the diff is done; see
    [Unexplained consumed nonce on startup](#unexplained-consumed-nonce-on-startup).
    A nonce whose row was already reminted still halts as a double payout.
@@ -249,7 +253,8 @@ problem, not a bitmap problem.
 ### After upgrading to this check
 
 Before this version, a chain-ahead nonce that could not be repaired was moved to
-`manual_review` and the operator started anyway. Those rows now refuse boot. Before
+`manual_review` and the operator started anyway. Those whose stored release signature
+did not land now refuse boot; one whose journaled release landed still boots. Before
 upgrading, list the `manual_review` withdrawals, check which of their nonces are set in
 the bitmap (see `withdrawal_manual_review.md`), and resolve those with the procedure below:
 

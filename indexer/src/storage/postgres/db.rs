@@ -221,8 +221,10 @@ fn database_url_password_is_blank(database_url: &str) -> bool {
 
 /// A full reset of every table, in dependency order. Only the pooled `drop_tables` uses it;
 /// resync deletes its own program's rows instead (see `wipe_program_on`).
-const DROP_STATEMENTS: [&str; 11] = [
+const DROP_STATEMENTS: [&str; 13] = [
     "DROP TABLE IF EXISTS resync_state CASCADE",
+    "DROP TABLE IF EXISTS consumed_channel_mints CASCADE",
+    "DROP TABLE IF EXISTS mint_status_history CASCADE",
     "DROP TABLE IF EXISTS pending_release_signatures CASCADE",
     "DROP TABLE IF EXISTS observed_releases CASCADE",
     "DROP TABLE IF EXISTS pending_remint_signatures CASCADE",

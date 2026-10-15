@@ -211,6 +211,8 @@ impl MockStorage {
         self.check_should_fail("drop_tables")?;
         self.pending_transactions.lock().unwrap().clear();
         self.mints.lock().unwrap().clear();
+        self.mint_status_history.lock().unwrap().clear();
+        self.consumed_mints.lock().unwrap().clear();
         self.committed_checkpoints.lock().unwrap().clear();
         Ok(())
     }

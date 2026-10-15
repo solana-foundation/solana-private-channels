@@ -209,6 +209,24 @@ async fn init_schema_fails_when_lock_is_held() -> Result<(), Box<dyn std::error:
 #[tokio::test(flavor = "multi_thread")]
 async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_consumed_mints(&[DbConsumedMint {
+            source_event_id: "event".to_string(),
+            signature: "sig".to_string(),
+            kind: "deposit".to_string(),
+            mint: "mint".to_string(),
+            recipient_ata: "ata".to_string(),
+            token_program: "token".to_string(),
+            amount: TokenAmount(1),
+        }])
+        .await?;
+    sqlx::query(
+        "INSERT INTO mint_status_history
+             (mint_address, status, effective_slot, transaction_index, instruction_index, signature)
+         VALUES ('mint', 'allowed', 1, 0, 0, 'sig')",
+    )
+    .execute(&pool)
+    .await?;
 
     storage.drop_tables().await?;
 
@@ -232,6 +250,13 @@ async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     .fetch_one(&pool)
     .await?;
     assert_eq!(count2.0, 3);
+
+    // A full reset leaves no row a later boot would load again.
+    assert!(storage.get_consumed_mints().await?.is_empty());
+    let history: (i64,) = sqlx::query_as("SELECT COUNT(*)::bigint FROM mint_status_history")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(history.0, 0);
     Ok(())
 }
 
