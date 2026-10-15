@@ -636,7 +636,8 @@ impl MockStorage {
             .collect())
     }
 
-    /// Mirrors the Postgres query: history and deposit mints across every store, minus `mints`.
+    /// Mirrors the Postgres query: history mints, deposit mints and the mints of withdrawals with
+    /// an observed release, across every store, minus `mints`.
     pub async fn get_unlisted_mints(&self) -> Result<Vec<String>, StorageError> {
         self.check_should_fail("get_unlisted_mints")?;
         let mut found: std::collections::BTreeSet<String> = self
@@ -650,12 +651,18 @@ impl MockStorage {
             let pending = self.pending_transactions.lock().unwrap();
             let singles = self.inserted_single_transactions.lock().unwrap();
             let batches = self.inserted_transactions.lock().unwrap();
+            let released = self.observed_releases.lock().unwrap();
             found.extend(
                 pending
                     .iter()
                     .chain(singles.iter())
                     .chain(batches.iter().flatten())
-                    .filter(|t| t.transaction_type == TransactionType::Deposit)
+                    .filter(|t| match t.transaction_type {
+                        TransactionType::Deposit => true,
+                        TransactionType::Withdrawal => t
+                            .withdrawal_nonce
+                            .is_some_and(|nonce| released.contains_key(&nonce)),
+                    })
                     .map(|t| t.mint.clone()),
             );
         }

@@ -454,6 +454,9 @@ async fn perform_reconciliation_check(
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS
             .with_label_values(&[ProgramType::Escrow.as_label()])
             .set(dark as f64);
+        OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS
+            .with_label_values(&[ProgramType::Escrow.as_label()])
+            .set(liability as f64);
     } else if fence.state() == FenceState::Closed {
         fence.note_closed_tick();
     }
@@ -5610,6 +5613,75 @@ mod tests {
             fence: SolvencyFence::closed(),
         };
         (env, requested)
+    }
+
+    /// The mock mirrors Postgres: a withdrawal whose release the escrow indexer observed puts
+    /// its mint in the universe; a withdrawal row alone does not.
+    #[tokio::test]
+    async fn mock_unlisted_mints_include_released_withdrawals() {
+        use crate::storage::common::models::DbObservedRelease;
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        seed_pending_withdrawal(&mock, 2, 2);
+        {
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            rows[0].mint = "released".to_string();
+            rows[1].mint = "unreleased".to_string();
+        }
+        mock.insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: 1,
+            signature: "release_1".to_string(),
+            slot: 5,
+            amount: None,
+        }])
+        .await
+        .unwrap();
+
+        let unlisted = mock.get_unlisted_mints().await.unwrap();
+
+        assert_eq!(unlisted, vec!["released".to_string()]);
+    }
+
+    /// A probe restores the liability-dark count and its gauge together, so monitoring never
+    /// shows a count the alerts are not using.
+    #[tokio::test]
+    async fn a_probe_restores_the_liability_dark_gauge() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1_000, 1_000).await;
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+        let (mut liability_dark, mut input_dark) = (1u32, 0u32);
+
+        let _ = perform_reconciliation_check(
+            &env.storage,
+            &recon_config_zero_tolerance(),
+            &fast_rpc(env.custody.url()),
+            &fast_rpc(env.channel.url()),
+            test_instance(),
+            &test_webhook_client(),
+            &MaskedAlerts::default(),
+            &None,
+            &mut None,
+            &mut counters,
+            &mut halted,
+            &mut liability_dark,
+            &mut input_dark,
+            &CancellationToken::new(),
+            &env.fence,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            liability_dark, 1,
+            "the probe's unknown ledger is not counted"
+        );
+        assert_eq!(
+            OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS
+                .with_label_values(&[ProgramType::Escrow.as_label()])
+                .get(),
+            1.0,
+            "the gauge shows the restored count"
+        );
     }
 
     #[tokio::test]
