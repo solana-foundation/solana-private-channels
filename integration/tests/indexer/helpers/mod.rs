@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 pub mod db;
+pub mod instance;
 pub mod operator_util;
 pub mod private_channel_node;
 pub mod test_types;
@@ -10,6 +11,7 @@ pub mod transactions;
 pub mod verification;
 
 pub use db::*;
+pub use instance::*;
 pub use operator_util::*;
 pub use private_channel_node::*;
 pub use test_types::*;

@@ -31,8 +31,18 @@ compose_file: "{{ 'docker-compose.devnet.yml' if network | default('localnet') i
 # is appended only on localnet (devnet/mainnet use real Solana RPC, no local
 # validator container). Override compose_services per-env if you need a custom
 # subset.
-compose_services_base: "postgres-primary postgres-replica write-node read-node gateway postgres-indexer indexer-solana indexer-private-channel operator-solana operator-private-channel"
-compose_services: "{{ compose_services_base }}{{ ' validator' if network | default('localnet') == 'localnet' else '' }}"
+compose_services_base: "postgres-primary postgres-replica write-node read-node gateway postgres-indexer indexer-private-channel"
+# These refuse to start without an escrow instance, so PHASE 1 leaves them out of a
+# localnet first boot that has none (`_workers_enabled`).
+compose_services_workers: "indexer-solana operator-solana operator-private-channel"
+compose_services: "{{ compose_services_base }}{{ (' ' ~ compose_services_workers) if (_workers_enabled | default(true) | bool) else '' }}{{ ' validator' if network | default('localnet') == 'localnet' else '' }}"
+
+# --- Program IDs ---
+# Fixed by each program's declare_id! and compiled into the indexer and clients, so
+# they are not deploy config. A custom ID needs rebuilt programs, images and clients;
+# PHASE 1 refuses an escrow_program_id / withdraw_program_id override that differs.
+compiled_escrow_program_id: 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
+compiled_withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 
 # Host interface the monitoring ports bind to. Loopback by default, matching the
 # raw compose stack: Grafana's datasource reads the indexer database, so an

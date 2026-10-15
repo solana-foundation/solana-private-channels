@@ -31,7 +31,7 @@ use {
         storage::{
             common::{
                 amount::TokenAmount,
-                models::{DbTransaction, TransactionStatus, TransactionType},
+                models::{DbTransaction, StoredSig, TransactionStatus, TransactionType},
                 storage::mock::MockStorage,
             },
             Storage,
@@ -111,13 +111,29 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     let recipient = Pubkey::new_unique();
     let sig = Signature::new_unique();
     let deadline = Utc::now() + chrono::Duration::seconds(20);
+    let transaction_id = 42;
 
     mock.pending_remint_transactions
         .lock()
         .unwrap()
         .push(make_row(
-            42, &mint, &initiator, &recipient, &sig, 5_000, deadline,
+            transaction_id,
+            &mint,
+            &initiator,
+            &recipient,
+            &sig,
+            5_000,
+            deadline,
         ));
+    // Boot rebuilds from the release journal, which the handoff writes with the row.
+    mock.release_signatures.lock().unwrap().insert(
+        transaction_id,
+        vec![StoredSig {
+            signature: sig.to_string(),
+            last_valid_block_height: 0,
+            blockhash_slot: None,
+        }],
+    );
 
     let storage = Arc::new(Storage::Mock(mock));
     let mut state = test_hooks::new_sender_state(
@@ -140,7 +156,7 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     assert_eq!(state.pending_remints.len(), 1, "exactly one row queued");
     let entry = &state.pending_remints[0];
 
-    assert_eq!(entry.ctx.transaction_id, Some(42));
+    assert_eq!(entry.ctx.transaction_id, Some(transaction_id));
     assert_eq!(entry.ctx.trace_id.as_deref(), Some("trace-42"));
     assert_eq!(entry.remint_info.mint, mint);
     assert_eq!(entry.remint_info.user, initiator);
@@ -219,14 +235,24 @@ async fn recover_escalates_malformed_row_but_continues_with_others() {
 
     // Row 2 — valid, must still be queued despite the bad sibling.
     let good_mint = Pubkey::new_unique();
+    let good_transaction_id = 11;
     let good = make_row(
-        11,
+        good_transaction_id,
         &good_mint,
         &Pubkey::new_unique(),
         &recipient,
         &sig,
         2_500,
         deadline,
+    );
+    // Boot rebuilds from the release journal, which the handoff writes with the row.
+    mock.release_signatures.lock().unwrap().insert(
+        good_transaction_id,
+        vec![StoredSig {
+            signature: sig.to_string(),
+            last_valid_block_height: 0,
+            blockhash_slot: None,
+        }],
     );
 
     mock.pending_remint_transactions
@@ -254,7 +280,10 @@ async fn recover_escalates_malformed_row_but_continues_with_others() {
 
     // Valid row queued, bad row skipped — one entry in the queue.
     assert_eq!(state.pending_remints.len(), 1);
-    assert_eq!(state.pending_remints[0].ctx.transaction_id, Some(11));
+    assert_eq!(
+        state.pending_remints[0].ctx.transaction_id,
+        Some(good_transaction_id)
+    );
     assert_eq!(state.pending_remints[0].remint_info.mint, good_mint);
 
     // The bad row MUST have emitted a ManualReview update so operators

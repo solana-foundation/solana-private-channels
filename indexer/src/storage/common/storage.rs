@@ -463,8 +463,8 @@ impl Storage {
     }
 
     /// Durably record a confirmed remint (status -> FailedReminted plus the
-    /// signature) in one write, before the async status writer runs. Closes the
-    /// crash window that would otherwise leave a landed remint as PendingRemint.
+    /// signature) in one write. The only operator write that sets FailedReminted,
+    /// so a reminted row always carries its landed signature.
     pub async fn record_remint_result(
         &self,
         transaction_id: i64,
@@ -829,8 +829,9 @@ impl Storage {
         delete_remint_signatures::delete_remint_signatures(self, transaction_id).await
     }
 
-    /// Drop remint signatures whose parent transaction is no longer
-    /// `PendingRemint`. Returns the number of rows removed.
+    /// Drop remint signatures only for terminal parents (completed, failed,
+    /// failed_reminted). A ManualReview row keeps its journal, since its MintTo
+    /// may still land. Returns the rows removed.
     pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
         gc_stale_remint_signatures::gc_stale_remint_signatures(self).await
     }
@@ -1771,6 +1772,66 @@ mod tests {
                 !storage.get_release_signatures(1).await.unwrap().is_empty(),
                 retained,
                 "{status:?} must {} its signatures",
+                if retained { "keep" } else { "lose" }
+            );
+        }
+    }
+
+    /// Mirrors the Postgres claim: a row with a landed remint was already
+    /// refunded, so its release is never claimed.
+    #[tokio::test]
+    async fn release_claim_refuses_a_reminted_row() {
+        let (storage, mock) = make_mock_storage();
+        let mut row = make_db_transaction();
+        row.id = 1;
+        row.status = TransactionStatus::Processing;
+        row.landed_remint_signature = Some("remint-landed".to_string());
+        let token = row.updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let claimed = storage
+            .claim_and_persist_signature(1, token, "sig-reminted".to_string(), 1, None)
+            .await
+            .unwrap();
+
+        assert!(claimed.is_none(), "a reminted row must not be released");
+    }
+
+    /// A non-terminal row can still have a remint in flight, so only a
+    /// terminal parent lets the sweep reclaim its journal.
+    #[tokio::test]
+    async fn remint_signature_gc_reclaims_terminal_rows_only() {
+        let cases = [
+            (TransactionStatus::Pending, true),
+            (TransactionStatus::Processing, true),
+            (TransactionStatus::Parked, true),
+            (TransactionStatus::PendingRemint, true),
+            (TransactionStatus::ManualReview, true),
+            (TransactionStatus::Completed, false),
+            (TransactionStatus::Failed, false),
+            (TransactionStatus::FailedReminted, false),
+        ];
+
+        for (status, retained) in cases {
+            let (storage, mock) = make_mock_storage();
+            let mut row = make_db_transaction();
+            row.id = 1;
+            row.status = status;
+            mock.pending_transactions.lock().unwrap().push(row);
+            assert_eq!(
+                storage
+                    .claim_remint_attempt(1, "sig-gc".to_string(), 10, None, &[])
+                    .await
+                    .unwrap(),
+                RemintClaim::Claimed
+            );
+
+            storage.gc_stale_remint_signatures().await.unwrap();
+
+            assert_eq!(
+                !storage.get_remint_signatures(1).await.unwrap().is_empty(),
+                retained,
+                "{status:?} must {} its journal",
                 if retained { "keep" } else { "lose" }
             );
         }

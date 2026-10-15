@@ -78,8 +78,8 @@ restart, since they only ingest.
 Before any operator restarts, engineering must clear the signing authority and
 take every row of that source transaction out of reach:
 
-1. Record the signature journals in the incident record. Recovery deletes a
-   row's remint journal once it leaves `pending_remint`, so this comes first.
+1. Record the signature journals in the incident record. Recovery deletes
+   both journals once a row goes terminal, so this comes first.
    ```sql
    SELECT transaction_id, signature, last_valid_block_height
      FROM pending_release_signatures

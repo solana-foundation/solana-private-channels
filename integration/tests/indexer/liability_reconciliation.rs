@@ -7,8 +7,8 @@ use crate::helpers::{
     mint_2022_to_owner,
 };
 use crate::setup::{
-    allow_mint_for_program, find_allowed_mint_pda, find_event_authority_pda, find_instance_pda,
-    TestEnvironment, TEST_ADMIN_KEYPAIR,
+    allow_mint_for_program, find_allowed_mint_pda, find_event_authority_pda, TestEnvironment,
+    TEST_ADMIN_KEYPAIR,
 };
 use private_channel_escrow_program_client::{
     instructions::DepositBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -938,10 +938,13 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
     let channel = MockRpcServer::start().await;
     mock_absent_channel_mint(&channel);
 
-    // The instance address is derived before anything exists on-chain, so the indexer can be
-    // watching it from empty and every row below arrives through the live stream.
+    // Only the instance exists before the indexer starts, since it refuses a missing one.
+    // Every row below then arrives through the live stream.
     let instance_seed = Keypair::new();
-    let (instance, _) = find_instance_pda(&instance_seed.pubkey());
+    let (_, instance) =
+        TestEnvironment::setup_instance(&client, &faucet, Some(instance_seed.insecure_clone()))
+            .await
+            .expect("instance");
     let mut indexer = EscrowIndexer::start(
         &db_url,
         &geyser_endpoint,

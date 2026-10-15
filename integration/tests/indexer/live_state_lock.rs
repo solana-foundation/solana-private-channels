@@ -97,6 +97,7 @@ fn common_config(postgres: PostgresConfig) -> PrivateChannelIndexerConfig {
 }
 
 fn operator_config() -> OperatorConfig {
+    test_utils::operator_helper::set_operator_env_vars(&solana_sdk::signature::Keypair::new());
     OperatorConfig {
         db_poll_interval: Duration::from_secs(60),
         batch_size: 10,
@@ -400,8 +401,8 @@ async fn operator_stops_when_the_live_lock_is_lost_during_fallback_validation() 
     assert_stopped_on_lock_loss(result);
 }
 
-/// I15. A lock lost while the withdraw boot preflight waits on RPC must stop startup before
-/// any worker starts. With no fallback the preflight makes the first RPC call.
+/// I15. A lock lost while the withdraw startup waits on RPC must stop it before any worker
+/// starts. With no fallback the instance check makes the first RPC call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operator_stops_when_the_live_lock_is_lost_during_the_withdraw_preflight() {
     let (url, _container) = start_postgres("live_lock_lost_preflight").await;
@@ -416,7 +417,7 @@ async fn operator_stops_when_the_live_lock_is_lost_during_the_withdraw_preflight
     .await;
 
     assert_stopped_on_lock_loss(result);
-    // Only the preflight's first call reached RPC: no retry and no worker ran before the stop.
+    // Only the first startup call reached RPC: no retry and no worker ran before the stop.
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
 }
 

@@ -725,15 +725,17 @@ async fn seed_tx(db_url: &str, signature: &str, ty: &str, status: &str) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
          VALUES ($1, $4, 'seed', 'seed', 'seed_mint', 100,
-                 $2::transaction_type, $3::transaction_status, NOW(), NOW())
+                 $2::transaction_type, $3::transaction_status, NOW(), NOW(), $5)
          RETURNING id",
     )
     .bind(signature)
     .bind(ty)
     .bind(status)
     .bind(SEED_SLOT)
+    // A reminted row must carry its landed remint (table CHECK).
+    .bind((status == "failed_reminted").then(|| format!("{signature}-remint")))
     .fetch_one(&pool)
     .await
     .expect("seed transaction")
@@ -3263,6 +3265,7 @@ impl Stack {
             workers.push(
                 Worker::spawn(move || async move {
                     start_solana_to_private_channel_operator_with_config(
+                        rpc.clone(),
                         rpc,
                         db,
                         admin(),
