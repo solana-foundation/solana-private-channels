@@ -567,23 +567,22 @@ async fn indexer_stops_when_the_live_lock_is_lost_while_building_the_datasource(
 /// crash of whichever task happened to exit first on the shared cancel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operator_reports_a_running_sender_lock_loss_as_such() {
-    // The running workers sign, and the admin signer is read once per process.
-    static SIGNER: std::sync::Once = std::sync::Once::new();
-    SIGNER.call_once(|| {
-        let key = bs58::encode(solana_sdk::signature::Keypair::new().to_bytes()).into_string();
-        std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var("ADMIN_PRIVATE_KEY", key);
-    });
     let (url, _container) = start_postgres("sender_lock_lost_running").await;
     let postgres = PostgresConfig {
         database_url: url.clone(),
         max_connections: 5,
     };
+    // Startup checks the escrow instance on the source chain before any worker runs.
+    let mut source = mockito::Server::new_async().await;
+    let _instance = crate::helpers::instance::mock_instance_account(&mut source).await;
+    let mut common = common_config(postgres);
+    common.source_rpc_url = Some(source.url());
+    common.escrow_instance_id = Some(crate::helpers::instance::test_instance());
     let sender_key =
         private_channel_indexer::operator::sender::sender_lock_key(ProgramType::Escrow);
     let run = tokio::spawn(operator::run(
         connect(&url).await,
-        common_config(postgres),
+        common,
         operator_config(),
         None,
     ));
