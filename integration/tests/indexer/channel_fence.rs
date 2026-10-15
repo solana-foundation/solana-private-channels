@@ -186,6 +186,22 @@ async fn primary_pitr_below_fence_refuses_boot() {
     assert_eq!(checkpoint_of(&pool).await, Some(CHECKPOINT as i64));
 }
 
+/// Serve the escrow instance the operator's startup check reads from Solana.
+async fn mock_instance(server: &mut ServerGuard) -> mockito::Mock {
+    server
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getAccountInfo"})))
+        .with_body(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "context": {"slot": 1},
+                "value": test_utils::instance_helper::test_instance_account(),
+            }})
+            .to_string(),
+        )
+        .create_async()
+        .await
+}
+
 /// Apex 164: the channel was restored behind the indexer DB, so completed deposits lost
 /// their credit. The escrow operator must refuse to start rather than keep minting there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,6 +212,7 @@ async fn escrow_operator_refuses_on_fence_mismatch() {
     let mut rpc = MockitoServer::new_async().await;
     let _slot = mock_slot(&mut rpc, 105).await;
     let _fence_block = mock_block(&mut rpc, CHECKPOINT, "ReproducedHash100", 99, "x").await;
+    let _instance = mock_instance(&mut rpc).await;
 
     let storage = std::sync::Arc::new(Storage::Postgres(
         PostgresDb::new(&postgres).await.expect("storage"),
@@ -207,7 +224,7 @@ async fn escrow_operator_refuses_on_fence_mismatch() {
         source_rpc_url: Some(rpc.url()),
         fallback_rpc_url: None,
         postgres,
-        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        escrow_instance_id: Some(test_utils::instance_helper::test_instance()),
     };
     let config = test_utils::operator_helper::default_operator_config();
     // Without the fence the operator would go on to sign mints, so give it a signer.
@@ -317,14 +334,27 @@ async fn primary_restore_refuses_everything() {
     let storage = std::sync::Arc::new(Storage::Postgres(
         PostgresDb::new(&postgres).await.expect("storage"),
     ));
+    // Both operators read the escrow instance from Solana before the fence, and the
+    // withdraw operator's Solana endpoints also answer its boot genesis probe.
+    let mut solana = MockitoServer::new_async().await;
+    let _genesis = solana
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getGenesisHash"})))
+        .with_body(
+            json!({"jsonrpc": "2.0", "id": 1, "result": "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY"})
+                .to_string(),
+        )
+        .create_async()
+        .await;
+    let _instance = mock_instance(&mut solana).await;
     let escrow = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         rpc_url: node.url.clone(),
-        source_rpc_url: Some(node.url.clone()),
+        source_rpc_url: Some(solana.url()),
         fallback_rpc_url: None,
         postgres: postgres.clone(),
-        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        escrow_instance_id: Some(test_utils::instance_helper::test_instance()),
     };
     let err = tokio::time::timeout(
         Duration::from_secs(120),
@@ -340,19 +370,7 @@ async fn primary_restore_refuses_everything() {
     .expect_err("a restored primary must refuse the escrow operator");
     assert!(matches!(err, OperatorError::ChannelFence { .. }), "{err}");
 
-    // The withdraw operator reads the channel as its source chain. Its Solana endpoints only
-    // need to answer the boot genesis probe, which runs before the fence.
-    let mut solana = MockitoServer::new_async().await;
-    let _genesis = solana
-        .mock("POST", "/")
-        .match_body(Matcher::PartialJson(json!({"method": "getGenesisHash"})))
-        .with_body(
-            json!({"jsonrpc": "2.0", "id": 1, "result": "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY"})
-                .to_string(),
-        )
-        .expect_at_least(1)
-        .create_async()
-        .await;
+    // The withdraw operator reads the channel as its source chain.
     let withdraw = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
@@ -362,7 +380,7 @@ async fn primary_restore_refuses_everything() {
             &solana.url(),
         )),
         postgres: postgres.clone(),
-        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        escrow_instance_id: Some(test_utils::instance_helper::test_instance()),
     };
     let storage = std::sync::Arc::new(Storage::Postgres(
         PostgresDb::new(&postgres).await.expect("storage"),
