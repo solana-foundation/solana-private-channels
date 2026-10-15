@@ -187,7 +187,8 @@ Truncation deletes in batches, and each batch commits the new retention floor
 (`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or
 aborted run therefore never advertises history it has already removed. Each batch
 also deletes the `address_signatures` rows of the transactions it removes, so the
-dump must hold that table too.
+dump must hold that table too. Rows left by truncations run before this change stay
+until removed once by hand: `DELETE FROM address_signatures WHERE slot < <getFirstAvailableBlock>;`
 
 **`--keep-slots` is a slot span, not a block count.** Blocks are sparse relative
 to slots: an idle node ticks `1000 / blocktime_ms` slots per block it produces
