@@ -84,9 +84,9 @@ async fn seed_mint_status_allowed(
 }
 
 /// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the
-/// operator claims it and the custody slot before its solvency fence opens. A test that also
-/// runs a withdraw processor keeps it within reach of the chain, since that processor anchors
-/// its allowlist read at the checkpoint.
+/// operator claims it and the custody slot before its solvency fence opens. The write only
+/// moves forward. A test that also runs a withdraw processor keeps it within reach of the
+/// chain, since that processor anchors its allowlist read at the checkpoint.
 async fn seed_escrow_checkpoint(
     storage: &Storage,
     slot: u64,
@@ -403,6 +403,17 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .build();
 
     storage.insert_db_transaction(&deposit_txn).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
     seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // 3. Start a PrivateChannel core node as the mint target. It reports every
@@ -500,6 +511,17 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .transaction_type(TransactionType::Deposit)
         .build();
     storage.insert_db_transaction(&deposit_txn).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
     seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Duplicate insert with same signature should not create a second mint.
@@ -751,12 +773,28 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
         10_000,
     )
     .await?;
-    seed_escrow_checkpoint(&storage, client.get_slot().await? + 5).await?;
+    // The fence opens only on a tick whose custody slot the checkpoint covers, and the withdraw
+    // processor later anchors its allowlist read at the checkpoint, so it can sit neither
+    // behind the chain nor far ahead of it: keep it a few slots ahead until the mint is claimed.
+    let reseed = {
+        let storage = storage.clone();
+        let client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(slot) = client.get_slot().await {
+                    let _ = seed_escrow_checkpoint(&storage, slot + 5).await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    };
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
     // error leaves the row Processing for recovery to reconcile against the
     // persisted signature, so it journals its signature and never reaches Failed.
     wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
+    reseed.abort();
     let mint_row = db::get_transaction(&pool, &mint_fail_sig)
         .await?
         .expect("the deposit row must exist");
