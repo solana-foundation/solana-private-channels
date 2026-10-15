@@ -238,10 +238,11 @@ async fn truncate_slots_inner(
         return Ok(report);
     }
 
-    // The proof can take long on an idle lock session; a dropped session frees the lock.
-    ensure_lock_held(lock_conn).await?;
     // A resync wipes the checkpoint, so one read before a long proof proves nothing now.
     ensure_withdraw_indexer_read_past(&options.consumer_check, truncate_before_slot).await?;
+    // Checked last: the proof and the read above can take long, and a dropped session
+    // frees the lock.
+    ensure_lock_held(lock_conn).await?;
 
     let (blocks_deleted, transactions_deleted) = process_block_batches(
         pool,
@@ -1365,6 +1366,46 @@ mod tests {
 
         let err = assert_refused(&url, &apply_opts(3, 100, dump.path(), &restore), &db.pool).await;
         assert!(err.contains("grew from 1 to 2"), "{err}");
+    }
+
+    /// The second checkpoint read can wait on a slow indexer database, so the lock is
+    /// checked after it. Here the lock session dies during that second read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lock_lost_during_the_second_checkpoint_read_aborts() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        sqlx::raw_sql(
+            "CREATE TABLE checkpoint_reads (n INT NOT NULL);
+             INSERT INTO checkpoint_reads VALUES (0);
+             CREATE FUNCTION withdraw_checkpoint()
+             RETURNS TABLE (program_type TEXT, last_committed_slot BIGINT)
+             LANGUAGE plpgsql AS $$
+             DECLARE reads INT;
+             BEGIN
+                 UPDATE checkpoint_reads SET n = n + 1 RETURNING n INTO reads;
+                 IF reads = 2 THEN
+                     PERFORM pg_terminate_backend(pid) FROM pg_locks
+                     WHERE locktype = 'advisory';
+                 END IF;
+                 RETURN QUERY SELECT 'withdraw'::TEXT, 100::BIGINT;
+             END $$;
+             CREATE VIEW indexer_state AS SELECT * FROM withdraw_checkpoint();",
+        )
+        .execute(db.pool.as_ref())
+        .await
+        .unwrap();
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        let options = TruncateOptions {
+            consumer_check: ConsumerCheck::WithdrawIndexer {
+                database_url: url.clone(),
+            },
+            ..apply_opts(3, 100, dump.path(), &restore)
+        };
+
+        let err = assert_refused(&url, &options, &db.pool).await;
+        assert!(err.contains("lock"), "{err}");
     }
 
     /// A deployment with no withdraw indexer opts out explicitly and needs no indexer database.
