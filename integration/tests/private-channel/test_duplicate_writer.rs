@@ -56,6 +56,7 @@ fn write_node_config(db_url: String, port: u16) -> NodeConfig {
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![],
         max_blockhashes: 150,
+        allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,
         metrics: Arc::new(NoopMetrics),
@@ -598,6 +599,89 @@ async fn write_node_validates_the_read_nodes_latest_blockhash() {
         .await
         .expect("getLatestBlockhash on the read node");
     await_blockhash_validity(&write_client, &new_hash, true).await;
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+}
+
+/// The window the write node published, as the ledger holds it.
+async fn published_window(conn: &mut PgConnection) -> Option<u64> {
+    let raw: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'max_blockhashes'")
+            .fetch_optional(conn)
+            .await
+            .expect("failed to read the published window");
+    raw.map(|raw| u64::from_le_bytes(raw.try_into().expect("the window must be 8 bytes")))
+}
+
+/// `lastValidBlockHeight` minus the height it was minted at. Blocks keep coming, so the
+/// read is retried until no block landed around it.
+async fn advertised_window_minus_one(client: &RpcClient) -> u64 {
+    let commitment = solana_commitment_config::CommitmentConfig::processed();
+    for _ in 0..50 {
+        let before = client.get_block_height().await.expect("getBlockHeight");
+        let (_, last_valid) = client
+            .get_latest_blockhash_with_commitment(commitment)
+            .await
+            .expect("getLatestBlockhash");
+        if client.get_block_height().await.expect("getBlockHeight") == before {
+            return last_valid - before;
+        }
+    }
+    panic!("the height never held still across a getLatestBlockhash");
+}
+
+/// A read node advertises the writer's window, not its own flag, and follows a writer
+/// restarted with a new one without being restarted itself. A larger window needs the
+/// explicit allowance, since it outlives deadlines the reader already handed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_node_follows_the_writers_window() {
+    let (_pg, url) = start_postgres().await;
+    let mut conn = PgConnection::connect(&url).await.expect("connect");
+    let writer_with = |max_blockhashes| {
+        let mut config = write_node_config(url.clone(), get_free_port());
+        config.mode = NodeMode::Write;
+        config.max_blockhashes = max_blockhashes;
+        config
+    };
+
+    let writer = run_node(writer_with(5))
+        .await
+        .expect("the write node must start");
+    await_first_block_in_db(&mut conn).await;
+    assert_eq!(published_window(&mut conn).await, Some(5));
+
+    let read_port = get_free_port();
+    let mut read_config = write_node_config(url.clone(), read_port);
+    read_config.mode = NodeMode::Read;
+    read_config.max_blockhashes = 150;
+    let reader = run_node(read_config)
+        .await
+        .expect("the read node must start");
+    await_first_block(read_port).await;
+    let client = RpcClient::new(format!("http://127.0.0.1:{read_port}"));
+    assert_eq!(advertised_window_minus_one(&client).await, 4);
+
+    writer.shutdown().await;
+    let writer = run_node(writer_with(3))
+        .await
+        .expect("a smaller window needs no allowance");
+    assert_eq!(published_window(&mut conn).await, Some(3));
+    assert_eq!(advertised_window_minus_one(&client).await, 2);
+
+    writer.shutdown().await;
+    let refused = run_node(writer_with(7)).await;
+    let err = refused.err().expect("a larger window must be refused");
+    assert!(err.to_string().contains("3 to 7"), "{err}");
+    assert_eq!(published_window(&mut conn).await, Some(3));
+
+    let mut allowed = writer_with(7);
+    allowed.allow_max_blockhashes_increase = true;
+    let writer = run_node(allowed)
+        .await
+        .expect("an allowed increase must start");
+    assert_eq!(published_window(&mut conn).await, Some(7));
+    assert_eq!(advertised_window_minus_one(&client).await, 6);
 
     reader.shutdown().await;
     writer.shutdown().await;

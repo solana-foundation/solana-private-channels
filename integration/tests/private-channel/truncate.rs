@@ -24,7 +24,7 @@ use {
     anyhow::{anyhow, Context, Result},
     private_channel_core::accounts::{
         traits::BlockInfo,
-        truncate::{truncate_slots, TruncateOptions},
+        truncate::{truncate_slots, ConsumerCheck, TruncateOptions},
         AccountsDB, PostgresAccountsDB,
     },
     solana_sdk::{hash::Hash, signature::Signature},
@@ -205,6 +205,8 @@ async fn seed_fixture(pool: &PgPool) -> Result<Vec<Signature>> {
             .with_context(|| format!("Failed to insert account_history row at slot {}", slot))?;
     }
 
+    // The write node publishes its window at boot; W = 1 keeps every cut here allowed.
+    private_channel_core::accounts::blockhash_window::publish(pool, 1).await?;
     Ok(signatures)
 }
 
@@ -235,6 +237,7 @@ async fn test_truncate_apply_mode_e2e() -> Result<()> {
         pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     let report = truncate_slots(&db, &options).await?;
@@ -310,6 +313,7 @@ async fn test_truncate_dry_run_e2e() -> Result<()> {
         pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: true,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     let report = tokio::time::timeout(Duration::from_secs(10), truncate_slots(&db, &options))
@@ -340,6 +344,47 @@ async fn test_truncate_dry_run_e2e() -> Result<()> {
     Ok(())
 }
 
+/// A cut that keeps fewer than 2 x max_blockhashes blocks is refused with a valid dump in
+/// hand, and every table it would have touched is left exactly as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_refuses_below_two_windows_e2e() -> Result<()> {
+    let (db, _container) = start_postgres("truncate_two_windows").await?;
+    let pool = db.pool.clone();
+    seed_fixture(pool.as_ref()).await?;
+    private_channel_core::accounts::blockhash_window::publish(pool.as_ref(), 2).await?;
+    let backup_path =
+        container_pg_dump(&_container, "truncate_two_windows", &["-Fc"], "two_windows")?;
+    let restore_bin = container_pg_restore_bin(&_container, "two_windows")?;
+
+    // keep_slots 3 keeps slots 3 to 5, three blocks, one short of 2W = 4.
+    let options = TruncateOptions {
+        keep_slots: 3,
+        pg_dump_path: Some(backup_path.clone()),
+        pg_restore_bin: restore_bin.clone(),
+        batch_size: 2,
+        dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
+    };
+    let err = truncate_slots(&db, &options)
+        .await
+        .expect_err("a cut inside two windows must be refused");
+    assert!(err.to_string().contains("keep_slots >= 4"), "{err}");
+
+    assert_eq!(count_rows(pool.as_ref(), "blocks").await?, 5);
+    assert_eq!(count_rows(pool.as_ref(), "transactions").await?, 5);
+    assert_eq!(count_rows(pool.as_ref(), "account_history").await?, 5);
+    let floor = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM metadata WHERE key = 'first_available_block'",
+    )
+    .fetch_one(pool.as_ref())
+    .await?;
+    assert_eq!(floor, 0, "a refused run must not write the floor");
+
+    cleanup_backup_artifact(&backup_path);
+    cleanup_backup_artifact(&restore_bin);
+    Ok(())
+}
+
 /// SOLA6-107: any fresh file used to pass the gate, even one that is not a dump.
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_arbitrary_file_is_refused() -> Result<()> {
@@ -355,6 +400,7 @@ async fn fresh_arbitrary_file_is_refused() -> Result<()> {
         pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
     let result = truncate_slots(&db, &options).await;
 
@@ -414,6 +460,7 @@ async fn no_dump_is_refused() -> Result<()> {
         pg_restore_bin: PathBuf::from("pg_restore"),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
     let result = truncate_slots(&db, &options).await;
 
@@ -457,6 +504,7 @@ async fn assert_dump_refused_with(
         pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
     let result = truncate_slots(&db, &options).await;
 
