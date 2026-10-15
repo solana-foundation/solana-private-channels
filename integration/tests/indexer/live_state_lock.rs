@@ -26,6 +26,7 @@ use {
         },
         DatasourceType,
     },
+    private_channel_metrics::{HealthConfig, HealthState},
     solana_commitment_config::CommitmentLevel,
     sqlx::Connection,
     std::{
@@ -477,5 +478,121 @@ async fn resync_stops_when_its_lock_is_lost_while_waiting_out_stale_workers() {
     assert_eq!(
         table, None,
         "nothing, not even the schema, may be touched inside the grace"
+    );
+}
+
+/// Withdraw indexer on Yellowstone with backfill off, so startup goes straight to the
+/// datasource build, whose anchor read goes to `backfill_rpc`. Withdraw skips reconciliation.
+fn rpc_polling_withdraw_configs(
+    postgres: PostgresConfig,
+    rpc: &str,
+) -> (PrivateChannelIndexerConfig, IndexerConfig) {
+    let mut common = common_config(postgres);
+    common.program_type = ProgramType::Withdraw;
+    common.rpc_url = rpc.to_string();
+    common.source_rpc_url = None;
+    common.escrow_instance_id = None;
+    (common, indexer_config())
+}
+
+/// I17. A lock lost while the datasource is being built and started must stop the indexer
+/// before the live source runs. Its tip read hangs on a black hole, so the start stays parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexer_stops_when_the_live_lock_is_lost_while_building_the_datasource() {
+    let (url, _container) = start_postgres("live_lock_lost_datasource_build").await;
+    let (rpc, accepts) = black_hole_rpc().await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+    let (common, indexer) = rpc_polling_withdraw_configs(postgres, &rpc);
+    let health = HealthState::new(HealthConfig::indexer());
+    let run = tokio::spawn(private_channel_indexer::indexer::run(
+        common,
+        indexer,
+        Some(health.clone()),
+    ));
+
+    // The lock is taken before the build, so a first accept means run is parked in it.
+    wait_until(
+        "the datasource start to reach RPC",
+        Duration::from_secs(30),
+        || async { accepts.load(Ordering::SeqCst) >= 1 },
+    )
+    .await;
+    assert_eq!(
+        health.last_progress_at().load(Ordering::SeqCst),
+        0,
+        "the stall clock must not start before the live source does"
+    );
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    let result = tokio::time::timeout(LOCK_LOST_STOP_BOUND, run)
+        .await
+        .expect("the indexer must stop soon after losing the live-state lock")
+        .expect("indexer task must not panic");
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "the indexer must stop on the lost lock, got: {result:?}"
+    );
+
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("admin connect");
+    let anchor: Option<i64> = sqlx::query_scalar(
+        "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
+    )
+    .fetch_optional(&mut conn)
+    .await
+    .expect("read the checkpoint")
+    .flatten();
+    assert_eq!(
+        anchor, None,
+        "no anchor may be written after the lock is lost"
+    );
+}
+
+/// I18. A sender lock lost while the operator runs must be reported as that loss, not as a
+/// crash of whichever task happened to exit first on the shared cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_reports_a_running_sender_lock_loss_as_such() {
+    let (url, _container) = start_postgres("sender_lock_lost_running").await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+    // Startup checks the escrow instance on the source chain before any worker runs.
+    let mut source = mockito::Server::new_async().await;
+    let _instance = crate::helpers::instance::mock_instance_account(&mut source).await;
+    let mut common = common_config(postgres);
+    common.source_rpc_url = Some(source.url());
+    common.escrow_instance_id = Some(crate::helpers::instance::test_instance());
+    let sender_key =
+        private_channel_indexer::operator::sender::sender_lock_key(ProgramType::Escrow);
+    let run = tokio::spawn(operator::run(
+        connect(&url).await,
+        common,
+        operator_config(),
+        None,
+    ));
+    wait_until(
+        "the operator to take the sender lock",
+        Duration::from_secs(30),
+        || async { advisory_sessions(&url, sender_key, true).await == 1 },
+    )
+    .await;
+
+    terminate_advisory_lock_holder(&url, sender_key).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .expect("the operator must stop after losing the sender lock")
+        .expect("operator task must not panic");
+    assert!(
+        matches!(result, Err(OperatorError::SenderLockLost { .. })),
+        "a running sender-lock loss must be reported as such, got: {result:?}"
     );
 }

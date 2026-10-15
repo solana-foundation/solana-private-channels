@@ -35,6 +35,10 @@ does not have it. The usual causes:
 2. A load balancer is splitting requests across replicas at different heights, so
    one replica lists a slot that another will not serve.
 3. The endpoint was restarted from a recent snapshot and never backfilled.
+4. Core truncation ran with `--skip-withdraw-indexer-check` while a withdraw
+   indexer was behind, or a withdraw indexer resync started below a cut that had
+   already been checked. Truncation otherwise refuses to cut past the withdraw
+   indexer's checkpoint.
 
 ### Symptom
 
@@ -42,7 +46,7 @@ does not have it. The usual causes:
 - The indexer's current slot stops advancing for one `program_type` while the
   chain tip keeps rising, so the lag panel climbs.
 - Deposits or withdrawals at and after the wedged slot never appear in the DB.
-- Live polling and reconnect gap-fill stay healthy and keep retrying; they do
+- Live polling and reconnect gap-fill stay up and keep retrying; they do
   not crash-loop. A startup backfill that hits the slot instead exits and is
   restarted in a loop, logging `Startup backfill failed` and `Backfill slot <N>
   is unavailable`. Each run exits within seconds, so the alert may not fire;
@@ -77,13 +81,15 @@ wedged slot named in the log is where the indexer stopped, **not** necessarily t
 slot the endpoint is missing, so confirm by asking for the first block at or after
 the batch end (`getBlocksWithLimit(<end+1>, 1)`) and trying to fetch that one.
 
-The corresponding log lines name the slot:
+The corresponding log lines name the slot, and which line it is tells you which
+endpoint refused it:
 
 ```
-# live polling
+# live RPC polling: the endpoint is COMMON_RPC_URL
 Slot <N> is unavailable: a block exists here that this endpoint will not serve; refusing to checkpoint past unknown contents
 
-# backfill or reconnect gap-fill
+# startup backfill or Yellowstone reconnect gap-fill: the endpoint is INDEXER_BACKFILL_RPC_URL,
+# else [indexer.backfill] rpc_url in the TOML, else COMMON_RPC_URL
 Backfill slot <N> is unavailable: a block exists here that this endpoint will not serve; aborting before checkpoint
 ```
 
@@ -93,19 +99,24 @@ Confirm the durable checkpoint is parked just below the named slot:
 SELECT program_type, last_committed_slot, updated_at FROM indexer_state;
 ```
 
-Confirm the endpoint really cannot serve it (substitute the slot from the log):
+Confirm the endpoint really cannot serve it. Run this in the indexer's
+environment so the variables are its own, and set `SLOT` to the slot from the
+log. It asks every configured endpoint, so it also shows which one, if any, has
+the block. An unset variable is skipped; a backfill URL set only in the TOML
+(`[indexer.backfill] rpc_url`) is not seen by it, so check that one by hand.
 
 ```sh
-curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","transactionDetails":"none","maxSupportedTransactionVersion":1,"rewards":false,"commitment":"finalized"}]}'
+SLOT=<N>
+for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$SLOT,{\"encoding\":\"json\",\"transactionDetails\":\"none\",\"maxSupportedTransactionVersion\":1,\"rewards\":false,\"commitment\":\"finalized\"}]}"; echo; done
 ```
 
-An error with code `-32004`, `-32007` or `-32009`, or a `null` result, confirms
-it. Then check that the node nonetheless lists the slot as a producer:
+On the endpoint that refused it, an error with code `-32004`, `-32007` or
+`-32009`, or a `null` result, confirms it. Then check that the same endpoint
+nonetheless lists the slot as a producer (set `url` to it):
 
 ```sh
-curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"getBlocks","params":[<N>,<N>,{"commitment":"finalized"}]}'
+curl -s "$url" -H 'content-type: application/json' -d \
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocks\",\"params\":[$SLOT,$SLOT,{\"commitment\":\"finalized\"}]}"
 ```
 
 If that returns `[<N>]` while `getBlock` refuses, the endpoint is internally
@@ -117,11 +128,23 @@ inconsistent (cause 2 above) and repointing at a single archival node fixes it.
    `indexer-solana` that is an archival Solana RPC provider; for
    `indexer-private-channel` that is a read node whose `blocks` table still
    holds the slot (check whether truncation removed it).
-2. Repoint the indexer and restart it:
-   - `COMMON_RPC_URL` for the primary datasource, and
-   - `COMMON_FALLBACK_RPC_URL` if one is configured.
+2. Repoint the endpoint that refused the slot, as named by the log line under
+   Detection, and restart the indexer:
+   - `COMMON_RPC_URL` for `Slot <N> is unavailable` (live RPC polling).
+   - `INDEXER_BACKFILL_RPC_URL` (or `[indexer.backfill] rpc_url` in the TOML)
+     for `Backfill slot <N> is unavailable` (startup backfill and Yellowstone
+     gap-fill; a `resync` run reads the same setting). These use
+     `COMMON_RPC_URL` only when neither is set, so repointing `COMMON_RPC_URL`
+     alone clears this case only then. Devnet sets `INDEXER_BACKFILL_RPC_URL`.
 
-   Both are read once at startup, so the process must be restarted.
+   `COMMON_FALLBACK_RPC_URL` does not clear this wedge. The indexer asks it only
+   for a block the primary served but could not decode, never for a block the
+   primary will not serve. If the loop above shows only the fallback has the
+   block, point the variable above at that endpoint and, in the same change,
+   point `COMMON_FALLBACK_RPC_URL` at a different archival endpoint or unset it.
+   The indexer refuses to start when a block source equals the fallback.
+
+   All of these are read once at startup, so the process must be restarted.
 3. Watch the counter go quiet and the checkpoint resume:
 
    ```sql

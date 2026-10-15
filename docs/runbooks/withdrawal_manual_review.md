@@ -102,7 +102,7 @@ have prefixes.
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
-| `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved | no | processor requeue cap |
+| `(freshness)` or `freshness unproven` | J - RPC behind the slot the gate proved (use this, not I) | no | processor requeue cap |
 | `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
@@ -112,6 +112,7 @@ have prefixes.
 | `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
 | `Max retries exceeded` together with `no signatures to verify` | I - retry budget spent with nothing broadcast (use this, not C) | no | `sender/transaction.rs` |
+| `requeue cap reached before this attempt broadcast` together with `no signatures to verify` or `never handed to the sender` | I - retry budget spent with nothing broadcast (use this, not C) | no | `sender/transaction.rs`, `processor.rs` |
 | `was recorded before the refund could be claimed` | K - release observed at the refund claim | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
@@ -416,6 +417,31 @@ release and the channel-side remint may have left partial state.
      row's status until restoration is reconciled - the alert state
      preserves the trail.
 
+**`remint failed: remint attempt cap reached`.** The channel rejected at
+least 3 remint attempts on chain (each finalized with an error), and every
+listed `MintTo` is proven dead. A send the RPC refused only expires and does
+not count, so an RPC outage keeps retrying instead of reaching this. For this
+message, replace the balance check in step 2 with:
+
+- Use the remint journal check at the top of this page, which classifies
+  every listed signature from one snapshot. Do not rely on the ATA balance
+  here, because an unrelated transfer to the user would mislead it.
+- Before restoring, also scan the user ATA's history from the row's `slot`
+  (the burn) for a `MintTo` carrying this withdrawal's `private_channel:remint:`
+  memo. A second sender could have sent one that is not in the list. Do not
+  start at `processed_at`: it is the escalation time, after every attempt. If
+  the read node's history does not reach back to that slot, or a matching
+  `MintTo` succeeded, do not restore; [escalate](_escalation.md) (Tier 2).
+- Find why the channel rejected the mint (operator logs for the transaction,
+  or the `err` of each signature in that snapshot) and fix it before any
+  restoration. A frozen ATA, a rotated mint authority or a supply limit
+  rejects every retry the same way.
+- If the rejection is `InvalidOwner` on the idempotent ATA create, the user
+  moved their token account to another owner, so minting there would credit
+  that owner. As part of the step 3 escalation, restore only to a token account
+  whose current owner is the row's `initiator`, or reconcile an agreed manual
+  release instead.
+
 ## Path C - ambiguous on-chain state
 
 The withdrawal *may* have landed; the operator could not verify before
@@ -679,10 +705,14 @@ finalized-failed or expired (`SigFinality::Dead`) demotes the stuck
 `processing` row back to `pending` for a fresh send. After
 `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with no release ever
 landing, recovery quarantines instead of looping forever. So the
-release-funds transaction was rebroadcast 3 times and every attempt died
-on-chain or expired - none finalized. The row data is valid (distinct
+release-funds transaction was retried 3 times and every attempt that was
+broadcast died on-chain or expired - none finalized. The row data is valid (distinct
 from Path A/F) and the signatures are conclusively Dead each cycle
 (distinct from Path C's ambiguity).
+
+If `pending_release_signatures` has no row for the transaction, step 2 has
+nothing to read: either every attempt failed before sending, or the sender
+deleted signatures the chain rejected. The operator logs hold the cause.
 
 ### Step 1 - verify on-chain
 
@@ -739,25 +769,37 @@ UPDATE transactions SET status = 'failed', updated_at = NOW()
 ## Path I - retry budget spent with nothing broadcast
 
 `error_message` contains `Max retries exceeded` and `no signatures to verify`,
-and `pending_release_signatures` has no row for the transaction. The sender's
-per-nonce attempt counter reached `operator.retry_max_attempts`
-(`OPERATOR_RETRY_MAX_ATTEMPTS`) before any release was broadcast. There are two
+or `requeue cap reached before this attempt broadcast` together with
+`no signatures to verify` or `never handed to the sender`. There are three
 causes:
 
-- A zero budget. The operator now refuses to start with `retry_max_attempts = 0`,
-  but rows quarantined before that check existed are not repaired by a restart:
-  with no recorded signature the stalled-release reconciliation never picks them up.
+- A zero budget. The sender's per-nonce attempt counter reached
+  `operator.retry_max_attempts` (`OPERATOR_RETRY_MAX_ATTEMPTS`) at once. The
+  operator now refuses to start with `retry_max_attempts = 0`, but rows
+  quarantined before that check existed are not repaired by a restart: with no
+  recorded signature the stalled-release reconciliation never picks them up.
 - Repeated build or sign failures, for example the blockhash RPC being down.
-  The counter survives a pre-broadcast requeue, so a small budget runs out.
+  The attempt counter survives a pre-broadcast requeue, so a small budget runs out.
+- The pre-broadcast requeue cap. The row was requeued
+  `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) times after failures before any send
+  (build or sign failed, chain state or the database unreadable), and the next
+  failure escalated it. `build/sign failed` and `chain state unreadable` come
+  from the sender; `never handed to the sender` comes from the processor.
 
-Nothing was broadcast for these rows.
+The failing attempt broadcast nothing. With `no signatures to verify`,
+`pending_release_signatures` has no row for the transaction. With
+`never handed to the sender`, it may still hold signatures from earlier
+attempts that recovery proved dead; step 2 settles them either way.
 
 1. Find out why the attempts failed. Read the operator logs for the nonce
-   (`Transaction attempt n/m` and the build or sign error before each) and fix that
-   cause first. For a zero budget, confirm the running operator has
+   (`Transaction attempt n/m` and the build or sign error before each; for
+   `never handed to the sender`, the processor error before
+   `Withdrawal failed after max pre-broadcast requeues`) and fix that cause
+   first. For a zero budget, confirm the running operator has
    `retry_max_attempts` of at least 1.
 2. Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
-   verdict: `NOT_LANDED`. If `LANDED`, switch to Path C.
+   verdict: `NOT_LANDED`. If `LANDED`, switch to Path C. If `AMBIGUOUS`,
+   [escalate](_escalation.md) (Tier 2).
 3. Re-arm the row so the operator sends it again:
 
 ```sql

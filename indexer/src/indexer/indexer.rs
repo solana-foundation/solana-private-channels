@@ -13,7 +13,9 @@ use crate::{
         transaction_processor::TransactionProcessor,
     },
     operator::{RetryConfig, RpcClientWithRetry},
-    shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
+    shutdown_utils::{
+        cleanup_after_backfill, drain_unless_lock_lost, shutdown_indexer, stop_signal, StopReason,
+    },
     storage::common::storage::live_lock::{
         under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
     },
@@ -144,32 +146,6 @@ async fn abandon_writers_on_lost_lock(
     error!("Live-state lock lost; stopping without draining");
     crate::shutdown_utils::abort_and_await_writers(writers).await;
     true
-}
-
-/// Run a drain, but stop the writers with no flush as soon as the live-state lock is lost.
-/// The writers are aborted inside the lock branch, before the drain is dropped, because
-/// dropping it releases the checkpoint sender and would cue the flush being prevented.
-async fn drain_unless_lock_lost<T>(
-    lock_lost: &CancellationToken,
-    cancellation_token: &CancellationToken,
-    writers: &[tokio::task::AbortHandle],
-    drain: impl std::future::Future<Output = T>,
-) -> Result<T, IndexerError> {
-    tokio::select! {
-        biased;
-        _ = async {
-            lock_lost.cancelled().await;
-            for writer in writers {
-                writer.abort();
-            }
-        } => {
-            error!("Live-state lock lost during shutdown; stopping without draining");
-            cancellation_token.cancel();
-            crate::shutdown_utils::abort_and_await_writers(writers).await;
-            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
-        }
-        result = drain => Ok(result),
-    }
 }
 
 /// How long a fill that failed to send waits for the processor it suspects of dying.
@@ -1023,164 +999,185 @@ pub async fn run(
         }
     }
 
-    // 6. Start datasource
-    let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
-        #[cfg(feature = "datasource-rpc")]
-        DatasourceType::RpcPolling => {
-            let rpc_config = indexer_config.rpc_polling.as_ref().ok_or_else(|| {
-                DataSourceError::InvalidConfig {
-                    reason: "RPC polling config required for RpcPolling datasource".to_string(),
-                }
-            })?;
-
-            // A fill is what recovers slots below wherever the stream starts. Without one
-            // the stream is the only producer, so it has to resume from the checkpoint
-            // rather than the tip it would otherwise default to.
-            let live_start_slot = match rpc_live_start_slot {
-                Some(resolved) => Some(resolved),
-                None => {
-                    let checkpoint =
-                        get_last_checkpoint(&storage, common_config.program_type).await?;
-                    start_floor(
-                        RPC_POLLING_START_SETTING,
-                        common_config.program_type,
-                        checkpoint,
-                        rpc_config.from_slot,
-                    )?;
-                    live_resume_slot(checkpoint, rpc_config.from_slot)
-                }
-            };
-
-            let mut source = RpcPollingSource::new(
-                common_config.rpc_url.clone(),
-                live_start_slot,
-                rpc_config.poll_interval_ms,
-                rpc_config.error_retry_interval_ms,
-                rpc_config.batch_size,
-                rpc_config.encoding,
-                rpc_config.commitment,
-                common_config.program_type,
-                common_config.escrow_instance_id,
-                common_config.fallback_rpc_url.clone(),
-            );
-            if let Some(h) = health.clone() {
-                source = source.with_health(h);
-            }
-            Box::new(source)
-        }
-
-        #[cfg(feature = "datasource-yellowstone")]
-        DatasourceType::Yellowstone => {
-            let yellowstone_config = indexer_config.yellowstone.as_ref().ok_or_else(|| {
-                DataSourceError::InvalidConfig {
-                    reason: "Yellowstone config required for Yellowstone datasource".to_string(),
-                }
-            })?;
-
-            info!(
-                "Starting Yellowstone datasource from {} (commitment: {})",
-                yellowstone_config.endpoint, yellowstone_config.commitment
-            );
-
-            let source = YellowstoneSource::new(
-                yellowstone_config.endpoint.clone(),
-                yellowstone_config.x_token.clone(),
-                yellowstone_config.commitment.clone(),
-                common_config.program_type,
-                common_config.escrow_instance_id,
-            );
-
+    // 6. Build and start the datasource. The Yellowstone build writes the startup anchor while
+    //    the writers above run, so a lock lost here stops them all without a drain.
+    let mut build_writers = vec![
+        processor_handle.abort_handle(),
+        checkpoint_handle.abort_handle(),
+    ];
+    if let Some(task) = &backfill_task {
+        build_writers.push(task.abort_handle());
+    }
+    let build = async {
+        let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
             #[cfg(feature = "datasource-rpc")]
-            let source = {
-                use solana_commitment_config::CommitmentLevel as SdkCommitmentLevel;
-                use solana_transaction_status::UiTransactionEncoding;
+            DatasourceType::RpcPolling => {
+                let rpc_config = indexer_config.rpc_polling.as_ref().ok_or_else(|| {
+                    DataSourceError::InvalidConfig {
+                        reason: "RPC polling config required for RpcPolling datasource".to_string(),
+                    }
+                })?;
 
-                let encoding = indexer_config
-                    .rpc_polling
-                    .as_ref()
-                    .map(|c| c.encoding)
-                    .unwrap_or(UiTransactionEncoding::Json);
-
-                let commitment = match yellowstone_config.commitment.to_lowercase().as_str() {
-                    "processed" => SdkCommitmentLevel::Processed,
-                    "finalized" => SdkCommitmentLevel::Finalized,
-                    _ => SdkCommitmentLevel::Confirmed,
+                // A fill is what recovers slots below wherever the stream starts. Without one
+                // the stream is the only producer, so it has to resume from the checkpoint
+                // rather than the tip it would otherwise default to.
+                let live_start_slot = match rpc_live_start_slot {
+                    Some(resolved) => Some(resolved),
+                    None => {
+                        let checkpoint =
+                            get_last_checkpoint(&storage, common_config.program_type).await?;
+                        start_floor(
+                            RPC_POLLING_START_SETTING,
+                            common_config.program_type,
+                            checkpoint,
+                            rpc_config.from_slot,
+                        )?;
+                        live_resume_slot(checkpoint, rpc_config.from_slot)
+                    }
                 };
 
-                let gap_rpc_poller = Arc::new(RpcPoller::new(
-                    indexer_config.backfill.rpc_url.clone(),
-                    encoding,
-                    commitment,
-                ));
+                let mut source = RpcPollingSource::new(
+                    common_config.rpc_url.clone(),
+                    live_start_slot,
+                    rpc_config.poll_interval_ms,
+                    rpc_config.error_retry_interval_ms,
+                    rpc_config.batch_size,
+                    rpc_config.encoding,
+                    rpc_config.commitment,
+                    common_config.program_type,
+                    common_config.escrow_instance_id,
+                    common_config.fallback_rpc_url.clone(),
+                );
+                if let Some(h) = health.clone() {
+                    source = source.with_health(h);
+                }
+                Box::new(source)
+            }
 
-                // The gap-fill is this datasource's only way back to a slot the stream
-                // failed closed on, and it runs unattended, so it gets the archival
-                // fallback. Empty means unset (env renders an unconfigured var as "").
-                let gap_fallback_poller = common_config
-                    .fallback_rpc_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|url| !url.is_empty())
-                    .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
+            #[cfg(feature = "datasource-yellowstone")]
+            DatasourceType::Yellowstone => {
+                let yellowstone_config = indexer_config.yellowstone.as_ref().ok_or_else(|| {
+                    DataSourceError::InvalidConfig {
+                        reason: "Yellowstone config required for Yellowstone datasource"
+                            .to_string(),
+                    }
+                })?;
 
                 info!(
-                    "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
-                    indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
+                    "Starting Yellowstone datasource from {} (commitment: {})",
+                    yellowstone_config.endpoint, yellowstone_config.commitment
                 );
 
-                // Reconnect repair replays from the durable checkpoint, so one has to exist
-                // before the stream can deliver anything. Failing here refuses to start,
-                // which beats streaming past a window that could never be recovered: once a
-                // later slot is checkpointed, the slots below it stop being reachable.
-                let anchor = ensure_startup_anchor(
-                    &storage,
+                let source = YellowstoneSource::new(
+                    yellowstone_config.endpoint.clone(),
+                    yellowstone_config.x_token.clone(),
+                    yellowstone_config.commitment.clone(),
                     common_config.program_type,
-                    &gap_rpc_poller,
-                    startup_anchor_hint,
-                )
-                .await?;
+                    common_config.escrow_instance_id,
+                );
 
-                // Startup owns everything below its live boundary, so the first stream only
-                // replays above it. With no backfill the anchor is that boundary itself.
-                let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
+                #[cfg(feature = "datasource-rpc")]
+                let source = {
+                    use solana_commitment_config::CommitmentLevel as SdkCommitmentLevel;
+                    use solana_transaction_status::UiTransactionEncoding;
 
-                source
-                    .with_startup_floor(startup_floor)
-                    .with_gap_detection(
-                        gap_rpc_poller,
-                        gap_fallback_poller,
-                        indexer_config.backfill.max_gap_slots,
-                        indexer_config.backfill.batch_size,
+                    let encoding = indexer_config
+                        .rpc_polling
+                        .as_ref()
+                        .map(|c| c.encoding)
+                        .unwrap_or(UiTransactionEncoding::Json);
+
+                    let commitment = match yellowstone_config.commitment.to_lowercase().as_str() {
+                        "processed" => SdkCommitmentLevel::Processed,
+                        "finalized" => SdkCommitmentLevel::Finalized,
+                        _ => SdkCommitmentLevel::Confirmed,
+                    };
+
+                    let gap_rpc_poller = Arc::new(RpcPoller::new(
+                        indexer_config.backfill.rpc_url.clone(),
+                        encoding,
+                        commitment,
+                    ));
+
+                    // The gap-fill is this datasource's only way back to a slot the stream
+                    // failed closed on, and it runs unattended, so it gets the archival
+                    // fallback. Empty means unset (env renders an unconfigured var as "").
+                    let gap_fallback_poller = common_config
+                        .fallback_rpc_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
+
+                    info!(
+                        "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
+                        indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
+                    );
+
+                    // Reconnect repair replays from the durable checkpoint, so one has to exist
+                    // before the stream can deliver anything. Failing here refuses to start,
+                    // which beats streaming past a window that could never be recovered: once a
+                    // later slot is checkpointed, the slots below it stop being reachable.
+                    let anchor = ensure_startup_anchor(
+                        &storage,
+                        common_config.program_type,
+                        &gap_rpc_poller,
+                        startup_anchor_hint,
                     )
-                    .with_storage(storage.clone())
-            };
+                    .await?;
 
-            let source = if let Some(h) = health.clone() {
-                source.with_health(h)
-            } else {
-                source
-            };
+                    // Startup owns everything below its live boundary, so the first stream only
+                    // replays above it. With no backfill the anchor is that boundary itself.
+                    let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
 
-            Box::new(source)
-        }
+                    source
+                        .with_startup_floor(startup_floor)
+                        .with_gap_detection(
+                            gap_rpc_poller,
+                            gap_fallback_poller,
+                            indexer_config.backfill.max_gap_slots,
+                            indexer_config.backfill.batch_size,
+                        )
+                        .with_storage(storage.clone())
+                };
 
-        // Catch-all for disabled features
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(DataSourceError::InvalidConfig {
-                reason: format!(
-                    "Datasource {:?} is not compiled. Rebuild with the appropriate feature flag",
-                    indexer_config.datasource_type
-                ),
+                let source = if let Some(h) = health.clone() {
+                    source.with_health(h)
+                } else {
+                    source
+                };
+
+                Box::new(source)
             }
-            .into());
-        }
-    };
 
-    info!("Starting datasource...");
-    let datasource_handle = datasource
-        .start(instruction_tx.clone(), cancellation_token.clone())
-        .await?;
+            // Catch-all for disabled features
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(DataSourceError::InvalidConfig {
+                    reason: format!(
+                        "Datasource {:?} is not compiled. Rebuild with the appropriate \
+                         feature flag",
+                        indexer_config.datasource_type
+                    ),
+                }
+                .into());
+            }
+        };
+
+        info!("Starting datasource...");
+        let datasource_handle = datasource
+            .start(instruction_tx.clone(), cancellation_token.clone())
+            .await?;
+        Ok::<_, IndexerError>((datasource, datasource_handle))
+    };
+    let (datasource, datasource_handle) =
+        drain_unless_lock_lost(&live_lock_lost, &cancellation_token, &build_writers, build)
+            .await??;
+    // Start the stall clock at the live handoff, so a source that never delivers reads as
+    // stalled. Not earlier, so slow boot steps with no slot traffic do not read as a stall.
+    if let Some(h) = &health {
+        h.record_progress();
+    }
 
     info!("Indexer started, waiting for shutdown signal...");
 
@@ -2062,10 +2059,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(
-            matches!(
-                result,
-                Err(IndexerError::Storage(StorageError::LiveStateLockLost))
-            ),
+            matches!(result, Err(StorageError::LiveStateLockLost)),
             "a lock lost mid-drain must report the lost lock"
         );
         assert!(

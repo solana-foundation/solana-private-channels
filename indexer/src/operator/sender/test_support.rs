@@ -3,7 +3,7 @@
 //! Building it in one place keeps a new field from meaning a dozen edited call
 //! sites.
 
-use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
+use super::types::{InFlightQueue, InstructionWithSigners, SenderState, MAX_IN_FLIGHT};
 use crate::config::ProgramType;
 use crate::operator::utils::account_util::bitmap_account_bytes;
 use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
@@ -103,6 +103,7 @@ pub(super) fn sender_state_with_storage_and_role(
         pending_remints: Vec::new(),
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        send_tasks: tokio::task::JoinSet::new(),
         consumed: None,
     }
 }
@@ -544,4 +545,28 @@ pub(super) fn mock_bitmap_sequence(
         .create();
 
     (mock, calls)
+}
+
+/// An instruction with nothing in it, for paths that never reach the chain.
+pub(super) fn dummy_instruction() -> InstructionWithSigners {
+    InstructionWithSigners {
+        instructions: vec![],
+        fee_payer: Pubkey::default(),
+        signers: Vec::<&'static solana_keychain::Signer>::new(),
+        compute_unit_price: None,
+        compute_budget: None,
+    }
+}
+
+/// An RPC URL that accepts every connection and never answers, so a send parks on it.
+pub(super) async fn black_hole_rpc() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    url
 }

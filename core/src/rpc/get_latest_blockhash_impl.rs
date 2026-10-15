@@ -1,6 +1,9 @@
-use crate::rpc::{
-    error::{custom_error, JSON_RPC_SERVER_ERROR},
-    ReadDeps,
+use crate::{
+    accounts::blockhash_window::MAX_BLOCKHASHES_KEY,
+    rpc::{
+        error::{custom_error, JSON_RPC_SERVER_ERROR},
+        ReadDeps,
+    },
 };
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcContextConfig;
@@ -26,11 +29,21 @@ pub async fn get_latest_blockhash_impl(
     let block_height = snapshot.block_height.unwrap_or(0);
     let blockhash = snapshot.blockhash;
 
+    // The writer's own window, not a local flag, so the deadline matches what it admits.
+    let max_blockhashes = snapshot.max_blockhashes.ok_or_else(|| {
+        custom_error(
+            JSON_RPC_SERVER_ERROR,
+            format!(
+                "No blockhash window published: metadata key `{MAX_BLOCKHASHES_KEY}` is not set \
+                 until the write node has booted on this ledger"
+            ),
+        )
+    })?;
+
     // The window holds max_blockhashes entries and evicts one per produced block,
     // so a hash minted here is live for that many heights and the last of them is
     // the deadline. Inclusive, as Solana's is.
-    let last_valid_block_height =
-        block_height.saturating_add(read_deps.max_blockhashes.saturating_sub(1));
+    let last_valid_block_height = block_height.saturating_add(max_blockhashes.saturating_sub(1));
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

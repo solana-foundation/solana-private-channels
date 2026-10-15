@@ -66,6 +66,7 @@ fn minimal_node_config(accountsdb_connection_url: String, port: u16) -> NodeConf
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![dummy_admin],
         max_blockhashes: 150,
+        allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
         perf_sample_period_secs: 10,
         metrics: Arc::new(NoopMetrics),
@@ -773,6 +774,69 @@ async fn aio_never_serves_a_stale_cache_after_startup() -> Result<()> {
         account.is_none(),
         "the first read must come from Postgres, not the stale cache: {account:?}"
     );
+
+    handles.shutdown().await;
+    Ok(())
+}
+
+/// `lastValidBlockHeight` minus the Postgres height around it, retried until it reads
+/// `expected`: the cached tip can trail Postgres by a block between mirrors.
+async fn await_advertised_window(client: &RpcClient, expected: u64) {
+    let mut last = None;
+    for _ in 0..50 {
+        let before = client.get_block_height().await.expect("getBlockHeight");
+        let (_, last_valid) = client
+            .get_latest_blockhash_with_commitment(client.commitment())
+            .await
+            .expect("getLatestBlockhash");
+        if client.get_block_height().await.expect("getBlockHeight") == before {
+            if last_valid - before == expected {
+                return;
+            }
+            last = Some(last_valid - before);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the advertised window never read {expected}, last {last:?}");
+}
+
+/// The cached tip does not carry the window, so the cache path reads the published value
+/// per call and follows a writer that republished it.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_path_follows_a_republished_window() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(format!("redis://{redis_host}:{redis_port}"));
+    let handles = run_node(config).await.expect("run_node");
+    let url = format!("http://127.0.0.1:{port}");
+    wait_for_first_block(&url).await;
+    let client = RpcClient::new(url);
+
+    await_advertised_window(&client, 149).await;
+    let db = PostgresAccountsDB::new(&pg_url, false)
+        .await
+        .expect("connect to postgres");
+    private_channel_core::accounts::blockhash_window::publish(db.pool.as_ref(), 5).await?;
+    await_advertised_window(&client, 4).await;
 
     handles.shutdown().await;
     Ok(())

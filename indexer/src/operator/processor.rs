@@ -5,7 +5,9 @@ use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawConfigSetup,
     WithdrawalRemintInfo,
 };
-use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
+use crate::operator::recovery::{
+    check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
+};
 use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
 };
@@ -128,11 +130,13 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         OperatorError::Program(_) => ErrorDisposition::Quarantine("program_error"),
         // MissingBuilder means the processor was constructed without the state it
         // needs — configuration bug, not a row problem.  Exit to surface it.
-        // Sender-lock and config errors are startup errors and never reach the
-        // processor, but they're Fatal in spirit, so classify them alongside.
+        // Sender-lock, config and supervisor errors never reach the processor,
+        // but they're Fatal in spirit, so classify them alongside.
         OperatorError::MissingBuilder
         | OperatorError::SenderAlreadyRunning { .. }
         | OperatorError::SenderLockLostAtBoot { .. }
+        | OperatorError::CriticalTaskExited { .. }
+        | OperatorError::SenderLockLost { .. }
         | OperatorError::ChannelFence { .. }
         | OperatorError::InvalidConfig(_) => ErrorDisposition::Fatal,
         // A dead downstream channel means the sender or storage writer died; the
@@ -479,6 +483,7 @@ async fn requeue_or_quarantine_head(
             attempts = transaction.recovery_requeue_attempts,
             "Withdrawal failed after max pre-broadcast requeues; quarantining"
         );
+        let reason = format!("{PREBROADCAST_CAP_REACHED}, never handed to the sender: {reason}");
         quarantine_single(storage, storage_tx, pt_label, transaction, reason).await;
     } else {
         requeue_single_prebroadcast(storage, pt_label, transaction).await;
@@ -4087,6 +4092,10 @@ mod tests {
             .expect("a row out of requeues must be escalated");
         assert_eq!(update.status, TransactionStatus::ManualReview);
         assert_eq!(update.transaction_id, 1);
+        // The runbook needs both phrases to route this to the nothing-broadcast path.
+        let message = update.error_message.expect("escalation carries a message");
+        assert!(message.contains(PREBROADCAST_CAP_REACHED), "{message}");
+        assert!(message.contains("never handed to the sender"), "{message}");
     }
 
     /// A valid deposit transaction is wrapped as a Mint builder with the correct ATA and

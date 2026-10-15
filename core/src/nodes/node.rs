@@ -2,6 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures,
+            blockhash_window,
             postgres::{ensure_address_signatures_signature_index, PostgresAccountsDB},
             redis::RedisAccountsDB,
             writer_epoch,
@@ -96,8 +97,11 @@ pub struct NodeConfig {
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
     /// How many blocks a blockhash stays valid for. A block count, not a
     /// duration: blocks come from traffic and from the idle heartbeat, so the
-    /// wall-clock window moves with load exactly as it does on Solana.
+    /// wall-clock window moves with load exactly as it does on Solana. Read
+    /// mode ignores it and uses the value write modes publish to the ledger.
     pub max_blockhashes: usize,
+    /// Let a write node boot with a larger window than the ledger last recorded.
+    pub allow_max_blockhashes_increase: bool,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
     pub metrics: SharedMetrics,
@@ -124,6 +128,18 @@ pub fn resolve_max_blockhashes(
     }
 }
 
+/// A warning when an allowed increase took effect: every live hash now outlives the
+/// deadline readers handed out, and hashes just past it are admissible again.
+fn window_change_note(previous: Option<u64>, configured: u64) -> Option<String> {
+    let previous = previous.filter(|&p| p < configured)?;
+    Some(format!(
+        "max_blockhashes grew from {previous} to {configured}: every hash handed out before \
+         this boot stays admissible {} blocks past its advertised deadline, so a client that \
+         re-signs at that deadline may see the original land as well",
+        configured - previous
+    ))
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -145,6 +161,7 @@ impl Default for NodeConfig {
             redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
             admin_keys: vec![],         // No admin keys by default
             max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
+            allow_max_blockhashes_increase: false,
             blocktime_ms: DEFAULT_BLOCKTIME_MS,
             perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
@@ -288,7 +305,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     if config.blocktime_ms == 0 {
         return Err("blocktime_ms cannot be 0".into());
     }
-    // All modes need a non-zero window: Read advertises it as last_valid_block_height, write modes size the dedup cache with it.
+    // Write modes size the dedup cache with it and publish it. Read ignores it but still refuses zero.
     if config.max_blockhashes == 0 {
         return Err(
             "max_blockhashes must be greater than 0 (if you set the deprecated \
@@ -480,6 +497,19 @@ async fn start_services(
         };
         let writer_epoch = writer_epoch::bump(postgres_db).await?;
         info!("Claimed writer epoch {writer_epoch}");
+        // Readers derive their deadline from this row and truncation sizes what it keeps by
+        // it, so neither can disagree with the window this writer admits on.
+        let window = config.max_blockhashes as u64;
+        let previous_window = blockhash_window::publish_as_writer(
+            &postgres_db.pool,
+            window,
+            writer_epoch,
+            config.allow_max_blockhashes_increase,
+        )
+        .await?;
+        if let Some(note) = window_change_note(previous_window, window) {
+            warn!("{note}");
+        }
         // Before any address_signatures writer starts, so a first build blocks nothing live.
         ensure_address_signatures_signature_index(&postgres_db.pool).await?;
         repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
@@ -634,11 +664,9 @@ async fn start_services(
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
-            let max_blockhashes = config.max_blockhashes as u64;
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
                 accounts_db,
-                max_blockhashes,
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
                 ),
@@ -1160,6 +1188,16 @@ mod tests {
         assert!(err
             .to_string()
             .contains("max_blockhashes must be greater than 0"));
+    }
+
+    /// Only a larger window revives hashes, so only an increase is worth a warning.
+    #[test]
+    fn window_change_note_flags_only_an_increase() {
+        assert_eq!(window_change_note(None, 150), None, "first publish");
+        assert_eq!(window_change_note(Some(150), 150), None, "unchanged");
+        assert_eq!(window_change_note(Some(150), 100), None, "decrease");
+        let note = window_change_note(Some(100), 150).expect("increase");
+        assert!(note.contains("100") && note.contains("150"), "{note}");
     }
 
     /// The deprecated duration maps to the block count it used to imply, so an

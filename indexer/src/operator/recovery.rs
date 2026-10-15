@@ -59,6 +59,11 @@ pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 pub(crate) const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
+/// Marks a ManualReview escalation at the pre-broadcast requeue cap, where the failing
+/// attempt sent nothing. The runbook routes it to the nothing-broadcast path.
+pub(crate) const PREBROADCAST_CAP_REACHED: &str =
+    "requeue cap reached before this attempt broadcast";
+
 /// How long a `Processing` withdrawal may keep failing its on-chain release
 /// proof before it is escalated to a human.
 ///

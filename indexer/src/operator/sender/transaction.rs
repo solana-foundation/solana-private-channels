@@ -4,7 +4,9 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
-use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS};
+use crate::operator::recovery::{
+    load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
+};
 use crate::operator::utils::instruction_util::{
     mint_extra_error_checks_policy, TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
 };
@@ -317,7 +319,7 @@ pub(super) async fn route_builder_error(
                         nonce, "Could not read chain state to build the transaction: {e}"
                     );
                     let reason = format!(
-                        "chain state unreadable after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                        "{PREBROADCAST_CAP_REACHED}, chain state unreadable after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
                     );
                     requeue_or_fail_prebroadcast(
                         state,
@@ -593,40 +595,44 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height, blockhash_slot) =
-        match build_and_sign(&state.rpc_client, instruction.clone()).await {
-            Ok(signed) => signed,
-            Err(e) => {
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[pt, "error"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "build_sign_error"])
-                    .inc();
-                error!("Failed to build/sign transaction: {}", e);
-                // The failure came before a signature existed, so a withdrawal
-                // with nothing stashed from an earlier attempt provably never
-                // broadcast and can simply be retried.
-                match prebroadcast_requeue_target(state, ctx) {
-                    Some((nonce, transaction_id)) => {
-                        let reason = format!(
-                            "build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+    let (transaction, signature, last_valid_block_height, blockhash_slot) = match build_and_sign(
+        &state.rpc_client,
+        instruction.clone(),
+    )
+    .await
+    {
+        Ok(signed) => signed,
+        Err(e) => {
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "build_sign_error"])
+                .inc();
+            error!("Failed to build/sign transaction: {}", e);
+            // The failure came before a signature existed, so a withdrawal
+            // with nothing stashed from an earlier attempt provably never
+            // broadcast and can simply be retried.
+            match prebroadcast_requeue_target(state, ctx) {
+                Some((nonce, transaction_id)) => {
+                    let reason = format!(
+                            "{PREBROADCAST_CAP_REACHED}, build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
                         );
-                        requeue_or_fail_prebroadcast(
-                            state,
-                            ctx,
-                            storage_tx,
-                            nonce,
-                            transaction_id,
-                            &reason,
-                        )
-                        .await;
-                    }
-                    None => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
+                    requeue_or_fail_prebroadcast(
+                        state,
+                        ctx,
+                        storage_tx,
+                        nonce,
+                        transaction_id,
+                        &reason,
+                    )
+                    .await;
                 }
-                return;
+                None => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
             }
-        };
+            return;
+        }
+    };
 
     // A withdrawal nonce is consumed on broadcast, so a release that lands must already
     // have a durable signature record for crash recovery to reconcile against, and this
@@ -1932,7 +1938,7 @@ pub(super) async fn fire_and_store(
 /// cycle.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fire_and_store(
-    state: &SenderState,
+    state: &mut SenderState,
     instruction: InstructionWithSigners,
     compute_unit_price: Option<u64>,
     ctx: TransactionContext,
@@ -1961,7 +1967,9 @@ pub(super) fn spawn_fire_and_store(
     let program_type = state.program_type;
     let storage = state.storage.clone();
 
-    tokio::spawn(fire_and_store_task(
+    // Reap finished sends so the set only holds live ones.
+    while state.send_tasks.try_join_next().is_some() {}
+    state.send_tasks.spawn(fire_and_store_task(
         rpc_client,
         storage,
         in_flight,
@@ -2633,11 +2641,11 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
-        ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
-        mock_bitmap_read_failure, mock_finalized_anchor, mock_initialized_mint,
-        mock_with_processing_row, push_processing_deposit_row, push_processing_row,
-        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
-        sender_state as make_sender_state_with_server, sender_state_with_storage,
+        black_hole_rpc, dummy_instruction, ensure_test_signer, mock_bitmap_account,
+        mock_bitmap_account_counted, mock_bitmap_read_failure, mock_finalized_anchor,
+        mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
+        push_processing_row, push_withdrawal_with_nonce, requeue_attempts, row_status,
+        row_updated_at, sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
@@ -2647,21 +2655,10 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use solana_commitment_config::CommitmentConfig;
-    use solana_keychain::Signer;
     use solana_sdk::pubkey::Pubkey;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
-
-    fn dummy_instruction() -> InstructionWithSigners {
-        InstructionWithSigners {
-            instructions: vec![],
-            fee_payer: Pubkey::default(),
-            signers: Vec::<&'static Signer>::new(),
-            compute_unit_price: None,
-            compute_budget: None,
-        }
-    }
 
     fn make_sender_state() -> SenderState {
         make_sender_state_with_server("http://localhost:8899")
@@ -3432,44 +3429,71 @@ mod tests {
         );
     }
 
-    /// The cap lives in the same write that requeues, so a row that has spent
-    /// its budget escalates rather than cycling between Pending and Processing.
-    /// The capped write still bumps `updated_at`, so the escalation has to
-    /// present the lease that write returned or it would park nothing.
+    /// The cap lives in the requeue write, so a spent row escalates instead of cycling, presenting
+    /// the lease that write returned or it would park nothing. Covers both pre-broadcast
+    /// triggers: a build/sign failure and an unreadable chain or database.
     #[tokio::test]
     async fn build_failure_at_the_requeue_cap_escalates_to_manual_review() {
-        let txn_id = 11;
-        let nonce = 8;
-        let mock = mock_with_processing_row(txn_id);
-        mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
-            MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
-        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
-        state.release_leases.insert(nonce, lease);
-        state.remint_cache.insert(nonce, make_remint_info(txn_id));
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        for trigger in ["build/sign failure", "chain state unreadable"] {
+            let txn_id = 11;
+            let nonce = 8;
+            let mock = mock_with_processing_row(txn_id);
+            mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
+                MAX_RECOVERY_REQUEUE_ATTEMPTS;
+            let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+            let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+            state.release_leases.insert(nonce, lease);
+            state.remint_cache.insert(nonce, make_remint_info(txn_id));
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        send_and_confirm(
-            &mut state,
-            dummy_instruction(),
-            None,
-            &withdrawal_ctx(txn_id, nonce),
-            RetryPolicy::Idempotent,
-            &ExtraErrorCheckPolicy::None,
-            &storage_tx,
-        )
-        .await;
+            if trigger == "build/sign failure" {
+                send_and_confirm(
+                    &mut state,
+                    dummy_instruction(),
+                    None,
+                    &withdrawal_ctx(txn_id, nonce),
+                    RetryPolicy::Idempotent,
+                    &ExtraErrorCheckPolicy::None,
+                    &storage_tx,
+                )
+                .await;
+            } else {
+                route_builder_error(
+                    &mut state,
+                    &withdrawal_ctx(txn_id, nonce),
+                    &storage_tx,
+                    crate::error::StorageError::DatabaseError {
+                        message: "transient".to_string(),
+                    }
+                    .into(),
+                )
+                .await;
+            }
 
-        let update = storage_rx
-            .try_recv()
-            .expect("a row out of requeues must be escalated");
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        assert!(update.alert_only, "the fenced write already parked the row");
-        assert_eq!(
-            row_status(&mock, txn_id),
-            Some(TransactionStatus::ManualReview),
-            "the escalation must park the row, not requeue it"
-        );
+            let update = storage_rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{trigger}: a row out of requeues must be escalated"));
+            assert_eq!(update.status, TransactionStatus::ManualReview, "{trigger}");
+            assert!(
+                update.alert_only,
+                "{trigger}: the fenced write already parked the row"
+            );
+            assert_eq!(
+                row_status(&mock, txn_id),
+                Some(TransactionStatus::ManualReview),
+                "{trigger}: the escalation must park the row, not requeue it"
+            );
+            // The runbook needs both phrases to route this to the nothing-broadcast path.
+            let message = update.error_message.expect("escalation carries a message");
+            assert!(
+                message.contains(PREBROADCAST_CAP_REACHED),
+                "{trigger}: {message}"
+            );
+            assert!(
+                message.contains("no signatures to verify"),
+                "{trigger}: {message}"
+            );
+        }
     }
 
     /// An attempt that reaches the cap after recovery requeued its row and the
@@ -6400,6 +6424,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6493,6 +6518,7 @@ mod tests {
             SenderState {
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+                send_tasks: tokio::task::JoinSet::new(),
                 ..make_sender_state_with_server(&server.url())
             }
         };
@@ -6601,6 +6627,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6653,6 +6680,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6701,6 +6729,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6763,6 +6792,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -6843,6 +6873,7 @@ mod tests {
                 q
             },
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            send_tasks: tokio::task::JoinSet::new(),
             ..make_sender_state_with_server(&server.url())
         };
 
@@ -8108,7 +8139,7 @@ mod tests {
     /// fetcher can re-emit the transaction on the next poll cycle.
     #[tokio::test]
     async fn spawn_fire_and_store_cap_exhausted_returns_false() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
 
         // Hold all permits — simulates MAX_IN_FLIGHT tasks in-flight.
         let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
@@ -8126,7 +8157,7 @@ mod tests {
         };
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             ctx,
@@ -8149,13 +8180,13 @@ mod tests {
     /// so back-pressure is applied as soon as the task starts, not after it finishes.
     #[tokio::test]
     async fn spawn_fire_and_store_available_capacity_returns_true_and_consumes_permit() {
-        let state = make_sender_state();
+        let mut state = make_sender_state();
         assert_eq!(state.semaphore.available_permits(), MAX_IN_FLIGHT);
 
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         let result = spawn_fire_and_store(
-            &state,
+            &mut state,
             dummy_instruction(),
             None,
             TransactionContext {
@@ -8179,6 +8210,53 @@ mod tests {
             MAX_IN_FLIGHT - 1,
             "one permit must be held by the spawned task"
         );
+    }
+
+    /// A lost live-state lock aborts the sender, and a mint send it spawned must stop with it
+    /// rather than broadcast after the operator has given the lock up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_sender_aborts_its_spawned_mint_sends() {
+        let state = make_sender_state_with_server(&black_hole_rpc().await);
+        let semaphore = state.semaphore.clone();
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+
+        let sender = tokio::spawn(async move {
+            let mut state = state;
+            let (storage_tx, _storage_rx) = mpsc::channel(10);
+            assert!(spawn_fire_and_store(
+                &mut state,
+                dummy_instruction(),
+                None,
+                TransactionContext {
+                    kind: TransactionKind::Mint,
+                    transaction_id: Some(1),
+                    withdrawal_nonce: None,
+                    trace_id: None,
+                    deposit_claim_lease: None,
+                },
+                RetryPolicy::None,
+                ExtraErrorCheckPolicy::None,
+                storage_tx,
+                SendDurability::Terminal,
+            ));
+            let _ = spawned_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        spawned_rx.await.unwrap();
+        assert_eq!(semaphore.available_permits(), MAX_IN_FLIGHT - 1);
+
+        sender.abort();
+        let _ = sender.await;
+
+        // The send task releases its permit only once it has stopped.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while semaphore.available_permits() < MAX_IN_FLIGHT {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawned mint send outlived the aborted sender"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     // ── run_poll_task: cancellation ───────────────────────────────────

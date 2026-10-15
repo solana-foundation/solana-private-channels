@@ -15,7 +15,7 @@ use {
     anyhow::{anyhow, Context, Result},
     private_channel_core::accounts::{
         traits::BlockInfo,
-        truncate::{truncate_slots, TruncateOptions},
+        truncate::{truncate_slots, ConsumerCheck, TruncateOptions},
         PostgresAccountsDB,
     },
     solana_sdk::{hash::Hash, signature::Signature},
@@ -109,6 +109,8 @@ async fn seed_minimal_blocks(pool: &PgPool) -> Result<()> {
             .execute(pool)
             .await?;
     }
+    // The write node publishes its window at boot; W = 1 keeps every cut here allowed.
+    private_channel_core::accounts::blockhash_window::publish(pool, 1).await?;
     Ok(())
 }
 
@@ -155,6 +157,7 @@ async fn test_truncate_aborts_when_backup_path_missing() -> Result<()> {
         pg_dump_path: Some(missing),
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     let err = truncate_slots(&db, &opts)
@@ -191,6 +194,7 @@ async fn test_truncate_aborts_when_backup_path_not_supplied() -> Result<()> {
         pg_dump_path: None, // ← the violation
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     let err = truncate_slots(&db, &opts)
@@ -220,6 +224,7 @@ async fn test_truncate_rejects_keep_slots_zero() -> Result<()> {
         pg_dump_path: None,
         batch_size: 2,
         dry_run: false,
+        consumer_check: ConsumerCheck::Skip,
     };
 
     let err = truncate_slots(&db, &opts)
