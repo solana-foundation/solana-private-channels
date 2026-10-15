@@ -164,8 +164,8 @@ JWT_SECRET=<openssl rand -hex 32>
 ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
 # Non-secret values below go in .env.devnet
-# Escrow instance (from Step 3)
-ESCROW_INSTANCE_ID=<your_instance_address>
+# Escrow instance (from Step 3). The indexer and operators refuse a blank or all-ones value.
+COMMON_ESCROW_INSTANCE_ID=<your_instance_address>
 
 # Keys allowed to mint on the Solana Private Channels payment channel (comma-separated public keys)
 # For testing, use your operator's public key
@@ -231,8 +231,8 @@ For reference, here are the ports and endpoints that are now running:
 | PostgreSQL Primary | `5432` | State database (write) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Replica | `5433` | State database (read) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Indexer | `5434` | Indexer/operator database — bound to `127.0.0.1` (loopback-only), not externally reachable |
-| Operator (Solana) | `9102` | Deposit operator metrics |
-| Operator (channel) | `9103` | Withdrawal operator metrics |
+| Operator (Solana) | `9102` | Deposit operator metrics, bound to `127.0.0.1` (loopback-only), unauthenticated |
+| Operator (channel) | `9103` | Withdrawal operator metrics, bound to `127.0.0.1` (loopback-only), unauthenticated |
 | Grafana | `37429` | Metrics dashboard — bound to `127.0.0.1` (loopback-only); set `GF_ADMIN_PASSWORD` before startup |
 | Prometheus | `9090` | Metrics collection — bound to `127.0.0.1` (loopback-only) |
 | cAdvisor | `8080` | Container metrics — bound to `127.0.0.1` (loopback-only) |

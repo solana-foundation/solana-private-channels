@@ -4,7 +4,7 @@
 #
 # What this script does (in order):
 #   1.  Parse script-level flags (--rebuild, --clean).
-#   2.  Sanity-check that the bench binary and .env file exist.
+#   2.  Build the bench binary (a no-op when current) and ensure .env exists.
 #   3.  Load environment variables from .env.
 #   4.  Compute CPU affinity splits so services and the bench binary don't
 #       compete for the same cores.
@@ -14,7 +14,8 @@
 #   7.  Build Docker service images if missing or --rebuild was passed.
 #   8.  Optionally wipe data volumes (--clean) to start from a clean state.
 #   9.  Fix WAL archive volume permissions that Docker creates as root.
-#   10. Start all Docker Compose services.
+#   10. Start all Docker Compose services except the workers, which start in step 12
+#       once the escrow instance exists.
 #   11. Pin all private_channel containers to the service CPU set.
 #   12. Wait for every service to reach a stable/healthy state before
 #       proceeding — this prevents the bench from hitting a half-started node.
@@ -61,7 +62,8 @@ BENCH_ENV="${BENCH_DIR}/.env"
 #                       running after the bench finishes (or is interrupted)
 #                       so logs and metrics can be collected for offline
 #                       analysis.  Stop them manually afterwards with
-#                       `docker compose -f <repo>/docker-compose.yml down`.
+#                       `docker compose -f <repo>/docker-compose.yml --env-file
+#                       <repo>/versions.env --env-file <bench>/.env down`.
 #
 # --private-channel-threads N  Pin Solana Private Channels service containers to the first N CPU cores
 #                     and the bench binary to the remaining cores.  When
@@ -94,21 +96,14 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 2 — Build bench binary (if needed) and ensure .env exists
+# Step 2 — Build bench binary and ensure .env exists
 #
-# With --rebuild the binary is always recompiled.  On first run (no binary
-# yet) it is built automatically so `run.sh --rebuild` works from scratch.
+# Always run the cached Cargo build: it is a no-op when the binary is current, and
+# a binary older than its sources may lack a subcommand this script calls.
 # The .env file is auto-seeded from .env.sample if it does not exist yet.
 # ---------------------------------------------------------------------------
-if [ "${REBUILD}" -eq 1 ]; then
-    echo "Building bench binary (--rebuild flag set)..."
-    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
-elif [ ! -f "${BENCH_BIN}" ]; then
-    echo "Bench binary not found — building (this may take a few minutes)..."
-    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
-else
-    echo "Bench binary found — skipping build"
-fi
+echo "Building bench binary (a no-op when up to date)..."
+cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
 
 if [ ! -f "${BENCH_ENV}" ]; then
     if [ -f "${BENCH_DIR}/.env.sample" ]; then
@@ -290,6 +285,14 @@ for secret_key in POSTGRES_PASSWORD POSTGRES_REPLICATION_PASSWORD \
     fi
 done
 
+# Compose takes the signer backend from env with no default; bench signs with the
+# in-memory admin key, so fill memory into an older .env that predates the keys.
+for signer_key in ADMIN_SIGNER OPERATOR_SIGNER; do
+    if [ -z "${!signer_key:-}" ]; then
+        patch_env "${signer_key}" memory
+    fi
+done
+
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
 # --env-file in docker compose, so without this re-source the operator
@@ -417,8 +420,12 @@ done
 # above) which makes startup faster and avoids redundant layer checks.
 # Services run in detached mode (-d); logs are not tailed here.
 # ---------------------------------------------------------------------------
-echo "Starting all services..."
-"${COMPOSE[@]}" up -d --no-build
+# The workers refuse to start until the escrow instance exists, so they start after the
+# validator is up and the instance is created (Step 12).
+WORKERS=(indexer-solana operator-solana operator-private-channel)
+mapfile -t CORE_SERVICES < <("${COMPOSE[@]}" config --services | grep -vxF -f <(printf '%s\n' "${WORKERS[@]}"))
+echo "Starting all services except the workers..."
+"${COMPOSE[@]}" up -d --no-build "${CORE_SERVICES[@]}"
 
 # ---------------------------------------------------------------------------
 # Step 10b — Detect Docker gateway IP and refresh Prometheus + Grafana
@@ -657,6 +664,20 @@ wait_rpc "read-node"  "http://localhost:${READ_PORT}"  "private-channel-read-nod
 # Gateway: check its own /health endpoint (not a proxied backend call).
 wait_http_health "gateway" "http://localhost:${GATEWAY_PORT}/health"
 
+# Create the instance the workers watch, then start them.
+"${BENCH_BIN}" create-instance \
+    --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
+    --solana-rpc-url "${BENCH_SOLANA_RPC_URL:-http://localhost:${PRIVATE_CHANNEL_VALIDATOR_PORT:-18899}}" \
+    --instance-seed-keypair "${INSTANCE_SEED_FILE}"
+"${COMPOSE[@]}" up -d --no-build "${WORKERS[@]}"
+# Step 11 ran before the workers existed, so pin them here.
+if [ -n "${SERVICE_CPUSET}" ]; then
+    for worker in "${WORKERS[@]}"; do
+        docker update --cpuset-cpus="${SERVICE_CPUSET}" "private-channel-${worker}" >/dev/null \
+            || echo "  WARNING: could not pin private-channel-${worker}"
+    done
+fi
+
 # Remaining services have no healthcheck or RPC endpoint; just confirm they
 # are running and haven't crashed immediately on startup.
 wait_running "private-channel-streamer"
@@ -709,7 +730,7 @@ cleanup() {
     if [ "${TEARDOWN}" -eq 0 ]; then
         echo "Skipping teardown (--no-teardown). Containers are still running."
         echo "  Inspect logs:  docker logs <container>"
-        echo "  Stop later:    docker compose -f ${REPO_ROOT}/docker-compose.yml down"
+        echo "  Stop later:    docker compose -f ${REPO_ROOT}/docker-compose.yml --env-file ${REPO_ROOT}/versions.env --env-file ${BENCH_ENV} down"
         return
     fi
     echo "Tearing down all services..."

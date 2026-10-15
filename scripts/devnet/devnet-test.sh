@@ -46,6 +46,8 @@ if [ -f .env ]; then
   source .env
   set +a
 fi
+# Compose has no default signer backend; this script runs the in-memory admin key.
+export ADMIN_SIGNER="${ADMIN_SIGNER:-memory}" OPERATOR_SIGNER="${OPERATOR_SIGNER:-memory}"
 
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
 PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
@@ -160,9 +162,14 @@ cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin allow_mint -- 
 
 echo ""
 echo "=== Step 4: Update .env ==="
-sedi "s/^ESCROW_INSTANCE_ID=.*/ESCROW_INSTANCE_ID=$INSTANCE_ID/" .env
-export ESCROW_INSTANCE_ID=$INSTANCE_ID
-echo "Updated .env with ESCROW_INSTANCE_ID=$INSTANCE_ID"
+# An .env from before the rename has no COMMON_ line to replace, so append one.
+if grep -q '^COMMON_ESCROW_INSTANCE_ID=' .env; then
+    sedi "s/^COMMON_ESCROW_INSTANCE_ID=.*/COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID/" .env
+else
+    echo "COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID" >> .env
+fi
+export COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID
+echo "Updated .env with COMMON_ESCROW_INSTANCE_ID=$INSTANCE_ID"
 
 echo ""
 echo "=== Step 5: Update indexer config ==="

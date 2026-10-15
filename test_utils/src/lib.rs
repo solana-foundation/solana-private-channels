@@ -1,5 +1,6 @@
 pub mod channel_shim;
 pub mod indexer_helper;
+pub mod instance_helper;
 pub mod mint_helper;
 pub mod mock_rpc;
 #[cfg(feature = "test-mock-yellowstone")]

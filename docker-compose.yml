@@ -503,8 +503,8 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
       # Injected by bench-tps/scripts/run.sh, the full-stack orchestration script that
       # derives the escrow instance PDA and writes it to .env before starting services.
-      # When absent (e.g. manual `docker compose up`), the TOML config's
-      # escrow_instance_id is used — update that value to match your deployment.
+      # When absent from every env file, the TOML config's escrow_instance_id is used.
+      # A blank value in an env file overrides it and is refused at startup, as is all-ones.
       - COMMON_ESCROW_INSTANCE_ID
     volumes:
       - ./indexer/config:/config:ro
@@ -589,17 +589,19 @@ services:
       - COMMON_SOURCE_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
       # Injected by bench-tps/scripts/run.sh, the full-stack orchestration script that
       # derives the escrow instance PDA and writes it to .env before starting services.
-      # When absent (e.g. manual `docker compose up`), the TOML config's
-      # escrow_instance_id is used — update that value to match your deployment.
+      # When absent from every env file, the TOML config's escrow_instance_id is used.
+      # A blank value in an env file overrides it and is refused at startup, as is all-ones.
       - COMMON_ESCROW_INSTANCE_ID
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack). The operator alias is deliberate: both roles are
       # the same hot service identity. Both operator services must share this key:
       # it pays Solana releases, signs channel remints as mint authority, and
       # deposits make it the withdraw fee treasury.
-      - ADMIN_SIGNER=memory
+      # Backend from the env file, no default; presets and Ansible set memory. Other
+      # backends also need their ADMIN_*/OPERATOR_* vars passed in an override.
+      - ADMIN_SIGNER=${ADMIN_SIGNER:?ADMIN_SIGNER must be set (memory, vault, turnkey or privy)}
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - OPERATOR_SIGNER=memory
+      - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
@@ -608,9 +610,9 @@ services:
       # at any sink (presence is checked at startup, delivery failures are logged).
       - OPERATOR_RECONCILIATION_WEBHOOK_URL=${RECONCILIATION_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:
-      # Exposed to host so bench-tps can scrape private_channel_operator_mints_sent_total
-      # from outside Docker for e2e deposit measurement (BENCH_INDEXER_METRICS_URL).
-      - "9102:9102"
+      # Loopback only: unauthenticated, so never on a public interface. Host-local
+      # bench-tps scrapes it here; Prometheus scrapes over the Docker network.
+      - "127.0.0.1:9102:9102"
     volumes:
       - ./indexer/config:/config:ro
     command:
@@ -656,9 +658,11 @@ services:
       # the same hot service identity. Both operator services must share this key:
       # it pays Solana releases, signs channel remints as mint authority, and
       # deposits make it the withdraw fee treasury.
-      - ADMIN_SIGNER=memory
+      # Backend from the env file, no default; presets and Ansible set memory. Other
+      # backends also need their ADMIN_*/OPERATOR_* vars passed in an override.
+      - ADMIN_SIGNER=${ADMIN_SIGNER:?ADMIN_SIGNER must be set (memory, vault, turnkey or privy)}
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - OPERATOR_SIGNER=memory
+      - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       # Patched into .env by run.sh before `docker compose up` runs.
       # Passed through from the host shell — run.sh exports it via
@@ -667,9 +671,9 @@ services:
       - METRICS_PORT=9103
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:
-      # Exposed to host so bench-tps can scrape private_channel_operator_mints_sent_total
-      # from outside Docker for e2e withdraw measurement (BENCH_WITHDRAW_OPERATOR_METRICS_URL).
-      - "9103:9103"
+      # Loopback only: unauthenticated, so never on a public interface. Host-local
+      # bench-tps scrapes it here; Prometheus scrapes over the Docker network.
+      - "127.0.0.1:9103:9103"
     volumes:
       - ./indexer/config:/config:ro
     command:

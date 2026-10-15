@@ -84,13 +84,11 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     // Deterministic test: never observes wall clock outside the 10s poll loop.
-    let escrow_instance_id = Pubkey::new_unique();
     let operator_keypair = Keypair::new();
 
-    let harness =
-        start_solana_to_private_channel_operator_with_mocks(escrow_instance_id, operator_keypair)
-            .await
-            .expect("harness start");
+    let harness = start_solana_to_private_channel_operator_with_mocks(operator_keypair)
+        .await
+        .expect("harness start");
 
     // Script the wire responses the operator will consume on the happy path
     // for one deposit. Methods the mock never expects are returned as
@@ -248,12 +246,9 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
 /// unreadable the fence stays closed, so a ready deposit is never locked or sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escrow_operator_moves_nothing_until_its_first_clean_tick() {
-    let harness = start_solana_to_private_channel_operator_with_mocks_dark(
-        Pubkey::new_unique(),
-        Keypair::new(),
-    )
-    .await
-    .expect("harness start");
+    let harness = start_solana_to_private_channel_operator_with_mocks_dark(Keypair::new())
+        .await
+        .expect("harness start");
     let mint_pk = Pubkey::new_unique();
     harness.storage.mints.lock().unwrap().insert(
         mint_pk.to_string(),

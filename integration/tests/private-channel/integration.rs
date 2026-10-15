@@ -304,6 +304,15 @@ async fn setup(
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
 
+    setup_solana_escrow_instance(
+        &test_validator.rpc_url(),
+        &faucet_keypair,
+        &operator_key,
+        &escrow_instance,
+    )
+    .await
+    .expect("Failed to set up the escrow instance");
+
     // Start both indexers in parallel — each has its own DB and datasource
     println!("\n=== Starting PrivateChannel Indexer and Solana Indexer in parallel ===");
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);

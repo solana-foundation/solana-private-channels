@@ -67,11 +67,10 @@ fn make_bad_deposit(id: i64) -> DbTransaction {
 /// classification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn processor_quarantines_deposit_with_malformed_mint_string() {
-    let escrow_instance = Pubkey::new_unique();
     let keypair = Keypair::new();
     let txn_id = 501;
 
-    let harness = start_solana_to_private_channel_operator_with_mocks(escrow_instance, keypair)
+    let harness = start_solana_to_private_channel_operator_with_mocks(keypair)
         .await
         .expect("harness start");
 

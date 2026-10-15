@@ -63,7 +63,8 @@ channel_buffer_size = 100
 #   ADMIN_SIGNER=memory|vault|turnkey|privy
 #   ADMIN_PRIVATE_KEY=<key-or-identifier>
 #
-# Optional (falls back to admin if not set):
+# Operator role. Unset: it signs with the admin signer. Set: it must load or the
+# operator refuses to start. OPERATOR_* key vars without OPERATOR_SIGNER are refused.
 #   OPERATOR_SIGNER=memory|vault|turnkey|privy
 #   OPERATOR_PRIVATE_KEY=<key-or-identifier>
 #
