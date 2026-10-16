@@ -1,0 +1,32 @@
+name: Cargo Audit
+
+# Runs on dependency changes, and weekly because new advisories land without a code change.
+on:
+  push:
+    branches: [main]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "**/Cargo.lock", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Cargo.lock
+        run: cargo audit

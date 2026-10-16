@@ -1,0 +1,19 @@
+# Advisories with no compatible fix. Each entry says why it does not reach a release binary
+# or why it cannot be bumped yet. Revisit when the upstream crate moves.
+[advisories]
+ignore = [
+    # astral-tokio-tar 0.5: testcontainers, integration tests only
+    "RUSTSEC-2026-0066",
+    "RUSTSEC-2026-0112",
+    "RUSTSEC-2026-0113",
+    "RUSTSEC-2026-0145",
+    # curve25519-dalek 3 / ed25519-dalek 1 / idna 0.1: solana-runtime and jsonrpc client, tests only
+    "RUSTSEC-2024-0344",
+    "RUSTSEC-2022-0093",
+    "RUSTSEC-2024-0421",
+    # rsa: pulled in by jsonwebtoken, unused since every JWT key is an HMAC secret; no fix released
+    "RUSTSEC-2023-0071",
+    # h2 0.3: reaches core and indexer only as the reqwest 0.11 client to the configured RPC
+    # and webhook, which could already stall the indexer; fixed by moving to reqwest 0.12
+    "RUSTSEC-2026-0258",
+]
