@@ -1107,9 +1107,20 @@ pub(super) async fn handle_nonce_already_used(
     // manual review for want of evidence we already wrote down.
     if signatures.is_empty() {
         if let Some(transaction_id) = ctx.transaction_id {
-            signatures =
-                super::state::load_persisted_release_signatures(&state.storage, transaction_id)
-                    .await;
+            signatures = match load_pending_sigs(&state.storage, transaction_id).await {
+                Ok(sigs) => sigs,
+                // An unread journal is not an empty one, so recovery re-reads it instead of a human.
+                Err(reason) => {
+                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                    leave_processing_for_recovery(
+                        state.program_type.as_label(),
+                        Some(transaction_id),
+                        &signature,
+                        &format!("nonce already used and the journal could not be read: {reason}"),
+                    );
+                    return;
+                }
+            };
         }
     }
 
@@ -1880,7 +1891,7 @@ async fn defer_remint_after_failure(
         ctx.withdrawal_nonce,
     );
 
-    state.pending_remints.push(PendingRemint {
+    state.queue_runtime_remint(PendingRemint {
         ctx: ctx.clone(),
         remint_info: info,
         signatures,
@@ -2823,6 +2834,47 @@ mod tests {
         // remint_cache and pending_signatures should be drained
         assert!(!state.remint_cache.contains_key(&5));
         assert!(!state.pending_signatures.contains_key(&5));
+    }
+
+    /// A handoff made while the durable backlog still drains must be recorded,
+    /// so a later page never reloads the row while its terminal write is queued.
+    #[tokio::test]
+    async fn permanent_failure_handoff_during_backlog_drain_is_never_paged() {
+        let mock = mock_with_processing_row(10);
+        let sig = Signature::new_unique();
+        mock.insert_release_signature(10, sig.to_string(), 0, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
+        state.remint_backlog_cursor = Some(0);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(5, make_remint_info(10));
+        state.pending_signatures.insert(
+            5,
+            vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+        assert!(state.remint_runtime_ids.contains(&10));
+
+        // The handoff copied row 10 into the list pages read from.
+        state.hydrate_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the page must not reload row 10"
+        );
     }
 
     #[tokio::test]
@@ -5671,6 +5723,50 @@ mod tests {
             "no status may be written for a landed release"
         );
         assert!(state.pending_remints.is_empty(), "no remint may be queued");
+    }
+
+    /// A journal that could not be read is not an empty one: the row stays Processing
+    /// for recovery to re-read, instead of going to manual review.
+    #[tokio::test]
+    async fn nonce_already_used_with_unreadable_journal_leaves_row_for_recovery() {
+        let server = mockito::Server::new_async().await;
+        let mock = mock_with_processing_row(70);
+        mock.set_should_fail("get_release_signatures", true);
+        let mut state = sender_state_with_storage(&server.url(), mock);
+        state.program_type = ProgramType::Withdraw;
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.remint_cache.insert(4, make_remint_info(70));
+        state.in_flight_withdrawals.insert(4);
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(70),
+            withdrawal_nonce: Some(4),
+            trace_id: Some("trace-70".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed {
+                error: Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                slot: 1,
+            }),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no status may be written");
+        assert!(state.pending_remints.is_empty(), "no remint may be queued");
+        assert!(!state.in_flight_withdrawals.contains(&4));
+        assert!(!state.remint_cache.contains_key(&4));
     }
 
     // ── NonceOutsideCurrentGeneration routing ────────────────────────

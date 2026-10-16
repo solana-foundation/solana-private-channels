@@ -268,5 +268,4 @@ exclusive, and the env var counts as the URL, so unset it when skipping.
 |--------|-------------|
 | `scripts/ensure-operator-keypair.sh` | Generate operator keypair if missing |
 | `scripts/update-admin-env.sh` | Update `.env` with admin pubkey |
-| `scripts/reconcile-escrow-balance.sh` | Reconcile on-chain vs DB escrow balances (supports alert webhooks); connects via libpq `PG*` env / `PGPASSFILE` |
 | `scripts/devnet/devnet-test.sh` | Full E2E test: instance creation through deposit/withdrawal/backfill validation |

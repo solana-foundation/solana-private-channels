@@ -100,11 +100,11 @@ fn tx_with_account_keys(total_keys: usize) -> Transaction {
         account_keys.push(Pubkey::new_unique());
     }
 
-    // Key 0 signs and key 1 is writable; the program and padding keys stay read-only.
+    // Key 0 signs; every other key is read-only, since the Memo is given none.
     let header = MessageHeader {
         num_required_signatures: 1,
         num_readonly_signed_accounts: 0,
-        num_readonly_unsigned_accounts: (total_keys - 2) as u8,
+        num_readonly_unsigned_accounts: (total_keys - 1) as u8,
     };
     let message = Message {
         header,

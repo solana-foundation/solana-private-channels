@@ -71,6 +71,8 @@ pub enum OperatorError {
     )]
     SenderLockLostAtBoot { program_type: crate::ProgramType },
 
+    /// A supervised worker exited on its own. Returned after the rest drain, so the process
+    /// exits nonzero and its supervisor treats the stop as a failure.
     #[error("Critical operator task {task} exited unexpectedly")]
     CriticalTaskExited { task: &'static str },
 

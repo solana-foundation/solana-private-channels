@@ -6,6 +6,7 @@ pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
 pub mod close;
+pub mod count_pending_remint_transactions;
 pub mod count_pending_transactions;
 pub mod delete_release_signature;
 pub mod delete_release_signatures;
@@ -548,12 +549,23 @@ impl Storage {
         record_remint_result::record_remint_result(self, transaction_id, remint_signature).await
     }
 
-    /// Returns all withdrawal transactions in PendingRemint status.
-    /// Called on startup to re-hydrate the remint queue after a crash.
+    /// Counts PendingRemint withdrawals with `id > after_id`, the backlog not yet loaded.
+    pub async fn count_pending_remint_transactions(
+        &self,
+        after_id: i64,
+    ) -> Result<i64, StorageError> {
+        count_pending_remint_transactions::count_pending_remint_transactions(self, after_id).await
+    }
+
+    /// Returns one page of PendingRemint withdrawals with `id > after_id`, oldest id first.
+    /// The sender loads its remint queue page by page, so memory stays bounded.
     pub async fn get_pending_remint_transactions(
         &self,
+        after_id: i64,
+        limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_pending_remint_transactions::get_pending_remint_transactions(self).await
+        get_pending_remint_transactions::get_pending_remint_transactions(self, after_id, limit)
+            .await
     }
 
     /// Current status of one row, or `None` if it does not exist. Used to
@@ -1198,7 +1210,10 @@ mod tests {
             "the authoritative row carries the on-chain refusal"
         );
 
-        let rehydrated = storage.get_pending_remint_transactions().await.unwrap();
+        let rehydrated = storage
+            .get_pending_remint_transactions(0, i64::MAX)
+            .await
+            .unwrap();
         assert_eq!(rehydrated.len(), 1);
         assert!(
             rehydrated[0].release_refused_on_chain,

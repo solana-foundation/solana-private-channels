@@ -6191,6 +6191,7 @@ dependencies = [
 name = "private-channel-core"
 version = "0.1.0"
 dependencies = [
+ "agave-reserved-account-keys",
  "anyhow",
  "async-channel",
  "axum",

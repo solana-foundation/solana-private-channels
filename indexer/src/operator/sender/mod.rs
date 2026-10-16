@@ -71,9 +71,9 @@ pub mod test_hooks {
         super::mint::try_jit_mint_initialization(state, transaction_id, instruction).await
     }
 
-    /// Drives `process_pending_remints` end-to-end. Each call walks
-    /// every matured `PendingRemint` in `state.pending_remints` and
-    /// either re-queues it (RPC error), promotes to `Completed`
+    /// Drives `process_pending_remints` end-to-end. Each call walks up to
+    /// `MAX_REMINTS_PER_TICK` matured entries in `state.pending_remints` and
+    /// either re-queues each (RPC error), promotes to `Completed`
     /// (withdrawal finalized), or hands off to `execute_deferred_remint`.
     pub async fn process_pending_remints(
         state: &mut SenderState,
@@ -312,9 +312,8 @@ pub async fn run_sender(
     // release query. Moving it above `state` would invert that and must not be done.
     let _sender_lock = sender_lock;
 
-    // Re-hydrate the deferred remint queue from any PendingRemint rows written
-    // before a crash. These will be picked up by process_pending_remints on the
-    // next tick
+    // Hydrate the first page of PendingRemint rows written before a crash. The
+    // rest load page by page in process_pending_remints as the queue drains.
     state.recover_pending_remints(&storage_tx).await?;
 
     let mut rotation_check_interval = interval(ROTATION_CHECK_INTERVAL);

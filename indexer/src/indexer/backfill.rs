@@ -51,20 +51,24 @@ pub fn validate_gap(
     Ok(Some(gap))
 }
 
-fn calculate_batches(from_slot: u64, to_slot: u64, batch_size: usize) -> Vec<Vec<u64>> {
-    // A zero size would never advance and grow the list without bound.
+/// Yields the slots after `from_slot` up to `to_slot` one batch at a time, so memory stays
+/// bounded by `batch_size` however long the range is.
+fn calculate_batches(
+    from_slot: u64,
+    to_slot: u64,
+    batch_size: usize,
+) -> impl Iterator<Item = Vec<u64>> {
+    // A zero size would never advance.
     let batch_size = batch_size.max(1);
-    let mut batches = vec![];
-    let mut next_slot = from_slot + 1;
-
-    while next_slot <= to_slot {
-        let batch_end = std::cmp::min(next_slot + batch_size as u64, to_slot + 1);
-        let batch: Vec<u64> = (next_slot..batch_end).collect();
-        batches.push(batch);
-        next_slot = batch_end;
-    }
-
-    batches
+    // (1, 0) is an empty range; the guard also keeps `from_slot + 1` from overflowing.
+    let (first, last) = if from_slot < to_slot {
+        (from_slot + 1, to_slot)
+    } else {
+        (1, 0)
+    };
+    (first..=last).step_by(batch_size).map(move |start| {
+        (start..=start.saturating_add(batch_size as u64 - 1).min(to_slot)).collect()
+    })
 }
 
 /// The highest slot at or below `tip` that produced a block, floored at `floor`.
@@ -206,11 +210,11 @@ pub async fn fill_slot_range(
         .with_label_values(&[program_type.as_label()])
         .set(gap as f64);
 
-    let all_batches = calculate_batches(from_slot, to_slot, batch_size);
+    let batches = calculate_batches(from_slot, to_slot, batch_size);
     // Last block completed, which the next chunk's first block must name exactly.
     let mut last_block: Option<u64> = None;
 
-    for slots in all_batches {
+    for slots in batches {
         let mut retry_count = 0;
         let blocks = loop {
             match fetch_blocks_with_retry(rpc_poller, &slots, last_block, retry_count).await {
@@ -962,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batches_full_batches() {
-        let batches = calculate_batches(100, 109, 3);
+        let batches = calculate_batches(100, 109, 3).collect::<Vec<_>>();
 
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0], vec![101, 102, 103]);
@@ -972,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batches_partial_last_batch() {
-        let batches = calculate_batches(100, 105, 3);
+        let batches = calculate_batches(100, 105, 3).collect::<Vec<_>>();
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0], vec![101, 102, 103]);
@@ -981,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_calculate_batches_single_slot() {
-        let batches = calculate_batches(100, 101, 10);
+        let batches = calculate_batches(100, 101, 10).collect::<Vec<_>>();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], vec![101]);
@@ -989,8 +993,8 @@ mod tests {
 
     #[test]
     fn test_calculate_batches_same_from_to_slot() {
-        // from_slot == to_slot: next_slot = from_slot+1 > to_slot, so no iterations
-        let batches = calculate_batches(100, 100, 10);
+        // from_slot == to_slot: nothing comes after from_slot, so no batches
+        let batches = calculate_batches(100, 100, 10).collect::<Vec<_>>();
         assert!(batches.is_empty());
     }
 
@@ -998,9 +1002,30 @@ mod tests {
     /// backstop for library callers that build the config directly.
     #[test]
     fn test_calculate_batches_zero_size_still_advances() {
-        let batches = calculate_batches(100, 103, 0);
+        let batches = calculate_batches(100, 103, 0).collect::<Vec<_>>();
 
         assert_eq!(batches, vec![vec![101], vec![102], vec![103]]);
+    }
+
+    /// Batches are produced on demand, so a huge range costs one batch of memory.
+    #[test]
+    fn calculate_batches_is_lazy() {
+        let first = calculate_batches(0, u64::MAX / 2, 100).next();
+
+        assert_eq!(first, Some((1..=100).collect::<Vec<u64>>()));
+    }
+
+    #[test]
+    fn calculate_batches_ends_at_u64_max() {
+        let batches = calculate_batches(u64::MAX - 2, u64::MAX, 2)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(batches, vec![vec![u64::MAX - 1, u64::MAX]]);
+
+        let empty = calculate_batches(u64::MAX, u64::MAX, 2)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert!(empty.is_empty());
     }
 
     #[cfg(feature = "datasource-rpc")]

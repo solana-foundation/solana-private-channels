@@ -739,13 +739,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_recent_blockhash_impl() {
         let (mut db, _pg) = start_pg().await;
-        seed_db(&mut db).await;
+        let blockhash = Hash::new_unique();
+        db.write_batch(&[], vec![], Some(make_block_info(10, blockhash)))
+            .await
+            .unwrap();
         let deps = make_read_deps(db);
         let resp = get_recent_blockhash_impl::get_recent_blockhash_impl(&deps)
             .await
             .unwrap();
+        assert_eq!(resp.value.blockhash, blockhash.to_string());
         assert_eq!(resp.value.fee_calculator.lamports_per_signature, 5000);
         assert_eq!(resp.context.slot, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_recent_blockhash_fails_when_the_store_cannot_be_read() {
+        let deps = make_read_deps(crate::test_helpers::dead_postgres_db());
+        let err = get_recent_blockhash_impl::get_recent_blockhash_impl(&deps)
+            .await
+            .expect_err("a failed read must not return a zero hash");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
     }
 
     // ── get_transaction_count ─────────────────────────────────────────────

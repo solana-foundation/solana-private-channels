@@ -673,7 +673,7 @@ async fn execute_deferred_remint_durably_records_landed_signature() {
 
     // Terminal row is not handed back to the restart sweep.
     let still_pending = storage_mock
-        .get_pending_remint_transactions()
+        .get_pending_remint_transactions(0, i64::MAX)
         .await
         .unwrap();
     assert!(

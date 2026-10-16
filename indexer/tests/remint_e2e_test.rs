@@ -127,7 +127,7 @@ async fn insert_withdrawal(
 /// 1. A withdrawal transaction is inserted in Processing status.
 /// 2. `set_pending_remint` transitions it to PendingRemint, storing the
 ///    withdrawal signatures and deadline in the new columns.
-/// 3. `get_pending_remint_transactions` retrieves exactly that row with all
+/// 3. A `get_pending_remint_transactions` page retrieves exactly that row with all
 ///    fields intact — including the signature strings and deadline timestamp.
 ///
 /// This proves the schema migrations ran correctly and the SQL queries for
@@ -162,8 +162,8 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
         )
         .await?;
 
-    // Simulate restart: fetch all PendingRemint rows as recover_pending_remints would.
-    let pending = storage.get_pending_remint_transactions().await?;
+    // Simulate restart: read the PendingRemint backlog as recover_pending_remints pages it.
+    let pending = storage.get_pending_remint_transactions(0, i64::MAX).await?;
 
     // Exactly one row should come back.
     assert_eq!(pending.len(), 1, "exactly one PendingRemint row expected");
@@ -264,7 +264,7 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
         .await?;
 
     // Confirm it shows up in recovery before resolution.
-    let before = storage.get_pending_remint_transactions().await?;
+    let before = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(before.len(), 1, "row should appear before resolution");
 
     // Simulate the operator resolving the row (e.g. withdrawal was finalized).
@@ -280,7 +280,7 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
 
     // After resolution the row must be invisible to the recovery query.
     // A subsequent restart must not re-queue this entry.
-    let after = storage.get_pending_remint_transactions().await?;
+    let after = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert!(
         after.is_empty(),
         "resolved row must not appear in recovery query — would cause duplicate remint"
@@ -311,7 +311,7 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
         .await?;
 
     // Confirm it appears in recovery before resolution.
-    let before = storage.get_pending_remint_transactions().await?;
+    let before = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(before.len(), 1);
 
     // 2. Simulate a successful remint: recording it moves the row to
@@ -321,7 +321,7 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
         .await?;
 
     // 3. Row must not appear in recovery — a second remint would double-credit the user.
-    let after = storage.get_pending_remint_transactions().await?;
+    let after = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert!(
         after.is_empty(),
         "FailedReminted row must not appear in recovery query — would cause duplicateremint"
@@ -407,7 +407,7 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
         .await?;
 
     // Step 5a: resolved row must not surface in recovery — prevents duplicate remint.
-    let after_recovery = storage.get_pending_remint_transactions().await?;
+    let after_recovery = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert!(
         after_recovery.is_empty(),
         "FailedReminted row must not appear in recovery query"
@@ -489,7 +489,7 @@ async fn test_multiple_pending_remints_excluded_from_balance(
     );
 
     // Recovery query must return all three rows for the next startup.
-    let pending = storage.get_pending_remint_transactions().await?;
+    let pending = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(
         pending.len(),
         3,
@@ -522,7 +522,7 @@ async fn test_manual_review_not_returned_by_recovery_query(
         .await?;
 
     // Confirm it appears before resolution.
-    let before = storage.get_pending_remint_transactions().await?;
+    let before = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert_eq!(before.len(), 1, "row should appear before resolution");
 
     // Simulate exhausted finality check retries escalating to ManualReview.
@@ -537,7 +537,7 @@ async fn test_manual_review_not_returned_by_recovery_query(
         .await?;
 
     // Must not appear in recovery — would loop re-queueing on every restart.
-    let after = storage.get_pending_remint_transactions().await?;
+    let after = storage.get_pending_remint_transactions(0, i64::MAX).await?;
     assert!(
         after.is_empty(),
         "ManualReview row must not appear in recovery query — would cause looping re-queue"

@@ -770,6 +770,16 @@ fn check_limits(limits: &Limits) -> Result<(), String> {
     Ok(())
 }
 
+/// Every response carries the origin as a header, so one that is not a valid header
+/// value would fail each response instead of the startup.
+fn check_cors_origin(origin: &str) -> Result<(), String> {
+    hyper::header::HeaderValue::from_str(origin)
+        .map(|_| ())
+        .map_err(|_| {
+            format!("GATEWAY_CORS_ALLOWED_ORIGIN ({origin:?}) is not a valid HTTP header value")
+        })
+}
+
 /// Lenient trim used by `Gateway::new`, which is not a validated entry point: a library
 /// caller handing it a blank or whitespace-only secret gets RBAC off. `run` applies the
 /// strict rule in `resolve_jwt_secret` before any `Gateway` is built.
@@ -2291,6 +2301,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);
+    // Checked before it is logged, so a newline in it cannot forge a log line.
+    check_cors_origin(&args.cors_allowed_origin)?;
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
 
     // Config rules run before anything connects, so a bad value never opens the pool.
@@ -4599,6 +4611,30 @@ mod tests {
             .expect_err("bad limits must be refused");
         assert!(
             err.to_string().contains("GATEWAY_MAX_CONNECTIONS_PER_IP"),
+            "got: {err}"
+        );
+    }
+
+    /// An origin that is not a valid header value would panic every response, so `run`
+    /// must refuse it before connecting or binding.
+    #[tokio::test]
+    async fn run_refuses_an_invalid_cors_origin_before_connecting() {
+        let args = parse_args(&[
+            "--port",
+            "0",
+            "--jwt-secret",
+            "",
+            "--auth-database-url",
+            UNREACHABLE_AUTH_DB,
+            "--cors-allowed-origin",
+            "https://app.example.com\r\nX-Injected: 1",
+        ]);
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("a bad origin must be refused, not served")
+            .expect_err("a bad origin must be refused");
+        assert!(
+            err.to_string().contains("GATEWAY_CORS_ALLOWED_ORIGIN"),
             "got: {err}"
         );
     }
