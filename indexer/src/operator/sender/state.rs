@@ -3,7 +3,7 @@ use crate::error::account::AccountError;
 use crate::error::{OperatorError, StorageError};
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::recovery::{load_pending_sigs, JournalError};
-use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
+use crate::operator::sender::types::{PendingRemint, TransactionContext};
 use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
@@ -21,7 +21,6 @@ use private_channel_metrics::MetricLabel;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -852,11 +851,9 @@ impl SenderState {
             .into_iter()
             .filter(|tx| !self.remint_runtime_ids.contains(&tx.id))
             .collect();
-        if self.remint_backlog_cursor.is_none() {
-            self.remint_runtime_ids.clear();
-        }
 
         if transactions.is_empty() {
+            self.forget_runtime_ids_once_drained();
             return Ok(());
         }
 
@@ -868,7 +865,10 @@ impl SenderState {
         // PrivateChannel only supports SPL Token for now.
         let private_channel_token_program = self.mint_cache.get_private_channel_token_program();
 
+        // Id of the last row fully handled, where a failed journal read rewinds the cursor.
+        let mut done_through = after_id;
         for tx in transactions {
+            let resume_after = std::mem::replace(&mut done_through, tx.id);
             // Parse pubkeys stored as strings. On any failure we cannot remint safely,
             // and silently skipping would leave the row stuck in PendingRemint on every
             // restart — so we escalate to ManualReview.
@@ -914,11 +914,16 @@ impl SenderState {
                 }
                 Ok(sigs) => Ok(sigs),
                 Err(JournalError::Corrupt(reason)) => Err(reason),
-                // A failed read says nothing about the row, so fail the boot like the
-                // row query above instead of sending the row to ManualReview.
+                // A failed read says nothing about the row, so fail like the row query
+                // above instead of sending it to ManualReview. The rewind makes the next
+                // page read retry this row and every one after it.
                 Err(JournalError::Unavailable(reason)) => {
+                    self.remint_backlog_cursor = Some(resume_after);
                     return Err(StorageError::DatabaseError {
-                        message: format!("boot recovery of transaction {}: {reason}", tx.id),
+                        message: format!(
+                            "pending remint recovery of transaction {}: {reason}",
+                            tx.id
+                        ),
                     }
                     .into());
                 }
@@ -1004,7 +1009,16 @@ impl SenderState {
             });
         }
 
+        self.forget_runtime_ids_once_drained();
         Ok(())
+    }
+
+    /// Runtime ids only guard against reloading while the backlog drains, so drop them once
+    /// it has. Done after a page loads, since a rewind may page past them again.
+    fn forget_runtime_ids_once_drained(&mut self) {
+        if self.remint_backlog_cursor.is_none() {
+            self.remint_runtime_ids.clear();
+        }
     }
 
     /// Queue a remint handed off at runtime; while the backlog drains, paging must never reload it.
@@ -1796,19 +1810,20 @@ mod tests {
 
     const PAGE_READ: &str = "get_pending_remint_transactions";
 
-    /// Seed parseable PendingRemint rows with the given ids, due an hour from now.
+    /// Seed parseable, journaled PendingRemint rows with the given ids, due an hour from now.
     fn seed_backlog(mock: &MockStorage, ids: impl IntoIterator<Item = i64>) {
         let deadline = Utc::now() + chrono::Duration::hours(1);
-        let mut rows = mock.pending_remint_transactions.lock().unwrap();
         for id in ids {
-            rows.push(make_pending_remint_row(
+            let row = make_pending_remint_row(
                 id,
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Signature::new_unique(),
                 deadline,
-            ));
+            );
+            journal_mirrored_releases(mock, &row, None);
+            mock.pending_remint_transactions.lock().unwrap().push(row);
         }
     }
 
@@ -1858,6 +1873,31 @@ mod tests {
             .get(PAGE_READ)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// A journal read that fails while a page loads must not skip the rows after it: the
+    /// cursor rewinds to the last row handled, so the next read loads them.
+    #[tokio::test]
+    async fn a_failed_journal_read_rewinds_the_backlog_cursor() {
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=3);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.remint_backlog_cursor = Some(0);
+
+        mock.set_should_fail("get_release_signatures", true);
+        assert!(state.hydrate_pending_remints(&storage_tx).await.is_err());
+        assert!(queued_ids(&state).is_empty());
+        assert_eq!(
+            state.remint_backlog_cursor,
+            Some(0),
+            "a short page that failed must be read again"
+        );
+
+        mock.set_should_fail("get_release_signatures", false);
+        state.hydrate_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(queued_ids(&state), vec![1, 2, 3]);
+        assert_eq!(state.remint_backlog_cursor, None);
     }
 
     /// Boot must load at most one page, however large the durable backlog, and
