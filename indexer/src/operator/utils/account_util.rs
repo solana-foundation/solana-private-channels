@@ -319,20 +319,32 @@ pub fn bitmap_account_bytes(generation: u64, consumed: &[u64], bump: u8) -> Vec<
     data
 }
 
+/// Serialized escrow `Instance` account data, for tests that need a live instance on chain.
+#[cfg(test)]
+pub(crate) fn instance_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
+    borsh::to_vec(&Instance {
+        discriminator,
+        bump: 255,
+        version: 1,
+        instance_seed: seed,
+        admin: Pubkey::new_unique(),
+    })
+    .unwrap()
+}
+
+/// A live escrow instance PDA and its account data.
+#[cfg(test)]
+pub(crate) fn live_instance() -> (Pubkey, Vec<u8>) {
+    let seed = Pubkey::new_unique();
+    (
+        find_instance_pda(&seed),
+        instance_bytes(INSTANCE_DISCRIMINATOR, seed),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn instance_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
-        borsh::to_vec(&Instance {
-            discriminator,
-            bump: 255,
-            version: 1,
-            instance_seed: seed,
-            admin: Pubkey::new_unique(),
-        })
-        .unwrap()
-    }
 
     #[test]
     fn instance_account_must_be_a_live_escrow_instance() {

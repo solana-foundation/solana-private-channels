@@ -2372,6 +2372,23 @@ mod tests {
 
         let mut destination = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut destination);
+        // Startup refuses an instance that is not live on chain. Created before the bitmap
+        // mock, so mockito answers the instance read with this one.
+        let (instance, instance_data) = crate::operator::utils::account_util::live_instance();
+        let _instance = destination
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(instance.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":900}},"value":{{"owner":"{}","lamports":1,"data":["{}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                STANDARD.encode(&instance_data),
+            ))
+            .create_async()
+            .await;
         let _bitmap = mock_bitmap_not_found(&mut destination);
         let fee_payer_balance = destination
             .mock("POST", "/")
@@ -2398,6 +2415,7 @@ mod tests {
         let (mut common, config) = startup_fixture(ProgramType::Withdraw);
         common.rpc_url = destination.url();
         common.source_rpc_url = Some(source.url());
+        common.escrow_instance_id = Some(instance);
         let operator = tokio::spawn(run(
             Arc::new(Storage::Mock(MockStorage::new())),
             common,
