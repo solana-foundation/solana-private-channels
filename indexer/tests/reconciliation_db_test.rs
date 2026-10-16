@@ -353,6 +353,25 @@ async fn mock_escrow_rpc(
         .create_async()
         .await;
 
+    // Reads must answer at or past the newest recent block, so the chain's clock sits at `slot`.
+    for (method, result) in [
+        ("getSlot", serde_json::json!(slot)),
+        ("getBlocks", serde_json::json!([slot])),
+        (
+            "getBlockTime",
+            serde_json::json!(chrono::Utc::now().timestamp()),
+        ),
+    ] {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": method}),
+            ))
+            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string())
+            .create_async()
+            .await;
+    }
+
     server
 }
 
