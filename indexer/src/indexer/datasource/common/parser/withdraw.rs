@@ -1,8 +1,9 @@
 use crate::{
     error::{account::AccountError, ParserError},
     indexer::datasource::common::parser::resolve_account,
-    indexer::datasource::common::types::{CompiledInstruction, InstructionLocation},
-    indexer::datasource::rpc_polling::types::InnerInstructions,
+    indexer::datasource::common::types::{
+        CompiledInstruction, InnerInstructions, InstructionLocation,
+    },
 };
 use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};

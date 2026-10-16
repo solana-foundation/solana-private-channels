@@ -65,7 +65,8 @@ take_backup() {
         -U "${PGUSER}" \
         -D "${dest}" \
         -Ft -z -X stream -P; then
-      echo "[$(date -Iseconds)] Backup complete: ${dest}"
+      echo "[$(date -Iseconds)] Base backup written: ${dest}"
+      LAST_BACKUP="${dest}"
       return 0
     fi
     echo "[$(date -Iseconds)] ERROR: pg_basebackup failed (attempt ${attempt}/${MAX_ATTEMPTS})" >&2
@@ -150,6 +151,12 @@ while true; do
     if backup_remains; then
       echo "[$(date -Iseconds)] Retention verified: ${BACKUP_DIR} holds a complete base backup"
       prune_old_wal
+      # A clock that jumped back can make pruning delete this cycle's backup, so check it by name.
+      if [ -f "${LAST_BACKUP}/base.tar.gz" ]; then
+        echo "[$(date -Iseconds)] Backup complete: ${LAST_BACKUP}"
+      else
+        echo "[$(date -Iseconds)] ERROR: this cycle's backup ${LAST_BACKUP} was pruned, check the host clock" >&2
+      fi
     else
       echo "[$(date -Iseconds)] ERROR: no complete base backup remains after pruning, skipping WAL pruning" >&2
     fi

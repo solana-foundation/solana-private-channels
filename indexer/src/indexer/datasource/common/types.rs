@@ -34,6 +34,21 @@ pub struct CompiledInstruction {
     pub data: String, // base58 encoded
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct InnerInstructions {
+    pub index: u8,
+    pub instructions: Vec<InnerInstruction>,
+}
+
+/// A single inner (CPI) instruction; `stack_height` is its CPI depth, used to match a deposit to the event it emitted.
+#[derive(Debug, Deserialize, Clone)]
+pub struct InnerInstruction {
+    #[serde(flatten)]
+    pub instruction: CompiledInstruction,
+    #[serde(rename = "stackHeight")]
+    pub stack_height: Option<u32>,
+}
+
 /// Where an instruction sits in its transaction, used to find the self-CPI
 /// event it emitted.
 #[derive(Debug, Clone, Copy)]

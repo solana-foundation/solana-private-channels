@@ -8,6 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 five8_core = { workspace = true }
+agave-reserved-account-keys = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 axum = { workspace = true }

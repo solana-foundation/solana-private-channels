@@ -8,7 +8,7 @@
 //! in-file (in `sender/state.rs`). The observable public seam for integration
 //! testing is the storage round-trip: if the operator crashes with pending
 //! remints in flight, it relies on `get_pending_remint_transactions` to return
-//! the rows on restart, and takes their signatures from
+//! the rows, a page at a time, from restart on, and takes their signatures from
 //! `pending_release_signatures`. The `remint_signatures` mirror that
 //! `set_pending_remint` writes feeds its own replay guard and the stalled-row
 //! sweep.
@@ -26,6 +26,8 @@
 //!   E. Write-ahead `pending_remint_signatures` round-trip: one live attempt
 //!      per transaction, reads back in order, and GC keeps rows while
 //!      PendingRemint but sweeps them once the parent is terminal.
+//!   F. A page holds only PendingRemint rows above the cursor, in id order,
+//!      up to the limit.
 
 use private_channel_indexer::storage::common::models::StoredSig;
 use {
@@ -114,7 +116,7 @@ async fn test_pending_remint_round_trip_preserves_signatures_and_deadline() {
     // we can query directly — no manual status update needed after this.
 
     let rows = db
-        .get_pending_remint_transactions_internal()
+        .get_pending_remint_transactions_internal(0, i64::MAX)
         .await
         .expect("get_pending_remint_transactions must succeed");
 
@@ -171,7 +173,10 @@ async fn test_release_refusal_round_trips_with_the_pending_remint_row() {
         .await
         .unwrap();
 
-    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    let rows = db
+        .get_pending_remint_transactions_internal(0, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 2);
     let refused = rows.iter().find(|r| r.id == ids[0]).unwrap();
     let ordinary = rows.iter().find(|r| r.id == ids[1]).unwrap();
@@ -236,9 +241,64 @@ async fn test_pending_remint_query_filters_by_status() {
         .await
         .unwrap();
 
-    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    let rows = db
+        .get_pending_remint_transactions_internal(0, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1, "only the pending_remint row must return");
     assert_eq!(rows[0].id, ids[0]);
+}
+
+// ── Case F ──────────────────────────────────────────────────────────────────
+/// The sender loads the backlog one page at a time, so a page must hold only
+/// `pending_remint` rows above the cursor, in id order, and stop at the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pending_remint_page_is_id_ordered_after_the_cursor() {
+    let (db, url, _container) = start_pg("pending_remint_page").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut ids = Vec::new();
+    for nonce in 0..4i64 {
+        let tx = make_withdrawal(&Signature::new_unique().to_string(), nonce);
+        let id = db.insert_transaction_internal(&tx).await.unwrap();
+        sqlx::query(
+            "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    // `x` stays processing, so it sits inside the range but must never be returned.
+    let (a, _x, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+    for id in [a, b, c] {
+        db.set_pending_remint_internal(
+            id,
+            vec!["fake".to_string()],
+            vec![0],
+            Utc::now() + ChronoDuration::minutes(10),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    let page = |after, limit| db.get_pending_remint_transactions_internal(after, limit);
+    let ids_of = |rows: Vec<private_channel_indexer::storage::common::models::DbTransaction>| {
+        rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids_of(page(0, 2).await.unwrap()), vec![a, b]);
+    assert_eq!(ids_of(page(b, 2).await.unwrap()), vec![c]);
+    assert!(page(c, 2).await.unwrap().is_empty());
+
+    // The count behind the remint gauge sees the same rows, so it skips the processing one too.
+    let count = |after| db.count_pending_remint_transactions_internal(after);
+    assert_eq!(count(0).await.unwrap(), 3);
+    assert_eq!(count(a).await.unwrap(), 2);
+    assert_eq!(count(c).await.unwrap(), 0);
 }
 
 // ── Case D ──────────────────────────────────────────────────────────────────
@@ -276,7 +336,10 @@ async fn test_finality_check_attempts_persisted_across_restart() {
     .unwrap();
 
     // Fresh PendingRemint rows start at 0.
-    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    let rows = db
+        .get_pending_remint_transactions_internal(0, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(rows[0].finality_check_attempts, 0);
 
     // Two consecutive bumps mirror the defer path advancing through the cap.
@@ -290,7 +353,10 @@ async fn test_finality_check_attempts_persisted_across_restart() {
         .unwrap();
 
     // Restart-equivalent read sees the persisted counter, not 0.
-    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    let rows = db
+        .get_pending_remint_transactions_internal(0, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].finality_check_attempts, 2);
 

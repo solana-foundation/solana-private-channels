@@ -4,8 +4,10 @@ use crate::rpc::{
     WriteDeps,
 };
 use crate::transactions::{
-    all_instructions_allowed, has_address_table_lookups, is_allowed_program_instruction,
-    lists_native_mint, ADDRESS_LOOKUP_UNSUPPORTED, NATIVE_MINT_UNSUPPORTED, PROGRAM_NOT_ALLOWED,
+    all_instructions_allowed, has_address_table_lookups, has_unused_writable_account,
+    has_writable_program_or_reserved_account, is_allowed_program_instruction, lists_native_mint,
+    ADDRESS_LOOKUP_UNSUPPORTED, NATIVE_MINT_UNSUPPORTED, PROGRAM_NOT_ALLOWED,
+    UNUSED_WRITABLE_ACCOUNT, WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -89,6 +91,17 @@ pub async fn send_transaction_impl(
         return Err(custom_error(INVALID_PARAMS_CODE, PROGRAM_NOT_ALLOWED));
     }
 
+    if has_unused_writable_account(&sanitized_tx) {
+        return Err(custom_error(INVALID_PARAMS_CODE, UNUSED_WRITABLE_ACCOUNT));
+    }
+
+    if has_writable_program_or_reserved_account(&sanitized_tx) {
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT,
+        ));
+    }
+
     // Get the signature before sending to channel
     let signature = sanitized_tx.signature().to_string();
 
@@ -126,7 +139,7 @@ mod tests {
         hash::Hash,
         instruction::Instruction,
         message::{
-            compiled_instruction::CompiledInstruction, v0, v0::MessageAddressTableLookup,
+            compiled_instruction::CompiledInstruction, v0, v0::MessageAddressTableLookup, Message,
             MessageHeader, VersionedMessage,
         },
         pubkey::Pubkey,
@@ -585,6 +598,114 @@ mod tests {
                 .expect_err("a tx listing the native mint must be rejected");
             assert_eq!(err.code(), INVALID_PARAMS_CODE);
             assert_eq!(err.message(), NATIVE_MINT_UNSUPPORTED);
+            assert!(
+                rx.is_empty(),
+                "rejected tx must not reach the ingress queue"
+            );
+        }
+    }
+
+    // The scheduler write-locks every writable key, so a key no instruction uses
+    // would serialize unrelated transactions on that account.
+    #[tokio::test]
+    async fn unused_writable_account_rejected() {
+        let payer = Keypair::new();
+        // Key 1 is writable, but the Memo is given no accounts.
+        let message = Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), Pubkey::new_unique(), spl_memo::id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts: vec![],
+                data: b"carrier".to_vec(),
+            }],
+        };
+        let tx = Transaction::new(&[&payer], message, Hash::default());
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("a writable key no instruction uses must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), UNUSED_WRITABLE_ACCOUNT);
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
+    }
+
+    // Memo never writes, so a writable key only a Memo is given is as unused as one
+    // no instruction is given.
+    #[tokio::test]
+    async fn writable_account_given_only_to_memo_rejected() {
+        let payer = Keypair::new();
+        let message = Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), Pubkey::new_unique(), spl_memo::id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts: vec![1],
+                data: b"carrier".to_vec(),
+            }],
+        };
+        let tx = Transaction::new(&[&payer], message, Hash::default());
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("a writable key only a Memo is given must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), UNUSED_WRITABLE_ACCOUNT);
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
+    }
+
+    // Every honest tx read-locks the programs it runs, so a carrier that write-locks
+    // one, even through an instruction it is given to, serializes them all behind it.
+    #[tokio::test]
+    async fn writable_program_or_reserved_account_rejected() {
+        // spl_token is a loaded program, the clock sysvar a reserved key.
+        for protected_key in [spl_token::ID, solana_sdk_ids::sysvar::clock::ID] {
+            let payer = Keypair::new();
+            // Key 1 is writable and given to an ATA instruction, so it is not unused.
+            let message = Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![
+                    payer.pubkey(),
+                    protected_key,
+                    spl_associated_token_account::id(),
+                ],
+                recent_blockhash: Hash::default(),
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 2,
+                    accounts: vec![1],
+                    data: b"carrier".to_vec(),
+                }],
+            };
+            let tx = Transaction::new(&[&payer], message, Hash::default());
+            let (deps, rx) = make_write_deps();
+
+            let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+                .await
+                .expect_err("a writable program or reserved key must be rejected");
+            assert_eq!(err.code(), INVALID_PARAMS_CODE);
+            assert_eq!(err.message(), WRITABLE_PROGRAM_OR_RESERVED_ACCOUNT);
             assert!(
                 rx.is_empty(),
                 "rejected tx must not reach the ingress queue"

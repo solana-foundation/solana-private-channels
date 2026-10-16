@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
-use super::remint::FinalityRpc;
+use super::remint::{FinalityRpc, REMINT_HYDRATE_PAGE};
 use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
 use super::{classify_signatures, SigFinality};
 
@@ -101,6 +101,9 @@ impl SenderState {
             pending_signatures: HashMap::new(),
             release_leases: HashMap::new(),
             pending_remints: Vec::new(),
+            remint_backlog_cursor: None,
+            remint_runtime_ids: HashSet::new(),
+            remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             solvency_fence,
@@ -511,36 +514,6 @@ async fn diff_bitmap(
     Ok((db_only, chain_only))
 }
 
-/// Read a withdrawal's broadcast signatures back from durable storage.
-///
-/// Every release persists its signature before broadcast, so this is the record
-/// that survives a restart. A read failure or an unparseable entry yields
-/// nothing, which routes callers to manual review rather than letting them
-/// conclude anything about whether the release landed.
-pub(super) async fn load_persisted_release_signatures(
-    storage: &Storage,
-    transaction_id: i64,
-) -> Vec<PendingSig> {
-    match storage.get_release_signatures(transaction_id).await {
-        Ok(stored) => stored
-            .iter()
-            .filter_map(|entry| {
-                Signature::from_str(&entry.signature)
-                    .ok()
-                    .map(|signature| PendingSig {
-                        signature,
-                        last_valid_block_height: entry.last_valid_block_height.max(0) as u64,
-                        blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
-                    })
-            })
-            .collect(),
-        Err(e) => {
-            error!(transaction_id, "Release signature lookup failed: {e}");
-            Vec::new()
-        }
-    }
-}
-
 /// What a chain-ahead nonce turned out to be, which decides whether startup
 /// can continue past it.
 ///
@@ -626,7 +599,19 @@ async fn resolve_chain_ahead_nonce(
         TransactionStatus::Processing | TransactionStatus::PendingRemint
     );
 
-    let signatures = load_persisted_release_signatures(storage, row.id).await;
+    // Like an unread row, an unread journal proves nothing, so nothing is written and boot refuses.
+    let signatures = match load_pending_sigs(storage, row.id).await {
+        Ok(signatures) => signatures,
+        Err(e) => {
+            error!(
+                nonce,
+                transaction_id = row.id,
+                "Release signature journal unusable, leaving the row as it is: {e}"
+            );
+            report_unexplained(nonce);
+            return ChainAheadOutcome::Unexplained;
+        }
+    };
 
     let verdict = if signatures.is_empty() {
         None
@@ -827,8 +812,49 @@ impl SenderState {
         if self.program_type != ProgramType::Withdraw {
             return Ok(());
         }
+        // Armed only at boot, so a sender that never recovered never pages rows behind its queue.
+        // Ids are BIGSERIAL, so 0 is below every row.
+        self.remint_backlog_cursor = Some(0);
+        self.hydrate_pending_remints(storage_tx).await
+    }
 
-        let transactions = self.storage.get_pending_remint_transactions().await?;
+    /// Load the next page of durable pending remints; a no-op once the backlog is drained.
+    pub(super) async fn hydrate_pending_remints(
+        &mut self,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) -> Result<(), OperatorError> {
+        let Some(after_id) = self.remint_backlog_cursor else {
+            return Ok(());
+        };
+        // Counted first so the remint gauge can still show the whole backlog, not just this page.
+        let waiting = self
+            .storage
+            .count_pending_remint_transactions(after_id)
+            .await?;
+        // Paged by id, not deadline: ids never change, so every row is read at most once.
+        let transactions = self
+            .storage
+            .get_pending_remint_transactions(after_id, REMINT_HYDRATE_PAGE as i64)
+            .await?;
+
+        // A short page means no unread row is left; ids are ascending, so the last is the max.
+        self.remint_backlog_cursor = match transactions.last() {
+            Some(last) if transactions.len() == REMINT_HYDRATE_PAGE => Some(last.id),
+            _ => None,
+        };
+        self.remint_backlog_unloaded = match self.remint_backlog_cursor {
+            Some(_) => (waiting.max(0) as u64).saturating_sub(transactions.len() as u64),
+            None => 0,
+        };
+        // A runtime handoff may still have its terminal write queued, e.g. a ManualReview.
+        // Reloading it could remint a row that then lands in manual review and is refunded again.
+        let transactions: Vec<_> = transactions
+            .into_iter()
+            .filter(|tx| !self.remint_runtime_ids.contains(&tx.id))
+            .collect();
+        if self.remint_backlog_cursor.is_none() {
+            self.remint_runtime_ids.clear();
+        }
 
         if transactions.is_empty() {
             return Ok(());
@@ -980,6 +1006,32 @@ impl SenderState {
 
         Ok(())
     }
+
+    /// Queue a remint handed off at runtime; while the backlog drains, paging must never reload it.
+    pub(super) fn queue_runtime_remint(&mut self, entry: PendingRemint) {
+        if let (Some(_), Some(id)) = (self.remint_backlog_cursor, entry.ctx.transaction_id) {
+            self.remint_runtime_ids.insert(id);
+        }
+        self.pending_remints.push(entry);
+    }
+
+    /// Queued remints plus backlog rows not loaded yet, the value the remint gauge reports.
+    /// While the backlog drains, a runtime row past the cursor can be counted twice.
+    pub(super) fn remint_backlog_size(&self) -> usize {
+        self.pending_remints.len() + self.remint_backlog_unloaded as usize
+    }
+
+    /// Backlog entries in the queue, the count the refill threshold uses.
+    pub(super) fn queued_backlog_remints(&self) -> usize {
+        self.pending_remints
+            .iter()
+            .filter(|e| {
+                e.ctx
+                    .transaction_id
+                    .is_none_or(|id| !self.remint_runtime_ids.contains(&id))
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -1078,7 +1130,7 @@ mod tests {
 
     // ── recover_pending_remints: happy path ──────────────────────────
 
-    /// On startup, all PendingRemint rows from the database must be fully
+    /// On startup, the first page of PendingRemint rows must be fully
     /// reconstructed into the in-memory `pending_remints` queue so the
     /// operator can continue where it left off before the crash.
     ///
@@ -1738,6 +1790,266 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
+    // ── pending remint backlog paging ────────────────────────────────
+
+    use crate::operator::sender::remint::{process_pending_remints, REMINT_HYDRATE_PAGE as PAGE};
+
+    const PAGE_READ: &str = "get_pending_remint_transactions";
+
+    /// Seed parseable PendingRemint rows with the given ids, due an hour from now.
+    fn seed_backlog(mock: &MockStorage, ids: impl IntoIterator<Item = i64>) {
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let mut rows = mock.pending_remint_transactions.lock().unwrap();
+        for id in ids {
+            rows.push(make_pending_remint_row(
+                id,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Signature::new_unique(),
+                deadline,
+            ));
+        }
+    }
+
+    /// A remint handed off at runtime, due an hour from now so no tick dials RPC.
+    fn runtime_entry(id: i64) -> PendingRemint {
+        PendingRemint {
+            ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(id),
+                withdrawal_nonce: Some(id as u64),
+                trace_id: Some(format!("trace-{id}")),
+                deposit_claim_lease: None,
+            },
+            remint_info: WithdrawalRemintInfo {
+                transaction_id: id,
+                source_event_id: SourceEventId::new(&format!("sig-{id}"), 0, None),
+                trace_id: format!("trace-{id}"),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+            signatures: Vec::new(),
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() + chrono::Duration::hours(1),
+            finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
+            coverage_checkpoint: None,
+            free_waits: 0,
+        }
+    }
+
+    fn queued_ids(state: &SenderState) -> Vec<i64> {
+        state
+            .pending_remints
+            .iter()
+            .map(|e| e.ctx.transaction_id.unwrap())
+            .collect()
+    }
+
+    fn page_reads(mock: &MockStorage) -> usize {
+        mock.call_counts
+            .lock()
+            .unwrap()
+            .get(PAGE_READ)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Boot must load at most one page, however large the durable backlog, and
+    /// arm the cursor only when a full page says more rows may follow.
+    #[tokio::test]
+    async fn recover_loads_one_page_and_arms_the_cursor() {
+        for n in [0, 3, PAGE, PAGE + 1] {
+            let mock = MockStorage::new();
+            seed_backlog(&mock, 1..=n as i64);
+            let mut state = make_sender_state(mock.clone());
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            state.recover_pending_remints(&storage_tx).await.unwrap();
+
+            let expected: Vec<i64> = (1..=n.min(PAGE) as i64).collect();
+            assert_eq!(queued_ids(&state), expected, "n = {n}");
+            let cursor = (n >= PAGE).then_some(PAGE as i64);
+            assert_eq!(state.remint_backlog_cursor, cursor, "n = {n}");
+            assert!(storage_rx.try_recv().is_err(), "n = {n}");
+            assert_eq!(page_reads(&mock), 1, "n = {n}");
+        }
+
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=PAGE as i64 + 1);
+        let mut state = make_sender_state_with_role(mock.clone(), ProgramType::Escrow);
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(page_reads(&mock), 0, "Escrow must never read the backlog");
+        assert_eq!(state.remint_backlog_cursor, None);
+    }
+
+    /// A runtime handoff whose terminal write may still be queued must never be
+    /// reloaded by a page, and runtime entries must not hold back the refill.
+    #[tokio::test]
+    async fn runtime_handoffs_are_never_paged_and_do_not_hold_the_refill() {
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=page + 5);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        // Two ids a page would see, plus memory-only fillers so the next page stays short.
+        state.queue_runtime_remint(runtime_entry(page + 2));
+        state.queue_runtime_remint(runtime_entry(page + 4));
+        for id in 10_000..10_000 + page - 2 {
+            state.queue_runtime_remint(runtime_entry(id));
+        }
+        // Resolved with its ManualReview still queued: gone from memory,
+        // still pending_remint in the DB.
+        state
+            .pending_remints
+            .retain(|e| e.ctx.transaction_id != Some(page + 2));
+        state
+            .pending_remints
+            .retain(|e| e.ctx.transaction_id != Some(1));
+        assert!(state.pending_remints.len() > PAGE);
+
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, vec![page + 1, page + 3, page + 5]);
+        let copies = |id| queued_ids(&state).iter().filter(|&&q| q == id).count();
+        assert_eq!(
+            copies(page + 2),
+            0,
+            "a resolved runtime row must not come back"
+        );
+        assert_eq!(
+            copies(page + 4),
+            1,
+            "a queued runtime row must not be loaded twice"
+        );
+        assert_eq!(state.remint_backlog_cursor, None);
+        assert!(state.remint_runtime_ids.is_empty());
+    }
+
+    /// Ticks load the rest of the backlog one full page at a time, only once
+    /// fewer than a page is queued, each row once, and stop reading when drained.
+    #[tokio::test]
+    async fn ticks_drain_the_backlog_page_by_page() {
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=2 * page + 10);
+        mock.pending_remint_transactions.lock().unwrap()[PAGE].mint = "bad-mint".to_string();
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(1024);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.remint_backlog_unloaded, page as u64 + 10);
+        assert_eq!(
+            state.remint_backlog_size(),
+            2 * PAGE + 10,
+            "the gauge sees the whole backlog"
+        );
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(page_reads(&mock), 1, "a full queue must not read");
+
+        state.pending_remints.pop();
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (page + 2..=2 * page).collect::<Vec<_>>());
+        assert_eq!(state.remint_backlog_unloaded, 10);
+
+        state.pending_remints.truncate(PAGE - 1);
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (2 * page + 1..=2 * page + 10).collect::<Vec<_>>());
+        assert_eq!(state.remint_backlog_cursor, None);
+        assert_eq!(state.remint_backlog_unloaded, 0);
+        assert_eq!(page_reads(&mock), 3);
+        let mut ids = queued_ids(&state);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            state.pending_remints.len(),
+            "no row is queued twice"
+        );
+
+        state.pending_remints.clear();
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(
+            page_reads(&mock),
+            3,
+            "a drained backlog must not be read again"
+        );
+
+        let update = storage_rx.try_recv().expect("the bad row escalates");
+        assert_eq!(update.transaction_id, page + 1);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(storage_rx.try_recv().is_err(), "it escalates exactly once");
+    }
+
+    /// A page read error at boot fails boot; on a tick it only delays the page.
+    #[tokio::test]
+    async fn page_read_failure_fails_boot_but_only_delays_a_tick() {
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=3);
+        mock.set_fail_times(PAGE_READ, 1);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        let err = state
+            .recover_pending_remints(&storage_tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OperatorError::Storage(_)), "{err:?}");
+
+        let page = PAGE as i64;
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=page + 5);
+        let mut state = make_sender_state(mock.clone());
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        state.pending_remints.pop();
+
+        mock.set_fail_times(PAGE_READ, 1);
+        let failures = || {
+            crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&["withdraw", "pending_remint_page_read_failed"])
+                .get()
+        };
+        let failed_before = failures();
+        let before = queued_ids(&state);
+        process_pending_remints(&mut state, &storage_tx).await;
+        assert_eq!(state.remint_backlog_cursor, Some(page));
+        assert_eq!(queued_ids(&state), before);
+        assert_eq!(
+            failures(),
+            failed_before + 1.0,
+            "a failed page read must be counted"
+        );
+
+        process_pending_remints(&mut state, &storage_tx).await;
+        let added: Vec<i64> = queued_ids(&state)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added, (page + 1..=page + 5).collect::<Vec<_>>());
+    }
+
     // ── SenderState construction tests ───────────────────────────────
 
     use crate::config::{PostgresConfig, ProgramType, StorageType};
@@ -2205,6 +2517,175 @@ mod tests {
         })
         .await;
         assert!(ahead.is_ok(), "{ahead:?}");
+    }
+
+    /// A journal that could not be read is not an empty journal: the row may be paid, so it
+    /// must stay Processing and the nonce stays unexplained.
+    #[tokio::test]
+    async fn chain_ahead_nonce_with_unreadable_journal_leaves_the_row_untouched() {
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = make_sender_state(mock.clone());
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            2,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == 7)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
+    }
+
+    /// At the boot gate the same read failure refuses to start and writes nothing, like an
+    /// unread row.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_refuses_without_a_write_when_the_journal_cannot_be_read() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
+
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = sender_state_with_storage(&server.url(), mock.clone());
+
+        let err = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            OperatorError::Program(crate::error::ProgramError::UnexplainedConsumedNonces {
+                nonces,
+            }) => assert_eq!(nonces, vec![2]),
+            other => panic!("expected UnexplainedConsumedNonces, got: {other}"),
+        }
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == 7)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
+    }
+
+    /// A journal read error on an earlier nonce must not stop a later double payout being found.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_double_payout_halts_despite_an_earlier_journal_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[2, 3]);
+
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            2,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
+        );
+        seed_withdrawal(&mock, 8, 3, TransactionStatus::FailedReminted, None);
+        mock.set_should_fail("get_release_signatures", true);
+
+        let state = sender_state_with_storage(&server.url(), mock);
+
+        let err = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            OperatorError::Program(crate::error::ProgramError::BitmapDivergence {
+                chain_only,
+                ..
+            }) => assert_eq!(chain_only, vec![3]),
+            other => panic!("expected BitmapDivergence, got: {other}"),
+        }
+    }
+
+    /// A journal entry that does not parse is corrupt, so the row is left as it is rather
+    /// than repaired from the entries that do parse, and the nonce stays unexplained.
+    #[tokio::test]
+    async fn chain_ahead_nonce_with_a_corrupt_journal_leaves_the_row_untouched() {
+        let transaction_id = 7;
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            2,
+            TransactionStatus::Processing,
+            None,
+        );
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![
+                crate::storage::common::models::StoredSig {
+                    signature: "not-a-signature".to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                },
+                crate::storage::common::models::StoredSig {
+                    signature: Signature::new_unique().to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                },
+            ],
+        );
+
+        let state = make_sender_state(mock.clone());
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            2,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
     }
 
     /// A payout no signature accounts for is unexplained money leaving the instance, so it must not report as repaired.

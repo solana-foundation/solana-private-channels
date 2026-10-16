@@ -52,10 +52,15 @@ pub struct Config {
     #[arg(long, env = "AUTH_RATE_LIMIT_BURST", default_value = "10")]
     pub auth_rate_limit_burst: NonZeroU32,
 
-    /// Credential attempts allowed per minute against a single username,
-    /// regardless of which IPs they come from.
-    #[arg(long, env = "AUTH_USERNAME_ATTEMPTS_PER_MINUTE", default_value = "5")]
-    pub auth_username_attempts_per_minute: NonZeroU32,
+    /// Failed logins (and registrations of a taken name) per minute on one username,
+    /// across all IPs, before further failures return 429. Not a guess limit: a
+    /// correct password always succeeds, so this cannot lock an account out.
+    #[arg(
+        long,
+        env = "AUTH_USERNAME_FAILED_LOGINS_PER_MINUTE",
+        default_value = "5"
+    )]
+    pub auth_username_failed_logins_per_minute: NonZeroU32,
 
     /// Maximum concurrent client connections. Connections beyond this are
     /// dropped so a flood cannot exhaust sockets, tasks or memory before the

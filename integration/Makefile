@@ -138,7 +138,6 @@ fmt:
 #   accounts/error\.rs                   │ (a) │ error-enum Display/From impls
 #   accounts/types\.rs                   │ (a) │ StoredTransaction wrapper
 #   accounts/mod\.rs                     │ (a) │ bpf_loader_* account factories
-#   rpc/get_recent_blockhash_impl\.rs    │ (a) │ default-value fallbacks only
 #   core/src/client\.rs                  │ (a) │ deprecated RPC client stub
 #   operator/utils/signer_util\.rs       │ (b) │ Vault/Turnkey/Privy HSM paths
 #   core/src/processor\.rs               │ (b) │ BPF host-function stubs
@@ -165,7 +164,6 @@ COV_IGNORE_PATTERNS := \
     accounts/error\.rs \
     accounts/types\.rs \
     accounts/mod\.rs \
-    rpc/get_recent_blockhash_impl\.rs \
     core/src/client\.rs \
     operator/utils/signer_util\.rs \
     core/src/processor\.rs \
