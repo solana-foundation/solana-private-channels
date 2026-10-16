@@ -1976,6 +1976,7 @@ mod tests {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         let address = Pubkey::new_unique();
         write_address_history(&db, &address, 0..10).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
         // Keeping 3 slots of 0..=9 puts the floor at 7.
