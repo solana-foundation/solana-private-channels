@@ -112,8 +112,9 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          provenance: false
-          sbom: false
+          # Attach a SLSA provenance and an SBOM attestation to the pushed image.
+          provenance: mode=max
+          sbom: true
           build-args: |
             SOLANA_VERSION=${{ env.SOLANA_VERSION }}
             PNPM_VERSION=${{ env.PNPM_VERSION }}
