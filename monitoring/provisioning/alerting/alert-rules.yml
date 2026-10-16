@@ -1071,6 +1071,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: solvency-fence-tripped
+        title: "Escrow solvency fence tripped; value movement is halted"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }} confirmed an insolvency and tripped its solvency fence: no mint or release moves until the halt is cleared. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Solvency fence."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, program_type) (private_channel_operator_solvency_fence_state)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [1]
+              refId: C
+
   - orgId: 1
     name: operator-alert-delivery-alerts
     folder: Solana Private Channels Alerts
