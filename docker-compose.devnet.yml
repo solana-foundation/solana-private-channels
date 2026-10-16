@@ -346,6 +346,7 @@ services:
       - postgres-indexer-data:/var/lib/postgresql/data
       - postgres-indexer-wal-archive:/wal_archive
       - ./init-indexer-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
+      - ./init-indexer-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
     command: |
       postgres
       -c wal_level=replica
@@ -569,14 +570,11 @@ services:
     depends_on:
       postgres-primary:
         condition: service_healthy
-    # TODO: pg_basebackup fails because POSTGRES_USER ("private_channel") lacks the
-    # REPLICATION attribute and isn't in pg_hba.conf for replication. Switch
-    # to POSTGRES_REPLICATION_USER/_PASSWORD (already used by the streaming
-    # replica). Pre-existing gap; backups currently never complete.
+    # The replication login, the one init-primary-hba.sh admits for replication.
     environment:
       - PGHOST=postgres-primary
-      - PGUSER=${POSTGRES_USER}
-      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - PGUSER=${POSTGRES_REPLICATION_USER}
+      - PGPASSWORD=${POSTGRES_REPLICATION_PASSWORD}
       - PG_BACKUP_INTERVAL_HOURS=${PG_BACKUP_INTERVAL_HOURS:-6}
       - PG_BACKUP_RETENTION_COUNT=${PG_BACKUP_RETENTION_COUNT:-3}
     volumes:
@@ -596,7 +594,7 @@ services:
     depends_on:
       postgres-indexer:
         condition: service_healthy
-    # TODO: same pg_hba/role mismatch as pg-backup-primary above.
+    # Superuser login, admitted for replication by init-indexer-hba.sh.
     environment:
       - PGHOST=postgres-indexer
       - PGUSER=${POSTGRES_INDEXER_USER}

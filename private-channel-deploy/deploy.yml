@@ -980,6 +980,7 @@
       - init-primary-hba.sh
       - init-auth-roles.sql
       - init-indexer-roles.sql
+      - init-indexer-hba.sh
       - init-indexer-login.sql
       - yellowstone-config.json
 
@@ -1008,6 +1009,12 @@
         src: "{{ repo_root }}/init-indexer-roles.sql"
         dest: "{{ target_config_dir }}/init-indexer-roles.sql"
         mode: "0644"
+
+    - name: Copy postgres indexer HBA script to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/init-indexer-hba.sh"
+        dest: "{{ target_config_dir }}/init-indexer-hba.sh"
+        mode: "0755"
 
     # Creates the indexer cluster's own login on a data directory that predates
     # it; the entrypoint never would.
