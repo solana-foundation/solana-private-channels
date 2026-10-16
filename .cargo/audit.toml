@@ -13,7 +13,4 @@ ignore = [
     "RUSTSEC-2024-0421",
     # rsa: pulled in by jsonwebtoken, unused since every JWT key is an HMAC secret; no fix released
     "RUSTSEC-2023-0071",
-    # h2 0.3: reaches core and indexer only as the reqwest 0.11 client to the configured RPC
-    # and webhook, which could already stall the indexer; fixed by moving to reqwest 0.12
-    "RUSTSEC-2026-0258",
 ]
