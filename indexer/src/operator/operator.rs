@@ -550,7 +550,10 @@ pub async fn run(
 /// Logs a worker's panic or cancellation here, since a lost lock or failed drain returns early.
 fn worker_exited(task: Worker, joined: Result<(), tokio::task::JoinError>) -> StopCause {
     if let Err(join_error) = joined {
-        error!(task = task.label(), "Critical operator task failed: {}", join_error);
+        error!(
+            task = task.label(),
+            "Critical operator task failed: {}", join_error
+        );
     }
     StopCause::Exited(task)
 }
