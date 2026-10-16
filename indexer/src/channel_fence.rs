@@ -408,8 +408,9 @@ mod tests {
                 async move { verify_channel_fence(&rpc, Some(&fence(100, "H")), BOOT).await },
             );
         tokio::time::sleep(Duration::from_millis(8)).await;
-        behind.remove();
+        // Mounted before the lagging answer is removed, so no poll lands on a route-less 501.
         let _caught_up = mock_slot(&mut server, 120);
+        behind.remove();
         assert_eq!(check.await.unwrap(), FenceVerdict::Ok);
     }
 
@@ -427,8 +428,9 @@ mod tests {
                 async move { verify_channel_fence(&rpc, Some(&fence(100, "H")), BOOT).await },
             );
         tokio::time::sleep(Duration::from_millis(20)).await;
-        missing.remove();
+        // Same order as above: the new answer is up before the old one goes.
         let _present = mock_block(&mut server, 100, block_body("H", 99));
+        missing.remove();
         assert_eq!(check.await.unwrap(), FenceVerdict::Ok);
     }
 
