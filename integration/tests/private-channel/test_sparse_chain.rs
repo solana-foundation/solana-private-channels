@@ -95,6 +95,7 @@ fn node_config(pg_url: &str, port: u16, max_blockhashes: usize) -> NodeConfig {
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![Keypair::new().pubkey()],
         max_blockhashes,
+        allow_max_blockhashes_increase: false,
         blocktime_ms: BLOCKTIME_MS,
         perf_sample_period_secs: 3_600,
         metrics: Arc::new(NoopMetrics),

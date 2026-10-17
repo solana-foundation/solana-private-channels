@@ -72,6 +72,7 @@ fn load_config(db_url: String, port: u16) -> NodeConfig {
         redis_cache_url: None,
         admin_keys: vec![],
         max_blockhashes: 150,
+        allow_max_blockhashes_increase: false,
         redis_block_ttl_secs: 3_600,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,

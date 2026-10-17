@@ -16,13 +16,17 @@ pub mod gc_stale_release_signatures;
 pub mod gc_stale_remint_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
+pub mod get_channel_fence;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
+pub mod get_consumed_mints;
 pub mod get_in_flight_amounts_by_mint;
+pub mod get_max_withdrawal_nonce;
 pub mod get_mint;
 pub mod get_mint_addresses;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
+pub mod get_newest_known_mint_signatures;
 pub mod get_observed_release;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
@@ -36,8 +40,10 @@ pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
+pub mod get_unlisted_mints;
 pub mod get_withdrawal_by_nonce;
 pub mod init_schema;
+pub mod insert_consumed_mints;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
@@ -48,6 +54,7 @@ pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod requeue_halted_claim;
+pub mod requeue_unclaimed;
 pub mod resync_state;
 pub mod sender_lock;
 pub mod set_pending_remint;
@@ -55,6 +62,7 @@ pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_complete_stalled_withdrawal;
 pub mod try_fail_processing;
+pub mod try_mark_reminted;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -193,7 +201,69 @@ impl Storage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
-        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, None)
+            .await
+    }
+
+    /// Update a checkpoint and, when `fence` is newer than the stored one, the channel
+    /// fence with it, in one statement.
+    pub async fn update_committed_checkpoint_with_fence(
+        &self,
+        program_type: &str,
+        slot: u64,
+        fence: Option<&ChannelFence>,
+    ) -> Result<(), StorageError> {
+        update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot, fence)
+            .await
+    }
+
+    /// The channel fence on the withdraw checkpoint row, or `None` when never written.
+    pub async fn get_channel_fence(&self) -> Result<Option<FenceRecord>, StorageError> {
+        get_channel_fence::get_channel_fence(self).await
+    }
+
+    /// The channel mint signature of the newest `completed` deposit (`Deposit`) or the newest
+    /// `failed_reminted` withdrawal (`Withdrawal`) on `mint`, if any.
+    pub async fn get_newest_known_mint_signatures(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, StorageError> {
+        get_newest_known_mint_signatures::get_newest_known_mint_signatures(self, mint, kind).await
+    }
+
+    /// Record walked channel mints. Idempotent on the source event.
+    pub async fn insert_consumed_mints(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), StorageError> {
+        insert_consumed_mints::insert_consumed_mints(self, mints).await
+    }
+
+    /// Every channel mint an earlier walk recorded.
+    pub async fn get_consumed_mints(&self) -> Result<Vec<DbConsumedMint>, StorageError> {
+        get_consumed_mints::get_consumed_mints(self).await
+    }
+
+    /// Highest withdrawal nonce any row holds, or `None` with no withdrawal.
+    pub async fn get_max_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        get_max_withdrawal_nonce::get_max_withdrawal_nonce(self).await
+    }
+
+    /// CAS a claimed withdrawal to `FailedReminted` with its landed remint signature.
+    pub async fn try_mark_reminted(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signature: String,
+    ) -> Result<bool, StorageError> {
+        try_mark_reminted::try_mark_reminted(
+            self,
+            transaction_id,
+            expected_updated_at,
+            remint_signature,
+        )
+        .await
     }
 
     /// Terminal status write; `Ok(false)` if row already off Processing.
@@ -284,6 +354,11 @@ impl Storage {
         get_mint_addresses::get_mint_addresses(self).await
     }
 
+    /// Mints the DB holds status history or deposit rows for but no `mints` row.
+    pub async fn get_unlisted_mints(&self) -> Result<Vec<String>, StorageError> {
+        get_unlisted_mints::get_unlisted_mints(self).await
+    }
+
     /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, where a
     /// withdrawal the operator marked `completed` counts as released too. Startup only;
     /// runtime holds out for the observed release.
@@ -297,9 +372,9 @@ impl Storage {
         .await
     }
 
-    /// Per-mint sum of every unsettled transaction amount (pending / processing /
-    /// parked / pending_remint), used as the in-flight envelope by the runtime
-    /// reconciliation halt decision, plus settled rows above each type's bound.
+    /// Per-mint sum of unsettled deposits (pending / processing / parked / pending_remint),
+    /// the in-flight envelope of the runtime reconciliation halt decision, plus settled
+    /// deposits and withdrawals in any status above each type's bound.
     pub async fn get_in_flight_amounts_by_mint(
         &self,
         deposits_after: Option<u64>,
@@ -464,8 +539,8 @@ impl Storage {
     }
 
     /// Durably record a confirmed remint (status -> FailedReminted plus the
-    /// signature) in one write, before the async status writer runs. Closes the
-    /// crash window that would otherwise leave a landed remint as PendingRemint.
+    /// signature) in one write. The only operator write that sets FailedReminted,
+    /// so a reminted row always carries its landed signature.
     pub async fn record_remint_result(
         &self,
         transaction_id: i64,
@@ -591,6 +666,16 @@ impl Storage {
         expected_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, StorageError> {
         requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
+    }
+
+    /// CAS `Processing` to `Pending` for a claim the sender refused before claiming, only if
+    /// nothing was ever journaled for the row; spends no requeue attempt.
+    pub async fn requeue_unclaimed(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        requeue_unclaimed::requeue_unclaimed(self, transaction_id, expected_updated_at).await
     }
 
     /// Cap-gated CAS `Processing` → `Pending` on `updated_at` for pre-broadcast
@@ -841,8 +926,9 @@ impl Storage {
         delete_remint_signatures::delete_remint_signatures(self, transaction_id).await
     }
 
-    /// Drop remint signatures whose parent transaction is no longer
-    /// `PendingRemint`. Returns the number of rows removed.
+    /// Drop remint signatures only for terminal parents (completed, failed,
+    /// failed_reminted). A ManualReview row keeps its journal, since its MintTo
+    /// may still land. Returns the rows removed.
     pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
         gc_stale_remint_signatures::gc_stale_remint_signatures(self).await
     }
@@ -1791,6 +1877,66 @@ mod tests {
         }
     }
 
+    /// Mirrors the Postgres claim: a row with a landed remint was already
+    /// refunded, so its release is never claimed.
+    #[tokio::test]
+    async fn release_claim_refuses_a_reminted_row() {
+        let (storage, mock) = make_mock_storage();
+        let mut row = make_db_transaction();
+        row.id = 1;
+        row.status = TransactionStatus::Processing;
+        row.landed_remint_signature = Some("remint-landed".to_string());
+        let token = row.updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let claimed = storage
+            .claim_and_persist_signature(1, token, "sig-reminted".to_string(), 1, None)
+            .await
+            .unwrap();
+
+        assert!(claimed.is_none(), "a reminted row must not be released");
+    }
+
+    /// A non-terminal row can still have a remint in flight, so only a
+    /// terminal parent lets the sweep reclaim its journal.
+    #[tokio::test]
+    async fn remint_signature_gc_reclaims_terminal_rows_only() {
+        let cases = [
+            (TransactionStatus::Pending, true),
+            (TransactionStatus::Processing, true),
+            (TransactionStatus::Parked, true),
+            (TransactionStatus::PendingRemint, true),
+            (TransactionStatus::ManualReview, true),
+            (TransactionStatus::Completed, false),
+            (TransactionStatus::Failed, false),
+            (TransactionStatus::FailedReminted, false),
+        ];
+
+        for (status, retained) in cases {
+            let (storage, mock) = make_mock_storage();
+            let mut row = make_db_transaction();
+            row.id = 1;
+            row.status = status;
+            mock.pending_transactions.lock().unwrap().push(row);
+            assert_eq!(
+                storage
+                    .claim_remint_attempt(1, "sig-gc".to_string(), 10, None, &[])
+                    .await
+                    .unwrap(),
+                RemintClaim::Claimed
+            );
+
+            storage.gc_stale_remint_signatures().await.unwrap();
+
+            assert_eq!(
+                !storage.get_remint_signatures(1).await.unwrap().is_empty(),
+                retained,
+                "{status:?} must {} its journal",
+                if retained { "keep" } else { "lose" }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_get_committed_checkpoint_via_mock() {
         let (storage, _mock) = make_mock_storage();
@@ -2614,6 +2760,31 @@ mod tests {
         );
     }
 
+    /// Mirror of the Postgres guard: a release recorded for the row's nonce refuses the
+    /// claim and journals nothing.
+    #[tokio::test]
+    async fn mock_remint_claim_refused_when_a_release_was_observed() {
+        use crate::storage::common::models::DbObservedRelease;
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 9, Some(77), TransactionStatus::PendingRemint);
+        mock.insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: 77,
+            signature: "release-landed".to_string(),
+            slot: 500,
+            amount: None,
+        }])
+        .await
+        .unwrap();
+
+        let claim = mock
+            .claim_remint_attempt(9, "sig-claim".to_string(), 0, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(claim, RemintClaim::ReleaseObserved);
+        assert!(mock.get_remint_signatures(9).await.unwrap().is_empty());
+    }
+
     // ── unreleased withdrawal nonce bounds ───────────────────────────
 
     /// Seed a withdrawal at `nonce` in `status` into the mock's row table.
@@ -2924,10 +3095,13 @@ mod tests {
             // Above the deposit bound but a withdrawal, whose bound it is below.
             db.push(sloted_txn(6, Withdrawal, Completed, 5_000, 32));
             db.push(sloted_txn(7, Deposit, Processing, 2_000, 64));
+            // Unsettled withdrawals count only above their bound, and only as the adjustment.
+            db.push(sloted_txn(8, Withdrawal, Pending, 11, 128));
+            db.push(sloted_txn(9, Withdrawal, Pending, 10, 256));
         }
         let (in_flight, adjustment) = envelope_parts(&storage, Some(1_000), Some(10)).await;
         assert_eq!(in_flight, BigDecimal::from(64u64));
-        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32));
+        assert_eq!(adjustment, BigDecimal::from(2u64 + 4 + 16 + 32 + 128));
 
         // Raising the withdrawal bound drops every withdrawal, leaving the deposits.
         let (_, adjustment) = envelope_parts(&storage, Some(1_000), Some(5_000)).await;
@@ -2963,16 +3137,65 @@ mod tests {
         );
     }
 
+    /// Mock twin of the Postgres test of the same name, with the same rows.
+    #[tokio::test]
+    async fn unlisted_mints_come_from_history_and_deposits_only() {
+        use TransactionStatus::*;
+        use TransactionType::*;
+        let (storage, mock) = make_mock_storage();
+        let history = |mint: &str| crate::storage::common::models::DbMintStatus {
+            withdrawals_blocked: true,
+            mint_address: mint.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 1,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+            signature: format!("history-{mint}"),
+            created_at: Utc::now(),
+        };
+        mock.mints.lock().unwrap().insert(
+            "listed".to_string(),
+            DbMint::new("listed".to_string(), 6, "spl".to_string(), TokenAmount(1)),
+        );
+        mock.mint_status_history.lock().unwrap().extend([
+            history("listed"),
+            history("history_only"),
+            history("history_only"),
+        ]);
+        let row = |id, mint: &str, kind, status| {
+            let mut t = sloted_txn(id, kind, status, 1, 1);
+            t.mint = mint.to_string();
+            t
+        };
+        mock.pending_transactions.lock().unwrap().extend([
+            row(1, "listed", Deposit, Completed),
+            row(2, "deposit_only", Deposit, Pending),
+            row(3, "withdrawal_only", Withdrawal, Completed),
+        ]);
+        mock.inserted_single_transactions.lock().unwrap().push(row(
+            4,
+            "deposit_only",
+            Deposit,
+            Completed,
+        ));
+
+        let mut unlisted = storage.get_unlisted_mints().await.unwrap();
+        unlisted.sort();
+        assert_eq!(unlisted, vec!["deposit_only", "history_only"]);
+    }
+
     /// Every status is either in the envelope or counted by the slot arms; a new status
-    /// must be classified here before this compiles.
+    /// must be classified here before this compiles. Only deposits enter the envelope.
     #[tokio::test]
     async fn every_status_is_counted_exactly_once_above_the_bound() {
         use TransactionStatus::*;
-        fn in_envelope(status: TransactionStatus) -> bool {
-            match status {
+        fn in_envelope(status: TransactionStatus, kind: TransactionType) -> bool {
+            let unsettled = match status {
                 Pending | Processing | Parked | PendingRemint => true,
                 Completed | Failed | FailedReminted | ManualReview => false,
-            }
+            };
+            unsettled && kind == TransactionType::Deposit
         }
         let all = [
             Pending,
@@ -2994,7 +3217,7 @@ mod tests {
                 let (in_flight, adjustment) = envelope_parts(&storage, Some(10), Some(10)).await;
                 let seven = BigDecimal::from(7u64);
                 let zero = BigDecimal::from(0u64);
-                let expected = if in_envelope(status) {
+                let expected = if in_envelope(status, kind) {
                     (seven, zero)
                 } else {
                     (zero, seven)

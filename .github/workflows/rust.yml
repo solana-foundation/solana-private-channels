@@ -9,6 +9,7 @@ on:
         main,
         hardening/pre-release-audit,
         hardening/cantina-reaudit,
+        audit/apex-audit-scan-remediation,
         cantina-audit,
         ottersec-audit,
         feature/smt-to-bitmap-migration,

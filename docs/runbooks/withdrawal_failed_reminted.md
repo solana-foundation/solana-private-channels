@@ -13,6 +13,18 @@ the user's burned private channel tokens.
 
 No funds are stranded. No recovery action needed.
 
+**Exception:** if `error_message` contains `remint landed but the row is no
+longer pending_remint`, another writer moved the row while this remint
+landed, so the row's status does not show the refund. The user is refunded
+by `remint_signature`. Check the row's status, then:
+
+- Cancel any out-of-band refund in progress for this `transaction_id`, and
+  record the remint signature in the incident record.
+- If the row is `manual_review`, mark it reminted with the Triage SQL in
+  [`withdrawal_manual_review.md`](withdrawal_manual_review.md).
+- If the row is `completed`, the release landed too:
+  [escalate](_escalation.md) (Tier 1).
+
 ## Reconciliation steps
 
 1. **Confirm the remint signature on-chain.**

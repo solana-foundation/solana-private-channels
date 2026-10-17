@@ -114,7 +114,7 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
-    /// Expiry in seconds on cached Redis block entries; 0 disables it
+    /// Expiry in seconds on cached Redis block and transaction entries; 0 disables it
     #[arg(
         long,
         default_value_t = 3600,
@@ -125,6 +125,11 @@ struct Args {
     /// How many blocks a blockhash stays valid for
     #[arg(long, default_value_t = 150, env = "PRIVATE_CHANNEL_MAX_BLOCKHASHES")]
     max_blockhashes: usize,
+
+    /// Let a write node boot with a larger window than the ledger last recorded. Every
+    /// hash already handed out then stays valid past its advertised deadline.
+    #[arg(long, env = "PRIVATE_CHANNEL_ALLOW_MAX_BLOCKHASHES_INCREASE")]
+    allow_max_blockhashes_increase: bool,
 
     /// Deprecated: transaction expiration as a duration in milliseconds. Mapped
     /// to a block count and removed after the next release.
@@ -218,6 +223,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             args.transaction_expiration_ms,
             args.blocktime_ms,
         ),
+        allow_max_blockhashes_increase: args.allow_max_blockhashes_increase,
         blocktime_ms: args.blocktime_ms,
         perf_sample_period_secs: args.perf_sample_period_secs,
         metrics,

@@ -16,14 +16,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     let recent_blockhash = ctx.get_blockhash().await.unwrap();
     println!("Got recent blockhash: {:?}", recent_blockhash);
 
-    let is_valid = ctx
-        .read_client
-        .is_blockhash_valid(
-            &recent_blockhash,
-            solana_commitment_config::CommitmentConfig::confirmed(),
-        )
-        .await
-        .unwrap();
+    let is_valid = blockhash_is_valid(ctx, &recent_blockhash).await;
 
     assert!(is_valid, "Recent blockhash should be valid");
     println!("✓ Recent blockhash is valid");
@@ -64,14 +57,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
 
     // The first blockhash should still be in the window if the window is large enough
     // Note: This test may pass or fail depending on the blockhash window size
-    let first_is_valid = ctx
-        .read_client
-        .is_blockhash_valid(
-            &first_blockhash,
-            solana_commitment_config::CommitmentConfig::confirmed(),
-        )
-        .await
-        .unwrap();
+    let first_is_valid = blockhash_is_valid(ctx, &first_blockhash).await;
 
     if first_is_valid {
         println!("✓ First blockhash is still valid (in window but not latest)");
@@ -89,14 +75,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     let fake_blockhash = Hash::new_unique();
     println!("Fake blockhash: {:?}", fake_blockhash);
 
-    let fake_is_valid = ctx
-        .read_client
-        .is_blockhash_valid(
-            &fake_blockhash,
-            solana_commitment_config::CommitmentConfig::confirmed(),
-        )
-        .await
-        .unwrap();
+    let fake_is_valid = blockhash_is_valid(ctx, &fake_blockhash).await;
 
     assert!(!fake_is_valid, "Fake blockhash should be invalid");
     println!("✓ Fake blockhash is correctly rejected");
@@ -105,14 +84,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
     println!("\n--- Test 5: RPC-Dedup consistency ---");
     // Get a fresh blockhash and immediately validate it
     let fresh_blockhash = ctx.get_blockhash().await.unwrap();
-    let fresh_is_valid = ctx
-        .read_client
-        .is_blockhash_valid(
-            &fresh_blockhash,
-            solana_commitment_config::CommitmentConfig::confirmed(),
-        )
-        .await
-        .unwrap();
+    let fresh_is_valid = blockhash_is_valid(ctx, &fresh_blockhash).await;
 
     assert!(
         fresh_is_valid,
@@ -175,5 +147,31 @@ fn memo_ix(tag: &str) -> Instruction {
         program_id: spl_memo::id(),
         accounts: vec![],
         data: tag.as_bytes().to_vec(),
+    }
+}
+
+/// isBlockhashValid, retried while the node answers that its window is catching up: a
+/// block cut in progress gives that answer for a hash it does not hold yet.
+async fn blockhash_is_valid(ctx: &PrivateChannelContext, blockhash: &Hash) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match ctx
+            .read_client
+            .is_blockhash_valid(
+                blockhash,
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            )
+            .await
+        {
+            Ok(valid) => return valid,
+            Err(e) if e.to_string().contains("catching up") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "isBlockhashValid kept answering catching up"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("isBlockhashValid failed: {e}"),
+        }
     }
 }

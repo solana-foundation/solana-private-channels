@@ -140,7 +140,9 @@ List all verified wallets for the authenticated user. Requires a valid JWT.
 
 Remove a verified wallet from the authenticated user. Requires a valid JWT.
 Returns `204 No Content` on success, or `400` with `wallet not associated with
-this user` when the pubkey is not one of the caller's verified wallets.
+this user` when the pubkey is not one of the caller's verified wallets. A
+successful unlink also revokes the account's outstanding challenge, so a
+signature collected before the unlink cannot relink the wallet.
 
 ---
 

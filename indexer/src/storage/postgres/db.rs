@@ -9,9 +9,10 @@ use crate::{
     error::StorageError,
     indexer::checkpoint::program_key,
     storage::common::models::{
-        DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
-        StoredSig, TransactionStatus, TransactionType,
+        ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease, DbTransaction,
+        FenceRecord, HaltInfo, MintDbBalance, MintInFlightAmount, MintStatusAtSlot,
+        ReleasedWithdrawal, ResyncBlockers, ServicedRow, StoredSig, TransactionStatus,
+        TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::resync_state::resync_halt_reason,
@@ -220,8 +221,10 @@ fn database_url_password_is_blank(database_url: &str) -> bool {
 
 /// A full reset of every table, in dependency order. Only the pooled `drop_tables` uses it;
 /// resync deletes its own program's rows instead (see `wipe_program_on`).
-const DROP_STATEMENTS: [&str; 11] = [
+const DROP_STATEMENTS: [&str; 13] = [
     "DROP TABLE IF EXISTS resync_state CASCADE",
+    "DROP TABLE IF EXISTS consumed_channel_mints CASCADE",
+    "DROP TABLE IF EXISTS mint_status_history CASCADE",
     "DROP TABLE IF EXISTS pending_release_signatures CASCADE",
     "DROP TABLE IF EXISTS observed_releases CASCADE",
     "DROP TABLE IF EXISTS pending_remint_signatures CASCADE",
@@ -237,8 +240,10 @@ const DROP_STATEMENTS: [&str; 11] = [
 /// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
 const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
 
-/// Statuses the reconciliation envelope counts as unsettled.
-const ENVELOPE_STATUSES: &str = "('pending', 'processing', 'parked', 'pending_remint')";
+/// Rows the reconciliation envelope counts: unsettled deposits only. A withdrawal burns before it releases,
+/// so an unsettled one can never explain supply above custody, only hide a real shortfall.
+const ENVELOPE_ROWS: &str =
+    "(transaction_type = 'deposit' AND status IN ('pending', 'processing', 'parked', 'pending_remint'))";
 
 /// Statuses that can still have a broadcast in flight whether or not a journal survives.
 const UNSETTLED_STATUSES: &str = "('processing', 'pending_remint', 'manual_review')";
@@ -253,8 +258,17 @@ const RELEASED_BY_OBSERVATION: &str = "r.withdrawal_nonce IS NOT NULL";
 const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
     "(t.status = 'completed' OR r.withdrawal_nonce IS NOT NULL)";
 
+/// Mint sources besides `mints` that the escrow program has vetted: status history, deposits,
+/// and withdrawals with an observed release, since `ReleaseFunds` checks the `AllowedMint`.
+/// A withdrawal row on its own is channel-side, where anyone can burn a mint of their own.
+const UNLISTED_MINT_SOURCES: &str = "SELECT mint_address FROM mint_status_history \
+     UNION SELECT mint AS mint_address FROM transactions WHERE transaction_type = 'deposit' \
+     UNION SELECT t.mint AS mint_address FROM transactions t \
+       JOIN observed_releases r ON r.withdrawal_nonce = t.withdrawal_nonce \
+       WHERE t.transaction_type = 'withdrawal'";
+
 /// The per-mint reconciliation aggregate. Only the test for a released withdrawal varies, so
-/// both reads share one shape and one mint universe.
+/// both reads share one shape and one mint universe: `mints` plus the unlisted mints.
 ///
 /// A payout discharges what the chain says it moved, capped at what its row owed: releasing
 /// less leaves the rest owed, and releasing more leaves the excess standing as a shortfall
@@ -262,9 +276,13 @@ const RELEASED_BY_OBSERVATION_OR_STATUS: &str =
 fn mint_balances_query(released: &str) -> String {
     format!(
         r#"
+            WITH universe AS (
+                SELECT mint_address FROM mints
+                UNION {UNLISTED_MINT_SOURCES}
+            )
             SELECT
-                m.mint_address,
-                m.token_program,
+                u.mint_address,
+                COALESCE(m.token_program, '') AS token_program,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
                     0
@@ -276,14 +294,15 @@ fn mint_balances_query(released: &str) -> String {
                              ELSE 0 END),
                     0
                 )::NUMERIC AS total_withdrawals
-            FROM mints m
+            FROM universe u
+            LEFT JOIN mints m ON m.mint_address = u.mint_address
             LEFT JOIN transactions t
-              ON t.mint = m.mint_address
+              ON t.mint = u.mint_address
              AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
             LEFT JOIN observed_releases r
               ON r.withdrawal_nonce = t.withdrawal_nonce
              AND r.slot <= $1
-            GROUP BY m.mint_address, m.token_program
+            GROUP BY u.mint_address, m.token_program
             "#
     )
 }
@@ -485,6 +504,11 @@ impl PostgresDb {
         .await?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_slot ON transactions (slot)")
+            .execute(&self.pool)
+            .await?;
+
+        // The reconciliation mint universe and every ledger read join on mint.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_mint ON transactions (mint)")
             .execute(&self.pool)
             .await?;
 
@@ -754,6 +778,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // The channel fence. Additive and nullable so older binaries ignore it.
+        sqlx::query(
+            "ALTER TABLE indexer_state
+                ADD COLUMN IF NOT EXISTS fence_slot BIGINT,
+                ADD COLUMN IF NOT EXISTS fence_blockhash TEXT",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Widen an already-created table. Rows written before this still hold their
         // defaulted zero, which no migration can tell apart from a real genesis
         // checkpoint, so this only stops new phantom rows being made.
@@ -850,6 +883,26 @@ impl PostgresDb {
         sqlx::query(
             r#"
             ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'failed_reminted';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // A reminted row must carry the remint that refunded it, whoever writes
+        // it, or a later re-arm cannot tell the row was already refunded.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'failed_reminted_has_landed_signature'
+                      AND conrelid = 'transactions'::regclass
+                ) THEN
+                    ALTER TABLE transactions
+                    ADD CONSTRAINT failed_reminted_has_landed_signature
+                    CHECK (status <> 'failed_reminted' OR landed_remint_signature IS NOT NULL);
+                END IF;
+            END $$;
             "#,
         )
         .execute(&self.pool)
@@ -992,6 +1045,26 @@ impl PostgresDb {
                     ALTER TABLE observed_releases ALTER COLUMN amount TYPE NUMERIC(20,0);
                 END IF;
             END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Channel mints a consumed-set walk authenticated. A later walk stops at the newest
+        // mint the DB knows, which recovery itself moves, so what an earlier walk found
+        // below that point is kept here. Restored with the rows it explains.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS consumed_channel_mints (
+                source_event_id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                recipient_ata TEXT NOT NULL,
+                token_program TEXT NOT NULL,
+                amount NUMERIC(20,0) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
             "#,
         )
         .execute(&self.pool)
@@ -1159,10 +1232,14 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
-        // Lowest slot any interrupted wipe deleted, so a rerun cannot pick a genesis above it.
-        sqlx::query("ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT")
-            .execute(&self.pool)
-            .await?;
+        // Lowest and highest slot any interrupted wipe deleted, so a rerun cannot pick a
+        // genesis above the first or rebuild to a tip below the second.
+        sqlx::query(
+            "ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT,
+                                      ADD COLUMN IF NOT EXISTS latest_slot BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("Database schema initialized");
         Ok(())
@@ -1189,12 +1266,15 @@ impl PostgresDb {
         let mut tx = conn.begin().await?;
 
         // The marker commits with the deletes, so an ambiguous COMMIT cannot leave one without the other.
-        // It keeps the lowest slot ever deleted, since a rerun no longer sees those rows.
+        // It keeps the lowest and highest slot ever deleted, since a rerun no longer sees those rows.
         let claimed = sqlx::query(
-            "INSERT INTO resync_state (program_type, earliest_slot)
-             VALUES ($1, (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2))
+            "INSERT INTO resync_state (program_type, earliest_slot, latest_slot)
+             VALUES ($1,
+                     (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2),
+                     (SELECT MAX(slot) FROM transactions WHERE transaction_type = $2))
              ON CONFLICT (id) DO UPDATE
-             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot)
+             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot),
+                 latest_slot = GREATEST(resync_state.latest_slot, EXCLUDED.latest_slot)
              WHERE resync_state.program_type = EXCLUDED.program_type",
         )
         .bind(&key)
@@ -1789,25 +1869,153 @@ impl PostgresDb {
         &self,
         program_type: &str,
         slot: u64,
+        fence: Option<&ChannelFence>,
     ) -> Result<(), sqlx::Error> {
         // Monotonic guard: GREATEST() prevents a lower slot (e.g. backfill
         // replay after a flushed Yellowstone update) from regressing the cursor.
+        // The fence moves only forward too, both columns together.
         sqlx::query(
             r#"
-            INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
-            VALUES ($1, $2, NOW())
+            INSERT INTO indexer_state (program_type, last_committed_slot, fence_slot, fence_blockhash, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (program_type)
             DO UPDATE SET
                 last_committed_slot = GREATEST(indexer_state.last_committed_slot, EXCLUDED.last_committed_slot),
+                fence_slot = CASE
+                    WHEN EXCLUDED.fence_slot > COALESCE(indexer_state.fence_slot, -1)
+                    THEN EXCLUDED.fence_slot ELSE indexer_state.fence_slot END,
+                fence_blockhash = CASE
+                    WHEN EXCLUDED.fence_slot > COALESCE(indexer_state.fence_slot, -1)
+                    THEN EXCLUDED.fence_blockhash ELSE indexer_state.fence_blockhash END,
                 updated_at = NOW()
             "#,
         )
         .bind(program_type)
         .bind(slot as i64)
+        .bind(fence.map(|f| f.slot as i64))
+        .bind(fence.map(|f| f.blockhash.clone()))
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    pub async fn get_channel_fence_internal(&self) -> Result<Option<FenceRecord>, sqlx::Error> {
+        let row: Option<(Option<i64>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT fence_slot, fence_blockhash, last_committed_slot FROM indexer_state \
+             WHERE program_type = $1",
+        )
+        .bind(program_key(ProgramType::Withdraw))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((Some(slot), Some(blockhash), checkpoint)) => Some(FenceRecord {
+                fence: ChannelFence {
+                    slot: slot as u64,
+                    blockhash,
+                },
+                checkpoint: checkpoint.map_or(slot, |c| c.max(slot)) as u64,
+            }),
+            _ => None,
+        })
+    }
+
+    pub async fn get_newest_known_mint_signatures_internal(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let query = match kind {
+            TransactionType::Deposit => {
+                r#"
+                SELECT counterpart_signature FROM transactions
+                 WHERE mint = $1 AND transaction_type = 'deposit' AND status = 'completed'
+                   AND counterpart_signature IS NOT NULL
+                 ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 1
+                "#
+            }
+            TransactionType::Withdrawal => {
+                r#"
+                SELECT landed_remint_signature FROM transactions
+                 WHERE mint = $1 AND transaction_type = 'withdrawal' AND status = 'failed_reminted'
+                   AND landed_remint_signature IS NOT NULL
+                 ORDER BY processed_at DESC NULLS LAST, id DESC LIMIT 1
+                "#
+            }
+        };
+        sqlx::query_scalar(query)
+            .bind(mint)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn insert_consumed_mints_internal(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), sqlx::Error> {
+        for mint in mints {
+            sqlx::query(
+                r#"
+                INSERT INTO consumed_channel_mints
+                    (source_event_id, signature, kind, mint, recipient_ata, token_program, amount)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (source_event_id) DO NOTHING
+                "#,
+            )
+            .bind(&mint.source_event_id)
+            .bind(&mint.signature)
+            .bind(&mint.kind)
+            .bind(&mint.mint)
+            .bind(&mint.recipient_ata)
+            .bind(&mint.token_program)
+            .bind(mint.amount)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_consumed_mints_internal(&self) -> Result<Vec<DbConsumedMint>, sqlx::Error> {
+        sqlx::query_as::<_, DbConsumedMint>(
+            "SELECT source_event_id, signature, kind, mint, recipient_ata, token_program, amount \
+             FROM consumed_channel_mints",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_max_withdrawal_nonce_internal(&self) -> Result<Option<u64>, sqlx::Error> {
+        let max: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(withdrawal_nonce) FROM transactions WHERE transaction_type = 'withdrawal'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(max.map(|nonce| nonce as u64))
+    }
+
+    pub async fn try_mark_reminted_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signature: String,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'failed_reminted',
+                landed_remint_signature = $3,
+                processed_at = NOW()
+            WHERE id = $1
+              AND status IN ('processing', 'pending_remint')
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(remint_signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn get_and_lock_pending_transactions_internal(
@@ -1924,6 +2132,8 @@ impl PostgresDb {
     ) -> Result<bool, sqlx::Error> {
         // Only write non-terminal source states — blocks late writes after recovery.
         // release_signatures is COALESCE-guarded so a None never wipes provenance.
+        // failed_reminted is refused: only record_remint_result may set it, since
+        // only it stores the landed signature with it.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -1934,6 +2144,7 @@ impl PostgresDb {
                 release_signatures = COALESCE($5, release_signatures)
             WHERE id = $1
               AND status IN ('processing', 'pending_remint')
+              AND $2 <> 'failed_reminted'
             "#,
         )
         .bind(transaction_id)
@@ -2049,6 +2260,32 @@ impl PostgresDb {
               AND EXISTS (
                   SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+              )
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// `requeue_halted_claim_internal` without the halt predicate, for a claim the operator
+    /// refused in process before it was made. Same lease CAS and same journal guard.
+    pub async fn requeue_unclaimed_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
               AND NOT EXISTS (
                   SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
               )
@@ -2595,9 +2832,9 @@ impl PostgresDb {
     }
 
     /// Durably record a confirmed remint: flip status to FailedReminted and
-    /// store the signature in one UPDATE, before the async writer runs. The
-    /// `pending_remint` guard makes it a no-op on an already-terminal row, so
-    /// a replayed call can never resurrect or double-record.
+    /// store the signature in one UPDATE. The `pending_remint` guard makes it a
+    /// no-op on an already-terminal row, so a replayed call can never resurrect
+    /// or double-record.
     pub async fn record_remint_result_internal(
         &self,
         transaction_id: i64,
@@ -2643,7 +2880,7 @@ impl PostgresDb {
             // on-call: a missing row is a bug (the id came from a live
             // PendingRemint row), a non-pending_remint status is expected on an
             // idempotent replay. Both still signal RowNotFound so the caller
-            // falls back to the async writer.
+            // reads the row back to see who owns it.
             match current.as_deref() {
                 None => warn!("record_remint_result: transaction {transaction_id} not found"),
                 Some(status) => info!(
@@ -2716,6 +2953,8 @@ impl PostgresDb {
               AND NOT EXISTS (
                   SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
               )
+              -- A landed remint already refunded the row; releasing it would pay twice.
+              AND landed_remint_signature IS NULL
             RETURNING updated_at
             "#,
         )
@@ -2901,6 +3140,9 @@ impl PostgresDb {
     /// sides could read `pending_remint` and commit. The write takes the row lock
     /// and its trigger bumps `updated_at`, so a completion pinned on the old
     /// version no longer matches once a claim commits.
+    ///
+    /// The parent write is also refused when a release for the row's nonce is on
+    /// record, so one indexed after the caller's own lookup still blocks the refund.
     pub async fn claim_remint_attempt_internal(
         &self,
         transaction_id: i64,
@@ -2922,14 +3164,35 @@ impl PostgresDb {
                     WHERE id = $1
                       AND status = 'pending_remint'
                       AND transaction_type = 'withdrawal'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM observed_releases o
+                          WHERE o.withdrawal_nonce = transactions.withdrawal_nonce
+                      )
                     "#,
                 )
                 .bind(transaction_id)
                 .execute(&mut *tx)
                 .await?;
                 if parent.rows_affected() == 0 {
+                    // Zero rows is a moved row, or a recorded release on a row still ours; only the latter escalates.
+                    let observed: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM transactions t
+                            JOIN observed_releases o ON o.withdrawal_nonce = t.withdrawal_nonce
+                            WHERE t.id = $1 AND t.status = 'pending_remint'
+                        )
+                        "#,
+                    )
+                    .bind(transaction_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
                     tx.rollback().await?;
-                    return Ok(RemintClaim::RowMoved);
+                    return Ok(if observed {
+                        RemintClaim::ReleaseObserved
+                    } else {
+                        RemintClaim::RowMoved
+                    });
                 }
 
                 sqlx::query(
@@ -3007,17 +3270,17 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Drop remint signatures whose parent transaction is no longer
-    /// `pending_remint`. Returns the number of rows removed.
+    /// Drop remint signatures whose parent transaction is terminal. Returns the
+    /// number of rows removed. A `manual_review` row keeps its journal: its
+    /// MintTo may still land, and recovery needs the signature to rule that out.
+    /// A `failed_reminted` parent always carries its landed signature (table
+    /// CHECK), so dropping its journal loses no evidence.
     pub async fn gc_stale_remint_signatures_internal(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM pending_remint_signatures
-            WHERE transaction_id IN (
-                SELECT id FROM transactions WHERE status <> 'pending_remint'
-            )
-            "#,
-        )
+        let result = sqlx::query(&format!(
+            "DELETE FROM pending_remint_signatures
+             WHERE transaction_id IN (SELECT id FROM transactions
+                                      WHERE status IN {TERMINAL_STATUSES})"
+        ))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -3040,27 +3303,43 @@ impl PostgresDb {
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
     ///
-    /// Journalled release signatures are copied onto the row in the same
-    /// UPDATE. The journal is GC'd once the row leaves `Processing`, and the
-    /// reconcile sweep only fetches rows carrying those columns.
+    /// Journalled release signatures are copied onto the row, because the
+    /// reconcile sweep only fetches rows carrying those columns. The rows are
+    /// locked first, so a claim in flight commits its journal before the copy
+    /// reads it.
     ///
     /// Scope is intentionally DB-wide over `transaction_type = 'withdrawal'`
     /// to match the fetcher's own scope. The data model assumes a single
     /// withdrawal operator per database; multi-instance isolation would
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
-    // Coverage-ignore rationale (category b, defensive recovery):
-    //   `quarantine_active_withdrawals_internal` is only invoked by
-    //   the poison-pill pipeline in `operator/processor.rs`
-    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded.
-    //   Integration tests do not produce malformed rows that would trip
-    //   it. The SQL itself is trivial; the behavior is covered via the
-    //   `Storage::Mock` variant in in-crate tests and by the runbook drills.
     pub async fn quarantine_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,
         min_nonce: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock first: this waits out a claim in flight, whose journal insert
+        // commits under the same row lock, and rechecks the status after it.
+        let ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM transactions
+            WHERE transaction_type = 'withdrawal'
+              AND status IN ('pending', 'processing', 'parked')
+              AND ($1::BIGINT IS NULL OR id <> $1)
+              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(exclude_id)
+        .bind(min_nonce)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // A new statement reads a new snapshot, so the copy sees every journal
+        // committed before the locks were taken.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -3078,17 +3357,15 @@ impl PostgresDb {
                      WHERE p.transaction_id = transactions.id),
                     remint_last_valid_block_heights
                 )
-            WHERE transaction_type = 'withdrawal'
+            WHERE id = ANY($1)
               AND status IN ('pending', 'processing', 'parked')
-              AND ($1::BIGINT IS NULL OR id <> $1)
-              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
             "#,
         )
-        .bind(exclude_id)
-        .bind(min_nonce)
-        .execute(&self.pool)
+        .bind(&ids)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -3284,32 +3561,41 @@ impl PostgresDb {
             .await
     }
 
-    /// Every mint address the DB knows: the mint universe runtime reconciliation checks.
-    /// Addresses only, so it can be read before the tick knows whether the ledger is
-    /// pinnable at all.
-    /// Every mint with its token program, which custody needs to derive the escrow ATA.
+    /// Every `mints` row with its token program, which custody needs to derive the escrow ATA.
+    /// With `get_unlisted_mints_internal` it is the universe runtime reconciliation checks.
     pub async fn get_mint_addresses_internal(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
         sqlx::query_as("SELECT mint_address, token_program FROM mints")
             .fetch_all(&self.pool)
             .await
     }
 
-    /// Per-mint sum of every unsettled transaction amount (the in-flight
-    /// envelope). Both types are summed as a deliberate over-approximation: a
-    /// larger envelope only ever delays detection of a real insolvency, never
-    /// fabricates a false halt.
+    /// Mints with status history, deposit rows or released withdrawals but no `mints` row. A
+    /// `BlockMint` in range writes only history, and an indexer that started after the
+    /// `AllowMint` has no row.
+    pub async fn get_unlisted_mints_internal(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(&format!(
+            "SELECT mint_address FROM ({UNLISTED_MINT_SOURCES}) u \
+             WHERE NOT EXISTS (SELECT 1 FROM mints m WHERE m.mint_address = u.mint_address)"
+        ))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Per-mint sum of unsettled deposits (the in-flight envelope). Withdrawals stay out: their
+    /// burn is already in the supply read, and a wider envelope would hide a real shortfall.
     ///
-    /// Settled deposits above `deposits_after` and settled withdrawals above `withdrawals_after`
-    /// are summed apart as the adjustment; one statement, so each row is counted once.
+    /// Settled deposits above `deposits_after` and withdrawals in any status above
+    /// `withdrawals_after` are summed apart as the adjustment; one statement, so each row is
+    /// counted once.
     pub async fn get_in_flight_amounts_by_mint_internal(
         &self,
         deposits_after: Option<i64>,
         withdrawals_after: Option<i64>,
     ) -> Result<Vec<MintInFlightAmount>, sqlx::Error> {
-        // Sum of every in-flight row per mint: the supply-vs-custody transient bound.
-        // Deposits and pending_remint raise supply; burn-side withdrawals over-count but only widen it, never false-halt.
+        // A withdrawal explains supply above custody only when its release landed and its burn is
+        // newer than the supply anchor, so in any status it counts only through its slot arm.
         // `slot` holds Solana slots for deposits and channel slots for withdrawals, so each arm has its own bound.
-        let mut rows = format!("status IN {ENVELOPE_STATUSES}");
+        let mut rows = ENVELOPE_ROWS.to_string();
         let mut binds = Vec::new();
         for (kind, bound) in [
             ("deposit", deposits_after),
@@ -3326,9 +3612,9 @@ impl PostgresDb {
         let sql = format!(
             r#"
             SELECT mint AS mint_address,
-                   COALESCE(SUM(amount) FILTER (WHERE status IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                   COALESCE(SUM(amount) FILTER (WHERE {ENVELOPE_ROWS}), 0)::NUMERIC
                        AS in_flight_amount,
-                   COALESCE(SUM(amount) FILTER (WHERE status NOT IN {ENVELOPE_STATUSES}), 0)::NUMERIC
+                   COALESCE(SUM(amount) FILTER (WHERE NOT {ENVELOPE_ROWS}), 0)::NUMERIC
                        AS adjustment_amount
             FROM transactions
             WHERE {rows}
@@ -3509,10 +3795,11 @@ impl PostgresDb {
         &self,
         own: TransactionType,
     ) -> Result<ResyncBlockers, sqlx::Error> {
-        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot): (
+        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot, latest_slot): (
             bool,
             bool,
             bool,
+            Option<i64>,
             Option<i64>,
         ) = sqlx::query_as(&format!(
             "SELECT
@@ -3529,7 +3816,9 @@ impl PostgresDb {
                            WHERE transaction_type = 'withdrawal' AND status = 'failed'),
                    EXISTS (SELECT 1 FROM observed_releases),
                    LEAST((SELECT MIN(slot) FROM transactions WHERE transaction_type = $1),
-                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2))"
+                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2)),
+                   GREATEST((SELECT MAX(slot) FROM transactions WHERE transaction_type = $1),
+                            (SELECT latest_slot FROM resync_state WHERE program_type = $2))"
         ))
         .bind(own)
         .bind(program_key(match own {
@@ -3543,6 +3832,7 @@ impl PostgresDb {
             failed_withdrawals,
             observed_releases,
             earliest_slot,
+            latest_slot,
         })
     }
 

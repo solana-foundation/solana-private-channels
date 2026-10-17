@@ -38,7 +38,11 @@ use {
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::time::{Duration, Instant},
     test_utils::{
-        mock_rpc::Reply, operator_helper::start_solana_to_private_channel_operator_with_mocks,
+        mock_rpc::Reply,
+        operator_helper::{
+            start_solana_to_private_channel_operator_with_mocks,
+            start_solana_to_private_channel_operator_with_mocks_dark,
+        },
     },
 };
 
@@ -80,13 +84,11 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     // Deterministic test: never observes wall clock outside the 10s poll loop.
-    let escrow_instance_id = Pubkey::new_unique();
     let operator_keypair = Keypair::new();
 
-    let harness =
-        start_solana_to_private_channel_operator_with_mocks(escrow_instance_id, operator_keypair)
-            .await
-            .expect("harness start");
+    let harness = start_solana_to_private_channel_operator_with_mocks(operator_keypair)
+        .await
+        .expect("harness start");
 
     // Script the wire responses the operator will consume on the happy path
     // for one deposit. Methods the mock never expects are returned as
@@ -235,6 +237,74 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
         blockhash_calls >= send_calls,
         "invariant: every sendTransaction is preceded by a getLatestBlockhash \
          (got {blockhash_calls} vs {send_calls})"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The escrow operator moves nothing before its first clean reconciliation tick: with custody
+/// unreadable the fence stays closed, so a ready deposit is never locked or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escrow_operator_moves_nothing_until_its_first_clean_tick() {
+    let harness = start_solana_to_private_channel_operator_with_mocks_dark(Keypair::new())
+        .await
+        .expect("harness start");
+    // Boot enumerates the channel mints it knows, so the rows go in once the first tick has
+    // run dark and the fence is still closed.
+    let custody = harness.custody_rpc.as_ref().expect("escrow harness");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while custody.call_count("getSlot") == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        custody.call_count("getSlot") >= 1,
+        "the first reconciliation tick ran and found custody dark"
+    );
+    let mint_pk = Pubkey::new_unique();
+    harness.storage.mints.lock().unwrap().insert(
+        mint_pk.to_string(),
+        DbMint::new(
+            mint_pk.to_string(),
+            6,
+            spl_token::id().to_string(),
+            TokenAmount(1),
+        ),
+    );
+    harness
+        .storage
+        .mint_status_history
+        .lock()
+        .unwrap()
+        .push(DbMintStatus {
+            withdrawals_blocked: false,
+            mint_address: mint_pk.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+            signature: format!("test-seed-{mint_pk}"),
+            created_at: chrono::Utc::now(),
+        });
+    harness.storage.set_checkpoint("escrow", 100);
+    harness
+        .storage
+        .pending_transactions
+        .lock()
+        .unwrap()
+        .push(pending_deposit_row(1, mint_pk, Pubkey::new_unique()));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        harness.storage.calls("get_and_lock_pending_transactions"),
+        0,
+        "no row is locked while the fence is closed"
+    );
+    assert_eq!(harness.rpc.call_count("sendTransaction"), 0);
+    assert_eq!(
+        harness.storage.pending_transactions.lock().unwrap()[0].status,
+        TransactionStatus::Pending
     );
 
     harness.shutdown().await;

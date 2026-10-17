@@ -8,7 +8,7 @@
 //! - Buffer time before storage closure
 
 use crate::config::ProgramType;
-use crate::error::IndexerError;
+use crate::error::{IndexerError, StorageError};
 use crate::indexer::checkpoint::{get_last_checkpoint, CheckpointMsg};
 use crate::indexer::datasource::common::datasource::DataSource;
 use crate::indexer::datasource::common::types::ProcessorMessage;
@@ -176,6 +176,32 @@ async fn abort_and_await_writers_within(writers: &[tokio::task::AbortHandle], ti
             return;
         }
         tokio::time::sleep(WRITER_STOP_POLL_INTERVAL).await;
+    }
+}
+
+/// Run a drain, but stop the writers with no flush as soon as the live-state lock is lost.
+/// Writers are aborted before the token is cancelled, so an idle worker never wakes on the
+/// cancel and starts a drain, and before the drain is dropped, so dropping it cues no flush.
+pub(crate) async fn drain_unless_lock_lost<T>(
+    lock_lost: &CancellationToken,
+    cancellation_token: &CancellationToken,
+    writers: &[tokio::task::AbortHandle],
+    drain: impl std::future::Future<Output = T>,
+) -> Result<T, StorageError> {
+    tokio::select! {
+        biased;
+        _ = async {
+            lock_lost.cancelled().await;
+            for writer in writers {
+                writer.abort();
+            }
+        } => {
+            error!("Live-state lock lost; stopping without draining");
+            cancellation_token.cancel();
+            abort_and_await_writers(writers).await;
+            Err(StorageError::LiveStateLockLost)
+        }
+        result = drain => Ok(result),
     }
 }
 

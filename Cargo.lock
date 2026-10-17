@@ -6354,7 +6354,6 @@ dependencies = [
  "figment",
  "futures 0.3.34",
  "mockito",
- "once_cell",
  "private-channel-core",
  "private-channel-escrow-program-client",
  "private-channel-metrics",
@@ -6458,10 +6457,13 @@ name = "private-channel-metrics"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hyper 1.11.1",
+ "hyper-util",
  "prometheus",
  "reqwest 0.11.27",
  "serde_json",
  "tokio",
+ "tower 0.5.2",
  "tracing",
 ]
 
@@ -14207,6 +14209,8 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 name = "test_utils"
 version = "0.1.0"
 dependencies = [
+ "base64 0.21.7",
+ "borsh 1.8.1",
  "bs58",
  "chrono",
  "futures 0.3.34",

@@ -63,6 +63,35 @@ fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     }
 }
 
+/// JSON-RPC code a node returns when it cannot answer at the requested `minContextSlot`.
+const MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
+
+/// Whether `e` says the node is behind a requested `minContextSlot`: its own -32016, the
+/// client's AccountNotFound wrapping of it, or our check of an answer below the floor.
+pub fn is_min_context_slot_error(e: &client_error::Error) -> bool {
+    match e.kind() {
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => {
+            *code == MIN_CONTEXT_SLOT_NOT_REACHED
+        }
+        ErrorKind::RpcError(RpcError::ForUser(msg)) => msg.contains(&format!(
+            "RPC response error {MIN_CONTEXT_SLOT_NOT_REACHED}"
+        )),
+        _ => false,
+    }
+}
+
+/// The error for an answer below `min_context_slot`, shaped like the node's own refusal.
+pub fn below_min_context_slot(slot: u64, min_context_slot: u64) -> client_error::Error {
+    client_error::Error::from(ErrorKind::RpcError(RpcError::RpcResponseError {
+        code: MIN_CONTEXT_SLOT_NOT_REACHED,
+        message: format!(
+            "Minimum context slot has not been reached: answered at slot {slot}, below \
+             {min_context_slot}"
+        ),
+        data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+    }))
+}
+
 /// The channel's `getSignatureStatusSnapshot` answer, every field from one committed state.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +99,25 @@ pub struct SignatureStatusSnapshot {
     pub block_height: u64,
     pub first_available_block: u64,
     pub value: Vec<Option<solana_transaction_status::TransactionStatus>>,
+}
+
+/// The endpoint does not implement the method (-32601).
+pub(crate) fn is_method_not_found(e: &client_error::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
+    )
+}
+
+/// The node's "skipped or missing" answers to `getBlock`, which name no block at all.
+fn is_missing_block(e: &client_error::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError {
+            code: -32004 | -32007 | -32009,
+            ..
+        })
+    )
 }
 
 pub struct RpcClientWithRetry {
@@ -219,9 +267,8 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the current slot with retry. The refund gate uses it as the last slot
-    /// a release could have landed in, which is what the indexer's checkpoint
-    /// then has to cover before an absent release record counts as evidence.
+    /// Get the current slot with retry. Unanchored: a lagging node reports its own
+    /// old slot, so it must not bound anything a refund or a verdict depends on.
     pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_slot", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_slot().await
@@ -264,6 +311,16 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Whether `slot`'s block time is within `CHANNEL_MAX_AGE_SECS` of our clock, which proves
+    /// the node answering at `slot` is live rather than replaying an old chain.
+    pub async fn tip_is_fresh(&self, slot: u64) -> Result<bool, Box<client_error::Error>> {
+        let max_age = crate::operator::escrow_sweep::CHANNEL_MAX_AGE_SECS;
+        let age = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(self.get_block_time(slot).await?);
+        Ok((-max_age..=max_age).contains(&age))
+    }
+
     /// Get the node's lowest retained slot with retry. An absence-based `Dead`
     /// finality verdict consults this to prove the endpoint still retains the
     /// attempt's slot range.
@@ -301,6 +358,59 @@ impl RpcClientWithRetry {
                 format!("getAddressIndexSlot reply lacks watermark or latestBlock: {reply}"),
             )))),
         }
+    }
+
+    /// Read `(blockhash, parentSlot)` of the block at `slot`, or `None` when the node
+    /// reports it skipped or missing (-32004, -32007, -32009, or a null result).
+    pub async fn get_block_summary(
+        &self,
+        slot: u64,
+    ) -> Result<Option<(String, u64)>, Box<client_error::Error>> {
+        let params = serde_json::json!([slot, {
+            "transactionDetails": "none",
+            "rewards": false,
+            "maxSupportedTransactionVersion": 1,
+            "commitment": self.rpc_client.commitment().commitment.to_string(),
+        }]);
+        let block = self
+            .with_retry("get_block_summary", RetryPolicy::Idempotent, || async {
+                match self
+                    .rpc_client
+                    .send::<Option<serde_json::Value>>(RpcRequest::GetBlock, params.clone())
+                    .await
+                {
+                    Err(e) if is_missing_block(&e) => Ok(None),
+                    other => other,
+                }
+            })
+            .await?;
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        match (block["blockhash"].as_str(), block["parentSlot"].as_u64()) {
+            (Some(hash), Some(parent)) => Ok(Some((hash.to_string(), parent))),
+            _ => Err(Box::new(client_error::Error::from(ErrorKind::Custom(
+                format!("getBlock({slot}) reply lacks blockhash or parentSlot"),
+            )))),
+        }
+    }
+
+    /// The first `limit` slots at or after `start_slot` that hold a block.
+    pub async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>, Box<client_error::Error>> {
+        self.with_retry("get_blocks_with_limit", RetryPolicy::Idempotent, || async {
+            self.rpc_client
+                .get_blocks_with_limit_and_commitment(
+                    start_slot,
+                    limit,
+                    self.rpc_client.commitment(),
+                )
+                .await
+        })
+        .await
     }
 
     /// Get the cluster genesis hash with retry. Used once at withdraw startup to
@@ -369,7 +479,8 @@ impl RpcClientWithRetry {
     /// snapshot whose context slot is at least `min_context_slot`. If the node
     /// cannot serve at that slot (a lagging or load-balanced backend) it returns
     /// an RPC error rather than an older snapshot, letting the caller fail closed.
-    /// This binds the returned account to a slot the caller has already proven fresh.
+    /// An answer below the slot is checked here too, so a node ignoring the
+    /// parameter is an error as well. Either error matches `is_min_context_slot_error`.
     pub async fn get_account_with_context_min_slot(
         &self,
         pubkey: &Pubkey,
@@ -392,6 +503,10 @@ impl RpcClientWithRetry {
                     .rpc_client
                     .get_ui_account_with_config(pubkey, config)
                     .await?;
+                // A backend that ignores the parameter is refused here; a retry may reach a fresher one.
+                if let Some(min) = min_context_slot.filter(|&min| response.context.slot < min) {
+                    return Err(below_min_context_slot(response.context.slot, min));
+                }
                 let value = match response.value {
                     None => None,
                     Some(account) => Some(account.to_account().ok_or_else(|| {
@@ -522,15 +637,23 @@ impl RpcClientWithRetry {
     /// enumeration cannot miss a mint that sits beyond the first window. Any page error
     /// propagates as `Err` so the caller can fail closed rather than treat a partial
     /// history as complete. Only entries `keep` accepts are retained, page by page.
+    ///
+    /// The walk ends early at the first page holding any `stop_at` signature, keeping only
+    /// the entries newer than it, and reports whether it met one. `until` is not used
+    /// because the RPC leaves that signature out, so meeting it could not be told apart.
     pub async fn get_signatures_for_address_paginated(
         &self,
         address: &Pubkey,
         page_limit: usize,
+        stop_at: &std::collections::HashSet<Signature>,
         keep: impl Fn(
             &solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
         ) -> bool,
     ) -> Result<
-        Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+        (
+            Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+            bool,
+        ),
         Box<client_error::Error>,
     > {
         let mut all = Vec::new();
@@ -557,8 +680,15 @@ impl RpcClientWithRetry {
             let page_len = page.len();
             // Capture the oldest signature on this page; it becomes the next page's cursor.
             let last_signature = page.last().map(|s| s.signature.clone());
+            let stop = page.iter().position(|status| {
+                Signature::from_str(&status.signature).is_ok_and(|sig| stop_at.contains(&sig))
+            });
             // Filter per page so a busy address's full history is never held in memory.
-            all.extend(page.into_iter().filter(|status| keep(status)));
+            let newer = page.into_iter().take(stop.unwrap_or(usize::MAX));
+            all.extend(newer.filter(|status| keep(status)));
+            if stop.is_some() {
+                return Ok((all, true));
+            }
 
             // A short page is the only legitimate end of history.
             if page_len < page_limit {
@@ -583,7 +713,7 @@ impl RpcClientWithRetry {
                 }
             }
         }
-        Ok(all)
+        Ok((all, false))
     }
 
     /// Get a confirmed transaction in JSON-parsed encoding (read-only, safe to retry)
@@ -614,6 +744,88 @@ impl RpcClientWithRetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve `entries` as the page of `address` history after `before`.
+    async fn page(
+        server: &mut mockito::ServerGuard,
+        before: Option<&str>,
+        entries: &[&str],
+    ) -> mockito::Mock {
+        let before = match before {
+            Some(sig) => format!(r#""before"\s*:\s*"{sig}""#),
+            None => r#""before"\s*:\s*null"#.to_string(),
+        };
+        let body: Vec<String> = entries
+            .iter()
+            .map(|sig| {
+                format!(
+                    r#"{{"signature":"{sig}","slot":1,"err":null,"memo":null,"blockTime":null,"confirmationStatus":"confirmed"}}"#
+                )
+            })
+            .collect();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(before),
+            ]))
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                body.join(",")
+            ))
+            .create_async()
+            .await
+    }
+
+    /// The bounded consumed-set walk stops at the newest signature the DB knows and says
+    /// whether it met it, so a stop the history never reaches can refuse boot.
+    #[tokio::test]
+    async fn paginated_stop_at_reports_membership() {
+        let sigs: Vec<String> = (0..5)
+            .map(|_| Signature::new_unique().to_string())
+            .collect();
+        let [s5, s4, s3, s2, s1] = [&sigs[0], &sigs[1], &sigs[2], &sigs[3], &sigs[4]];
+        let mut server = mockito::Server::new_async().await;
+        let _p1 = page(&mut server, None, &[s5, s4]).await;
+        let p2 = page(&mut server, Some(s4), &[s3, s2]).await;
+        let p3 = page(&mut server, Some(s2), &[s1]).await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let address = Pubkey::new_unique();
+        let names = |found: &[solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature]| {
+            found.iter().map(|s| s.signature.clone()).collect::<Vec<_>>()
+        };
+
+        // Met mid-page: only the newer entries come back and the walk stops there.
+        let stop = std::collections::HashSet::from([Signature::from_str(s2).unwrap()]);
+        let (found, met) = rpc
+            .get_signatures_for_address_paginated(&address, 2, &stop, |_| true)
+            .await
+            .unwrap();
+        assert!(met);
+        assert_eq!(names(&found), vec![s5.clone(), s4.clone(), s3.clone()]);
+        p2.assert_async().await;
+        assert!(
+            !p3.matched_async().await,
+            "the walk must stop at the page holding the stop"
+        );
+
+        // Never met: the whole history is walked and the caller is told so.
+        let stop = std::collections::HashSet::from([Signature::new_unique()]);
+        let (found, met) = rpc
+            .get_signatures_for_address_paginated(&address, 2, &stop, |_| true)
+            .await
+            .unwrap();
+        assert!(!met);
+        assert_eq!(found.len(), 5);
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[tokio::test]
@@ -1116,5 +1328,127 @@ mod tests {
             .await;
         let client = make_client_at(&server.url());
         assert!(client.get_genesis_hash().await.is_err());
+    }
+
+    /// Answers `getAccountInfo` with an empty account at each slot in `slots` in turn,
+    /// repeating the last, and counts the calls.
+    async fn mock_account_at_slots(
+        server: &mut mockito::ServerGuard,
+        slots: Vec<u64>,
+    ) -> Arc<AtomicU32> {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let n = counter.fetch_add(1, Ordering::SeqCst) as usize;
+                let slot = slots[n.min(slots.len() - 1)];
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":null}},"id":0}}"#
+                )
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+        calls
+    }
+
+    /// A backend that ignores `minContextSlot` and answers older is refused, not believed.
+    #[tokio::test]
+    async fn min_slot_answer_below_floor_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        mock_account_at_slots(&mut server, vec![40]).await;
+        let client = make_client_at(&server.url());
+
+        let err = client
+            .get_account_with_context_min_slot(
+                &Pubkey::default(),
+                CommitmentConfig::finalized(),
+                Some(50),
+            )
+            .await
+            .expect_err("an answer below the floor must not be returned");
+
+        assert!(is_min_context_slot_error(&err), "{err}");
+    }
+
+    /// Behind a load balancer the next try can reach a backend at the floor.
+    #[tokio::test]
+    async fn min_slot_check_retries_a_mixed_backend() {
+        let mut server = mockito::Server::new_async().await;
+        let calls = mock_account_at_slots(&mut server, vec![40, 60]).await;
+
+        let resp = make_client_fast_at(&server.url())
+            .get_account_with_context_min_slot(
+                &Pubkey::default(),
+                CommitmentConfig::finalized(),
+                Some(50),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.context.slot, 60);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The node's raw refusal and the client's AccountNotFound wrapping of it both count.
+    #[test]
+    fn min_context_slot_error_is_classified_in_both_shapes() {
+        let raw = client_error::Error::from(ErrorKind::RpcError(RpcError::RpcResponseError {
+            code: -32016,
+            message: "Minimum context slot has not been reached".to_string(),
+            data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+        }));
+        let wrapped = client_error::Error::from(ErrorKind::RpcError(RpcError::ForUser(
+            "AccountNotFound: pubkey=11111111111111111111111111111111: RPC response error \
+             -32016: Minimum context slot has not been reached"
+                .to_string(),
+        )));
+
+        assert!(is_min_context_slot_error(&raw));
+        assert!(is_min_context_slot_error(&wrapped));
+        assert!(!is_min_context_slot_error(&rpc_account_not_found()));
+        assert!(!is_min_context_slot_error(&rpc_method_not_found()));
+        assert!(!is_min_context_slot_error(&rpc_transient()));
+    }
+
+    /// A block time past the limit means the node's tip is old, so its absences prove nothing.
+    #[tokio::test]
+    async fn tip_is_fresh_rejects_an_old_block_time() {
+        for (age, fresh) in [(1, true), (121, false), (-121, false)] {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getBlockTime""#.into(),
+                ))
+                .with_status(200)
+                .with_body(format!(
+                    r#"{{"jsonrpc":"2.0","result":{},"id":0}}"#,
+                    chrono::Utc::now().timestamp() - age
+                ))
+                .create_async()
+                .await;
+
+            let got = make_client_at(&server.url()).tip_is_fresh(9).await.unwrap();
+
+            assert_eq!(got, fresh, "block {age}s old");
+        }
+    }
+
+    fn make_client_fast_at(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 5,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
     }
 }

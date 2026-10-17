@@ -11,17 +11,35 @@ on:
     paths:
       - "scripts/**"
       - "versions.env"
+      - "docker-compose*.yml"
+      - ".env.*"
+      - "private-channel-deploy/**"
       - "Makefile"
       - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
+      # startup-config.test.sh ties these program IDs to declare_id!.
+      - "private-channel-escrow-program/program/src/lib.rs"
+      - "private-channel-withdraw-program/program/src/lib.rs"
+      - "indexer/src/indexer/datasource/common/parser/escrow.rs"
+      - "indexer/src/indexer/datasource/common/parser/withdraw.rs"
+      - "core/src/bin/streamer.rs"
   pull_request:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit, audit/apex-audit-scan-remediation]
     paths:
       - "scripts/**"
       - "versions.env"
+      - "docker-compose*.yml"
+      - ".env.*"
+      - "private-channel-deploy/**"
       - "Makefile"
       - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
+      # startup-config.test.sh ties these program IDs to declare_id!.
+      - "private-channel-escrow-program/program/src/lib.rs"
+      - "private-channel-withdraw-program/program/src/lib.rs"
+      - "indexer/src/indexer/datasource/common/parser/escrow.rs"
+      - "indexer/src/indexer/datasource/common/parser/withdraw.rs"
+      - "core/src/bin/streamer.rs"
 
 permissions:
   contents: read
@@ -44,6 +62,21 @@ jobs:
       # update-admin-env.test.sh needs solana-keygen.
       - name: Setup Solana CLI
         uses: ./.github/actions/setup-solana
+
+      # startup-config.test.sh needs jq for its compose checks.
+      - name: Install jq
+        run: command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
+
+      # ansible-preflight.test.sh runs the deploy playbook's config asserts.
+      - name: Install ansible-core
+        run: |
+          command -v ansible-playbook >/dev/null && exit 0
+          python3 -m venv "$RUNNER_TEMP/ansible" || {
+            sudo apt-get update && sudo apt-get install -y python3-venv
+            python3 -m venv "$RUNNER_TEMP/ansible"
+          }
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet 'ansible-core>=2.16'
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
 
       - name: Run script tests
         run: |

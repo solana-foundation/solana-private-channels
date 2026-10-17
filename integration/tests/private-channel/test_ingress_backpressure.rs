@@ -66,6 +66,7 @@ fn load_config(db_url: String, port: u16, prometheus: bool) -> NodeConfig {
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![],
         max_blockhashes: 150,
+        allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,
         metrics: if prometheus {

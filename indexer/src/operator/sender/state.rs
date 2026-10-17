@@ -1,12 +1,14 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::account::AccountError;
-use crate::error::OperatorError;
+use crate::error::{OperatorError, StorageError};
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
-use crate::operator::recovery::load_pending_sigs;
-use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
+use crate::operator::recovery::{load_pending_sigs, JournalError};
+use crate::operator::sender::types::{PendingRemint, TransactionContext};
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     fetch_bitmap_generation, fetch_bitmap_if_present, fetch_consumed_nonces,
-    find_withdrawal_bitmap_pda, BitmapState, RetryConfig, RpcClientWithRetry,
+    fetch_consumed_nonces_at, find_withdrawal_bitmap_pda, BitmapState, RetryConfig,
+    RpcClientWithRetry,
 };
 use crate::operator::{
     MintCache, SourceEventId, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo,
@@ -19,7 +21,6 @@ use private_channel_metrics::MetricLabel;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -32,6 +33,7 @@ use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
 use super::{classify_signatures, SigFinality};
 
 impl SenderState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -40,6 +42,7 @@ impl SenderState {
         retry_max_attempts: u32,
         confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+        solvency_fence: SolvencyFence,
     ) -> Result<Self, OperatorError> {
         // Initialize global RPC client with retry
         let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -78,6 +81,8 @@ impl SenderState {
             instance_pda,
             in_flight_withdrawals: HashSet::new(),
             cached_generation: None,
+            anchor_high_water: 0,
+            refusal_floor: 0,
             retry_counts: HashMap::new(),
             rotation_retry_attempts: 0,
             rotation_in_flight: None,
@@ -100,6 +105,9 @@ impl SenderState {
             remint_backlog_unloaded: 0,
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            solvency_fence,
+            send_tasks: tokio::task::JoinSet::new(),
+            consumed: None,
         })
     }
 }
@@ -137,8 +145,25 @@ pub(crate) async fn verify_release_landed(
     nonce: u64,
     max_lvbh: u64,
 ) -> ReleaseVerdict {
+    verify_release_landed_at(rpc, instance_pda, nonce, max_lvbh)
+        .await
+        .0
+}
+
+/// `verify_release_landed`, plus the bitmap's context slot when the read shows the release
+/// window closed: `NotLanded` (tip past every lvbh) or the nonce's generation rotated away.
+/// Every release of the nonce happened at or below that slot, so it bounds the window.
+pub(crate) async fn verify_release_landed_at(
+    rpc: &RpcClientWithRetry,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> (ReleaseVerdict, Option<u64>) {
     let Some(instance_pda) = instance_pda else {
-        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+        return (
+            ReleaseVerdict::Uncertain("no instance pda configured".to_string()),
+            None,
+        );
     };
 
     let (ref_slot, lvbh) = match rpc
@@ -147,25 +172,32 @@ pub(crate) async fn verify_release_landed(
     {
         Ok(v) => v,
         Err(e) => {
-            return ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}"))
+            return (
+                ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}")),
+                None,
+            )
         }
     };
     // A blockhash stays valid for MAX_PROCESSING_AGE blocks past the tip it was
     // taken at, so its lvbh minus that window is the tip height at `ref_slot`.
     let Some(tip_height) = lvbh.checked_sub(MAX_PROCESSING_AGE as u64) else {
-        return ReleaseVerdict::Uncertain(format!(
-            "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
-             cannot derive a tip height"
-        ));
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
+                 cannot derive a tip height"
+            )),
+            None,
+        );
     };
-    if tip_height <= max_lvbh {
-        return ReleaseVerdict::Pending(format!(
+    let pending = (tip_height <= max_lvbh).then(|| {
+        ReleaseVerdict::Pending(format!(
             "finalized tip height {tip_height} is not past the attempt's last valid block \
              height {max_lvbh}, so the bits are too stale to prove non-release"
-        ));
-    }
+        ))
+    });
 
-    let bitmap = match fetch_consumed_nonces(
+    // Read even while pending: a rotation is final whatever the lvbh, and its slot bounds the window.
+    let (bitmap, slot) = match fetch_consumed_nonces_at(
         rpc,
         &find_withdrawal_bitmap_pda(&instance_pda),
         Some(ref_slot),
@@ -173,25 +205,47 @@ pub(crate) async fn verify_release_landed(
     )
     .await
     {
-        Ok(bitmap) => bitmap,
-        Err(e) => return ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")),
+        Ok(read) => read,
+        Err(e) => {
+            let verdict = pending
+                .unwrap_or_else(|| ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")));
+            return (verdict, None);
+        }
     };
 
     // Rotation clears every bit, so outside the current window a clear bit is
     // indistinguishable from a release that happened and was then wiped.
+    if nonce / NONCES_PER_GENERATION < bitmap.generation {
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "the bitmap rotated to generation {} and its bits say nothing about nonce {nonce}",
+                bitmap.generation
+            )),
+            Some(slot),
+        );
+    }
+    if let Some(pending) = pending {
+        return (pending, None);
+    }
     if !bitmap.covers(nonce) {
-        return ReleaseVerdict::Uncertain(format!(
-            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
-            bitmap.generation
-        ));
+        return (
+            ReleaseVerdict::Uncertain(format!(
+                "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+                bitmap.generation
+            )),
+            None,
+        );
     }
 
     if bitmap.is_consumed(nonce) {
-        ReleaseVerdict::Landed {
-            generation: bitmap.generation,
-        }
+        (
+            ReleaseVerdict::Landed {
+                generation: bitmap.generation,
+            },
+            None,
+        )
     } else {
-        ReleaseVerdict::NotLanded
+        (ReleaseVerdict::NotLanded, Some(slot))
     }
 }
 
@@ -221,15 +275,14 @@ pub(crate) async fn release_seen_at_confirmed(
 }
 
 /// Boot check of released nonces, from the current generation up, against Completed rows.
-/// A set bit with no Completed row is repaired in place when a landed signature proves it,
-/// otherwise left to recovery or escalated, and boot continues unless the nonce was paid twice.
-/// A Completed row with a clear bit claims a release the chain never made, so boot refuses.
+/// A set bit with no Completed row boots only when a landed journaled release on that
+/// row explains it. A Completed row with a clear bit claims a release the chain never
+/// made, and a DB numbering behind the chain's generation was restored; both refuse.
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     fallback_rpc_client: Option<&RpcClientWithRetry>,
     instance_pda: Option<Pubkey>,
-    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) -> Result<(), OperatorError> {
     let instance_pda = instance_pda.ok_or_else(|| AccountError::InstanceNotFound {
         instance: Pubkey::default(),
@@ -263,6 +316,7 @@ pub(crate) async fn validate_bitmap_consistency(
             consumed: Vec::new(),
         }
     });
+    refuse_if_numbering_behind(storage, bitmap.generation).await?;
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
 
     // The bitmap and the database are read at different instants, so a release
@@ -323,11 +377,12 @@ pub(crate) async fn validate_bitmap_consistency(
     // The bitmap is the withdraw role's, so its releases were broadcast to Solana.
     let finality = FinalityRpc::solana(rpc_client, fallback_rpc_client);
     let mut paid_twice = Vec::new();
+    let mut unexplained = Vec::new();
     for nonce in &chain_only {
-        if let ChainAheadOutcome::DoublePayout =
-            resolve_chain_ahead_nonce(storage, &finality, storage_tx, *nonce).await
-        {
-            paid_twice.push(*nonce);
+        match resolve_chain_ahead_nonce(storage, &finality, *nonce).await {
+            ChainAheadOutcome::Repaired | ChainAheadOutcome::Explained => {}
+            ChainAheadOutcome::Unexplained => unexplained.push(*nonce),
+            ChainAheadOutcome::DoublePayout => paid_twice.push(*nonce),
         }
     }
 
@@ -350,6 +405,46 @@ pub(crate) async fn validate_bitmap_consistency(
         .into());
     }
 
+    // Amount or recipient cannot tell two burns apart and a release names no burn, so
+    // a set bit no landed journaled signature explains might pay any pending row twice.
+    if !unexplained.is_empty() {
+        error!(
+            instance = %instance_pda,
+            generation = bitmap.generation,
+            nonces = ?unexplained,
+            "Consumed withdrawal nonces have no row that proves the release; the indexer \
+             database was likely restored past them. Refusing to start."
+        );
+        return Err(crate::error::ProgramError::UnexplainedConsumedNonces {
+            nonces: unexplained,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Refuse when the DB's numbering sits in a generation the chain rotated past. Rotation
+/// is only armed by a row already numbered in the next generation, so this never fires
+/// in normal operation, and a DB numbering ahead of the chain is the usual wait.
+async fn refuse_if_numbering_behind(
+    storage: &Storage,
+    chain_generation: u64,
+) -> Result<(), OperatorError> {
+    let db_generation = storage
+        .get_max_withdrawal_nonce()
+        .await?
+        .map(|nonce| nonce / NONCES_PER_GENERATION);
+    if db_generation.unwrap_or(0) < chain_generation {
+        crate::metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[ProgramType::Withdraw.as_label(), "bitmap_divergence"])
+            .inc();
+        return Err(crate::error::ProgramError::NonceGenerationBehindChain {
+            db_generation,
+            chain_generation,
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -427,18 +522,23 @@ async fn diff_bitmap(
 enum ChainAheadOutcome {
     /// The row was still open, so the repair write lands and closes the gap.
     Repaired,
-    /// Nothing could be written, so the payout stays unattributed.
-    Unrepaired,
+    /// A landed journaled release on a row the repair cannot write; nothing is written.
+    Explained,
+    /// No landed journaled signature ties the payout to a row, so boot refuses.
+    Unexplained,
     /// The user was refunded and the chain released the nonce as well.
     DoublePayout,
 }
 
-/// Count and log a chain-ahead nonce the boot repair could not close.
-fn report_unrepaired(nonce: u64) {
+/// Count and log a chain-ahead nonce the boot repair could not explain.
+fn report_unexplained(nonce: u64) {
     crate::metrics::OPERATOR_TRANSACTION_ERRORS
         .with_label_values(&[ProgramType::Withdraw.as_label(), "bitmap_divergence"])
         .inc();
-    error!(nonce, "Consumed nonce could not be repaired at boot");
+    crate::metrics::BITMAP_UNEXPLAINED_NONCE
+        .with_label_values(&[ProgramType::Withdraw.as_label()])
+        .inc();
+    error!(nonce, "Consumed nonce could not be explained at boot");
 }
 
 /// Repair a single nonce the chain consumed but the database never recorded.
@@ -454,7 +554,6 @@ fn report_unrepaired(nonce: u64) {
 async fn resolve_chain_ahead_nonce(
     storage: &Storage,
     finality: &FinalityRpc<'_>,
-    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     nonce: u64,
 ) -> ChainAheadOutcome {
     let row = match storage.get_withdrawal_by_nonce(nonce).await {
@@ -464,16 +563,16 @@ async fn resolve_chain_ahead_nonce(
                 nonce,
                 "Nonce consumed on-chain has no withdrawal row; funds moved with no record"
             );
-            report_unrepaired(nonce);
-            return ChainAheadOutcome::Unrepaired;
+            report_unexplained(nonce);
+            return ChainAheadOutcome::Unexplained;
         }
         Err(e) => {
             error!(
                 nonce,
                 "Could not load withdrawal row for consumed nonce: {e}"
             );
-            report_unrepaired(nonce);
-            return ChainAheadOutcome::Unrepaired;
+            report_unexplained(nonce);
+            return ChainAheadOutcome::Unexplained;
         }
     };
 
@@ -499,7 +598,7 @@ async fn resolve_chain_ahead_nonce(
         TransactionStatus::Processing | TransactionStatus::PendingRemint
     );
 
-    // Like an unread row, an unread journal writes nothing; recovery re-reads it at runtime.
+    // Like an unread row, an unread journal proves nothing, so nothing is written and boot refuses.
     let signatures = match load_pending_sigs(storage, row.id).await {
         Ok(signatures) => signatures,
         Err(e) => {
@@ -508,8 +607,8 @@ async fn resolve_chain_ahead_nonce(
                 transaction_id = row.id,
                 "Release signature journal unusable, leaving the row as it is: {e}"
             );
-            report_unrepaired(nonce);
-            return ChainAheadOutcome::Unrepaired;
+            report_unexplained(nonce);
+            return ChainAheadOutcome::Unexplained;
         }
     };
 
@@ -568,44 +667,36 @@ async fn resolve_chain_ahead_nonce(
                     ?outcome,
                     "Consumed nonce matched a landed signature but the repair did not apply"
                 );
-                report_unrepaired(nonce);
-                ChainAheadOutcome::Unrepaired
+                report_unexplained(nonce);
+                ChainAheadOutcome::Unexplained
             }
         };
     }
 
-    let reason = if repairable {
-        format!("nonce {nonce} is consumed on-chain but no broadcast signature accounts for it")
-    } else {
-        format!(
-            "nonce {nonce} is consumed on-chain but the row is already {:?}, so it cannot be reconciled automatically",
-            row.status
-        )
-    };
+    // The row's own landed release pays this nonce, so a re-indexed burn cannot reuse it.
+    // The ManualReview sweep or a human closes the row.
+    if let Some(sig) = verdict {
+        warn!(
+            nonce,
+            transaction_id = row.id,
+            status = ?row.status,
+            %sig,
+            "Consumed nonce is explained by this row's landed release; the row is left as it is"
+        );
+        return ChainAheadOutcome::Explained;
+    }
+
+    // No row is written: boot refuses, and a status write here would turn an RPC blip
+    // into a permanent manual review. The runbook completes rows from observed releases.
     error!(
         nonce,
         transaction_id = row.id,
         status = ?row.status,
-        attributed = verdict.is_some(),
-        "Consumed nonce cannot be reconciled; escalating"
+        repairable,
+        "Consumed nonce cannot be tied to this row's landed release"
     );
-    let update = TransactionStatusUpdate {
-        transaction_id: row.id,
-        trace_id: Some(row.trace_id.clone()),
-        status: TransactionStatus::ManualReview,
-        counterpart_signature: None,
-        processed_at: Some(Utc::now()),
-        error_message: Some(reason),
-        remint_signature: None,
-        remint_attempted: false,
-        alert_only: false,
-    };
-    send_guaranteed(storage_tx, update, "transaction status update")
-        .await
-        .ok();
-
-    report_unrepaired(nonce);
-    ChainAheadOutcome::Unrepaired
+    report_unexplained(nonce);
+    ChainAheadOutcome::Unexplained
 }
 
 impl SenderState {
@@ -615,11 +706,42 @@ impl SenderState {
     /// state. Callers that want it remembered go through `refresh_generation`
     /// instead, which is the only way a generation reaches the cache and is
     /// what keeps the cache from ever holding a number nobody read.
-    pub(super) async fn fetch_current_generation(&self) -> Result<u64, OperatorError> {
+    pub(super) async fn fetch_current_generation(&mut self) -> Result<u64, OperatorError> {
         let instance_pda = self.instance_pda.ok_or(AccountError::InstanceNotFound {
             instance: Pubkey::default(),
         })?;
-        fetch_bitmap_generation(&self.rpc_client, &find_withdrawal_bitmap_pda(&instance_pda)).await
+        let read = match self.generation_floor().await {
+            Ok(floor) => {
+                fetch_bitmap_generation(
+                    &self.rpc_client,
+                    &find_withdrawal_bitmap_pda(&instance_pda),
+                    floor,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok((generation, slot)) => {
+                self.anchor_high_water = self.anchor_high_water.max(slot);
+                Ok(generation)
+            }
+            Err(e) => {
+                crate::metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[self.program_type.as_label(), "generation_read_failed"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// The slot a generation read must answer at or past: the endpoint's finalized tip, never
+    /// below an earlier anchor, answer or refusal this sender saw. A node lagging evenly can still
+    /// answer at its own old tip; that costs at most one refused send, never a wrong payout.
+    pub(super) async fn generation_floor(&mut self) -> Result<u64, OperatorError> {
+        let anchor = finalized_anchor(&self.rpc_client).await?;
+        self.anchor_high_water = self.anchor_high_water.max(anchor);
+        Ok(self.anchor_high_water.max(self.refusal_floor))
     }
 
     /// Read the current generation and remember it.
@@ -729,11 +851,9 @@ impl SenderState {
             .into_iter()
             .filter(|tx| !self.remint_runtime_ids.contains(&tx.id))
             .collect();
-        if self.remint_backlog_cursor.is_none() {
-            self.remint_runtime_ids.clear();
-        }
 
         if transactions.is_empty() {
+            self.forget_runtime_ids_once_drained();
             return Ok(());
         }
 
@@ -745,7 +865,10 @@ impl SenderState {
         // PrivateChannel only supports SPL Token for now.
         let private_channel_token_program = self.mint_cache.get_private_channel_token_program();
 
+        // Id of the last row fully handled, where a failed journal read rewinds the cursor.
+        let mut done_through = after_id;
         for tx in transactions {
+            let resume_after = std::mem::replace(&mut done_through, tx.id);
             // Parse pubkeys stored as strings. On any failure we cannot remint safely,
             // and silently skipping would leave the row stuck in PendingRemint on every
             // restart — so we escalate to ManualReview.
@@ -782,39 +905,28 @@ impl SenderState {
 
             let amount = tx.amount.value();
 
-            // Pair each stored signature with its last_valid_block_height. The
-            // remint gate needs both to verify the withdrawal cannot still land.
-            // An empty array, a bad signature, or an array-length mismatch means
-            // we cannot safely run that check, so we escalate to ManualReview.
-            let sig_strings = tx.remint_signatures.unwrap_or_default();
-            let lvbhs = tx.remint_last_valid_block_heights.unwrap_or_default();
-
-            let parsed: Result<Vec<PendingSig>, String> = if sig_strings.is_empty() {
-                Err("no withdrawal signatures stored; cannot verify finality".to_string())
-            } else if sig_strings.len() != lvbhs.len() {
-                Err(format!(
-                    "lvbh length {} != signatures length {}",
-                    lvbhs.len(),
-                    sig_strings.len()
-                ))
-            } else {
-                sig_strings
-                    .iter()
-                    .zip(&lvbhs)
-                    .map(|(sig_string, &lvbh)| {
-                        let signature = Signature::from_str(sig_string)
-                            .map_err(|e| format!("invalid withdrawal signature: {e}"))?;
-                        let last_valid_block_height = u64::try_from(lvbh)
-                            .map_err(|_| format!("negative last_valid_block_height: {lvbh}"))?;
-                        Ok(PendingSig {
-                            signature,
-                            last_valid_block_height,
-                            // The transactions-row mirror never carried a slot;
-                            // the journal table is the authority for one.
-                            blockhash_slot: None,
-                        })
-                    })
-                    .collect()
+            // The journal is the authority, as on the live handoff: only it carries
+            // each attempt's blockhash slot, which the coverage proof needs. An empty
+            // or corrupt journal cannot prove the release dead, so it escalates.
+            let parsed = match load_pending_sigs(&self.storage, tx.id).await {
+                Ok(sigs) if sigs.is_empty() => {
+                    Err("no withdrawal signatures stored; cannot verify finality".to_string())
+                }
+                Ok(sigs) => Ok(sigs),
+                Err(JournalError::Corrupt(reason)) => Err(reason),
+                // A failed read says nothing about the row, so fail like the row query
+                // above instead of sending it to ManualReview. The rewind makes the next
+                // page read retry this row and every one after it.
+                Err(JournalError::Unavailable(reason)) => {
+                    self.remint_backlog_cursor = Some(resume_after);
+                    return Err(StorageError::DatabaseError {
+                        message: format!(
+                            "pending remint recovery of transaction {}: {reason}",
+                            tx.id
+                        ),
+                    }
+                    .into());
+                }
             };
 
             let Some(signatures) =
@@ -838,8 +950,6 @@ impl SenderState {
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
-                // Built from the fields rather than the row: `tx.remint_signatures` was
-                // moved out above, so the whole-row borrow `from_row` needs is gone.
                 source_event_id: SourceEventId::new(
                     &tx.signature,
                     tx.instruction_index,
@@ -899,7 +1009,16 @@ impl SenderState {
             });
         }
 
+        self.forget_runtime_ids_once_drained();
         Ok(())
+    }
+
+    /// Runtime ids only guard against reloading while the backlog drains, so drop them once
+    /// it has. Done after a page loads, since a rewind may page past them again.
+    fn forget_runtime_ids_once_drained(&mut self) {
+        if self.remint_backlog_cursor.is_none() {
+            self.remint_runtime_ids.clear();
+        }
     }
 
     /// Queue a remint handed off at runtime; while the backlog drains, paging must never reload it.
@@ -938,7 +1057,9 @@ mod tests {
         sender_state_with_storage_and_role,
     };
     use crate::storage::common::amount::TokenAmount;
-    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+    use crate::storage::common::models::{
+        DbTransaction, StoredSig, TransactionStatus, TransactionType,
+    };
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
     use solana_sdk::pubkey::Pubkey;
@@ -994,6 +1115,33 @@ mod tests {
         }
     }
 
+    /// Journal the release signatures the row mirrors, as the handoff writes both
+    /// from one journal read.
+    fn journal_mirrored_releases(
+        mock: &MockStorage,
+        row: &DbTransaction,
+        blockhash_slot: Option<i64>,
+    ) {
+        let signatures = row.remint_signatures.clone().unwrap_or_default();
+        let heights = row
+            .remint_last_valid_block_heights
+            .clone()
+            .unwrap_or_default();
+        let journal = signatures
+            .into_iter()
+            .zip(heights)
+            .map(|(signature, last_valid_block_height)| StoredSig {
+                signature,
+                last_valid_block_height,
+                blockhash_slot,
+            })
+            .collect();
+        mock.release_signatures
+            .lock()
+            .unwrap()
+            .insert(row.id, journal);
+    }
+
     // ── recover_pending_remints: happy path ──────────────────────────
 
     /// On startup, the first page of PendingRemint rows must be fully
@@ -1026,6 +1174,8 @@ mod tests {
         // outlive the intended ManualReview escalation.
         let mut row = make_pending_remint_row(42, &mint, &initiator, &recipient, &sig, deadline);
         row.finality_check_attempts = 2;
+        let blockhash_slot = 12_500;
+        journal_mirrored_releases(&mock, &row, Some(blockhash_slot));
         mock.pending_remint_transactions.lock().unwrap().push(row);
 
         let mut state = make_sender_state(mock);
@@ -1063,6 +1213,12 @@ mod tests {
         assert_eq!(entry.signatures.len(), 1);
         assert_eq!(entry.signatures[0].signature, sig);
         assert_eq!(entry.signatures[0].last_valid_block_height, 12_345);
+        // A pruned endpoint can prove the attempt's window only from its journaled slot.
+        assert_eq!(
+            entry.signatures[0].blockhash_slot,
+            Some(blockhash_slot as u64),
+            "a restart must keep the journaled blockhash slot"
+        );
 
         // Deadline must be the stored one, not a fresh window.
         // Allows up to 1s of clock skew between DB write and assertion.
@@ -1096,12 +1252,27 @@ mod tests {
         let mint = Pubkey::new_unique();
         let initiator = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
-        let sig = Signature::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut refused = make_pending_remint_row(1, &mint, &initiator, &recipient, &sig, deadline);
+        let mut refused = make_pending_remint_row(
+            1,
+            &mint,
+            &initiator,
+            &recipient,
+            &Signature::new_unique(),
+            deadline,
+        );
         refused.release_refused_on_chain = true;
-        let ordinary = make_pending_remint_row(2, &mint, &initiator, &recipient, &sig, deadline);
+        let ordinary = make_pending_remint_row(
+            2,
+            &mint,
+            &initiator,
+            &recipient,
+            &Signature::new_unique(),
+            deadline,
+        );
+        journal_mirrored_releases(&mock, &refused, None);
+        journal_mirrored_releases(&mock, &ordinary, None);
         mock.pending_remint_transactions
             .lock()
             .unwrap()
@@ -1139,6 +1310,7 @@ mod tests {
         let mut row =
             make_pending_remint_row(7, &mint, &Pubkey::new_unique(), &recipient, &sig, deadline);
         row.finality_check_attempts = -1;
+        journal_mirrored_releases(&mock, &row, None);
         mock.pending_remint_transactions.lock().unwrap().push(row);
 
         let mut state = make_sender_state(mock);
@@ -1152,6 +1324,11 @@ mod tests {
             .expect("corrupt row must produce a ManualReview update");
         assert_eq!(update.transaction_id, 7);
         assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("negative finality_check_attempts"),
+            "must escalate on the counter, not on an earlier check: {err}"
+        );
     }
 
     // ── recover_pending_remints: parse error escalations ─────────────
@@ -1194,6 +1371,7 @@ mod tests {
             &sig,
             deadline,
         );
+        journal_mirrored_releases(&mock, &good_row, None);
 
         mock.pending_remint_transactions
             .lock()
@@ -1279,8 +1457,8 @@ mod tests {
     // No negative-amount test here anymore: `TokenAmount(u64)` makes a negative
     // amount unconstructable; the rejection now lives in TokenAmount's decode tests.
 
-    /// An unparseable withdrawal signature in a PendingRemint row breaks the
-    /// finality check: the operator cannot call `get_signature_statuses` with
+    /// An unparseable signature in a PendingRemint row's release journal breaks
+    /// the finality check: the operator cannot call `get_signature_statuses` with
     /// an invalid signature, so it cannot determine whether the original
     /// withdrawal landed on-chain.
     ///
@@ -1293,7 +1471,7 @@ mod tests {
         let recipient = Pubkey::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut bad_row = make_pending_remint_row(
+        let bad_row = make_pending_remint_row(
             40,
             &mint,
             &Pubkey::new_unique(),
@@ -1301,8 +1479,15 @@ mod tests {
             &Signature::new_unique(),
             deadline,
         );
-        // Replace the valid signature with garbage.
-        bad_row.remint_signatures = Some(vec!["not-a-valid-signature".to_string()]);
+        // Only the journal is corrupt: boot must read it, not the row's mirror.
+        mock.release_signatures.lock().unwrap().insert(
+            bad_row.id,
+            vec![StoredSig {
+                signature: "not-a-valid-signature".to_string(),
+                last_valid_block_height: 12_345,
+                blockhash_slot: None,
+            }],
+        );
 
         mock.pending_remint_transactions
             .lock()
@@ -1321,7 +1506,7 @@ mod tests {
         assert_eq!(update.status, TransactionStatus::ManualReview);
         let err = update.error_message.as_deref().unwrap_or("");
         assert!(
-            err.contains("invalid withdrawal signature"),
+            err.contains("malformed stored release signature"),
             "error message should describe the signature parse failure: {err}"
         );
 
@@ -1332,37 +1517,24 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
-    /// A PendingRemint row whose `remint_signatures` and
-    /// `remint_last_valid_block_heights` arrays have different lengths cannot
-    /// be turned into a coherent `Vec<PendingSig>`. Index-pairing would be
-    /// undefined, so the remint gate cannot reliably check liveness.
-    ///
-    /// Escalate to ManualReview rather than guessing which sig got which lvbh.
+    /// Boot rebuilds from the journal, so a row with nothing journaled has no
+    /// signature to prove the release dead against, whatever its mirror holds.
     #[tokio::test]
-    async fn recover_pending_remints_escalates_lvbh_length_mismatch_to_manual_review() {
+    async fn recover_pending_remints_escalates_an_empty_journal_to_manual_review() {
         let mock = MockStorage::new();
-        let mint = Pubkey::new_unique();
-        let recipient = Pubkey::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
+        let transaction_id = 45;
 
-        let mut bad_row = make_pending_remint_row(
-            50,
-            &mint,
+        // The mirror carries a signature, but nothing is journaled.
+        let row = make_pending_remint_row(
+            transaction_id,
             &Pubkey::new_unique(),
-            &recipient,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
             &Signature::new_unique(),
             deadline,
         );
-        bad_row.remint_signatures = Some(vec![
-            Signature::new_unique().to_string(),
-            Signature::new_unique().to_string(),
-        ]);
-        bad_row.remint_last_valid_block_heights = Some(vec![100]);
-
-        mock.pending_remint_transactions
-            .lock()
-            .unwrap()
-            .push(bad_row);
+        mock.pending_remint_transactions.lock().unwrap().push(row);
 
         let mut state = make_sender_state(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -1371,20 +1543,113 @@ mod tests {
 
         let update = storage_rx
             .try_recv()
-            .expect("should receive ManualReview for length mismatch");
-        assert_eq!(update.transaction_id, 50);
+            .expect("an empty journal must escalate");
+        assert_eq!(update.transaction_id, transaction_id);
         assert_eq!(update.status, TransactionStatus::ManualReview);
         let err = update.error_message.as_deref().unwrap_or("");
         assert!(
-            err.contains("lvbh length"),
-            "error message should describe the length mismatch: {err}"
+            err.contains("no withdrawal signatures stored"),
+            "error message should say nothing is journaled: {err}"
         );
-
         assert!(
             state.pending_remints.is_empty(),
-            "row with mismatched array lengths must not be queued"
+            "a row with an empty journal must not be queued"
         );
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// No writer stores a negative height, so one is corruption. Wrapped to a huge
+    /// u64 it would read as Live on every tick and reach ManualReview only after
+    /// the waits run out, under a reason that points the on-call the wrong way.
+    #[tokio::test]
+    async fn recover_pending_remints_escalates_a_negative_journaled_height_to_manual_review() {
+        let mock = MockStorage::new();
+        let deadline = Utc::now() + chrono::Duration::seconds(20);
+        let transaction_id = 47;
+        let sig = Signature::new_unique();
+
+        let row = make_pending_remint_row(
+            transaction_id,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &sig,
+            deadline,
+        );
+        mock.release_signatures.lock().unwrap().insert(
+            transaction_id,
+            vec![StoredSig {
+                signature: sig.to_string(),
+                last_valid_block_height: -1,
+                blockhash_slot: None,
+            }],
+        );
+        mock.pending_remint_transactions.lock().unwrap().push(row);
+
+        let mut state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a negative journaled height must escalate at once");
+        assert_eq!(update.transaction_id, transaction_id);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        // The prefix is what the runbook routes on.
+        assert!(
+            err.contains("malformed stored release signature")
+                && err.contains("negative last_valid_block_height"),
+            "error message should name the corrupt height: {err}"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "a row with a corrupt journal must not be queued"
+        );
+        assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// A failed journal read says nothing about the row, so boot fails as it does
+    /// when the row query fails, rather than sending the row to ManualReview.
+    #[tokio::test]
+    async fn recover_pending_remints_fails_boot_when_the_journal_is_unreadable() {
+        let mock = MockStorage::new();
+        let deadline = Utc::now() + chrono::Duration::seconds(20);
+        let transaction_id = 46;
+
+        let row = make_pending_remint_row(
+            transaction_id,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Signature::new_unique(),
+            deadline,
+        );
+        journal_mirrored_releases(&mock, &row, None);
+        mock.pending_remint_transactions.lock().unwrap().push(row);
+        mock.set_should_fail("get_release_signatures", true);
+
+        let mut state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let err = state
+            .recover_pending_remints(&storage_tx)
+            .await
+            .expect_err("an unreadable journal must fail the boot");
+        assert!(
+            err.to_string()
+                .contains(&format!("transaction {transaction_id}")),
+            "the boot error must name the row: {err}"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "a row whose journal could not be read must not be queued"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a read failure must not send the row to ManualReview"
+        );
     }
 
     /// The deferred remint queue belongs to the Withdraw role. An Escrow sender
@@ -1459,17 +1724,16 @@ mod tests {
         // Deadline already in the past — crash happened mid-finality window.
         let past_deadline = Utc::now() - chrono::Duration::seconds(10);
 
-        mock.pending_remint_transactions
-            .lock()
-            .unwrap()
-            .push(make_pending_remint_row(
-                50,
-                &mint,
-                &Pubkey::new_unique(),
-                &recipient,
-                &sig,
-                past_deadline,
-            ));
+        let row = make_pending_remint_row(
+            50,
+            &mint,
+            &Pubkey::new_unique(),
+            &recipient,
+            &sig,
+            past_deadline,
+        );
+        journal_mirrored_releases(&mock, &row, None);
+        mock.pending_remint_transactions.lock().unwrap().push(row);
 
         let mut state = make_sender_state(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -1512,6 +1776,7 @@ mod tests {
             Utc::now() + chrono::Duration::seconds(30),
         );
         row.pending_remint_deadline_at = None; // simulate missing deadline
+        journal_mirrored_releases(&mock, &row, None);
 
         mock.pending_remint_transactions.lock().unwrap().push(row);
 
@@ -1545,19 +1810,20 @@ mod tests {
 
     const PAGE_READ: &str = "get_pending_remint_transactions";
 
-    /// Seed parseable PendingRemint rows with the given ids, due an hour from now.
+    /// Seed parseable, journaled PendingRemint rows with the given ids, due an hour from now.
     fn seed_backlog(mock: &MockStorage, ids: impl IntoIterator<Item = i64>) {
         let deadline = Utc::now() + chrono::Duration::hours(1);
-        let mut rows = mock.pending_remint_transactions.lock().unwrap();
         for id in ids {
-            rows.push(make_pending_remint_row(
+            let row = make_pending_remint_row(
                 id,
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Pubkey::new_unique(),
                 &Signature::new_unique(),
                 deadline,
-            ));
+            );
+            journal_mirrored_releases(mock, &row, None);
+            mock.pending_remint_transactions.lock().unwrap().push(row);
         }
     }
 
@@ -1607,6 +1873,31 @@ mod tests {
             .get(PAGE_READ)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// A journal read that fails while a page loads must not skip the rows after it: the
+    /// cursor rewinds to the last row handled, so the next read loads them.
+    #[tokio::test]
+    async fn a_failed_journal_read_rewinds_the_backlog_cursor() {
+        let mock = MockStorage::new();
+        seed_backlog(&mock, 1..=3);
+        let mut state = make_sender_state(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(10);
+        state.remint_backlog_cursor = Some(0);
+
+        mock.set_should_fail("get_release_signatures", true);
+        assert!(state.hydrate_pending_remints(&storage_tx).await.is_err());
+        assert!(queued_ids(&state).is_empty());
+        assert_eq!(
+            state.remint_backlog_cursor,
+            Some(0),
+            "a short page that failed must be read again"
+        );
+
+        mock.set_should_fail("get_release_signatures", false);
+        state.hydrate_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(queued_ids(&state), vec![1, 2, 3]);
+        assert_eq!(state.remint_backlog_cursor, None);
     }
 
     /// Boot must load at most one page, however large the durable backlog, and
@@ -1834,6 +2125,7 @@ mod tests {
             3,
             400,
             None,
+            SolvencyFence::open_from_start(),
         );
 
         assert!(result.is_ok());
@@ -1861,6 +2153,7 @@ mod tests {
             5,
             400,
             None,
+            SolvencyFence::open_from_start(),
         );
 
         assert!(result.is_ok());
@@ -1930,17 +2223,10 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_fails_without_instance_pda() {
         let state = make_sender_state(MockStorage::new());
-        let (storage_tx, _rx) = mpsc::channel(8);
 
-        let err = super::validate_bitmap_consistency(
-            &state.storage,
-            &state.rpc_client,
-            None,
-            None,
-            &storage_tx,
-        )
-        .await
-        .unwrap_err();
+        let err = super::validate_bitmap_consistency(&state.storage, &state.rpc_client, None, None)
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -1963,19 +2249,16 @@ mod tests {
         seed_withdrawal(&mock, 3, 3, TransactionStatus::Completed, None);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
         assert!(result.is_ok(), "agreeing sets must pass: {result:?}");
-        assert!(storage_rx.try_recv().is_err(), "nothing to repair");
     }
 
     /// Chain ahead: the release landed and a stored signature proves which one,
@@ -2023,19 +2306,16 @@ mod tests {
         );
 
         let state = sender_state_with_storage(&server.url(), mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
         assert!(result.is_ok(), "chain-ahead must not halt: {result:?}");
-        assert!(storage_rx.try_recv().is_err(), "the repair is a direct CAS");
         let row = mock
             .pending_transactions
             .lock()
@@ -2048,10 +2328,10 @@ mod tests {
         assert_eq!(row.counterpart_signature, Some(landed.to_string()));
     }
 
-    /// Chain ahead with nothing to attribute the payout to: still start, but the
-    /// nonce goes to a human rather than being silently completed.
+    /// Chain ahead with nothing to attribute the payout to: boot refuses, and the row is
+    /// left as it was so a later boot can still explain it.
     #[tokio::test]
-    async fn validate_bitmap_consistency_chain_ahead_without_signatures_escalates() {
+    async fn validate_bitmap_consistency_chain_ahead_without_signatures_refuses() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
@@ -2060,25 +2340,227 @@ mod tests {
         seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, None);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
-        assert!(result.is_ok(), "chain-ahead must not halt: {result:?}");
-        let update = storage_rx.try_recv().expect("row must be escalated");
-        assert_eq!(update.transaction_id, 7);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
+                ))
+            ),
+            "an unexplained consumed nonce must refuse boot: {result:?}"
+        );
+        assert_eq!(
+            state
+                .storage
+                .get_withdrawal_by_nonce(2)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TransactionStatus::Processing
+        );
+    }
+
+    /// Serve one finalized-success status for every `getSignatureStatuses` call.
+    fn mock_landed_status(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_body(
+                serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 100},
+                    "value": [{ "slot": 10, "confirmations": null, "err": null,
+                        "status": {"Ok": null}, "confirmationStatus": "finalized" }]
+                }})
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Run the boot gate against a chain whose generation-`generation` bitmap has
+    /// `consumed` set, over the rows `seed` puts in the DB.
+    async fn nonce_gate(
+        generation: u64,
+        consumed: &[u64],
+        statuses: Option<&str>,
+        seed: impl FnOnce(&MockStorage),
+    ) -> (Result<(), OperatorError>, MockStorage) {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let _bitmap = mock_bitmap_account(&mut server, generation, consumed);
+        let _statuses = match statuses {
+            Some("landed") => Some(mock_landed_status(&mut server)),
+            _ => None,
+        };
+        let mock = MockStorage::new();
+        seed(&mock);
+        let state = sender_state_with_storage(&server.url(), mock.clone());
+        let result = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+        )
+        .await;
+        (result, mock)
+    }
+
+    fn refused_on(result: &Result<(), OperatorError>) -> Option<Vec<u64>> {
+        match result {
+            Err(OperatorError::Program(
+                crate::error::ProgramError::UnexplainedConsumedNonces { nonces },
+            )) => Some(nonces.clone()),
+            _ => None,
+        }
+    }
+
+    /// After an indexer restore past a release, re-indexed burns are renumbered and a
+    /// set bit can no longer be tied to the burn it paid. Only a landed journaled
+    /// signature on the row explains a bit; anything else refuses boot (SOLA13-68).
+    #[tokio::test]
+    async fn nonce_gate_matrix() {
+        // (case, row status, stored signature, status answer, boots)
+        type Case<'a> = (
+            &'a str,
+            Option<TransactionStatus>,
+            Option<Signature>,
+            Option<&'a str>,
+            bool,
+        );
+        let landed = Some(Signature::new_unique());
+        let cases: Vec<Case> = vec![
+            ("no row", None, None, None, false),
+            (
+                "pending row",
+                Some(TransactionStatus::Pending),
+                None,
+                None,
+                false,
+            ),
+            (
+                "processing, no signature",
+                Some(TransactionStatus::Processing),
+                None,
+                None,
+                false,
+            ),
+            (
+                "processing, landed",
+                Some(TransactionStatus::Processing),
+                landed,
+                Some("landed"),
+                true,
+            ),
+            (
+                "processing, status unreadable",
+                Some(TransactionStatus::Processing),
+                landed,
+                None,
+                false,
+            ),
+            (
+                "failed, landed",
+                Some(TransactionStatus::Failed),
+                landed,
+                Some("landed"),
+                true,
+            ),
+            (
+                "manual review, landed",
+                Some(TransactionStatus::ManualReview),
+                landed,
+                Some("landed"),
+                true,
+            ),
+        ];
+        for (case, status, signature, statuses, ok) in cases {
+            let (result, mock) = nonce_gate(0, &[2], statuses, |mock| {
+                if let Some(status) = status {
+                    seed_withdrawal(mock, 7, 2, status, signature);
+                }
+            })
+            .await;
+            if let (Some(status), false) = (status, ok) {
+                let row = mock.pending_transactions.lock().unwrap()[0].clone();
+                assert_eq!(
+                    row.status, status,
+                    "{case}: a refusal leaves the row as it was"
+                );
+            }
+            if ok {
+                assert!(result.is_ok(), "{case}: {result:?}");
+            } else {
+                assert_eq!(refused_on(&result), Some(vec![2]), "{case}: {result:?}");
+            }
+        }
+
+        // A reminted row whose nonce was also released stays a double payout.
+        let (result, _) = nonce_gate(0, &[2], None, |mock| {
+            seed_withdrawal(mock, 7, 2, TransactionStatus::FailedReminted, None)
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(OperatorError::Program(
+                crate::error::ProgramError::BitmapDivergence { .. }
+            ))
+        ));
+
+        // The shifted-gap case: burns B3 and B4 were released as 4 and 5, the DB was
+        // restored and re-indexed them as 3 and 4. Neither bit is explained.
+        let (result, _) = nonce_gate(0, &[4, 5], None, |mock| {
+            seed_withdrawal(mock, 3, 3, TransactionStatus::Pending, None);
+            seed_withdrawal(mock, 4, 4, TransactionStatus::Pending, None);
+        })
+        .await;
+        assert_eq!(refused_on(&result), Some(vec![4, 5]));
+    }
+
+    /// Bits of a rotated-away generation are gone, so a DB restored to before the rotation
+    /// cannot be diffed against them. Its numbering still sits in the old generation,
+    /// which rotation never allows in normal operation, so boot refuses.
+    #[tokio::test]
+    async fn nonce_gate_generation_behind_chain_refuses() {
+        let per = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let (behind, _) = nonce_gate(1, &[], None, |mock| {
+            seed_withdrawal(mock, 1, per - 1, TransactionStatus::Completed, None)
+        })
+        .await;
+        assert!(
+            matches!(
+                behind,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::NonceGenerationBehindChain { .. }
+                ))
+            ),
+            "{behind:?}"
+        );
+
+        // An empty DB on a rotated chain is behind it too.
+        let (empty, _) = nonce_gate(1, &[], None, |_| {}).await;
+        assert!(empty.is_err(), "{empty:?}");
+
+        // The DB numbering ahead of the chain is the normal wait for a rotation.
+        let (ahead, _) = nonce_gate(0, &[], None, |mock| {
+            seed_withdrawal(mock, 1, per + 3, TransactionStatus::Pending, None)
+        })
+        .await;
+        assert!(ahead.is_ok(), "{ahead:?}");
     }
 
     /// A journal that could not be read is not an empty journal: the row may be paid, so it
-    /// must stay Processing with no status written.
+    /// must stay Processing and the nonce stays unexplained.
     #[tokio::test]
     async fn chain_ahead_nonce_with_unreadable_journal_leaves_the_row_untouched() {
         let mock = MockStorage::new();
@@ -2092,18 +2574,15 @@ mod tests {
         mock.set_should_fail("get_release_signatures", true);
 
         let state = make_sender_state(mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             2,
         )
         .await;
 
-        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
-        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
         let row = mock
             .pending_transactions
             .lock()
@@ -2115,9 +2594,10 @@ mod tests {
         assert_eq!(row.status, TransactionStatus::Processing);
     }
 
-    /// At the boot gate the same read failure starts and writes nothing, like an unread row.
+    /// At the boot gate the same read failure refuses to start and writes nothing, like an
+    /// unread row.
     #[tokio::test]
-    async fn validate_bitmap_consistency_starts_without_a_write_when_the_journal_cannot_be_read() {
+    async fn validate_bitmap_consistency_refuses_without_a_write_when_the_journal_cannot_be_read() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
@@ -2132,23 +2612,32 @@ mod tests {
         );
         mock.set_should_fail("get_release_signatures", true);
 
-        let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+        let state = sender_state_with_storage(&server.url(), mock.clone());
 
-        let result = super::validate_bitmap_consistency(
+        let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
-        .await;
+        .await
+        .unwrap_err();
 
-        assert!(
-            result.is_ok(),
-            "an unreadable journal must not block boot: {result:?}"
-        );
-        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+        match err {
+            OperatorError::Program(crate::error::ProgramError::UnexplainedConsumedNonces {
+                nonces,
+            }) => assert_eq!(nonces, vec![2]),
+            other => panic!("expected UnexplainedConsumedNonces, got: {other}"),
+        }
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == 7)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Processing);
     }
 
     /// A journal read error on an earlier nonce must not stop a later double payout being found.
@@ -2170,14 +2659,12 @@ mod tests {
         mock.set_should_fail("get_release_signatures", true);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2191,8 +2678,8 @@ mod tests {
         }
     }
 
-    /// A journal entry that does not parse is corrupt, so the row is left for recovery to
-    /// quarantine rather than repaired from the entries that do parse.
+    /// A journal entry that does not parse is corrupt, so the row is left as it is rather
+    /// than repaired from the entries that do parse, and the nonce stays unexplained.
     #[tokio::test]
     async fn chain_ahead_nonce_with_a_corrupt_journal_leaves_the_row_untouched() {
         let transaction_id = 7;
@@ -2221,18 +2708,15 @@ mod tests {
         );
 
         let state = make_sender_state(mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             2,
         )
         .await;
 
-        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
-        assert!(storage_rx.try_recv().is_err(), "no status may be written");
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
         let row = mock
             .pending_transactions
             .lock()
@@ -2246,27 +2730,34 @@ mod tests {
 
     /// A payout no signature accounts for is unexplained money leaving the instance, so it must not report as repaired.
     #[tokio::test]
-    async fn chain_ahead_nonce_with_no_attributable_signature_reports_unrepaired() {
+    async fn chain_ahead_nonce_with_no_attributable_signature_reports_unexplained() {
         let mock = MockStorage::new();
         seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, None);
 
         let state = make_sender_state(mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             2,
         )
         .await;
 
         assert!(
-            matches!(outcome, super::ChainAheadOutcome::Unrepaired),
+            matches!(outcome, super::ChainAheadOutcome::Unexplained),
             "an unattributed payout is not a repair"
         );
-        let update = storage_rx.try_recv().expect("the row must be escalated");
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(
+            state
+                .storage
+                .get_withdrawal_by_nonce(2)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TransactionStatus::Processing,
+            "the gate refuses boot instead of writing the row"
+        );
     }
 
     /// The other half of that rule: an attributed payout is genuinely closed and must raise no alert.
@@ -2311,12 +2802,10 @@ mod tests {
         );
 
         let state = sender_state_with_storage(&server.url(), mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             nonce,
         )
         .await;
@@ -2325,7 +2814,6 @@ mod tests {
             matches!(outcome, super::ChainAheadOutcome::Repaired),
             "an attributed payout closes the gap"
         );
-        assert!(storage_rx.try_recv().is_err(), "the repair is a direct CAS");
         let row = mock
             .pending_transactions
             .lock()
@@ -2381,21 +2869,15 @@ mod tests {
         );
 
         let state = sender_state_with_storage(&server.url(), mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             nonce,
         )
         .await;
 
         assert!(matches!(outcome, super::ChainAheadOutcome::Repaired));
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "a pending_remint repair must not go through the status writer"
-        );
         let row = mock
             .pending_transactions
             .lock()
@@ -2450,18 +2932,15 @@ mod tests {
         mock.set_should_fail("try_complete_stalled_withdrawal", true);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             nonce,
         )
         .await;
 
-        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
-        assert!(storage_rx.try_recv().is_err());
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
     }
 
     /// The repair decides on a status read before its RPC call. If this operator's lock
@@ -2516,21 +2995,15 @@ mod tests {
             .create();
 
         let state = sender_state_with_storage(&server.url(), mock.clone());
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let outcome = super::resolve_chain_ahead_nonce(
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
-            &storage_tx,
             nonce,
         )
         .await;
 
-        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "a boot completion must not go through the status writer"
-        );
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unexplained));
         let row = mock
             .pending_transactions
             .lock()
@@ -2556,14 +3029,12 @@ mod tests {
         seed_withdrawal(&mock, 7, 2, TransactionStatus::FailedReminted, None);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2581,68 +3052,69 @@ mod tests {
         }
     }
 
-    /// The repair only writes rows the operator still owns, so a chain-ahead
-    /// nonce on an already-terminal row silently writes nothing. It has to reach
-    /// a human instead of being logged as though it had been fixed, which is the
-    /// shape a real divergence takes when it disappears.
+    /// A row the repair cannot write is still explained by its own landed release, so
+    /// boot goes on and the row is left as it is for the sweep or a human.
     #[tokio::test]
-    async fn validate_bitmap_consistency_chain_ahead_on_terminal_row_alerts() {
-        let mut server = mockito::Server::new_async().await;
-        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
-        let landed = Signature::new_unique();
-        let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
-        let _statuses = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "method": "getSignatureStatuses"
-            })))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "context": {"slot": 100},
-                        "value": [{
-                            "slot": 10,
-                            "confirmations": null,
-                            "err": null,
-                            "status": {"Ok": null},
-                            "confirmationStatus": "finalized"
-                        }]
-                    }
-                })
-                .to_string(),
+    async fn validate_bitmap_consistency_chain_ahead_on_unwritable_row_is_explained() {
+        for status in [TransactionStatus::Failed, TransactionStatus::ManualReview] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+            let landed = Signature::new_unique();
+            let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
+            let _statuses = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                    "method": "getSignatureStatuses"
+                })))
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "context": {"slot": 100},
+                            "value": [{
+                                "slot": 10,
+                                "confirmations": null,
+                                "err": null,
+                                "status": {"Ok": null},
+                                "confirmationStatus": "finalized"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let mock = MockStorage::new();
+            seed_withdrawal(&mock, 7, 2, status, Some(landed));
+
+            let state = sender_state_with_storage(&server.url(), mock);
+
+            let result = super::validate_bitmap_consistency(
+                &state.storage,
+                &state.rpc_client,
+                None,
+                Some(Pubkey::new_unique()),
             )
-            .create();
+            .await;
 
-        let mock = MockStorage::new();
-        seed_withdrawal(&mock, 7, 2, TransactionStatus::Failed, Some(landed));
-
-        let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
-
-        let result = super::validate_bitmap_consistency(
-            &state.storage,
-            &state.rpc_client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "an ordinary chain-ahead nonce must not halt: {result:?}"
-        );
-        let update = storage_rx
-            .try_recv()
-            .expect("an unrepairable row must still be reported");
-        assert_eq!(
-            update.status,
-            TransactionStatus::ManualReview,
-            "a Completed write to a terminal row is dropped, so it must not be claimed"
-        );
+            assert!(
+                result.is_ok(),
+                "a landed release on the row explains the nonce: {result:?}"
+            );
+            assert_eq!(
+                state
+                    .storage
+                    .get_withdrawal_by_nonce(2)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                status,
+                "the row is not written"
+            );
+        }
     }
 
     /// The re-read exists to fail closed on the one divergence that matters, so
@@ -2658,14 +3130,12 @@ mod tests {
         let mock = MockStorage::new();
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2692,14 +3162,12 @@ mod tests {
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2725,14 +3193,12 @@ mod tests {
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
 
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2762,14 +3228,12 @@ mod tests {
         let mock = MockStorage::new();
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
@@ -2782,7 +3246,6 @@ mod tests {
             2,
             "the halt direction must consult the bitmap a second time"
         );
-        assert!(storage_rx.try_recv().is_err(), "nothing to repair");
     }
 
     /// A divergence that survives the re-read is real and must still halt, or
@@ -2796,14 +3259,12 @@ mod tests {
         let mock = MockStorage::new();
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();
@@ -2829,14 +3290,12 @@ mod tests {
         let mock = MockStorage::new();
         seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
         let state = sender_state_with_storage(&server.url(), mock);
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
@@ -2866,6 +3325,130 @@ mod tests {
             matches!(verdict, ReleaseVerdict::NotLanded),
             "a fork-only bit must not read as a landed release"
         );
+    }
+
+    fn generation_reader(url: &str) -> SenderState {
+        let mut state = sender_state_with_storage(url, MockStorage::new());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state
+    }
+
+    /// The floor is the latest of the finalized anchor, any earlier anchor and any refusal.
+    #[tokio::test]
+    async fn generation_floor_is_max_of_anchor_high_water_and_refusal_floor() {
+        for (refusal_floor, expected) in [(0u64, 300u64), (500, 500)] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![300]);
+            let mut state = generation_reader(&server.url());
+            state.refusal_floor = refusal_floor;
+
+            assert_eq!(state.generation_floor().await.unwrap(), expected);
+        }
+    }
+
+    /// A later anchor from a lagging backend cannot pull the floor back.
+    #[tokio::test]
+    async fn anchor_high_water_only_rises() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500, 400]);
+        let mut state = generation_reader(&server.url());
+
+        assert_eq!(state.generation_floor().await.unwrap(), 500);
+        assert_eq!(state.generation_floor().await.unwrap(), 500);
+        assert_eq!(state.anchor_high_water, 500);
+    }
+
+    /// A read answered past the anchor raises the floor to its slot, so a later read on an
+    /// older backend cannot roll the cached generation back.
+    #[tokio::test]
+    async fn generation_read_raises_the_floor_to_its_answer_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![100, 110]);
+        let _bitmap = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(1, &[], 200),
+            )
+            .create();
+        let mut state = generation_reader(&server.url());
+
+        assert_eq!(state.refresh_generation().await.unwrap(), 1);
+        assert_eq!(state.generation_floor().await.unwrap(), 200);
+    }
+
+    /// An answer behind the floor is a bitmap failure, and what the cache knew stays.
+    #[tokio::test]
+    async fn fetch_current_generation_leaves_the_cache_when_behind_the_floor() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _behind = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                crate::operator::sender::test_support::bitmap_account_response_at(2, &[], 400),
+            )
+            .create();
+        let mut state = generation_reader(&server.url());
+        state.cached_generation = Some(3);
+
+        let err = state.refresh_generation().await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(crate::error::ProgramError::BitmapUnavailable { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(state.cached_generation, Some(3));
+    }
+
+    /// A clear bit read at the anchored finalized slot reports that slot, the bound of
+    /// every slot a release could sit in.
+    #[tokio::test]
+    async fn verify_release_landed_at_carries_the_bitmap_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _finalized = mock_bitmap_at_slot(&mut server, 500, 0, &[]);
+        let state = generation_reader(&server.url());
+
+        let (verdict, slot) =
+            super::verify_release_landed_at(&state.rpc_client, state.instance_pda, 4, 10).await;
+
+        assert!(matches!(verdict, ReleaseVerdict::NotLanded));
+        assert_eq!(slot, Some(500));
+    }
+
+    /// A rotation is final whatever the attempt's lvbh, so a rotated-past nonce is
+    /// reported, with its slot, even while the tip has not passed the lvbh.
+    #[tokio::test]
+    async fn rotated_past_is_reported_even_before_the_tip_passes_lvbh() {
+        // The anchor's tip height is 850, below the attempt's lvbh of 900.
+        for (generation, rotated) in [(1u64, true), (0, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+            let _finalized = mock_bitmap_at_slot(&mut server, 500, generation, &[]);
+            let state = generation_reader(&server.url());
+
+            let (verdict, slot) =
+                super::verify_release_landed_at(&state.rpc_client, state.instance_pda, 4, 900)
+                    .await;
+
+            if rotated {
+                assert!(matches!(verdict, ReleaseVerdict::Uncertain(_)));
+                assert_eq!(slot, Some(500));
+            } else {
+                assert!(matches!(verdict, ReleaseVerdict::Pending(_)));
+                assert_eq!(slot, None);
+            }
+        }
     }
 
     /// Releases now stay processing until finality, so a restart in that window sees a bit
@@ -2898,21 +3481,26 @@ mod tests {
             .insert_release_signature(5, Signature::new_unique().to_string(), 1, None)
             .await
             .unwrap();
-        let (storage_tx, mut rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await;
 
         assert!(result.is_ok(), "boot must pass: {result:?}");
-        assert!(
-            rx.try_recv().is_err(),
-            "an in-flight release must not be escalated at boot"
+        assert_eq!(
+            state
+                .storage
+                .get_withdrawal_by_nonce(4)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TransactionStatus::Processing,
+            "an in-flight release must not be touched at boot"
         );
     }
 
@@ -2935,14 +3523,12 @@ mod tests {
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let state = sender_state_with_storage(&server.url(), MockStorage::new());
-        let (storage_tx, _rx) = mpsc::channel(8);
 
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
             None,
             Some(Pubkey::new_unique()),
-            &storage_tx,
         )
         .await
         .unwrap_err();

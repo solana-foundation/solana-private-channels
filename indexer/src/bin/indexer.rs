@@ -4,8 +4,8 @@ use figment::{
     Figment,
 };
 use private_channel_indexer::config::{
-    floor_operator_commitment, normalize_optional, validate_operator_startup,
-    DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    floor_operator_commitment, normalize_optional, parse_escrow_instance_id,
+    validate_operator_startup, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
 #[cfg(feature = "datasource-rpc")]
 use private_channel_indexer::config::{validate_rpc_batch_size, validate_rpc_encoding};
@@ -19,10 +19,8 @@ use private_channel_indexer::{
 };
 use serde::Deserialize;
 use solana_commitment_config::CommitmentLevel;
-use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::UiTransactionEncoding;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -311,12 +309,7 @@ async fn reconcile_once(
 
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
-    let escrow_instance_id = common
-        .escrow_instance_id
-        .map(|id_str| {
-            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
-        })
-        .transpose()?;
+    let escrow_instance_id = parse_escrow_instance_id(common.escrow_instance_id)?;
 
     let common_config = PrivateChannelIndexerConfig {
         program_type: common.program_type,
@@ -475,12 +468,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
     };
 
     // Parse escrow instance ID if provided
-    let escrow_instance_id = common
-        .escrow_instance_id
-        .map(|id_str| {
-            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
-        })
-        .transpose()?;
+    let escrow_instance_id = parse_escrow_instance_id(common.escrow_instance_id)?;
 
     let common_config = PrivateChannelIndexerConfig {
         program_type: common.program_type,
@@ -507,6 +495,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
 
     common_config.validate()?;
     indexer_config.validate()?;
+    private_channel_indexer::config::validate_withdraw_datasource(&common_config, &indexer_config)?;
 
     private_channel_indexer::run(common_config, indexer_config, Some(health)).await?;
 
@@ -539,6 +528,11 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     let storage_section: StorageSection = figment.extract_inner("storage")?;
     let operator: OperatorSection = figment.extract_inner("operator")?;
 
+    // Signers load before the pool opens; a bad signer config never touches the database.
+    private_channel_indexer::operator::init_signers()
+        .await
+        .map_err(|e| format!("Signer configuration error: {}", e))?;
+
     // Get DATABASE_URL from environment
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
@@ -551,11 +545,6 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         database_url,
         std::env::var("ALERT_WEBHOOK_URL").ok(),
     )?;
-
-    // Validate signer configuration early (from environment variables)
-    private_channel_indexer::operator::init_signers()
-        .await
-        .map_err(|e| format!("Signer configuration error: {}", e))?;
 
     // Initialize storage
     let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type
@@ -587,12 +576,7 @@ fn build_operator_config(
     database_url: String,
     alert_webhook_url: Option<String>,
 ) -> Result<(PrivateChannelIndexerConfig, OperatorConfig), String> {
-    let escrow_instance_id = common
-        .escrow_instance_id
-        .map(|id_str| {
-            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
-        })
-        .transpose()?;
+    let escrow_instance_id = parse_escrow_instance_id(common.escrow_instance_id)?;
 
     let postgres_config = PostgresConfig {
         database_url,
@@ -714,12 +698,12 @@ async fn run_resync(
     let common: CommonSection = figment.extract_inner("common")?;
     let storage: StorageSection = figment.extract_inner("storage")?;
     let indexer: IndexerSection = figment.extract_inner("indexer")?;
-    // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
-    validate_resync_config(&storage, &indexer)?;
-    // Reconcile reads only the admin pubkey; load it before anything connects.
-    private_channel_indexer::operator::init_admin_signer()
+    // Reconcile reads the admin pubkey; load it before anything connects.
+    private_channel_indexer::operator::init_signers()
         .await
         .map_err(|e| format!("Signer configuration error: {}", e))?;
+    // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
+    validate_resync_config(&storage, &indexer)?;
 
     // Get DATABASE_URL from environment
     let database_url =
@@ -761,12 +745,7 @@ async fn run_resync(
     );
 
     // Parse escrow instance ID if provided
-    let escrow_instance_id = common
-        .escrow_instance_id
-        .map(|id_str| {
-            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
-        })
-        .transpose()?;
+    let escrow_instance_id = parse_escrow_instance_id(common.escrow_instance_id)?;
 
     // Build backfill config base
     let backfill_config_base = BackfillConfig {
@@ -821,6 +800,7 @@ async fn run_resync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::pubkey::Pubkey;
 
     fn common_section(program_type: ProgramType) -> CommonSection {
         CommonSection {

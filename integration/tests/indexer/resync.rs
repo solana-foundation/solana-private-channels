@@ -553,15 +553,32 @@ fn script_channel_caught_up(mock: &MockRpcServer) {
     }
 }
 
-/// Answer the startup supply invariant with "no channel mint exists yet".
-///
-/// An absent mint account reads as zero supply, which can never exceed custody, so the
-/// invariant passes and the custody comparison stays the only thing under test. Startup
-/// now refuses to boot on a supply it could not read, so leaving the read unscripted
-/// would fail the boot rather than be ignored.
+/// Answer the startup supply invariant with "no channel mint exists yet" (zero supply).
+/// Supply only counts at or past the channel's newest recent block, so the mock also
+/// reports a tip at slot 100 stamped a second ago and answers the read at that slot.
 fn script_channel_empty_supply(mock: &MockRpcServer) {
-    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
+    const CHANNEL_TIP: u64 = 100;
+    mock.enqueue_sequence(
+        "getSlot",
+        std::iter::repeat_n(Reply::result(json!(CHANNEL_TIP)), 256),
+    );
+    mock.enqueue_sequence(
+        "getBlocks",
+        std::iter::repeat_n(Reply::result(json!([CHANNEL_TIP])), 256),
+    );
+    let time = Reply::dynamic(|_| json!(chrono::Utc::now().timestamp() - 1));
+    mock.enqueue_sequence("getBlockTime", std::iter::repeat_n(time, 256));
+    let reply = Reply::result(json!({"context": {"slot": CHANNEL_TIP}, "value": null}));
     mock.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 256));
+}
+
+/// Wait until the finalized chain reaches the escrow checkpoint. This harness indexes at
+/// confirmed, while production indexes at finalized, so its checkpoint can sit above the
+/// finalized custody read that startup refuses to compare against an ahead ledger.
+async fn wait_for_finalized_escrow_checkpoint(rpc_url: &str, db_url: &str) {
+    if let Some(checkpoint) = checkpoint_of(db_url, "escrow").await {
+        wait_for_finalized_slot(rpc_url, checkpoint as u64).await;
+    }
 }
 
 /// Place the single serviced mint on page 2: page 1 is a full `CHANNEL_PAGE_LIMIT`
@@ -699,7 +716,9 @@ async fn seed_pending_deposit(db_url: &str, signature: &str) {
 }
 
 /// Slot of every seeded row: above any slot a test validator reaches, so a seed never sits
-/// below the genesis a test resyncs from.
+/// below the genesis a test resyncs from. A resync refuses a row above its tip as soon as the
+/// tip is known, so a test whose resync gets past that point moves its seed into the replay
+/// range first.
 const SEED_SLOT: i64 = 1_000_000_000;
 
 /// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
@@ -708,15 +727,17 @@ async fn seed_tx(db_url: &str, signature: &str, ty: &str, status: &str) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
          VALUES ($1, $4, 'seed', 'seed', 'seed_mint', 100,
-                 $2::transaction_type, $3::transaction_status, NOW(), NOW())
+                 $2::transaction_type, $3::transaction_status, NOW(), NOW(), $5)
          RETURNING id",
     )
     .bind(signature)
     .bind(ty)
     .bind(status)
     .bind(SEED_SLOT)
+    // A reminted row must carry its landed remint (table CHECK).
+    .bind((status == "failed_reminted").then(|| format!("{signature}-remint")))
     .fetch_one(&pool)
     .await
     .expect("seed transaction")
@@ -903,6 +924,31 @@ async fn do_deposit(
     helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "Deposit").await
 }
 
+/// Moves all but `keep` of the user's tokens into escrow custody with a plain transfer. This
+/// harness plays the channel on the same validator, so every token outside custody reads as
+/// channel supply; a restarted escrow operator opens its solvency fence only once that matches.
+async fn top_up_custody_to_supply(
+    client: &RpcClient,
+    user: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    keep: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let amount = token_balance(client, user.pubkey(), mint).await - keep;
+    let ix = spl_token::instruction::transfer(
+        &TOKEN_PROGRAM_ID,
+        &get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID),
+        &get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID),
+        &user.pubkey(),
+        &[],
+        amount,
+    )?;
+    helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "TopUpCustody").await?;
+    // Custody is read at finalized, so the restart must not see the balance before the move.
+    wait_for_finalized_slot(&client.url(), client.get_slot().await? + 1).await;
+    Ok(())
+}
+
 /// Two Deposit instructions in ONE transaction (same signature, distinct
 /// instruction/inner index): the identity-granularity fixture for IT-R10.
 async fn do_double_deposit(
@@ -1018,10 +1064,20 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         .await?;
     }
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_sig_001'"
+        ),
+    )
+    .await;
 
     seed_withdrawal_side(&db_url).await;
     let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
@@ -1871,6 +1927,15 @@ async fn resync_aborts_on_signed_mint_that_does_not_pay_the_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -1972,6 +2037,15 @@ async fn resync_aborts_on_remint_marker_for_a_deposit_db_intact(
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_kind_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
+    // Inside the replay range, or the tip check would refuse before the mismatch is found.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {} WHERE signature = '{sentinel_signature}'",
+            h.genesis
+        ),
+    )
+    .await;
     let rows_before = row_count(&db_url).await;
 
     let result = h.run().await;
@@ -2018,7 +2092,8 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_reminted_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2087,7 +2162,8 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
         validator.rpc_url(),
         CommitmentConfig::confirmed(),
     ));
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("resync_released_withdrawal").await?;
 
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
@@ -2274,6 +2350,15 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         script_channel_floor(&mock);
         let sentinel = format!("rotation_sentinel_{}", &case[..1]);
         seed_pending_deposit(&db_url, &sentinel).await;
+        // Inside the replay range, since a refused case leaves it for the next discovery.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {} WHERE signature = '{sentinel}'",
+                h.genesis
+            ),
+        )
+        .await;
         let rows_before = row_count(&db_url).await;
         let status_before = status_of(&db_url, &dep).await.status;
 
@@ -2331,7 +2416,8 @@ async fn resync_across_admin_rotation_matrix() -> Result<(), Box<dyn std::error:
         program_type: ProgramType::Withdraw,
         instance: Some(env.instance),
         channel_url: mock.url(),
-        genesis,
+        // A withdraw resync replays from slot 0.
+        genesis: 0,
     };
     let wd = keys_of_type(&h.discover().await, "withdrawal")[0].clone();
     let memo = memo_for(&wd.source_event_id(), ConsumedMintKind::Remint);
@@ -2455,6 +2541,14 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
         let (db_url, storage, _pg) =
             start_postgres_for_resync(&format!("resync_pruned_{i}")).await?;
         seed_pending_deposit(&db_url, "resync_pruned_seed").await;
+        // Inside the replay range, or the tip check would refuse before the late floor read.
+        seed_sql(
+            &db_url,
+            &format!(
+                "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_pruned_seed'"
+            ),
+        )
+        .await;
 
         let mock = MockRpcServer::start().await;
         script_channel_caught_up(&mock);
@@ -2675,10 +2769,20 @@ async fn resync_refuses_while_a_worker_holds_the_live_lock(
         })
         .await?,
     ));
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
     };
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {current_slot} WHERE signature = 'resync_live_lock_seed'"
+        ),
+    )
+    .await;
     let service = make_resync_service(rpc_url, storage);
     run_resync(&service, current_slot)
         .await
@@ -2736,6 +2840,8 @@ async fn resync_initializes_schema_on_a_fresh_database() -> Result<(), Box<dyn s
     let rpc_url = test_validator.rpc_url();
     let (db_url, storage, _container) = start_bare_postgres_for_resync("resync_fresh_db").await?;
 
+    // Past slot 0, or the rebuild's range is empty and leaves no checkpoint to confirm.
+    wait_for_finalized_slot(&rpc_url, 1).await;
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
@@ -2805,6 +2911,14 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
     // Recent slots only, so every block is retrievable, and one round trip per slot
     // so the fill is long enough to still be running when the lock goes.
     let genesis_slot = current_slot.saturating_sub(BACKFILL_SPAN_SLOTS);
+    // Inside the replay range, or the rebuild would refuse to wipe a row above its tip.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET slot = {genesis_slot} WHERE signature = 'resync_lock_lost_seed'"
+        ),
+    )
+    .await;
 
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_url.clone(),
@@ -2891,13 +3005,10 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         Err(StorageError::UnfinishedResync { .. })
     ));
 
-    // A rerun of the same program finishes the rebuild and clears it.
-    let current_slot = {
-        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
-        client.get_slot()?
-    };
+    // A rerun of the same program finishes the rebuild and clears it. It starts from the same
+    // genesis, since the marker keeps the deleted seed's slot as the lowest a rerun may use.
     let rerun = make_resync_service(rpc_url, new_storage(&db_url).await);
-    run_resync(&rerun, current_slot)
+    run_resync(&rerun, genesis_slot)
         .await
         .expect("a same-program rerun must finish the interrupted resync");
     assert_eq!(marker(&db_url).await, None);
@@ -2946,6 +3057,7 @@ enum Refusal {
     ReleaseEvidence,
     OtherMarker,
     GenesisAboveRows,
+    WithdrawGenesis,
 }
 
 /// The unsafe state a refusal case starts from, so each case carries its own setup.
@@ -2961,6 +3073,8 @@ enum Seed {
     OtherMarker,
     /// One row of this type in this status at this slot.
     TxAt(&'static str, &'static str, i64),
+    /// Nothing at all: an empty or lost database.
+    Empty,
 }
 
 struct RefusalCase {
@@ -2999,6 +3113,7 @@ async fn seed_refusal(db_url: &str, seed: Seed) {
             )
             .await;
         }
+        Seed::Empty => {}
     }
 }
 
@@ -3083,7 +3198,15 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
             program: ProgramType::Withdraw,
             seed: Seed::TxAt("withdrawal", "pending", 100),
             genesis: 101,
-            expected: Refusal::GenesisAboveRows,
+            // The genesis-0 rule answers first, so the operator is not sent to 100 and refused again.
+            expected: Refusal::WithdrawGenesis,
+        },
+        RefusalCase {
+            name: "withdraw: empty table, genesis above 0",
+            program: ProgramType::Withdraw,
+            seed: Seed::Empty,
+            genesis: 1,
+            expected: Refusal::WithdrawGenesis,
         },
     ];
     for RefusalCase {
@@ -3123,6 +3246,9 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
                 genesis_slot: 101,
                 earliest_slot: 100,
             })) => Refusal::GenesisAboveRows,
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawGenesisNotZero {
+                ..
+            })) => Refusal::WithdrawGenesis,
             other => panic!("{case}: expected {expected:?}, got {other:?}"),
         };
         assert_eq!(got, expected, "{case}");
@@ -3217,7 +3343,9 @@ impl Stack {
     /// updated"), which is a startup artefact of this harness, not of the resync.
     async fn start(rpc_url: &str, db_url: &str, instance: Pubkey) -> Self {
         let (rpc, db) = (rpc_url.to_string(), db_url.to_string());
-        let channel = ChannelShim::start(rpc_url).await;
+        // The channel is this validator, so every token outside custody would read as unbacked
+        // channel supply; mirror custody so the escrow operator's solvency fence can open.
+        let channel = ChannelShim::start_mirroring_custody(rpc_url, instance).await;
         let mut workers = Vec::new();
         {
             let (rpc, db) = (rpc.clone(), db.clone());
@@ -3234,7 +3362,7 @@ impl Stack {
             let (rpc, db) = (rpc.clone(), db.clone());
             workers.push(
                 Worker::spawn(move || async move {
-                    start_private_channel_indexer(None, rpc, db)
+                    start_private_channel_indexer(rpc, db)
                         .await
                         .expect("start the withdraw indexer");
                 })
@@ -3242,10 +3370,11 @@ impl Stack {
             );
         }
         {
-            let (rpc, db) = (channel.url(), db.clone());
+            let (channel_rpc, rpc, db) = (channel.url(), rpc.clone(), db.clone());
             workers.push(
                 Worker::spawn(move || async move {
                     start_solana_to_private_channel_operator_with_config(
+                        channel_rpc,
                         rpc,
                         db,
                         admin(),
@@ -3644,6 +3773,182 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
     Ok(())
 }
 
+/// The withdraw indexer's checkpoint and fence, once it has written a fence.
+async fn withdraw_checkpoint_with_fence(db_url: &str) -> (i64, i64, String) {
+    let pool = fresh_pool(db_url).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(*WAIT_TIMEOUT_SECS);
+    loop {
+        let row: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT last_committed_slot, fence_slot, fence_blockhash FROM indexer_state
+              WHERE program_type = 'withdraw'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("checkpoint read");
+        if let Some((Some(checkpoint), Some(slot), Some(hash))) = row {
+            return (checkpoint, slot, hash);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the withdraw indexer never wrote a fence"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Put the withdraw checkpoint and fence back to `backup`, as the restored snapshot holds them.
+async fn restore_withdraw_checkpoint(db_url: &str, backup: (i64, i64, String)) {
+    sqlx::query(
+        "UPDATE indexer_state SET last_committed_slot = $1, fence_slot = $2, fence_blockhash = $3
+          WHERE program_type = 'withdraw'",
+    )
+    .bind(backup.0)
+    .bind(backup.1)
+    .bind(backup.2)
+    .execute(&fresh_pool(db_url).await)
+    .await
+    .expect("restore the withdraw checkpoint");
+}
+
+/// Stand in for an indexer-only restore to before `signatures` were serviced: the rows come
+/// back `pending` with no journal and no recorded channel mint, the way the older backup had them.
+async fn rewind_rows_to_pending(db_url: &str, signatures: &[&str]) {
+    let pool = fresh_pool(db_url).await;
+    for signature in signatures {
+        let id: i64 = sqlx::query_scalar("SELECT id FROM transactions WHERE signature = $1")
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("row to rewind");
+        for table in ["pending_release_signatures", "pending_remint_signatures"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE transaction_id = $1"))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("drop the journal");
+        }
+        sqlx::query(
+            "UPDATE transactions SET status = 'pending'::transaction_status,
+                counterpart_signature = NULL, landed_remint_signature = NULL,
+                remint_signatures = NULL, remint_last_valid_block_heights = NULL,
+                processed_at = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("rewind the row");
+    }
+}
+
+/// Apex SOLA13-33 and SOLA13-269: after an indexer restore a minted deposit and a reminted
+/// withdrawal come back `pending`. The operators must find both in the channel's own mint
+/// history and close them with the original signatures: no second mint, no remint, no release.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_indexer_rewind_completes_from_history() -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_indexer_rewind").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    // The backup this restore goes back to: the withdraw checkpoint and fence from before
+    // either row was serviced, since a real restore takes them from the same snapshot.
+    let backup = withdraw_checkpoint_with_fence(&db_url).await;
+    let deposit = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+
+    // The release fails because the destination has no token account, so the burn is reminted.
+    let destination = Keypair::new().pubkey();
+    let withdrawal =
+        helpers::execute_user_withdrawal_to(&client, user, env.mint, WITHDRAW_AMOUNT, destination)
+            .await?;
+    let settled = wait_for_any_status(
+        &db_url,
+        &withdrawal.signature,
+        &["pending_remint", "manual_review", "failed_reminted"],
+    )
+    .await;
+    stack.stop().await;
+    if settled != "failed_reminted" {
+        remint_as_operator(
+            &client,
+            &db_url,
+            &withdrawal.signature,
+            user.pubkey(),
+            env.mint,
+        )
+        .await;
+    }
+    let minted = row_of(&db_url, &deposit.to_string()).await.2;
+    let pool = fresh_pool(&db_url).await;
+    let reminted: Option<String> =
+        sqlx::query_scalar("SELECT landed_remint_signature FROM transactions WHERE signature = $1")
+            .bind(&withdrawal.signature)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        minted.is_some() && reminted.is_some(),
+        "both rows must be serviced first"
+    );
+
+    // A release to the destination would now land, so a second payout would be visible.
+    let ata_ix =
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &user.pubkey(),
+            &destination,
+            &env.mint,
+            &TOKEN_PROGRAM_ID,
+        );
+    helpers::send_and_confirm_instructions(&client, &[ata_ix], user, &[user], "ATA").await?;
+
+    rewind_rows_to_pending(&db_url, &[&deposit.to_string(), &withdrawal.signature]).await;
+    restore_withdraw_checkpoint(&db_url, backup).await;
+    // The restarted escrow indexer reconciles against finalized custody, which must have
+    // reached its checkpoint or its boot gives up re-reading.
+    let committed = checkpoint_of(&db_url, "escrow").await.unwrap_or(0) as u64;
+    wait_for_finalized_slot(&rpc_url, committed).await;
+    let supply_before = supply(&client, env.mint).await;
+    let custody_before = custody(&client, env.instance, env.mint).await;
+    let user_before = token_balance(&client, user.pubkey(), env.mint).await;
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+    wait_for_status(&db_url, &withdrawal.signature, "failed_reminted").await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+
+    assert_eq!(
+        row_of(&db_url, &deposit.to_string()).await.2,
+        minted,
+        "the original mint closes it"
+    );
+    let reminted_after: Option<String> =
+        sqlx::query_scalar("SELECT landed_remint_signature FROM transactions WHERE signature = $1")
+            .bind(&withdrawal.signature)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(reminted_after, reminted, "the original remint closes it");
+    assert_eq!(
+        supply(&client, env.mint).await,
+        supply_before,
+        "nothing may be minted again"
+    );
+    assert_eq!(
+        custody(&client, env.instance, env.mint).await,
+        custody_before,
+        "nothing may be released"
+    );
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before
+    );
+    assert_eq!(token_balance(&client, destination, env.mint).await, 0);
+    Ok(())
+}
+
 /// E2E-2 (26): an escrow resync on a busy system keeps every withdrawal and nonce, the withdraw
 /// indexer resumes from its kept checkpoint, and nothing is minted or released twice.
 #[tokio::test(flavor = "multi_thread")]
@@ -3730,6 +4035,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
     // channel supply, so the supply invariant reads an empty mock channel, as IT-R12 does.
     let mock = MockRpcServer::start().await;
     script_channel_empty_supply(&mock);
+    wait_for_finalized_escrow_checkpoint(&rpc_url, &db_url).await;
     let recon_storage = new_storage(&db_url).await;
     let recon = run_startup_reconciliation(
         &ReconciliationConfig {
@@ -3774,6 +4080,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         (2 * WITHDRAW_AMOUNT + 1).to_string()
     );
     script_channel_empty_supply(&mock);
+    wait_for_finalized_escrow_checkpoint(&rpc_url, &db_url).await;
     let recon_storage = new_storage(&db_url).await;
     let recon = run_startup_reconciliation(
         &ReconciliationConfig {
@@ -3973,15 +4280,18 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
     assert_eq!(deposit_outcomes(&db_url).await, deposits);
 
     // The workers run normally again: one new deposit is minted once and nothing else is.
+    // Its amount stays inside the reconciliation tolerance of the topped-up custody.
+    let late_deposit = 1_000;
+    top_up_custody_to_supply(&client, user, env.instance, env.mint, late_deposit).await?;
     let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
-    let deposit_c = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    let deposit_c = do_deposit(&client, user, env.instance, env.mint, late_deposit).await?;
     wait_for_status(&db_url, &deposit_c.to_string(), "completed").await;
     let_stack_settle(&db_url, &client).await;
     stack.stop().await;
     assert_eq!(deposit_count(&db_url).await, 3, "no duplicate deposit rows");
     assert_eq!(
         supply(&client, env.mint).await,
-        supply_before + DEPOSIT_AMOUNT,
+        supply_before + late_deposit,
         "only the new deposit is minted"
     );
     Ok(())
@@ -4014,7 +4324,8 @@ async fn e2e_interrupted_withdraw_resync_reruns_cleanly() -> Result<(), Box<dyn 
     let (validator, faucet) = start_test_validator_no_geyser().await;
     let rpc_url = validator.rpc_url();
     let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
-    let genesis = client.get_slot().await?;
+    // A withdraw resync replays from slot 0.
+    let genesis = 0;
     let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_interrupted_withdraw").await?;
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
     let user = &env.users[0];

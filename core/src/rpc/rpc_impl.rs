@@ -73,7 +73,6 @@ pub struct ReadDeps {
     pub accounts_db: AccountsDB,
     // Used for simulating sigverify
     pub admin_keys: Vec<Pubkey>,
-    pub max_blockhashes: u64,
     /// One permit per running `simulateTransaction`; a call finding none is refused.
     pub simulation_permits: tokio::sync::Semaphore,
     /// One permit per running block listing wider than `MAX_UNCAPPED_BLOCK_SPAN`.

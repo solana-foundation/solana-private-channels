@@ -7,9 +7,11 @@
 //! The operator-side `recover_pending_remints` is `pub(super)` and unit-tested
 //! in-file (in `sender/state.rs`). The observable public seam for integration
 //! testing is the storage round-trip: if the operator crashes with pending
-//! remints in flight, it relies on `set_pending_remint` to have durably
-//! persisted them and `get_pending_remint_transactions` to return them, a page
-//! at a time, from restart on.
+//! remints in flight, it relies on `get_pending_remint_transactions` to return
+//! the rows, a page at a time, from restart on, and takes their signatures from
+//! `pending_release_signatures`. The `remint_signatures` mirror that
+//! `set_pending_remint` writes feeds its own replay guard and the stalled-row
+//! sweep.
 //!
 //! Binary: `reconciliation_integration` (existing, has Postgres fixtures
 //! via the nearby `db_migration_race` tests).
@@ -464,11 +466,24 @@ async fn test_remint_signatures_round_trip_and_gc() {
         2
     );
 
-    // Once the parent goes terminal, GC sweeps its write-ahead rows.
+    // A ManualReview parent keeps its rows: its MintTo may still land.
     sqlx::query(
-        "UPDATE transactions SET status = 'failed_reminted'::transaction_status WHERE id = $1",
+        "UPDATE transactions SET status = 'manual_review'::transaction_status WHERE id = $1",
     )
     .bind(tx_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
+    assert_eq!(removed, 0, "a ManualReview parent must keep its rows");
+
+    // Once the parent goes terminal, GC sweeps its write-ahead rows.
+    sqlx::query(
+        "UPDATE transactions SET status = 'failed_reminted'::transaction_status,
+         landed_remint_signature = $2 WHERE id = $1",
+    )
+    .bind(tx_id)
+    .bind(attempt_b.clone())
     .execute(&pool)
     .await
     .unwrap();

@@ -35,6 +35,7 @@ use mockito::Server;
 use private_channel_indexer::config::{
     OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
 };
+use private_channel_indexer::error::{OperatorError, ProgramError};
 use private_channel_indexer::operator;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
@@ -83,7 +84,10 @@ async fn seed_mint_status_allowed(
     Ok(())
 }
 
-/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the operator claims it.
+/// Stands in for the indexer's checkpoint, which must cover a deposit's slot before the
+/// operator claims it and the custody slot before its solvency fence opens. The write only
+/// moves forward. A test that also runs a withdraw processor keeps it within reach of the
+/// chain, since that processor anchors its allowlist read at the checkpoint.
 async fn seed_escrow_checkpoint(
     storage: &Storage,
     slot: u64,
@@ -128,6 +132,37 @@ async fn start_operator_with_alert(
     instance: solana_sdk::pubkey::Pubkey,
     alert_url: Option<String>,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
+    let (storage, common_config, operator_config) = operator_inputs(
+        program_type,
+        rpc_url,
+        db_url,
+        operator_keypair,
+        instance,
+        alert_url,
+    )
+    .await?;
+
+    let task_handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
+            tracing::error!("Operator error: {}", e);
+        }
+    });
+
+    Ok(OperatorHandle {
+        _handle: task_handle,
+    })
+}
+
+/// What `start_operator_with_alert` passes to `operator::run`, for tests that need its result.
+async fn operator_inputs(
+    program_type: ProgramType,
+    rpc_url: String,
+    db_url: String,
+    operator_keypair: Keypair,
+    instance: solana_sdk::pubkey::Pubkey,
+    alert_url: Option<String>,
+) -> Result<(Arc<Storage>, PrivateChannelIndexerConfig, OperatorConfig), Box<dyn std::error::Error>>
+{
     let postgres_config = PostgresConfig {
         database_url: db_url.clone(),
         max_connections: 10,
@@ -155,15 +190,7 @@ async fn start_operator_with_alert(
 
     set_operator_env_vars(&operator_keypair);
 
-    let task_handle: JoinHandle<()> = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
-            tracing::error!("Operator error: {}", e);
-        }
-    });
-
-    Ok(OperatorHandle {
-        _handle: task_handle,
-    })
+    Ok((storage, common_config, operator_config))
 }
 
 /// Start an operator task with a fully custom [`OperatorConfig`].
@@ -400,7 +427,18 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .build();
 
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // 3. Start a PrivateChannel core node as the mint target. It reports every
     // found transaction as `finalized` instantly, so the operator's finalized
@@ -412,6 +450,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     // rpc_url (mint target) = PC node; the escrow instance stays on Solana.
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -496,7 +535,18 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .transaction_type(TransactionType::Deposit)
         .build();
     storage.insert_db_transaction(&deposit_txn).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        amount,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
@@ -513,6 +563,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -736,12 +787,46 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     .transaction_type(TransactionType::Deposit)
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The row stands in for a deposit, so custody must hold what it says was deposited.
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        bad_mint.pubkey(),
+        env.instance,
+        &bad_authority,
+        10_000,
+    )
+    .await?;
+    // The fence opens only on a tick whose custody slot the checkpoint covers, and the withdraw
+    // processor later anchors its allowlist read at the checkpoint, so it can sit neither
+    // behind the chain nor far ahead of it: keep it a few slots ahead until the mint is claimed.
+    let last_seeded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reseed = {
+        let storage = storage.clone();
+        let last_seeded = last_seeded.clone();
+        let client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(slot) = client.get_slot().await {
+                    let _ = seed_escrow_checkpoint(&storage, slot + 5).await;
+                    last_seeded.store(slot + 5, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    };
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
     // error leaves the row Processing for recovery to reconcile against the
     // persisted signature, so it journals its signature and never reaches Failed.
     wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
+    reseed.abort();
+    // The withdraw processor anchors its allowlist read at the checkpoint with a few quick
+    // retries, so let the chain pass the last seed before any withdrawal is offered.
+    while client.get_slot().await? < last_seeded.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let mint_row = db::get_transaction(&pool, &mint_fail_sig)
         .await?
         .expect("the deposit row must exist");
@@ -885,7 +970,18 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         storage.insert_db_transaction(&txn).await?;
         signatures.push(sig);
     }
-    seed_escrow_checkpoint(&storage, 1).await?;
+    // The rows stand in for deposits, so custody must hold what they say was deposited.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(
+        &client,
+        &faucet_keypair,
+        env.mint,
+        env.instance,
+        &admin,
+        DEPOSIT_AMOUNT * NUM_USERS as u64,
+    )
+    .await?;
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
     // The mint target is a PrivateChannel node (instant finality), so balances
@@ -895,6 +991,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
     let pc_client = RpcClient::new(pc_node.url.clone());
     let operator_handle = start_solana_to_private_channel_operator(
         pc_node.url.clone(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -968,6 +1065,7 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_solana_to_private_channel_operator(
+        test_validator.rpc_url(),
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -1056,7 +1154,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     mint_to_owner(&client, &admin, mint, holder.pubkey(), &admin, OVER_ISSUED).await?;
 
     // One active (pending) withdrawal so the halt's quarantine has a row to flip.
-    // Its amount joins the mint's in-flight envelope but stays well under the gap.
+    // A withdrawal never widens the envelope, since its burn is already in the supply.
     let wd_sig = Signature::new_unique().to_string();
     let withdrawal =
         DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
@@ -1104,6 +1202,8 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 
     let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
+    let fence = private_channel_indexer::operator::solvency_fence::SolvencyFence::closed();
+    let recon_fence = fence.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = run_reconciliation(
             recon_storage,
@@ -1113,6 +1213,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
             instance,
             health_for_task,
             recon_token_clone,
+            recon_fence,
         )
         .await
         {
@@ -1158,6 +1259,15 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
         !health.is_healthy(),
         "operator health must be forced unhealthy after a halt"
     );
+    // The in-process fence tripped too, so this process moves nothing even without the row.
+    assert!(
+        !fence.is_open(),
+        "a confirmed breach trips the solvency fence"
+    );
+    assert_eq!(
+        fence.state(),
+        private_channel_indexer::operator::solvency_fence::FenceState::Tripped
+    );
 
     // The active withdrawal was quarantined to manual_review by the halt.
     let pool = db::connect(&db_url).await?;
@@ -1190,7 +1300,6 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use test_utils::channel_shim::ChannelShim;
-    use test_utils::operator_helper::start_private_channel_to_solana_operator;
 
     println!("=== Operator Lifecycle: Boot Halts When DB Is Ahead Of The Bitmap ===");
 
@@ -1268,32 +1377,32 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     )
     .await?;
 
-    let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     // The validator has no status snapshot, so the operator reads the channel through this.
     let channel_shim = ChannelShim::start(&test_validator.rpc_url()).await;
-    let operator_handle = start_private_channel_to_solana_operator(
+    let (operator_storage, mut common_config, operator_config) = operator_inputs(
+        ProgramType::Withdraw,
         test_validator.rpc_url(),
-        channel_shim.url(),
         db_url.clone(),
-        operator_keypair,
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         env.instance,
+        None,
     )
     .await?;
+    common_config.source_rpc_url = Some(channel_shim.url());
 
-    // The operator must refuse to start: the task exits without processing any row.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut exited = false;
-    while std::time::Instant::now() < deadline {
-        if operator_handle._handle.is_finished() {
-            exited = true;
-            break;
+    // The operator must refuse to start on this divergence, not on any earlier boot failure.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        operator::run(operator_storage, common_config, operator_config, None),
+    )
+    .await
+    .expect("boot must end within 30 s");
+    match outcome {
+        Err(OperatorError::Program(ProgramError::BitmapDivergence { db_only, .. })) => {
+            assert_eq!(db_only, vec![0], "the refusal must name the unbacked nonce")
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        other => panic!("expected a bitmap divergence refusal, got {other:?}"),
     }
-    assert!(
-        exited,
-        "operator must refuse to start (the task exits) when the DB is ahead of the bitmap"
-    );
 
     // The innocent trigger withdrawal never leaves `pending`: the diff gates first.
     let trigger = db::get_transaction(&pool, &trigger_sig)
@@ -1304,20 +1413,16 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
         "trigger withdrawal must stay pending on refuse-to-start; got {}",
         trigger.status
     );
-
-    operator_handle.shutdown().await;
     Ok(())
 }
 
-/// The mirror image, and the direction that must NOT halt. A release lands
-/// on-chain and its `completed` write is lost, so a bit is set with no matching
-/// row. The money already moved correctly; halting the whole pipeline over a
-/// bookkeeping gap would be the wrong trade. The operator starts, reports the
-/// orphan nonce, and keeps processing new withdrawals.
+/// An indexer restore past a release (Apex SOLA13-68): a bit is set with no row to explain
+/// it and the restored sequence renumbers the next burn, so serving any withdrawal could
+/// pay twice. The operator refuses to start and the pending withdrawal is not touched.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn std::error::Error>>
+async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn std::error::Error>>
 {
-    println!("=== Operator Lifecycle: Boot Continues When The Chain Is Ahead ===");
+    println!("=== Operator Lifecycle: Boot Refuses When The Chain Is Ahead ===");
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -1376,6 +1481,16 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
     .await?;
     let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
 
+    // The boot gate reads the bitmap at finalized, so the consumed bit must be final first.
+    let released_at = client.get_slot().await?;
+    while client
+        .get_slot_with_commitment(CommitmentConfig::finalized())
+        .await?
+        < released_at
+    {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // Advance the sequence past the nonce the chain already consumed.
     sqlx::query("SELECT setval('withdrawal_nonce_seq', 0, true)")
         .execute(&pool)
@@ -1392,7 +1507,7 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
         ))
         .await?;
 
-    let operator_handle = start_operator_with_alert(
+    let (operator_storage, common_config, operator_config) = operator_inputs(
         ProgramType::Withdraw,
         test_validator.rpc_url(),
         db_url.clone(),
@@ -1401,21 +1516,31 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
         None,
     )
     .await?;
-
-    operator_util::wait_for_transaction_completion(&pool, &next_sig).await?;
-
-    assert!(
-        !operator_handle._handle.is_finished(),
-        "a chain-ahead divergence must not halt the operator"
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        operator::run(operator_storage, common_config, operator_config, None),
+    )
+    .await
+    .expect("boot must end within 60 s");
+    // Any earlier boot failure would also end the task, so the refusal must be this one.
+    match outcome {
+        Err(OperatorError::Program(ProgramError::UnexplainedConsumedNonces { nonces })) => {
+            assert_eq!(nonces, vec![0], "the refusal must name the orphan nonce")
+        }
+        other => panic!("expected an unexplained consumed nonce refusal, got {other:?}"),
+    }
+    let next = db::get_transaction(&pool, &next_sig)
+        .await?
+        .expect("the post-restore withdrawal row must exist");
+    assert_eq!(
+        next.status, "pending",
+        "nothing may be served after a refusal"
     );
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
-        balance_after,
-        balance_after_orphan + 25_000,
-        "the post-boot withdrawal must release exactly once"
+        balance_after, balance_after_orphan,
+        "no further release may land"
     );
-
-    operator_handle.shutdown().await;
     Ok(())
 }
 

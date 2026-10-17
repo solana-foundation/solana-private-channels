@@ -103,7 +103,8 @@ with `StartSlotAheadOfCheckpoint` instead. A configured `start_slot` may set the
 on a database that has never been indexed, where there is no checkpoint to skip past. If a
 skip is genuinely intended, drop the checkpoint with a destructive resync rather than
 raising the start slot. That resync still refuses a genesis above the program's earliest
-row, so it can skip only slots that hold none of its rows.
+row, so it can skip only slots that hold none of its rows. A withdraw resync cannot skip any,
+since it must replay from slot 0.
 
 ### Resync and the live-state lock
 
@@ -111,7 +112,8 @@ row, so it can skip only slots that hold none of its rows.
 withdrawals, the nonce sequence and its checkpoint) and rebuilds them from chain. It never
 touches the other program's rows, journals, nonces or checkpoint, because it cannot rebuild
 them. It also keeps `mints` and `mint_status_history`: withdrawals survive an escrow resync
-and reconciliation only sees mints listed in `mints`, and the rebuild upserts both. The
+and reconciliation checks the mints in `mints` (plus any with history or deposits but no
+`mints` row), and the rebuild upserts both. The
 nonce reset is an `ALTER SEQUENCE ... RESTART`, which rolls back with the rest of the delete
 if anything fails. It is guarded these ways.
 
@@ -149,8 +151,13 @@ if anything fails. It is guarded these ways.
    A resync refuses under any halt except its own next to its own marker.
 7. **The genesis slot may not drop indexed rows.** The delete takes every row of the
    program but the rebuild replays only from the genesis slot, so a genesis above the
-   program's earliest row refuses before anything is deleted. The marker keeps the lowest
-   slot its wipe deleted, so a rerun after an interrupted resync is held to the same bound.
+   program's earliest row refuses before anything is deleted. Likewise a replay tip below
+   the program's latest row refuses, and so does one whose block time is over 120s behind
+   wall clock, since an empty or restored table has no row to catch a lagging node. The
+   marker keeps the lowest and highest slot its wipe deleted, so a rerun after an
+   interrupted resync is held to the same bounds. A withdraw resync must replay from slot
+   0, since an empty or restored table cannot prove that no burn exists below a later
+   genesis.
 8. **The channel history must be complete.** The channel writes its address index after
    each block commits, so its history can briefly miss a mint that is already final.
    Before it reads that history, resync polls `getAddressIndexSlot` for up to 30s until
@@ -182,6 +189,34 @@ the same constraint the sender's singleton lock already carries.
 **Locations**: lock [`live_lock.rs`](../indexer/src/storage/common/storage/live_lock.rs);
 rebuild [`resync.rs`](../indexer/src/indexer/resync.rs); runbook
 [`live_state_lock_runbook.md`](runbooks/live_state_lock_runbook.md).
+
+### Channel fence and database restores
+
+The channel primary and the indexer DB are restored separately, so the indexer DB must
+never describe channel history the channel no longer has. The withdraw indexer stores the
+newest channel block at or below its checkpoint, slot and hash, on its `indexer_state` row
+(`fence_slot`, `fence_blockhash`), in the same statement as the checkpoint. A block hash
+is used, not a counter, because the channel produces it and a restored channel re-produces
+the same slots with new hashes. At boot the withdraw indexer and both operators wait for
+the channel tip to reach the fence slot and refuse to start only on proof: the slot holds
+a block with another hash, or the node serves a later block whose parent is below the
+fence slot. A block the node does not serve yet only makes boot wait, since a read node's
+cached tip can be ahead of its replica. The check runs at boot only, and a withdraw indexer
+left running moves its fence onto a restored chain, so every service must be stopped before
+a restore. Because only the RPC poller sees block hashes, the withdraw
+indexer requires the `rpc_polling` datasource.
+
+An indexer DB restored to an earlier point is allowed. At boot each operator walks every
+receipt mint's channel history, newest first, down to the newest mint of its own kind the
+DB already knows (a completed deposit for the escrow operator, a landed remint for the
+withdraw operator, since the other operator may already be running), and keeps every operator mint it finds by source event. A claimed deposit or
+withdrawal whose mint is already there is closed with that signature and nothing is sent.
+The walk refuses boot if it never reaches the known mint while the channel still serves its
+whole history (a rewound channel). History pruned by `truncate` is accepted, so indexer
+restore targets must stay inside the retained history. The
+withdraw operator's bitmap check refuses on any released nonce that no row's landed,
+journaled release explains, because re-indexed burns are renumbered and a release names no
+burn. The restore procedure and what each refusal means are in [PITR.md](PITR.md).
 
 ### Transaction Identity & CPI Indexing
 
@@ -244,7 +279,7 @@ Submits transactions to the respective cluster with:
 - Transaction confirmation polling
 - Status updates to database (processing → completed/failed)
 - Just-in-time mint initialization (if mint is not yet initialized on the Solana Private Channels payment channel, the Sender will include an `InitializeMint` instruction in the transaction prior to the `MintTo` instruction)
-- Rotating the withdrawal bitmap on the Mainnet escrow instance. On a timer the sender compares the bitmap's generation against the lowest withdrawal nonce that still owes a release, and arms a `RotateBitmap` when that nonce belongs to a later generation. Driving it from state rather than from a particular withdrawal means the rotation still happens when the row on the boundary was quarantined or never written.
+- Rotating the withdrawal bitmap on the Mainnet escrow instance. On a timer the sender compares the bitmap's generation against the lowest withdrawal nonce that still owes a release, and arms a `RotateBitmap` when that nonce belongs to a later generation. Driving it from state rather than from a particular withdrawal means the rotation still happens when the row on the boundary was quarantined or never written. The rotation carries the generation the arming read saw and is never re-bound at send time; one the chain has already moved past is disarmed and re-armed. Every generation read answers at or past the sender's floor (the endpoint's finalized tip, never below an earlier anchor, the slot an earlier read answered at, or the slot of a generation refusal it saw), so the sender's view of the generation never goes backwards. The tip comes from the same endpoint, so a node lagging evenly can still answer at its own old tip; that costs at most one refused send, and the refusal is then re-read at its own slot, where the answer is exact. Exactly one withdraw sender may run per escrow instance (the sender lock enforces this on one database); two senders on separate databases can still each rotate, which is unsupported.
 
 **Location**: [`indexer/src/operator/sender/`](../indexer/src/operator/sender/)
 
@@ -252,7 +287,7 @@ Submits transactions to the respective cluster with:
 
 #### Reconciliation
 
-Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks two per-mint invariants over finalized reads and fails closed on a proven insolvency: `channel_supply <= custody` beyond the in-flight envelope (over-issuance), and ledger liabilities `<= custody` (a drain), where liabilities are all deposits minus the releases the escrow indexer observed, both at the custody slot once the indexer's checkpoint covers it. Either breach for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). A release discharges what the chain says it moved, capped at what its withdrawal row owed. A tick that cannot pin the ledger leaves the liability arm unarmed, which is counted, exported and alerted on rather than passing silently. Custody is read from the escrow instance's ATA for each known mint, so the read cannot be inflated by accounts others create for the escrow. Channel supply only counts when the node's newest block is under 120 s old (and not stamped more than 120 s ahead) and the read answered at or after it; a read behind it is re-read up to three times (at most six per tick across all mints) before it counts as stale. Each mint's custody is compared with the ledger at the slot its custody read answered at, so custody read in batches need not share one slot, but every batch must answer at or after Solana's newest finalized block, which must itself be under 120 s old; batches send that block as `minContextSlot`, so a lagging backend's refusal is retried. A tick that cannot read a required input (mint set, custody, envelope, fresh supply, the escrow checkpoint, ledger rows) is a dark tick; three in a row halt without quarantining withdrawals. That outage halt never replaces an insolvency halt, while a breach confirmed during it still quarantines and replaces it, and `/health` is only forced to 503 once the halt flag has been written, with an outage reason replaced by the insolvency reason on an upgrade. The halt is also enforced in the claim that precedes every mint and release broadcast (a refused row that never broadcast goes back to `pending` without spending a requeue attempt), and a fetcher that cannot read the flag skips its poll. Reconciliation is a supervised task on the escrow operator, so if it dies the operator restarts. Startup runs the same supply invariant and the same custody-vs-ledger comparison before the pipeline boots; when its ledger checkpoint sits below the custody snapshot it re-reads the ledger with completed withdrawals counted as released, so indexer lag cannot fail a healthy boot and an unexplained shortfall still stops it. `indexer -c <escrow indexer config> reconcile` runs that comparison once, read-only and under the shared live-state lock so a resync cannot delete the ledger mid-run, after waiting for the escrow checkpoint to cover the custody slot, so status never stands in for an observed release; it exits 0 on a pass, 1 on a shortfall or supply breach, 2 on an error and 3 when the ledger never reaches the custody slot or a resync is rebuilding it.
+Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks two per-mint invariants over finalized reads and fails closed on a proven insolvency: `channel_supply <= custody` beyond the in-flight envelope (over-issuance; the envelope is unsettled deposits only, and a withdrawal in any status counts only when its channel slot is above the supply anchor, because its burn precedes its release), and ledger liabilities `<= custody` (a drain), where liabilities are all deposits minus the releases the escrow indexer observed, both at the custody slot once the indexer's checkpoint covers it. Either breach for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). A release discharges what the chain says it moved, capped at what its withdrawal row owed. A tick that cannot pin the ledger leaves the liability arm unarmed, which is counted, exported and alerted on rather than passing silently. Custody is read from the escrow instance's ATA for each known mint, so the read cannot be inflated by accounts others create for the escrow. The known mints are every `mints` row plus every mint with status history, deposit rows or a withdrawal whose release the escrow indexer observed, but no `mints` row (an indexer that started after the `AllowMint`; a withdrawal row alone is channel-side and anyone can burn a mint of their own, while `ReleaseFunds` checks the `AllowedMint`); such a mint takes its token program from its on-chain `AllowedMint`, and one whose `AllowedMint` cannot be read has no custody reading, so both invariants hold its breach streak for that tick rather than reset it, and the tick is dark. Channel supply only counts when the node's newest block is under 120 s old (and not stamped more than 120 s ahead) and the read answered at or after it; a read behind it is re-read up to three times (at most six per tick across all mints) before it counts as stale. Each mint's custody is compared with the ledger at the slot its custody read answered at, so custody read in batches need not share one slot, but every batch must answer at or after Solana's newest finalized block, which must itself be under 120 s old; batches send that block as `minContextSlot`, so a lagging backend's refusal is retried. A tick that cannot read a required input (mint set, custody, envelope, fresh supply, the escrow checkpoint, ledger rows, an unlisted mint's `AllowedMint`) is a dark tick; three in a row halt without quarantining withdrawals. That outage halt never replaces an insolvency halt, while a breach confirmed during it still quarantines and replaces it, and for an outage `/health` is only forced to 503 once the halt flag has been written, while a confirmed insolvency forces it whether or not the flag landed; an outage reason is replaced by the insolvency reason on an upgrade. The escrow operator also holds an in-memory solvency fence on its fetcher and pre-broadcast claim: it moves no value before the first clean reconciliation tick in the process that ran both invariants with the ledger pinned at the custody slot (while closed, the check is probed again every 15 s between configured ticks; a probe can open the fence but advances no streak, halts nothing and pages nothing), and a confirmed breach trips it before the flag write, so a failed write cannot leave that process minting; a tripped fence reopens only on restart. The halt is also enforced in the claim that precedes every mint and release broadcast (a refused row that never broadcast goes back to `pending` without spending a requeue attempt, as does one the solvency fence refuses before the claim; the fence is checked again after the claim write, and a row refused there keeps its persisted signature in `processing` for recovery), and a fetcher that cannot read the flag skips its poll. Reconciliation is a supervised task on the escrow operator, so if it dies the operator restarts. Startup runs the same supply invariant and the same custody-vs-ledger comparison before the pipeline boots; when its ledger checkpoint sits below the custody snapshot it re-reads the ledger with completed withdrawals counted as released, so indexer lag cannot fail a healthy boot and an unexplained shortfall still stops it. Startup holds both reads to the same freshness as runtime: custody must answer at or past the larger of Solana's newest recent finalized block and the committed escrow checkpoint (sent as `minContextSlot` and checked on the answer), and each supply read at or past the channel's newest recent block, anchored once per round with its own re-read budget. A stale custody read (`CustodyStale`), a sweep whose two calls never agreed on a slot (`CustodySlotUnsettled`), or a checkpoint that moved past the reading (`CustodyBehindLedger`), is read up to three times in all, 2 s apart, then the boot exits; a supply that stays stale counts as unread and ends in `SupplyInvariantUnverified`. `indexer -c <escrow indexer config> reconcile` runs that comparison once, read-only and under the shared live-state lock so a resync cannot delete the ledger mid-run, after waiting for the escrow checkpoint to cover the custody slot, so status never stands in for an observed release; it exits 0 on a pass, 1 on a shortfall or supply breach, 2 on an error and 3 when the ledger never reaches the custody slot or a resync is rebuilding it.
 
 **Location**: [`indexer/src/operator/reconciliation.rs`](../indexer/src/operator/reconciliation.rs), [`indexer/src/indexer/reconciliation.rs`](../indexer/src/indexer/reconciliation.rs)
 

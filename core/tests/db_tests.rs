@@ -808,6 +808,7 @@ async fn test_truncate_rejects_zero_keep_slots() {
         pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
@@ -827,6 +828,7 @@ async fn test_truncate_rejects_zero_batch_size() {
         pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 0,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
@@ -846,6 +848,7 @@ async fn test_truncate_empty_db_returns_none() {
         pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
@@ -876,6 +879,7 @@ async fn test_truncate_nothing_to_delete() {
         pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
@@ -907,10 +911,14 @@ async fn block_height_survives_pruning() {
         pg_restore_bin: restore.to_path_buf(),
         batch_size: 100,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
     let AccountsDB::Postgres(ref pg) = db else {
         panic!("expected Postgres")
     };
+    private_channel_core::accounts::blockhash_window::publish(pg.pool.as_ref(), 1)
+        .await
+        .unwrap();
     let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
         .await
         .unwrap();
@@ -946,9 +954,14 @@ async fn test_truncate_fails_without_backup() {
         pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
+        consumer_check: private_channel_core::accounts::truncate::ConsumerCheck::Skip,
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
+        // Seeded so the run reaches the backup proof instead of stopping at the window gate.
+        private_channel_core::accounts::blockhash_window::publish(pg.pool.as_ref(), 1)
+            .await
+            .unwrap();
         let result = private_channel_core::accounts::truncate::truncate_slots(pg, &opts).await;
         assert!(result.is_err());
         assert!(result

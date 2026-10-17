@@ -1,5 +1,6 @@
 use {
     super::{
+        blockhash_window::{self, MAX_BLOCKHASHES_KEY},
         pg_dump_proof::{check_transaction_cap, prove_dump, LiveLedger},
         postgres::PostgresAccountsDB,
         redis_coherence::read_deployment_id,
@@ -13,22 +14,14 @@ use {
         collections::{HashMap, HashSet},
         path::{Path, PathBuf},
     },
-    tracing::error,
+    tracing::{error, warn},
 };
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
-
-/// The fewest slots a retention may keep and still hold the whole blockhash
-/// window after a restart: the window in blocks, times the slots an idle node
-/// ticks per block it produces. One slot per block is the loaded floor.
-pub fn retention_floor_slots(max_blockhashes: usize, blocktime_ms: u64) -> u64 {
-    let heartbeat_ms = crate::stages::settle::HEARTBEAT_INTERVAL.as_millis() as u64;
-    let idle_slots_per_block = (heartbeat_ms / blocktime_ms.max(1)).max(1);
-    (max_blockhashes as u64).saturating_mul(idle_slots_per_block)
-}
 const ACCOUNT_HISTORY_TABLE: &str = "account_history";
 const TRUNCATE_ADVISORY_LOCK_ID: i64 = 0x434F4E_54525543; // "CONTRUC" as hex
 const MAX_BIND_PARAMS: usize = 60_000;
+const CONSUMER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct TruncateOptions {
@@ -39,6 +32,26 @@ pub struct TruncateOptions {
     pub pg_restore_bin: PathBuf,
     pub batch_size: usize,
     pub dry_run: bool,
+    pub consumer_check: ConsumerCheck,
+}
+
+/// The withdraw indexer reads core history, so a cut past its checkpoint wedges it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ConsumerCheck {
+    /// The withdraw indexer's database; its committed checkpoint must reach the cut.
+    WithdrawIndexer { database_url: String },
+    /// No withdraw indexer reads this ledger.
+    Skip,
+}
+
+// Hand written so a debug print of the options never shows the URL's credentials.
+impl std::fmt::Debug for ConsumerCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WithdrawIndexer { .. } => f.write_str("WithdrawIndexer { .. }"),
+            Self::Skip => f.write_str("Skip"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,6 +194,9 @@ async fn truncate_slots_inner(
         return Ok(report);
     }
 
+    let window = ensure_two_windows_kept(pool, latest_slot, truncate_before_slot).await?;
+    ensure_withdraw_indexer_read_past(&options.consumer_check, truncate_before_slot).await?;
+
     // Taken after T is fixed: rows written during the proof land at or above T and are
     // never deleted. Blocks land in slot order, so nothing new can appear below T.
     let transactions = live_doomed_transactions(pool, truncate_before_slot).await?;
@@ -214,18 +230,28 @@ async fn truncate_slots_inner(
 
     if options.dry_run {
         let (_, tx_count) =
-            process_block_batches(pool, truncate_before_slot, options.batch_size, true).await?;
+            process_block_batches(pool, truncate_before_slot, options.batch_size, window, true)
+                .await?;
         report.blocks_deleted = blocks_to_delete;
         report.transactions_deleted = tx_count;
         report.account_history_rows_deleted = account_history_rows_to_delete;
         return Ok(report);
     }
 
-    // The proof can take long on an idle lock session; a dropped session frees the lock.
+    // A resync wipes the checkpoint, so one read before a long proof proves nothing now.
+    ensure_withdraw_indexer_read_past(&options.consumer_check, truncate_before_slot).await?;
+    // Checked last: the proof and the read above can take long, and a dropped session
+    // frees the lock.
     ensure_lock_held(lock_conn).await?;
 
-    let (blocks_deleted, transactions_deleted) =
-        process_block_batches(pool, truncate_before_slot, options.batch_size, false).await?;
+    let (blocks_deleted, transactions_deleted) = process_block_batches(
+        pool,
+        truncate_before_slot,
+        options.batch_size,
+        window,
+        false,
+    )
+    .await?;
     report.blocks_deleted = blocks_deleted;
     report.transactions_deleted = transactions_deleted;
 
@@ -241,7 +267,7 @@ async fn truncate_slots_inner(
         set_first_available_block_metadata(pool, query_first_available_slot(pool).await?).await?;
 
     if blocks_deleted > 0 || transactions_deleted > 0 {
-        run_vacuum(pool, &["blocks", "transactions"]).await?;
+        run_vacuum(pool, &["blocks", "transactions", "address_signatures"]).await?;
     }
     if account_history_rows_deleted > 0 {
         run_vacuum(pool, &[ACCOUNT_HISTORY_TABLE]).await?;
@@ -250,10 +276,131 @@ async fn truncate_slots_inner(
     Ok(report)
 }
 
+/// Refuse a cut that leaves fewer than 2W blocks, with W read from the ledger the writer
+/// published it to. A transaction lands within W blocks of its blockhash, so 2W keeps its
+/// status for at least W blocks past its deadline, which is the client's retry grace.
+async fn ensure_two_windows_kept(
+    pool: &PgPool,
+    latest_slot: u64,
+    truncate_before_slot: u64,
+) -> Result<u64> {
+    let window = blockhash_window::read(pool)
+        .await
+        .context("Failed to read the published blockhash window")?
+        .ok_or_else(|| {
+            anyhow!(
+                "metadata key `{MAX_BLOCKHASHES_KEY}` is not set, so the blockhash window is \
+                 unknown; boot the write node on this build first, then retry"
+            )
+        })?;
+    let keep_blocks = window.saturating_mul(2);
+    // The slot of the oldest block truncation must keep; none means fewer than 2W blocks.
+    let floor_slot = sqlx::query_scalar::<_, i64>(
+        "SELECT slot FROM blocks ORDER BY slot DESC OFFSET $1 LIMIT 1",
+    )
+    .bind(i64::try_from(keep_blocks - 1).unwrap_or(i64::MAX))
+    .fetch_optional(pool)
+    .await
+    .context("Failed to find the oldest block of the retained window")?;
+
+    match floor_slot {
+        None => {
+            let oldest = query_first_available_slot(pool)
+                .await?
+                .unwrap_or(latest_slot);
+            Err(anyhow!(
+                "the ledger holds fewer than {keep_blocks} blocks (2 x max_blockhashes \
+                 {window}), so no block may be deleted yet; keep_slots >= {} deletes nothing",
+                latest_slot - oldest + 1
+            ))
+        }
+        Some(floor_slot) if truncate_before_slot > floor_slot as u64 => Err(anyhow!(
+            "this cut keeps fewer than {keep_blocks} blocks (2 x max_blockhashes {window}); \
+             use keep_slots >= {}",
+            latest_slot - floor_slot as u64 + 1
+        )),
+        Some(_) => Ok(window),
+    }
+}
+
+/// Refuse a batch if a writer published a larger window since the cut was checked. The
+/// row lock makes a writer's publish wait for this batch to commit.
+async fn ensure_window_not_grown(conn: &mut PgConnection, approved: u64) -> Result<()> {
+    let value: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = $1 FOR SHARE")
+            .bind(MAX_BLOCKHASHES_KEY)
+            .fetch_optional(&mut *conn)
+            .await
+            .context("Failed to lock the published blockhash window")?;
+    match blockhash_window::decode(value.as_deref()) {
+        Some(current) if current <= approved => Ok(()),
+        current => Err(anyhow!(
+            "max_blockhashes grew from {approved} to {} during truncation; rerun so the cut \
+             is checked against it",
+            current.map_or_else(|| "unset".to_string(), |w| w.to_string())
+        )),
+    }
+}
+
+/// Refuse unless the withdraw indexer has committed every slot below the cut. Runs before
+/// the proof to fail fast and again right before deleting, since a resync can drop the row.
+async fn ensure_withdraw_indexer_read_past(
+    check: &ConsumerCheck,
+    truncate_before_slot: u64,
+) -> Result<()> {
+    let database_url = match check {
+        ConsumerCheck::WithdrawIndexer { database_url } => database_url,
+        ConsumerCheck::Skip => {
+            warn!("Withdraw indexer check skipped; blocks it has not read yet may be deleted");
+            return Ok(());
+        }
+    };
+    // Bounded: the truncation lock is held, and a blackholed host would hold it for minutes.
+    let checkpoint = tokio::time::timeout(CONSUMER_CHECK_TIMEOUT, async {
+        let mut conn = PgConnection::connect(database_url)
+            .await
+            .context("Failed to connect to the withdraw indexer database")?;
+        // An undefined table is an error here, not an absent row: it means the wrong database.
+        let checkpoint = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
+        )
+        .fetch_optional(&mut conn)
+        .await
+        .context("Failed to read the withdraw indexer checkpoint from indexer_state")?
+        .flatten();
+        // Best effort: the session is dropped either way, and the answer is already read.
+        let _ = conn.close().await;
+        anyhow::Ok(checkpoint)
+    })
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Failed to connect to the withdraw indexer database within {CONSUMER_CHECK_TIMEOUT:?}"
+        )
+    })??;
+
+    let Some(checkpoint) = checkpoint else {
+        return Err(anyhow!(
+            "the withdraw indexer has no committed checkpoint, so nothing proves it has read \
+             the blocks this cut deletes; let it anchor first"
+        ));
+    };
+    // The indexer resumes at checkpoint + 1, so the block at the checkpoint may go.
+    if (checkpoint.max(0) as u64).saturating_add(1) < truncate_before_slot {
+        return Err(anyhow!(
+            "the withdraw indexer checkpoint {checkpoint} is behind this cut at slot \
+             {truncate_before_slot}; let it catch up to slot {} or keep more slots",
+            truncate_before_slot - 1
+        ));
+    }
+    Ok(())
+}
+
 async fn process_block_batches(
     pool: &PgPool,
     truncate_before_slot: u64,
     batch_size: usize,
+    window: u64,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
     let mut total_blocks = 0_u64;
@@ -327,6 +474,7 @@ async fn process_block_batches(
             .begin()
             .await
             .context("Failed to begin truncation transaction")?;
+        ensure_window_not_grown(&mut tx, window).await?;
 
         if !signatures.is_empty() {
             let sig_vec: Vec<Vec<u8>> = signatures.into_iter().collect();
@@ -343,6 +491,16 @@ async fn process_block_batches(
                     .execute(&mut *tx)
                     .await
                     .context("Failed to delete old transactions")?;
+
+                // Index rows are derived from the transactions deleted above, so they go with them.
+                sqlx::query(
+                    "DELETE FROM address_signatures WHERE signature = ANY($1) AND slot < $2",
+                )
+                .bind(chunk)
+                .bind(truncate_before_slot as i64)
+                .execute(&mut *tx)
+                .await
+                .context("Failed to delete old address_signatures rows")?;
             }
         }
 
@@ -655,6 +813,7 @@ async fn query_first_available_slot(pool: &PgPool) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::sync::Arc;
 
     #[test]
@@ -705,25 +864,6 @@ mod tests {
         assert_eq!(report.transactions_deleted, 0);
         assert_eq!(report.account_history_rows_deleted, 0);
         assert_eq!(report.first_available_block, None);
-    }
-
-    /// The floor is the dedup window at the widest block spacing the node has,
-    /// which moves with the blocktime and never drops below one slot per block.
-    #[test]
-    fn retention_floor_tracks_the_idle_gap() {
-        for (max_blockhashes, blocktime_ms, floor) in [
-            (150, 100, 1_500),
-            (150, 10, 15_000),
-            (150, 1_000, 150),
-            (150, 5_000, 150),
-            (1, 100, 10),
-        ] {
-            assert_eq!(
-                retention_floor_slots(max_blockhashes, blocktime_ms),
-                floor,
-                "{max_blockhashes} blockhashes at {blocktime_ms}ms"
-            );
-        }
     }
 
     // --- Integration tests requiring Postgres ---
@@ -854,6 +994,7 @@ mod tests {
     async fn truncate_runs_on_a_single_connection_pool() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
 
         // A short timeout so a regression fails in seconds rather than the 30s default.
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -926,6 +1067,7 @@ mod tests {
     async fn a_failed_release_does_not_return_a_locked_connection_to_the_pool() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
 
@@ -964,6 +1106,7 @@ mod tests {
             pg_restore_bin: pg_restore_bin.to_path_buf(),
             batch_size,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         }
     }
 
@@ -979,6 +1122,320 @@ mod tests {
         }
     }
 
+    async fn publish_window(pool: &PgPool, max_blockhashes: u64) {
+        crate::accounts::blockhash_window::publish(pool, max_blockhashes)
+            .await
+            .unwrap();
+    }
+
+    async fn block_slots(pool: &PgPool) -> Vec<i64> {
+        sqlx::query_scalar("SELECT slot FROM blocks ORDER BY slot")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Run a truncation that must be refused, check it deleted nothing and left the
+    /// floor key alone, and return its error text.
+    async fn assert_refused(url: &str, options: &TruncateOptions, observer: &PgPool) -> String {
+        let blocks = block_slots(observer).await;
+        let transactions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(observer)
+            .await
+            .unwrap();
+        let floor = read_floor_metadata(observer).await;
+
+        let err = truncate_on_fresh_pool(url, options, observer)
+            .await
+            .expect_err("the run must be refused");
+
+        assert_eq!(block_slots(observer).await, blocks, "no block deleted");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+            .fetch_one(observer)
+            .await
+            .unwrap();
+        assert_eq!(left, transactions, "no transaction deleted");
+        assert_eq!(
+            read_floor_metadata(observer).await,
+            floor,
+            "floor unchanged"
+        );
+        format!("{err:#}")
+    }
+
+    /// A ledger whose writer never published its window gives truncation nothing to size by.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_without_published_window() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+
+        let err = assert_refused(&url, &apply_opts(1, 100, dump.path(), &restore), &db.pool).await;
+        assert!(err.contains("max_blockhashes"), "{err}");
+    }
+
+    /// The cut must leave 2W blocks; the boundary itself is allowed. Dry runs are gated too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_a_cut_inside_two_windows() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5, 6]).await;
+        publish_window(&db.pool, 2).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+
+        for dry_run in [true, false] {
+            let mut short = apply_opts(2, 100, dump.path(), &restore);
+            short.dry_run = dry_run;
+            let err = assert_refused(&url, &short, &db.pool).await;
+            assert!(err.contains("keep_slots >= 4"), "dry_run {dry_run}: {err}");
+        }
+
+        let mut dry = apply_opts(4, 100, dump.path(), &restore);
+        dry.dry_run = true;
+        let report = truncate_on_fresh_pool(&url, &dry, &db.pool).await.unwrap();
+        assert_eq!(report.blocks_deleted, 2);
+
+        let report =
+            truncate_on_fresh_pool(&url, &apply_opts(4, 100, dump.path(), &restore), &db.pool)
+                .await
+                .unwrap();
+        assert_eq!(report.blocks_deleted, 2);
+        assert_eq!(block_slots(&db.pool).await, vec![3, 4, 5, 6]);
+    }
+
+    /// Below 2W blocks nothing may go, and a cut with nothing under it still skips as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_when_the_ledger_is_shorter_than_two_windows() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3]).await;
+        publish_window(&db.pool, 5).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+
+        let err = assert_refused(&url, &apply_opts(1, 100, dump.path(), &restore), &db.pool).await;
+        assert!(err.contains("fewer than 10 blocks"), "{err}");
+        assert!(err.contains("keep_slots >= 3"), "{err}");
+
+        let report =
+            truncate_on_fresh_pool(&url, &apply_opts(3, 100, dump.path(), &restore), &db.pool)
+                .await
+                .unwrap();
+        assert_eq!(report.blocks_deleted, 0);
+        assert!(report.backup_check.pg_dump_reason.contains("Skipped"));
+    }
+
+    /// Idle gaps make slots a poor proxy for blocks; the gate counts blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_counts_blocks_not_slots() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 10, 20, 30, 40]).await;
+        publish_window(&db.pool, 2).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+
+        // 21 slots is more than 2W, yet it keeps only 3 blocks.
+        let err = assert_refused(&url, &apply_opts(21, 100, dump.path(), &restore), &db.pool).await;
+        assert!(err.contains("keep_slots >= 31"), "{err}");
+
+        truncate_on_fresh_pool(&url, &apply_opts(31, 100, dump.path(), &restore), &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(block_slots(&db.pool).await, vec![10, 20, 30, 40]);
+    }
+
+    /// Put the withdraw indexer's checkpoint row in place: `None` leaves no row at all.
+    async fn seed_withdraw_checkpoint(pool: &PgPool, row: Option<Option<i64>>) {
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS indexer_state (
+                 program_type TEXT PRIMARY KEY,
+                 last_committed_slot BIGINT,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             DELETE FROM indexer_state;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        if let Some(slot) = row {
+            sqlx::query(
+                "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('withdraw', $1)",
+            )
+            .bind(slot)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Blocks the withdraw indexer has not read yet must survive; dry runs are gated too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_when_the_withdraw_checkpoint_is_behind() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        // keep_slots 3 cuts at slot 3, so the indexer must have read slot 2.
+        let gated = |database_url: &str, dry_run: bool| TruncateOptions {
+            dry_run,
+            consumer_check: ConsumerCheck::WithdrawIndexer {
+                database_url: database_url.to_string(),
+            },
+            ..apply_opts(3, 100, dump.path(), &restore)
+        };
+
+        sqlx::query("CREATE DATABASE no_indexer")
+            .execute(db.pool.as_ref())
+            .await
+            .unwrap();
+        let wrong_database = url.replace("/pg_test", "/no_indexer");
+        let unreachable = "postgres://postgres:password@127.0.0.1:1/pg_test";
+        for (label, checkpoint, database_url, expected) in [
+            ("no row", None, url.as_str(), "no committed checkpoint"),
+            (
+                "unset slot",
+                Some(None),
+                url.as_str(),
+                "no committed checkpoint",
+            ),
+            ("behind", Some(Some(1)), url.as_str(), "checkpoint 1"),
+            (
+                "no table",
+                Some(Some(100)),
+                wrong_database.as_str(),
+                "indexer_state",
+            ),
+            ("unreachable", Some(Some(100)), unreachable, "connect"),
+        ] {
+            seed_withdraw_checkpoint(&db.pool, checkpoint).await;
+            for dry_run in [true, false] {
+                let err = assert_refused(&url, &gated(database_url, dry_run), &db.pool).await;
+                assert!(err.contains(expected), "{label}, dry_run {dry_run}: {err}");
+            }
+        }
+
+        // One past the checkpoint is the first slot it has not read, so that cut is allowed.
+        seed_withdraw_checkpoint(&db.pool, Some(Some(2))).await;
+        let report = truncate_on_fresh_pool(&url, &gated(&url, true), &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(report.blocks_deleted, 2);
+
+        seed_withdraw_checkpoint(&db.pool, Some(Some(100))).await;
+        truncate_on_fresh_pool(&url, &gated(&url, false), &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(block_slots(&db.pool).await, vec![3, 4, 5]);
+    }
+
+    /// A resync can drop the checkpoint while the dump proof runs, so it is read again
+    /// right before deleting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_rechecks_the_withdraw_checkpoint_after_the_proof() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        seed_withdraw_checkpoint(&db.pool, Some(Some(100))).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        // Wipes the checkpoint while the proof runs, then restores as usual.
+        let restore = executable_script(&format!(
+            "#!/bin/sh\n\
+             docker exec {id} psql -U postgres -d pg_test -qAtc \
+             \"DELETE FROM indexer_state\" >/dev/null\n\
+             exec docker exec -i {id} pg_restore \"$@\"\n",
+            id = _pg.id()
+        ));
+        let options = TruncateOptions {
+            consumer_check: ConsumerCheck::WithdrawIndexer {
+                database_url: url.clone(),
+            },
+            ..apply_opts(3, 100, dump.path(), &restore)
+        };
+
+        let err = assert_refused(&url, &options, &db.pool).await;
+        assert!(err.contains("no committed checkpoint"), "{err}");
+    }
+
+    /// A writer can boot with a larger window while the proof runs, which moves the 2W
+    /// floor past a cut that was checked against the old window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_refuses_a_window_that_grew_during_the_proof() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        // Publishes a window of 2 while the proof runs, then restores as usual.
+        let restore = executable_script(&format!(
+            "#!/bin/sh\n\
+             docker exec {id} psql -U postgres -d pg_test -qAtc \
+             \"UPDATE metadata SET value = '\\\\x0200000000000000' \
+             WHERE key = 'max_blockhashes'\" >/dev/null\n\
+             exec docker exec -i {id} pg_restore \"$@\"\n",
+            id = _pg.id()
+        ));
+
+        let err = assert_refused(&url, &apply_opts(3, 100, dump.path(), &restore), &db.pool).await;
+        assert!(err.contains("grew from 1 to 2"), "{err}");
+    }
+
+    /// The second checkpoint read can wait on a slow indexer database, so the lock is
+    /// checked after it. Here the lock session dies during that second read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lock_lost_during_the_second_checkpoint_read_aborts() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        sqlx::raw_sql(
+            "CREATE TABLE checkpoint_reads (n INT NOT NULL);
+             INSERT INTO checkpoint_reads VALUES (0);
+             CREATE FUNCTION withdraw_checkpoint()
+             RETURNS TABLE (program_type TEXT, last_committed_slot BIGINT)
+             LANGUAGE plpgsql AS $$
+             DECLARE reads INT;
+             BEGIN
+                 UPDATE checkpoint_reads SET n = n + 1 RETURNING n INTO reads;
+                 IF reads = 2 THEN
+                     PERFORM pg_terminate_backend(pid) FROM pg_locks
+                     WHERE locktype = 'advisory';
+                 END IF;
+                 RETURN QUERY SELECT 'withdraw'::TEXT, 100::BIGINT;
+             END $$;
+             CREATE VIEW indexer_state AS SELECT * FROM withdraw_checkpoint();",
+        )
+        .execute(db.pool.as_ref())
+        .await
+        .unwrap();
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        let options = TruncateOptions {
+            consumer_check: ConsumerCheck::WithdrawIndexer {
+                database_url: url.clone(),
+            },
+            ..apply_opts(3, 100, dump.path(), &restore)
+        };
+
+        let err = assert_refused(&url, &options, &db.pool).await;
+        assert!(err.contains("lock"), "{err}");
+    }
+
+    /// A deployment with no withdraw indexer opts out explicitly and needs no indexer database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_skip_flag_bypasses_the_withdraw_check() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &[1, 2, 3, 4, 5]).await;
+        publish_window(&db.pool, 1).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+
+        let options = apply_opts(3, 100, dump.path(), &restore);
+        assert_eq!(options.consumer_check, ConsumerCheck::Skip);
+        truncate_on_fresh_pool(&url, &options, &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(block_slots(&db.pool).await, vec![3, 4, 5]);
+    }
+
     /// U1: the advertised floor must equal the retained minimum at every batching
     /// granularity, including single-row batches and runs that fit in one batch.
     #[tokio::test(flavor = "multi_thread")]
@@ -989,6 +1446,7 @@ mod tests {
         for batch_size in [1_usize, 3, 1000] {
             reset_ledger(&db.pool).await;
             store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+            publish_window(&db.pool, 1).await;
             let dump = container_pg_dump(&_pg, "pg_test");
 
             let report = truncate_on_fresh_pool(
@@ -1026,6 +1484,7 @@ mod tests {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         let seeded: Vec<u64> = (0..=15).chain(20..=30).collect();
         store_test_blocks(&db, &seeded).await;
+        publish_window(&db.pool, 1).await;
         // One dump serves both runs: blocks the first run deletes are below the live minimum.
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
@@ -1067,6 +1526,7 @@ mod tests {
     async fn dry_run_never_writes_floor_even_when_key_exists() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
 
@@ -1102,6 +1562,7 @@ mod tests {
             pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let result = truncate_slots(&db, &opts).await;
         assert!(result.is_err());
@@ -1117,6 +1578,7 @@ mod tests {
             pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 0,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let result = truncate_slots(&db, &opts).await;
         assert!(result.is_err());
@@ -1132,6 +1594,7 @@ mod tests {
             pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, None);
@@ -1145,12 +1608,14 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         // Store 5 blocks, keep_slots=10 → nothing to delete
         store_test_blocks(&db, &[0, 1, 2, 3, 4]).await;
+        publish_window(&db.pool, 1).await;
         let opts = TruncateOptions {
             keep_slots: 10,
             pg_dump_path: None,
             pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, Some(4));
@@ -1163,12 +1628,14 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         // Store 20 blocks, keep_slots=5 → 16 blocks eligible for deletion
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
         let opts = TruncateOptions {
             keep_slots: 5,
             pg_dump_path: None,
             pg_restore_bin: PathBuf::from("pg_restore"), // no pg_dump
             batch_size: 100,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let result = truncate_slots(&db, &opts).await;
         assert!(result.is_err());
@@ -1182,6 +1649,7 @@ mod tests {
     async fn truncate_dry_run_does_not_delete() {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
 
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
@@ -1191,6 +1659,7 @@ mod tests {
             pg_restore_bin: restore.to_path_buf(),
             batch_size: 100,
             dry_run: true,
+            consumer_check: ConsumerCheck::Skip,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, Some(19));
@@ -1210,6 +1679,7 @@ mod tests {
     async fn truncate_deletes_old_blocks_and_transactions() {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
 
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
@@ -1219,6 +1689,7 @@ mod tests {
             pg_restore_bin: restore.to_path_buf(),
             batch_size: 100,
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, Some(19));
@@ -1242,6 +1713,7 @@ mod tests {
     async fn truncate_batched_deletion() {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
 
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
@@ -1251,6 +1723,7 @@ mod tests {
             pg_restore_bin: restore.to_path_buf(),
             batch_size: 3, // small batch to exercise the batching loop
             dry_run: false,
+            consumer_check: ConsumerCheck::Skip,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.blocks_deleted, 15);
@@ -1296,6 +1769,7 @@ mod tests {
     async fn lock_lost_before_delete_aborts() {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         // Kills the lock session while the proof runs, then restores as usual.
         let restore = executable_script(&format!(
@@ -1372,7 +1846,34 @@ mod tests {
         signatures
     }
 
-    /// History reads after keeping slots 7 to 9 of 0..10: pruned rows end history, never error.
+    /// Index rows below `slot`, then at or above it.
+    async fn index_rows_split_at(pool: &PgPool, slot: u64) -> (i64, i64) {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*) FILTER (WHERE slot < $1), COUNT(*) FILTER (WHERE slot >= $1)
+             FROM address_signatures",
+        )
+        .bind(slot as i64)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An index row with no transaction behind it, below the floor.
+    async fn insert_orphan_index_row(pool: &PgPool, address: &Pubkey, slot: u64) {
+        let signature = Signature::new_unique();
+        sqlx::query(
+            "INSERT INTO address_signatures (address, slot, signature) VALUES ($1, $2, $3)",
+        )
+        .bind(address.as_ref())
+        .bind(slot as i64)
+        .bind(signature.as_ref())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// History reads after keeping slots 7 to 9 of 0..10: history ends at the floor, and a
+    /// cursor naming a pruned signature is refused.
     async fn assert_history_ends_at_the_floor(
         db: &PostgresAccountsDB,
         address: &solana_sdk::pubkey::Pubkey,
@@ -1407,34 +1908,43 @@ mod tests {
             names(&[7]),
             "next page"
         );
-        assert!(
-            read(10, Some(&sigs[3]), None, None).await.is_empty(),
-            "before a pruned row"
-        );
-        assert_eq!(
-            read(10, None, Some(&sigs[3]), None).await,
-            names(&[9, 8, 7]),
-            "until a pruned row"
-        );
         assert_eq!(
             read(10, None, None, Some(vec![(5, 8)])).await,
             names(&[8, 7]),
             "scope spanning the floor"
         );
+        // Truncation deletes a pruned row's index entry, so it reads as an unknown cursor.
+        let pruned = &sigs[3];
+        for (label, before, until) in [
+            ("before", Some(pruned), None),
+            ("until", None, Some(pruned)),
+        ] {
+            let err = db
+                .get_signatures_for_address(address, 10, before, until, None)
+                .await
+                .expect_err("a cursor naming a pruned signature must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{label}' is unavailable")),
+                "{label}: {err}"
+            );
+        }
     }
 
-    /// Regression: truncation leaves index rows behind, and a read reaching them failed.
+    /// History ends cleanly at the floor, even with an orphan index row below it.
     #[tokio::test(flavor = "multi_thread")]
     async fn history_survives_truncation() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         let address = solana_sdk::pubkey::Pubkey::new_unique();
         let sigs = write_address_history(&db, &address, 0..10).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
         truncate_on_fresh_pool(&url, &apply_opts(3, 4, dump.path(), &restore), &db.pool)
             .await
             .unwrap();
         assert_eq!(read_floor_metadata(&db.pool).await, Some(7));
+        insert_orphan_index_row(&db.pool, &address, 3).await;
 
         assert_history_ends_at_the_floor(&db, &address, &sigs).await;
     }
@@ -1445,6 +1955,7 @@ mod tests {
         let (db, _pg, url) = start_test_postgres_with_url().await;
         let address = solana_sdk::pubkey::Pubkey::new_unique();
         let sigs = write_address_history(&db, &address, 0..10).await;
+        publish_window(&db.pool, 1).await;
         let dump = container_pg_dump(&_pg, "pg_test");
         let restore = container_pg_restore_bin(&_pg);
         truncate_on_fresh_pool(&url, &apply_opts(3, 4, dump.path(), &restore), &db.pool)
@@ -1454,7 +1965,41 @@ mod tests {
             .execute(db.pool.as_ref())
             .await
             .unwrap();
+        insert_orphan_index_row(&db.pool, &address, 3).await;
 
         assert_history_ends_at_the_floor(&db, &address, &sigs).await;
+    }
+
+    /// Truncation deletes the index rows below the floor and keeps every row at or above it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncation_prunes_the_address_index_below_the_floor() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let address = Pubkey::new_unique();
+        write_address_history(&db, &address, 0..10).await;
+        publish_window(&db.pool, 1).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        // Keeping 3 slots of 0..=9 puts the floor at 7.
+        let opts = apply_opts(3, 4, dump.path(), &restore);
+        let floor = 7;
+        let (pruned_before, retained_before) = index_rows_split_at(&db.pool, floor).await;
+        assert!(pruned_before > 0, "the history must reach below the floor");
+
+        let mut dry = opts.clone();
+        dry.dry_run = true;
+        truncate_on_fresh_pool(&url, &dry, &db.pool).await.unwrap();
+        assert_eq!(
+            index_rows_split_at(&db.pool, floor).await,
+            (pruned_before, retained_before),
+            "a dry run must not delete index rows"
+        );
+
+        truncate_on_fresh_pool(&url, &opts, &db.pool).await.unwrap();
+        assert_eq!(read_floor_metadata(&db.pool).await, Some(floor));
+        assert_eq!(
+            index_rows_split_at(&db.pool, floor).await,
+            (0, retained_before),
+            "rows below the floor go, rows at or above it stay"
+        );
     }
 }

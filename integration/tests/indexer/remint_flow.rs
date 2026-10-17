@@ -213,6 +213,8 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
 
     let txn_id: i64 = 7_777;
     let info = make_remint_info(txn_id);
+    // The PendingRemint row this remint resolves.
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
 
     let prior_remint_sig = Signature::from_str(
         "4BxWw1FjwQCHXWkrK4ZehPWauFTPhBafSr9m8Cuht73LG73nUs3wfuJ6gigkhNppP4pYogP5pQDENbE5nQx1Qp4B",
@@ -587,10 +589,12 @@ async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
 #[tokio::test]
 async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_001;
     let info = make_remint_info(txn_id);
+    // The PendingRemint row this remint resolves.
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
 
     // No journaled attempt, so classification is skipped: send + confirm happy path.
     mock.enqueue("getLatestBlockhash", blockhash_reply());
@@ -728,5 +732,246 @@ async fn execute_deferred_remint_defers_when_send_fails() {
         storage_rx.try_recv().is_err(),
         "a deferred remint must not emit a status update"
     );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (f) Coverage bound: the anchored bitmap slot, not a lagging getSlot.
+// ─────────────────────────────────────────────────────────────────────
+// Dead signatures and a clear bitmap read at the anchor's slot 5_000. A `getSlot` lagging
+// at 100 must not let checkpoint 4_000 certify no release; checkpoint 5_000 does.
+#[tokio::test]
+async fn coverage_is_certified_by_the_bitmap_slot_not_a_lagging_get_slot() {
+    use base64::Engine as _;
+    use private_channel_indexer::operator::utils::account_util::bitmap_account_bytes;
+
+    let mock = MockRpcServer::start().await;
+    ensure_admin_signer_env();
+    let storage_mock = MockStorage::new();
+    let storage = Arc::new(Storage::Mock(storage_mock.clone()));
+    let mut state = test_hooks::new_sender_state(
+        &make_config(mock.url(), ProgramType::Withdraw),
+        CommitmentLevel::Confirmed,
+        Some(Pubkey::new_unique()),
+        storage,
+        1,
+        1,
+        None,
+    )
+    .expect("SenderState construction must succeed under Mock storage");
+    let (storage_tx, mut storage_rx) = mpsc::channel(8);
+    seed_pending_remint_row(&storage_mock, 95, 0);
+    storage_mock
+        .update_committed_checkpoint("escrow", 4_000)
+        .await
+        .unwrap();
+
+    let dead = Reply::result(json!({
+        "context": { "slot": 6_000 },
+        "value": [{
+            "slot": 100, "confirmations": null,
+            "err": { "InstructionError": [0, { "Custom": 1 }] },
+            "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
+            "confirmationStatus": "finalized"
+        }]
+    }));
+    mock.enqueue_sequence(
+        "getSignatureStatuses",
+        vec![dead.clone(), dead, confirmed_status_reply()],
+    );
+    mock.enqueue_sequence(
+        "getSlot",
+        std::iter::repeat_n(Reply::result(json!(100)), 16),
+    );
+    mock.enqueue_sequence(
+        "getLatestBlockhash",
+        std::iter::repeat_n(
+            Reply::result(json!({
+                "context": { "slot": 5_000 },
+                "value": {
+                    "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                    "lastValidBlockHeight": 1_000u64
+                }
+            })),
+            16,
+        ),
+    );
+    let bitmap =
+        base64::engine::general_purpose::STANDARD.encode(bitmap_account_bytes(0, &[], 255));
+    mock.enqueue_sequence(
+        "getAccountInfo",
+        std::iter::repeat_n(
+            Reply::dynamic(move |req| {
+                json!({
+                    "context": { "slot": req["params"][1]["minContextSlot"].as_u64().unwrap_or(5_000) },
+                    "value": {
+                        "data": [bitmap, "base64"], "executable": false, "lamports": 1u64,
+                        "owner": Pubkey::new_unique().to_string(), "rentEpoch": 0u64
+                    }
+                })
+            }),
+            16,
+        ),
+    );
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+
+    state.pending_remints.push(make_pending_remint(
+        95,
+        3,
+        vec![Signature::new_unique()],
+        0,
+        make_remint_info(95),
+    ));
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    assert!(storage_rx.try_recv().is_err(), "4_000 does not cover 5_000");
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "no refund on an uncovered window"
+    );
+    assert_eq!(state.pending_remints[0].coverage_slot, Some(5_000));
+
+    storage_mock
+        .update_committed_checkpoint("escrow", 5_000)
+        .await
+        .unwrap();
+    state.pending_remints[0].deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    let update = storage_rx
+        .recv()
+        .await
+        .expect("the covered absence refunds");
+    assert_eq!(update.status, TransactionStatus::FailedReminted);
+    assert_eq!(
+        mock.call_count("getSlot"),
+        0,
+        "the bound never comes from getSlot"
+    );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (g) A remint the channel rejects every time escalates at the attempt cap.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Each call sends a fresh MintTo that finalizes with an error. The next call
+// proves it dead and would resend forever; after `MAX` on-chain rejections the
+// next call must page a human instead of sending again.
+#[tokio::test]
+async fn a_remint_the_channel_always_rejects_escalates_at_the_attempt_cap() {
+    // Mirrors the private cap in `sender/remint.rs`.
+    const MAX: usize = 3;
+    let mock = MockRpcServer::start().await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    let txn_id: i64 = 7_004;
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
+
+    let failed_status = json!({
+        "slot": 42,
+        "confirmations": null,
+        "err": { "InstructionError": [0, { "Custom": 1 }] },
+        "status": { "Err": { "InstructionError": [0, { "Custom": 1 }] } },
+        "confirmationStatus": "finalized"
+    });
+    // One snapshot per classification, plus the rejection count read at the cap.
+    let failed_snapshot = |status: serde_json::Value| {
+        Reply::dynamic(move |req| {
+            let requested = req["params"][0].as_array().map_or(0, Vec::len);
+            json!({
+                "blockHeight": 200,
+                "firstAvailableBlock": 0,
+                "value": vec![status.clone(); requested],
+            })
+        })
+    };
+    mock.enqueue(
+        "getSignatureStatusSnapshot",
+        failed_snapshot(failed_status.clone()),
+    );
+    for _ in 0..MAX {
+        // A repeated blockhash would sign the same bytes, so every attempt would share one signature.
+        mock.enqueue(
+            "getLatestBlockhash",
+            Reply::result(json!({
+                "context": { "slot": 1 },
+                "value": {
+                    "blockhash": solana_sdk::hash::Hash::new_unique().to_string(),
+                    "lastValidBlockHeight": 100
+                }
+            })),
+        );
+        mock.enqueue("sendTransaction", send_transaction_echo_reply());
+        mock.enqueue(
+            "getSignatureStatuses",
+            Reply::result(json!({ "context": { "slot": 42 }, "value": [failed_status] })),
+        );
+        mock.enqueue(
+            "getSignatureStatusSnapshot",
+            failed_snapshot(failed_status.clone()),
+        );
+    }
+
+    for call in 1..=MAX {
+        let entry = make_pending_remint(
+            txn_id,
+            34,
+            vec![Signature::new_unique()],
+            0,
+            make_remint_info(txn_id),
+        );
+        let outcome = test_hooks::execute_deferred_remint(&state, entry, &storage_tx).await;
+        assert!(
+            matches!(
+                outcome,
+                test_hooks::DeferredRemintOutcome::DeferInFlight(..)
+            ),
+            "call {call}: a fresh attempt is reconciled on the next tick"
+        );
+        assert!(storage_rx.try_recv().is_err(), "call {call}: no status yet");
+    }
+
+    let journal: Vec<String> = storage_mock.remint_signatures.lock().unwrap()[&txn_id]
+        .iter()
+        .map(|stored| stored.signature.clone())
+        .collect();
+    let distinct: std::collections::HashSet<&String> = journal.iter().collect();
+    assert_eq!(journal.len(), MAX);
+    assert_eq!(distinct.len(), MAX, "every attempt is its own MintTo");
+
+    let entry = make_pending_remint(
+        txn_id,
+        34,
+        vec![Signature::new_unique()],
+        0,
+        make_remint_info(txn_id),
+    );
+    let outcome = test_hooks::execute_deferred_remint(&state, entry, &storage_tx).await;
+    assert!(matches!(
+        outcome,
+        test_hooks::DeferredRemintOutcome::Resolved
+    ));
+    let update = storage_rx
+        .try_recv()
+        .expect("the capped remint must escalate");
+    assert_eq!(update.status, TransactionStatus::ManualReview);
+    assert!(update.remint_attempted);
+    let message = update.error_message.expect("escalation carries a message");
+    assert!(message.contains("remint attempt cap reached"), "{message}");
+    for sig in &journal {
+        assert!(message.contains(sig), "{message} must name {sig}");
+    }
+    assert!(storage_rx.try_recv().is_err(), "exactly one escalation");
+
+    for method in [
+        "getLatestBlockhash",
+        "sendTransaction",
+        "getSignatureStatuses",
+    ] {
+        assert_eq!(mock.call_count(method), MAX, "{method}");
+    }
+    assert_eq!(mock.call_count("getSignatureStatusSnapshot"), MAX + 1);
     mock.shutdown().await;
 }

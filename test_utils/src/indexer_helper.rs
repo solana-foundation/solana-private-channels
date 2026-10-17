@@ -23,10 +23,8 @@ impl IndexerHandle {
     }
 }
 
-/// Start the PrivateChannel indexer.
-/// If geyser_endpoint is Some, uses Yellowstone datasource; otherwise uses RPC polling.
+/// Start the PrivateChannel (withdraw) indexer on RPC polling, the only datasource it accepts.
 pub async fn start_private_channel_indexer(
-    geyser_endpoint: Option<String>,
     rpc_url: String,
     database_url: String,
 ) -> Result<(IndexerHandle, Storage), Box<dyn std::error::Error>> {
@@ -47,23 +45,11 @@ pub async fn start_private_channel_indexer(
         commitment: CommitmentLevel::Finalized,
     };
 
-    let (datasource_type, yellowstone_config) = if let Some(endpoint) = geyser_endpoint {
-        (
-            DatasourceType::Yellowstone,
-            Some(YellowstoneConfig {
-                endpoint,
-                x_token: None,
-                commitment: "finalized".to_string(),
-            }),
-        )
-    } else {
-        (DatasourceType::RpcPolling, None)
-    };
-
     let backfill_config = BackfillConfig {
         enabled: true,
         batch_size: 100,
-        max_gap_slots: 100,
+        // Room for a restart from a checkpoint a test rolled back, as the Solana helper allows.
+        max_gap_slots: 1_000,
         exit_after_backfill: false,
         rpc_url: rpc_url.clone(),
         start_slot: None,
@@ -80,9 +66,9 @@ pub async fn start_private_channel_indexer(
     };
 
     let indexer_config = IndexerConfig {
-        datasource_type,
+        datasource_type: DatasourceType::RpcPolling,
         rpc_polling: Some(rpc_polling_config),
-        yellowstone: yellowstone_config,
+        yellowstone: None,
         backfill: backfill_config,
         // Disable the mismatch guard: gap-recovery restarts (indexer stopped
         // while deposits arrived) must not be blocked by startup reconciliation.

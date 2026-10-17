@@ -46,6 +46,27 @@ counter_vec!(
     &["program_type", "error_type"]
 );
 
+counter_vec!(
+    CHANNEL_FENCE_MISMATCH,
+    "private_channel_channel_fence_mismatch_total",
+    "Times the channel no longer held the block the withdraw checkpoint was built on",
+    &["program_type"]
+);
+
+counter_vec!(
+    CONSUMED_SET_HITS,
+    "private_channel_consumed_set_hits_total",
+    "Claimed rows the channel had already minted, by kind and outcome",
+    &["program_type", "kind", "outcome"]
+);
+
+counter_vec!(
+    BITMAP_UNEXPLAINED_NONCE,
+    "private_channel_bitmap_unexplained_nonce_total",
+    "Consumed withdrawal nonces no landed journaled release explains",
+    &["program_type"]
+);
+
 gauge_vec!(
     INDEXER_CHAIN_TIP_SLOT,
     "private_channel_indexer_chain_tip_slot",
@@ -213,6 +234,13 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_SOLVENCY_FENCE_STATE,
+    "private_channel_operator_solvency_fence_state",
+    "Escrow solvency fence: 0 closed (no clean reconciliation tick yet), 1 open, 2 tripped by a confirmed insolvency",
+    &["program_type"]
+);
+
+gauge_vec!(
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
     "private_channel_operator_reconciliation_liability_dark_ticks",
     "Consecutive reconciliation ticks whose ledger could not be pinned to the custody slot (0 when the liability invariant is armed)",
@@ -353,6 +381,8 @@ pub fn init_labels(program_type: &str) {
     INDEXER_BACKFILL_SLOTS_REMAINING.with_label_values(&[program_type]);
     INDEXER_CHECKPOINT_FRONTIER_LAG.with_label_values(&[program_type]);
     INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
+    CHANNEL_FENCE_MISMATCH.with_label_values(&[program_type]);
+    BITMAP_UNEXPLAINED_NONCE.with_label_values(&[program_type]);
 
     for error_type in &[
         "stream",
@@ -403,6 +433,10 @@ pub fn init_labels(program_type: &str) {
         "rotation_lost",
         "rotation_blocked_by_lower_nonce",
         "rotation_origination_read_failed",
+        "generation_read_failed",
+        "rotation_retry_held",
+        "release_sent_unchecked",
+        "hook_freshness_unproven",
         "bitmap_divergence",
         "mint_not_initialized",
         "confirmation_timeout_non_idempotent",
@@ -411,7 +445,9 @@ pub fn init_labels(program_type: &str) {
         "confirmation_error",
         "deposit_ownership_lost",
         "release_claim_lost",
+        "remint_record_failed",
         "halted_before_broadcast",
+        "solvency_fence_closed",
         "halt_read_error",
         "pending_remint_page_read_failed",
         "release_missing_claim_lease",
@@ -519,6 +555,7 @@ pub fn init_labels(program_type: &str) {
     // dark tick or "no data" and "armed" look the same.
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS.with_label_values(&[program_type]);
     OPERATOR_RECONCILIATION_INPUT_DARK_TICKS.with_label_values(&[program_type]);
+    OPERATOR_SOLVENCY_FENCE_STATE.with_label_values(&[program_type]);
 }
 
 pub fn init() {
@@ -554,6 +591,7 @@ pub fn init() {
         LIVE_STATE_LOCK_LOST,
         OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
+        OPERATOR_SOLVENCY_FENCE_STATE,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
         OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
@@ -607,6 +645,7 @@ mod tests {
             "private_channel_operator_backlog_depth",
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_reconciliation_input_dark_ticks",
+            "private_channel_operator_solvency_fence_state",
         ];
 
         for name in single_label_metrics {

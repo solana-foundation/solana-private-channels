@@ -79,7 +79,7 @@ groups:
             model:
               # Prod (Ansible) job names plus the dev/devnet compose job names.
               # Keep in sync with monitored-series-vanished below.
-              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}
+              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)|node-exporter"}
               instant: true
               refId: A
           - refId: C
@@ -224,7 +224,7 @@ groups:
               # sync with service-down-scrape). The `or vector(0)` on every
               # operand keeps the expression defined, so this rule itself can
               # never sit in NoData while Prometheus is reachable.
-              expr: ((count(last_over_time(probe_success{job="blackbox-http"}[24h])) or vector(0)) - (count(probe_success{job="blackbox-http"}) or vector(0))) + ((count(last_over_time(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}[24h])) or vector(0)) - (count(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}) or vector(0)))
+              expr: ((count(last_over_time(probe_success{job="blackbox-http"}[24h])) or vector(0)) - (count(probe_success{job="blackbox-http"}) or vector(0))) + ((count(last_over_time(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)|node-exporter"}[24h])) or vector(0)) - (count(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)|node-exporter"}) or vector(0)))
               instant: true
               refId: A
           - refId: C
@@ -728,7 +728,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} has proven that a block exists at a slot the datasource RPC will not serve, so the checkpoint cannot advance past it. This is a positive proof from a later block's parentSlot link, not a guess: the slot is not a skip. Repoint COMMON_RPC_URL (or COMMON_FALLBACK_RPC_URL) at a full-history archival endpoint and restart. This keys off the error counter rather than the checkpoint frontier-lag gauge, because an ungated RPC-polling indexer reports zero lag while wedged. See docs/runbooks/indexer_block_unavailable.md."
+          summary: "Indexer {{ $labels.program_type }} has proven that a block exists at a slot the datasource RPC will not serve, so the checkpoint cannot advance past it. This is a positive proof from a later block's parentSlot link, not a guess: the slot is not a skip. Repoint the endpoint that refused the slot at a full-history archival endpoint and restart: COMMON_RPC_URL for live polling (log 'Slot N is unavailable'), INDEXER_BACKFILL_RPC_URL (or [indexer.backfill] rpc_url) for the startup backfill and Yellowstone gap-fill (log 'Backfill slot N is unavailable'). COMMON_FALLBACK_RPC_URL is never asked for such a slot, so it does not clear this, and the indexer refuses to start if a block source equals it. This keys off the error counter rather than the checkpoint frontier-lag gauge, because an ungated RPC-polling indexer reports zero lag while wedged. See docs/runbooks/indexer_block_unavailable.md."
         labels:
           severity: critical
         data:
@@ -801,7 +801,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) could not prove it still owns its sender advisory lock (reason {{ $labels.reason }}) and shut itself down. Runbook: docs/runbooks/sender_lock_lost_runbook.md. Confirm the operator restarted and that exactly one sender holds each role key; note that OPERATOR_TASK_EXIT will normally be labelled fetcher, not sender, on this shutdown."
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) could not prove it still owns its sender advisory lock (reason {{ $labels.reason }}) and shut itself down. Runbook: docs/runbooks/sender_lock_lost_runbook.md. Confirm the operator restarted and that exactly one sender holds each role key; OPERATOR_TASK_EXIT does not fire on this shutdown."
         labels:
           severity: critical
         data:
@@ -919,6 +919,40 @@ groups:
             datasourceUid: prometheus
             model:
               expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}[15m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: remint-record-failing
+        title: "A landed remint cannot be recorded"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) confirmed a remint on the private channel but cannot record it on the withdrawal row, so the row stays pending_remint and the sender retries it every pass. No funds are at risk: the remint is journaled and never resent. The landed signature is in the sender's 'confirmed but durable persist failed' ERROR line. Check the operator's database connection. Until the remint is recorded, the row holds the bitmap rotation."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="remint_record_failed"}[10m])
               instant: true
               refId: A
           - refId: C
@@ -1074,4 +1108,81 @@ groups:
                 - evaluator:
                     type: gt
                     params: [0]
+              refId: C
+
+  - orgId: 1
+    name: storage-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      # Every real filesystem on the host, so the alerts follow the Postgres data
+      # wherever it is mounted. VACUUM keeps freed space for reuse rather than
+      # returning it, so truncation stops the fall but never raises free space.
+      # The warning therefore watches the trend, which truncation can clear.
+      - uid: disk-space-filling
+        title: "Host filesystem on course to fill within 24h"
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} will fill within 24h at its 6h rate. If it holds the Postgres data, take a dump to another volume and run private-channel-admin truncate; this clears once free space stops falling. See docs/CONFIG.md, Admin CLI."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: min by (instance, mountpoint) (predict_linear(node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|vfat|ramfs|nsfs", mountpoint!~".*/boot.*"}[6h], 24 * 3600))
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [0]
+              refId: C
+
+      - uid: disk-space-low
+        title: "Host filesystem below 10% free"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.instance }} has {{ $values.A }}% free. If it holds the Postgres data, settlement stops when it fills. Truncate now (dump to another volume) to stop the fall, then grow the volume: VACUUM keeps freed space for reuse, so this clears only once the disk has more room. See docs/CONFIG.md, Admin CLI."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: 100 * min by (instance, mountpoint) (node_filesystem_avail_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|vfat|ramfs|nsfs", mountpoint!~".*/boot.*"} / node_filesystem_size_bytes{job="node-exporter", fstype!~"tmpfs|overlay|squashfs|vfat|ramfs|nsfs", mountpoint!~".*/boot.*"})
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [10]
               refId: C

@@ -235,6 +235,7 @@ impl DataSource for RpcPollingSource {
 
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
+                    let mut blockhash = None;
                     match block_result {
                         Ok(BlockFetch::Present(block)) => {
                             // A block with incomplete meta, or holding a supported instruction
@@ -299,6 +300,7 @@ impl DataSource for RpcPollingSource {
                             };
 
                             last_block = Some(slot);
+                            blockhash = Some(block.blockhash.clone());
                             if !instructions_with_meta.is_empty() {
                                 info!(
                                     "Slot {}: found {} {:?} instructions",
@@ -367,7 +369,11 @@ impl DataSource for RpcPollingSource {
                     // Send SlotComplete marker for this slot
                     let send_res = send_guaranteed(
                         &tx,
-                        ProcessorMessage::SlotComplete { slot, program_type },
+                        ProcessorMessage::SlotComplete {
+                            slot,
+                            program_type,
+                            blockhash,
+                        },
                         "SlotComplete marker",
                     )
                     .await;

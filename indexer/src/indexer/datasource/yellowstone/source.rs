@@ -3197,7 +3197,11 @@ async fn handle_block(
 
     send_guaranteed(
         channel,
-        ProcessorMessage::SlotComplete { slot, program_type },
+        ProcessorMessage::SlotComplete {
+            slot,
+            program_type,
+            blockhash: None,
+        },
         "SlotComplete (yellowstone)",
     )
     .await
