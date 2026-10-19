@@ -5642,10 +5642,10 @@ mod tests {
         assert_eq!(unlisted, vec!["released".to_string()]);
     }
 
-    /// A probe restores the liability-dark count and its gauge together, so monitoring never
-    /// shows a count the alerts are not using.
+    /// A probe restores the liability-dark count it found. The gauge set beside it is not read
+    /// here: it is process-wide, so tests running in parallel overwrite it.
     #[tokio::test]
-    async fn a_probe_restores_the_liability_dark_gauge() {
+    async fn a_probe_restores_the_liability_dark_count() {
         let mint = Pubkey::new_unique();
         let env = tick_env(mint, 1_000, 1_000).await;
         let (mut counters, mut halted) = (BreachCounters::default(), false);
@@ -5674,13 +5674,6 @@ mod tests {
         assert_eq!(
             liability_dark, 1,
             "the probe's unknown ledger is not counted"
-        );
-        assert_eq!(
-            OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS
-                .with_label_values(&[ProgramType::Escrow.as_label()])
-                .get(),
-            1.0,
-            "the gauge shows the restored count"
         );
     }
 
