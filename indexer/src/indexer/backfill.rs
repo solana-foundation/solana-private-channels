@@ -239,6 +239,7 @@ pub async fn fill_slot_range(
         };
 
         for (slot, block_fetch) in blocks {
+            let mut blockhash = None;
             match block_fetch {
                 BlockFetch::Present(block) => {
                     // A block with incomplete meta, or holding a supported instruction that
@@ -305,6 +306,7 @@ pub async fn fill_slot_range(
                         .map_err(BackfillError::ChannelSend)?;
                     }
                     last_block = Some(slot);
+                    blockhash = Some(block.blockhash);
                     processed_count += 1;
                 }
                 BlockFetch::Skipped => {
@@ -324,7 +326,11 @@ pub async fn fill_slot_range(
 
             send_guaranteed(
                 instruction_tx,
-                ProcessorMessage::SlotComplete { slot, program_type },
+                ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type,
+                    blockhash,
+                },
                 "SlotComplete marker (backfill)",
             )
             .await
@@ -1524,21 +1530,34 @@ mod tests {
         /// endpoint will not serve (Unavailable) must abort with
         /// `SlotUnavailable { slot: N }` before sending SlotComplete{N}
         /// (and before any later slot's SlotComplete), so the checkpoint never
-        /// advances past a slot whose contents are unknown.
+        /// advances past a slot whose contents are unknown. A configured fallback is
+        /// never asked for it: only blocks the primary served but could not decode go there.
         #[tokio::test]
         async fn fill_slot_range_unavailable_aborts_before_slot_complete() {
             let mut server = Server::new_async().await;
+            let mut fallback = Server::new_async().await;
 
             // Batch over (100, 102] = [101, 102]. Slot 102 names 101 as its parent,
             // so a real block sits at 101 that the enumeration did not list and this
             // endpoint will not serve.
             let _c = chain(&mut server, 101, 102, &[(102, 101)]);
+            let fallback_untouched = fallback.mock("POST", "/").expect(0).create_async().await;
 
-            let poller = poller(&server);
+            let primary_poller = poller(&server);
+            let fallback_poller = poller(&fallback);
 
             let (tx, mut rx) = mpsc::channel(64);
-            let result =
-                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+            let result = fill_slot_range(
+                &primary_poller,
+                Some(&fallback_poller),
+                100,
+                102,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+            )
+            .await;
 
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -1554,6 +1573,7 @@ mod tests {
                 !advanced,
                 "no SlotComplete must be sent for slot 101 or beyond on an unavailable block"
             );
+            fallback_untouched.assert_async().await;
         }
 
         #[tokio::test]

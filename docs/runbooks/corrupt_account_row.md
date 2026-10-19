@@ -113,7 +113,9 @@ WHERE address = decode('<PUBKEY_HEX>', 'hex');
 ```
 
 A row with signature history had a real balance. A row with none may be a write
-that was interrupted before it ever mattered.
+that was interrupted before it ever mattered. On a truncated node this count only
+covers history since `getFirstAvailableBlock`, so zero there proves nothing; check
+the dump taken before truncation.
 
 ## Recovery
 

@@ -59,6 +59,11 @@ pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 pub(crate) const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
+/// Marks a ManualReview escalation at the pre-broadcast requeue cap, where the failing
+/// attempt sent nothing. The runbook routes it to the nothing-broadcast path.
+pub(crate) const PREBROADCAST_CAP_REACHED: &str =
+    "requeue cap reached before this attempt broadcast";
+
 /// How long a `Processing` withdrawal may keep failing its on-chain release
 /// proof before it is escalated to a human.
 ///
@@ -186,8 +191,8 @@ async fn recover_once(
     threshold: Duration,
     reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
-    // Best-effort GC of release and remint signatures whose parent left its
-    // live status; a failure here must not block recovery.
+    // Best-effort GC of release and remint signatures whose parent is
+    // terminal; a failure here must not block recovery.
     match storage.gc_stale_release_signatures().await {
         Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
@@ -226,8 +231,8 @@ async fn recover_once(
     }
 
     // Rescue parked withdrawals orphaned by a restart. A live sender unparks
-    // these itself, so anything stale here lost its in-memory driver. Parked
-    // rows were never sent on-chain, so requeue them without verifying finality.
+    // these itself, so anything stale here lost its in-memory driver. A parked row
+    // was never sent, or its send was refused by the program, so nothing can land.
     let stale_parked = storage
         .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT, owned_type)
         .await?;
@@ -805,9 +810,17 @@ pub(crate) async fn load_pending_sigs(
         let signature = Signature::from_str(sig_str).map_err(|e| {
             JournalError::Corrupt(format!("malformed stored release signature {sig_str}: {e}"))
         })?;
+        // A negative height is corrupt; cast, it would wrap into one no chain reaches
+        // and read as Live forever.
+        let lvbh = entry.last_valid_block_height;
+        let last_valid_block_height = u64::try_from(lvbh).map_err(|_| {
+            JournalError::Corrupt(format!(
+                "malformed stored release signature {sig_str}: negative last_valid_block_height {lvbh}"
+            ))
+        })?;
         pending.push(PendingSig {
             signature,
-            last_valid_block_height: entry.last_valid_block_height as u64,
+            last_valid_block_height,
             blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
         });
     }
@@ -819,9 +832,8 @@ pub(crate) async fn load_pending_sigs(
 /// recording, which leaves the columns untouched.
 ///
 /// An outer `None` means the read failed and the caller must defer. Quarantining
-/// blind is irreversible: the journal is GC'd as soon as the row leaves
-/// `Processing`, so a transient read error would otherwise destroy the row's only
-/// evidence and make it permanently unreconcilable.
+/// blind would leave the row without the copied signatures, and the stalled-row
+/// sweep only fetches rows that carry them, so the row could never self-clear.
 async fn stored_release_signatures(
     storage: &Storage,
     id: i64,
@@ -2865,7 +2877,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": 900},
                         "value": {
                             "owner": Pubkey::new_unique().to_string(),
                             "lamports": 1_000_000u64,
@@ -2963,14 +2975,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -3016,14 +3022,8 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_bitmap_consistency(
-            &storage,
-            &client,
-            None,
-            Some(Pubkey::new_unique()),
-            &storage_tx,
-        )
-        .await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, None, Some(Pubkey::new_unique())).await;
         assert!(
             matches!(
                 validated,

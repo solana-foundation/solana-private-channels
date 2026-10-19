@@ -99,9 +99,12 @@ serviced: they are not in the rebuilt window, so they cannot be replayed.
 
 Resync refuses this genesis if the program still holds a row below it, since the
 delete would drop that row and the rebuild would never replay it. Check with
-`SELECT MIN(slot) FROM transactions WHERE transaction_type = '<deposit|withdrawal>'`.
+`SELECT MIN(slot) FROM transactions WHERE transaction_type = 'deposit'`.
 If the earliest row is below the cutover there is no supported resync; escalate
 rather than deleting rows by hand.
+
+This step applies to deposits only. A withdraw resync must replay from slot 0, so there
+is no supported withdraw resync here; escalate.
 
 ### 4. Resync
 

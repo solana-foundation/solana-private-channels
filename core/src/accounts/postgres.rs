@@ -282,6 +282,15 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
 /// only by the write node under its lease, since the plain build blocks inserts until done.
 /// Non-unique: a signature has one row per address. Plain so a failed build never stays invalid.
 pub async fn ensure_address_signatures_signature_index(pool: &PgPool) -> Result<()> {
+    // CREATE INDEX takes its table lock before IF NOT EXISTS applies, so a restart
+    // would wait out a running VACUUM. Only a missing index is worth that wait.
+    let exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('address_signatures_signature_idx') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    if exists {
+        return Ok(());
+    }
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS address_signatures_signature_idx
          ON address_signatures (signature) INCLUDE (slot)",
@@ -304,6 +313,8 @@ mod tests {
     use solana_sdk::account::{AccountSharedData, ReadableAccount};
     use solana_sdk::pubkey::Pubkey;
     use solana_svm_callback::TransactionProcessingCallback;
+    use sqlx::{Connection, PgConnection};
+    use std::time::Duration;
 
     const ENV_VAR: &str = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS";
 
@@ -491,6 +502,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 10);
+    }
+
+    /// A restart must not wait out a VACUUM once the index exists: a plain CREATE INDEX
+    /// takes its table lock before IF NOT EXISTS applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_signature_index_does_not_wait_on_a_table_lock() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
+
+        // The lock VACUUM holds, from a session of its own that stays open.
+        let mut maintenance = PgConnection::connect(&url).await.unwrap();
+        let mut vacuum_lock = maintenance.begin().await.unwrap();
+        sqlx::query("LOCK TABLE address_signatures IN SHARE UPDATE EXCLUSIVE MODE")
+            .execute(&mut *vacuum_lock)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ensure_address_signatures_signature_index(db.pool.as_ref()),
+        )
+        .await
+        .expect("an existing index must not wait on the table lock")
+        .unwrap();
     }
 
     /// The synchronous TransactionProcessingCallback::get_account_shared_data

@@ -1,7 +1,11 @@
 use {
     super::{
-        current_slot::CURRENT_SLOT_KEY, get_block_height::BLOCK_HEIGHT_KEY,
-        get_latest_slot::LATEST_SLOT_KEY, postgres::PostgresAccountsDB, redis::RedisAccountsDB,
+        blockhash_window::{self, MAX_BLOCKHASHES_KEY},
+        current_slot::CURRENT_SLOT_KEY,
+        get_block_height::BLOCK_HEIGHT_KEY,
+        get_latest_slot::LATEST_SLOT_KEY,
+        postgres::PostgresAccountsDB,
+        redis::RedisAccountsDB,
         traits::AccountsDB,
     },
     anyhow::{anyhow, Context, Result},
@@ -27,12 +31,16 @@ pub struct BlockhashSnapshot {
     pub slot: Option<u64>,
     pub block_height: Option<u64>,
     pub blockhash: Hash,
+    /// The window the write node published; `None` until one has booted on this ledger.
+    pub max_blockhashes: Option<u64>,
 }
 
+/// Always Postgres: the window is not mirrored, and a cached tip read beside a lagging
+/// replica could pair a new hash with a window the writer has already replaced.
 pub async fn get_blockhash_snapshot(db: &AccountsDB) -> Result<BlockhashSnapshot> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_blockhash_snapshot_postgres(postgres_db).await,
-        AccountsDB::Redis(redis_db) => get_blockhash_snapshot_redis(redis_db).await,
+        AccountsDB::Redis(redis_db) => get_blockhash_snapshot_postgres(&redis_db.fallback).await,
     }
 }
 
@@ -43,12 +51,14 @@ async fn get_blockhash_snapshot_postgres(db: &PostgresAccountsDB) -> Result<Bloc
                 (SELECT value FROM metadata WHERE key = $2),
                 (SELECT value FROM metadata WHERE key = $3),
                 (SELECT value FROM metadata WHERE key = $4),
-                (SELECT MAX(slot) FROM blocks)",
+                (SELECT MAX(slot) FROM blocks),
+                (SELECT value FROM metadata WHERE key = $5)",
     )
     .bind(CURRENT_SLOT_KEY)
     .bind(LATEST_SLOT_KEY)
     .bind(BLOCK_HEIGHT_KEY)
     .bind(LATEST_BLOCKHASH_KEY)
+    .bind(MAX_BLOCKHASHES_KEY)
     .fetch_one(db.pool.as_ref())
     .await
     .context("Failed to query the blockhash snapshot")?;
@@ -70,42 +80,8 @@ async fn get_blockhash_snapshot_postgres(db: &PostgresAccountsDB) -> Result<Bloc
         slot: decode(0).or(decode(1)).or(max_slot),
         block_height: decode(2).or(max_slot),
         blockhash: Hash::new_from_array(hash_array),
+        max_blockhashes: blockhash_window::decode(row.get::<Option<Vec<u8>>, _>(5).as_deref()),
     })
-}
-
-/// The stamp, current slot, block height and blockhash, as one `MGET` returns them.
-type CachedTip = (Option<Vec<u8>>, Option<u64>, Option<u64>, Option<String>);
-
-/// One `MGET`, which sees one mirrored block. Anything short of a full answer reads
-/// all three from Postgres, so a cached hash is never paired with a Postgres height.
-async fn get_blockhash_snapshot_redis(db: &RedisAccountsDB) -> Result<BlockhashSnapshot> {
-    let mut conn = db.connection.clone();
-    let cached: redis::RedisResult<CachedTip> = redis::cmd("MGET")
-        .arg(super::redis_coherence::DEPLOYMENT_ID_KEY)
-        .arg(CURRENT_SLOT_KEY)
-        .arg(BLOCK_HEIGHT_KEY)
-        .arg(LATEST_BLOCKHASH_KEY)
-        .query_async(&mut conn)
-        .await;
-
-    match cached {
-        Ok((stamp, Some(slot), Some(block_height), Some(hash_str)))
-            if db.stamp_is_current(stamp.as_ref()) =>
-        {
-            let blockhash = Hash::from_str(&hash_str)
-                .map_err(|e| anyhow!("Invalid blockhash format: {}", e))?;
-            Ok(BlockhashSnapshot {
-                slot: Some(slot),
-                block_height: Some(block_height),
-                blockhash,
-            })
-        }
-        Ok(_) => get_blockhash_snapshot_postgres(&db.fallback).await,
-        Err(e) => {
-            warn!("Failed to get the blockhash snapshot from Redis: {}", e);
-            get_blockhash_snapshot_postgres(&db.fallback).await
-        }
-    }
 }
 
 async fn get_latest_blockhash_postgres(db: &PostgresAccountsDB) -> Result<Hash> {

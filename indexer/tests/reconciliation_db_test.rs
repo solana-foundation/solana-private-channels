@@ -14,7 +14,9 @@ use private_channel_indexer::{
     indexer::reconciliation::run_manual_reconciliation,
     storage::{
         common::{
-            amount::TokenAmount, models::DbObservedRelease, storage::live_lock::LiveLockMode,
+            amount::TokenAmount,
+            models::{DbMintStatus, DbObservedRelease},
+            storage::live_lock::LiveLockMode,
         },
         PostgresDb, Storage,
     },
@@ -100,8 +102,8 @@ async fn insert_transaction(
     sqlx::query(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
-         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, $5::transaction_type, $6::transaction_status, NOW(), NOW())",
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
+         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, $5::transaction_type, $6::transaction_status, NOW(), NOW(), $7)",
     )
     .bind(signature)
     .bind(slot)
@@ -109,6 +111,7 @@ async fn insert_transaction(
     .bind(TokenAmount(amount))
     .bind(transaction_type)
     .bind(status)
+    .bind(landed_remint_for(status))
     .execute(pool)
     .await?;
 
@@ -127,8 +130,8 @@ async fn insert_withdrawal(
     sqlx::query_scalar(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
-          transaction_type, status, created_at, updated_at)
-         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, 'withdrawal', $5::transaction_status, NOW(), NOW())
+          transaction_type, status, created_at, updated_at, landed_remint_signature)
+         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, 'withdrawal', $5::transaction_status, NOW(), NOW(), $6)
          RETURNING withdrawal_nonce",
     )
     .bind(signature)
@@ -136,8 +139,14 @@ async fn insert_withdrawal(
     .bind(mint)
     .bind(TokenAmount(amount))
     .bind(status)
+    .bind(landed_remint_for(status))
     .fetch_one(pool)
     .await
+}
+
+/// A reminted row must carry its landed remint (table CHECK); no other status does.
+fn landed_remint_for(status: &str) -> Option<String> {
+    (status == "failed_reminted").then(|| "remint-landed".to_string())
 }
 
 /// Record that the escrow indexer saw the release for `nonce` land at `slot`, with no
@@ -171,6 +180,24 @@ async fn observe_release_of(
             signature: format!("release_{nonce}"),
             slot,
             amount: Some(TokenAmount(amount)),
+        }])
+        .await?;
+    Ok(())
+}
+
+/// Record an admin status change for `mint`, the only write `BlockMint` makes.
+async fn insert_history(storage: &Storage, mint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: true,
+            mint_address: mint.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 1,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+            signature: format!("history-{mint}"),
+            created_at: chrono::Utc::now(),
         }])
         .await?;
     Ok(())
@@ -326,6 +353,25 @@ async fn mock_escrow_rpc(
         .create_async()
         .await;
 
+    // Reads must answer at or past the newest recent block, so the chain's clock sits at `slot`.
+    for (method, result) in [
+        ("getSlot", serde_json::json!(slot)),
+        ("getBlocks", serde_json::json!([slot])),
+        (
+            "getBlockTime",
+            serde_json::json!(chrono::Utc::now().timestamp()),
+        ),
+    ] {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": method}),
+            ))
+            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string())
+            .create_async()
+            .await;
+    }
+
     server
 }
 
@@ -377,8 +423,8 @@ async fn deposits_of_every_status_count_up_to_the_bound() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// One row per `mints` row: a mint with nothing in range still reports zero, withdrawal
-/// rows never duplicate it, and an address with no `mints` row never appears.
+/// One row per mint in the universe: a mint with nothing in range still reports zero, withdrawal
+/// rows never duplicate it, and a deposit's mint with no `mints` row is still valued.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_mint_row_appears_once_even_without_qualifying_rows(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -415,17 +461,24 @@ async fn every_mint_row_appears_once_even_without_qualifying_rows(
 
     let mut rows = storage.get_mint_balances_for_reconciliation(200).await?;
     rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
-    let mut expected = vec![empty, busy];
+    let mut expected = vec![empty, busy, orphan.clone()];
     expected.sort();
     let addresses: Vec<String> = rows.iter().map(|r| r.mint_address.clone()).collect();
-    assert_eq!(
-        addresses, expected,
-        "exactly one row per mints row, orphan excluded"
-    );
+    assert_eq!(addresses, expected, "exactly one row per mint");
     for row in &rows {
-        assert_eq!(row.total_deposits, BigDecimal::from(0u64));
+        let deposits = if row.mint_address == orphan {
+            700u64
+        } else {
+            0
+        };
+        assert_eq!(row.total_deposits, BigDecimal::from(deposits));
         assert_eq!(row.total_withdrawals, BigDecimal::from(0u64));
     }
+    let unlisted = rows.iter().find(|r| r.mint_address == orphan).unwrap();
+    assert_eq!(
+        unlisted.token_program, "",
+        "no `mints` row, no token program"
+    );
     Ok(())
 }
 
@@ -463,9 +516,9 @@ async fn unreleased_withdrawals_are_never_subtracted() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// The tick enumerates mints from `get_mint_addresses` and values them from the aggregate.
-/// The two read the same `mints` table, so they have to answer with the same universe or a
-/// mint gets valued without being checked, or checked without being valued.
+/// The tick enumerates mints from `get_mint_addresses` plus `get_unlisted_mints` and values them
+/// from the aggregate. The two have to answer with the same universe or a mint gets valued
+/// without being checked, or checked without being valued.
 #[tokio::test(flavor = "multi_thread")]
 async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -491,19 +544,33 @@ async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dy
         900,
     )
     .await?;
+    // And the unlisted shapes: history only, deposit only, and a withdrawal-only address,
+    // which is channel-side and stays out.
+    let history_only = Pubkey::new_unique().to_string();
+    let deposit_only = Pubkey::new_unique().to_string();
+    let unlisted_withdrawal = Pubkey::new_unique().to_string();
+    insert_history(&storage, &history_only).await?;
+    insert_transaction(
+        &pool,
+        "d_unlisted",
+        &deposit_only,
+        30,
+        "deposit",
+        "completed",
+        5,
+    )
+    .await?;
+    insert_withdrawal(&pool, "w_unlisted", &unlisted_withdrawal, 9, "pending", 5).await?;
 
     let mut enumerated: Vec<String> = storage
         .get_mint_addresses()
         .await?
         .into_iter()
         .map(|(mint, _)| mint)
+        .chain(storage.get_unlisted_mints().await?)
         .collect();
-    let mut aggregated: Vec<String> = storage
-        .get_mint_balances_for_reconciliation(10)
-        .await?
-        .into_iter()
-        .map(|r| r.mint_address)
-        .collect();
+    let rows = storage.get_mint_balances_for_reconciliation(10).await?;
+    let mut aggregated: Vec<String> = rows.iter().map(|r| r.mint_address.clone()).collect();
     enumerated.sort();
     aggregated.sort();
 
@@ -511,6 +578,90 @@ async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dy
         enumerated, aggregated,
         "enumeration and valuation must cover the same mints"
     );
+    for (mint, deposits) in [(&history_only, 0u64), (&deposit_only, 30)] {
+        let row = rows.iter().find(|r| &r.mint_address == mint).unwrap();
+        assert_eq!(row.token_program, "");
+        assert_eq!(row.total_deposits, BigDecimal::from(deposits));
+    }
+    Ok(())
+}
+
+/// The unlisted mints are exactly the admin-vetted ones without a `mints` row: status history
+/// (`BlockMint` writes only that) and deposits (the program needs an `AllowedMint` for one).
+/// The mock-side twin uses the same rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlisted_mints_come_from_history_deposits_and_observed_releases(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let listed = Pubkey::new_unique().to_string();
+    let history_only = Pubkey::new_unique().to_string();
+    let deposit_only = Pubkey::new_unique().to_string();
+    let withdrawal_only = Pubkey::new_unique().to_string();
+    let released_only = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &listed, 6, &spl_token::id().to_string()).await?;
+    insert_history(&storage, &listed).await?;
+    insert_transaction(&pool, "d_listed", &listed, 1, "deposit", "completed", 1).await?;
+    insert_history(&storage, &history_only).await?;
+    insert_history(&storage, &history_only).await?;
+    insert_transaction(&pool, "d_only_1", &deposit_only, 1, "deposit", "pending", 1).await?;
+    insert_transaction(
+        &pool,
+        "d_only_2",
+        &deposit_only,
+        1,
+        "deposit",
+        "completed",
+        2,
+    )
+    .await?;
+    insert_withdrawal(&pool, "w_only", &withdrawal_only, 1, "completed", 1).await?;
+    // A release the escrow indexer saw is program-vetted, unlike a withdrawal row on its own.
+    let nonce = insert_withdrawal(&pool, "w_released", &released_only, 1, "completed", 1).await?;
+    observe_release(&storage, nonce, 2).await?;
+
+    let mut unlisted = storage.get_unlisted_mints().await?;
+    unlisted.sort();
+    let mut expected = vec![history_only, deposit_only, released_only];
+    expected.sort();
+    assert_eq!(unlisted, expected);
+    Ok(())
+}
+
+/// The mint universe and every ledger read join on `transactions.mint`, so it is indexed.
+#[tokio::test(flavor = "multi_thread")]
+async fn transactions_mint_is_indexed() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, _storage, _pg) = start_postgres().await?;
+    let indexed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = 'transactions' \
+         AND indexdef LIKE '%(mint)%')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(indexed, "transactions(mint) has no index");
+    Ok(())
+}
+
+/// Startup reconciliation shares the aggregate, so a deposit for an unlisted mint is a
+/// liability there too, bounded at the slot like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_ledger_values_an_unlisted_mints_deposits() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_transaction(&pool, "d_startup", &mint, 450, "deposit", "completed", 5).await?;
+
+    for (slot, expected) in [(10u64, 450u64), (4, 0)] {
+        let rows = storage.get_mint_balances_for_reconciliation(slot).await?;
+        let row = rows
+            .into_iter()
+            .find(|r| r.mint_address == mint)
+            .ok_or("unlisted mint missing from the aggregate")?;
+        assert_eq!(
+            row.total_deposits,
+            BigDecimal::from(expected),
+            "slot {slot}"
+        );
+    }
     Ok(())
 }
 
@@ -1064,8 +1215,8 @@ async fn outage_halt_never_replaces_an_insolvency_halt() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// The envelope query sums only in-flight statuses, grouped per mint; terminal
-/// rows are excluded.
+/// The envelope query sums only unsettled deposits, grouped per mint; terminal rows and
+/// withdrawals in any status are excluded, since a withdrawal's burn precedes its release.
 #[tokio::test(flavor = "multi_thread")]
 async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
@@ -1073,7 +1224,7 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
     let mint_a = Pubkey::new_unique().to_string();
     let mint_b = Pubkey::new_unique().to_string();
 
-    // mint_a: pending 100 + processing 200 + parked 400 + pending_remint 800 = 1500.
+    // mint_a: pending 100 + processing 200 = 300; the unsettled withdrawals add nothing.
     insert_transaction(&pool, "a_pend", &mint_a, 100, "deposit", "pending", 1).await?;
     insert_transaction(&pool, "a_proc", &mint_a, 200, "deposit", "processing", 2).await?;
     insert_transaction(&pool, "a_park", &mint_a, 400, "withdrawal", "parked", 3).await?;
@@ -1087,6 +1238,7 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
         4,
     )
     .await?;
+    insert_transaction(&pool, "a_wpend", &mint_a, 1600, "withdrawal", "pending", 8).await?;
     // Terminal rows on mint_a must be excluded.
     insert_transaction(&pool, "a_done", &mint_a, 1, "deposit", "completed", 5).await?;
     insert_transaction(&pool, "a_fail", &mint_a, 2, "withdrawal", "failed", 6).await?;
@@ -1105,7 +1257,7 @@ async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std:
         .into_iter()
         .map(|r| (r.mint_address, r.in_flight_amount))
         .collect();
-    assert_eq!(by_mint.remove(&mint_a), Some(BigDecimal::from(1500u64)));
+    assert_eq!(by_mint.remove(&mint_a), Some(BigDecimal::from(300u64)));
     assert_eq!(by_mint.remove(&mint_b), Some(BigDecimal::from(250u64)));
     assert!(by_mint.is_empty(), "no unexpected mints in the envelope");
 
@@ -1173,13 +1325,15 @@ async fn envelope_adjustment_matches_the_mock() -> Result<(), Box<dyn std::error
     insert_transaction(&pool, "r5", &mint, 16, "withdrawal", "manual_review", 11).await?;
     insert_transaction(&pool, "r6", &mint, 32, "withdrawal", "completed", 5_000).await?;
     insert_transaction(&pool, "r7", &mint, 64, "deposit", "processing", 2_000).await?;
+    insert_transaction(&pool, "r8", &mint, 128, "withdrawal", "pending", 11).await?;
+    insert_transaction(&pool, "r9", &mint, 256, "withdrawal", "pending", 10).await?;
 
     let parts = envelope_parts(&storage, &mint, Some(1_000), Some(10)).await?;
     assert_eq!(
         parts,
         (
             BigDecimal::from(64u64),
-            BigDecimal::from(2u64 + 4 + 16 + 32)
+            BigDecimal::from(2u64 + 4 + 16 + 32 + 128)
         )
     );
     let (_, adjustment) = envelope_parts(&storage, &mint, Some(1_000), Some(5_000)).await?;
@@ -1188,16 +1342,17 @@ async fn envelope_adjustment_matches_the_mock() -> Result<(), Box<dyn std::error
 }
 
 /// Every status is either in the envelope or counted by its slot arm, never both; a new
-/// status must be classified here before this compiles.
+/// status must be classified here before this compiles. Only deposits enter the envelope.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_status_is_counted_exactly_once_above_the_bound(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use private_channel_indexer::storage::common::models::TransactionStatus::{self, *};
-    fn in_envelope(status: TransactionStatus) -> bool {
-        match status {
+    fn in_envelope(status: TransactionStatus, kind: &str) -> bool {
+        let unsettled = match status {
             Pending | Processing | Parked | PendingRemint => true,
             Completed | Failed | FailedReminted | ManualReview => false,
-        }
+        };
+        unsettled && kind == "deposit"
     }
     let all = [
         (Pending, "pending"),
@@ -1217,13 +1372,54 @@ async fn every_status_is_counted_exactly_once_above_the_bound(
             insert_transaction(&pool, &sig, &mint, 7, kind, label, 50).await?;
             let parts = envelope_parts(&storage, &mint, Some(10), Some(10)).await?;
             let (seven, zero) = (BigDecimal::from(7u64), BigDecimal::from(0u64));
-            let expected = if in_envelope(status) {
+            let expected = if in_envelope(status, kind) {
                 (seven, zero)
             } else {
                 (zero, seven)
             };
             assert_eq!(parts, expected, "{label} {kind}");
         }
+    }
+    Ok(())
+}
+
+/// An unsettled withdrawal counts only as the adjustment, and only above the supply anchor:
+/// at or below it the supply read already shows its burn, so it cannot explain a shortfall.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsettled_withdrawals_count_only_above_the_anchor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let zero = BigDecimal::from(0u64);
+    for status in ["pending", "processing", "parked", "pending_remint"] {
+        let mint = Pubkey::new_unique().to_string();
+        insert_transaction(
+            &pool,
+            &format!("{status}_at"),
+            &mint,
+            5,
+            "withdrawal",
+            status,
+            10,
+        )
+        .await?;
+        insert_transaction(
+            &pool,
+            &format!("{status}_up"),
+            &mint,
+            7,
+            "withdrawal",
+            status,
+            11,
+        )
+        .await?;
+        let parts = envelope_parts(&storage, &mint, None, Some(10)).await?;
+        assert_eq!(parts, (zero.clone(), BigDecimal::from(7u64)), "{status}");
+        let parts = envelope_parts(&storage, &mint, None, None).await?;
+        assert_eq!(
+            parts,
+            (zero.clone(), zero.clone()),
+            "{status} without an anchor"
+        );
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use crate::error::{
     CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
 };
 use crate::{
+    channel_fence::{verify_channel_fence, FenceVerdict, FenceWait},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
         datasource::common::{datasource::DataSource, types::ProcessorMessage},
@@ -11,13 +12,19 @@ use crate::{
         },
         transaction_processor::TransactionProcessor,
     },
-    shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
+    operator::{RetryConfig, RpcClientWithRetry},
+    shutdown_utils::{
+        cleanup_after_backfill, drain_unless_lock_lost, shutdown_indexer, stop_signal, StopReason,
+    },
     storage::common::storage::live_lock::{
         under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
     },
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
+use private_channel_metrics::MetricLabel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use std::time::Duration;
 
 #[cfg(feature = "datasource-rpc")]
 use crate::{
@@ -32,9 +39,6 @@ use crate::{
     },
     operator::escrow_sweep::CustodySnapshot,
 };
-#[cfg(feature = "datasource-rpc")]
-use private_channel_metrics::MetricLabel;
-use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
@@ -68,6 +72,49 @@ enum Supervision {
     BackfillFailed(IndexerError),
 }
 
+/// How long boot waits for a restored or lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: Duration::from_secs(1),
+    budget: Duration::from_secs(600),
+};
+
+/// Withdraw role: refuse to start on a channel that no longer holds the block this DB's
+/// checkpoint was built on.
+async fn verify_fence_at_boot(
+    storage: &Storage,
+    common_config: &PrivateChannelIndexerConfig,
+    indexer_config: &IndexerConfig,
+) -> Result<(), IndexerError> {
+    let fence = storage.get_channel_fence().await?;
+    let commitment = indexer_config
+        .rpc_polling
+        .as_ref()
+        .map(|c| c.commitment)
+        .unwrap_or(CommitmentLevel::Confirmed);
+    let rpc = RpcClientWithRetry::with_retry_config(
+        common_config.rpc_url.clone(),
+        RetryConfig::default(),
+        CommitmentConfig { commitment },
+    );
+    match verify_channel_fence(&rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(())
+        }
+        FenceVerdict::Mismatch(reason) => {
+            crate::metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[ProgramType::Withdraw.as_label()])
+                .inc();
+            error!("Indexer refusing to start: {reason}");
+            Err(IndexerError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Indexer refusing to start, channel fence unchecked: {reason}");
+            Err(IndexerError::ChannelFenceUnchecked { reason })
+        }
+    }
+}
+
 /// Wind the checkpoint writer down once the processor has ended.
 ///
 /// Closing its channel is the writer's cue to flush, which is what a restart needs. A lost
@@ -99,32 +146,6 @@ async fn abandon_writers_on_lost_lock(
     error!("Live-state lock lost; stopping without draining");
     crate::shutdown_utils::abort_and_await_writers(writers).await;
     true
-}
-
-/// Run a drain, but stop the writers with no flush as soon as the live-state lock is lost.
-/// The writers are aborted inside the lock branch, before the drain is dropped, because
-/// dropping it releases the checkpoint sender and would cue the flush being prevented.
-async fn drain_unless_lock_lost<T>(
-    lock_lost: &CancellationToken,
-    cancellation_token: &CancellationToken,
-    writers: &[tokio::task::AbortHandle],
-    drain: impl std::future::Future<Output = T>,
-) -> Result<T, IndexerError> {
-    tokio::select! {
-        biased;
-        _ = async {
-            lock_lost.cancelled().await;
-            for writer in writers {
-                writer.abort();
-            }
-        } => {
-            error!("Live-state lock lost during shutdown; stopping without draining");
-            cancellation_token.cancel();
-            crate::shutdown_utils::abort_and_await_writers(writers).await;
-            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
-        }
-        result = drain => Ok(result),
-    }
 }
 
 /// How long a fill that failed to send waits for the processor it suspects of dying.
@@ -217,12 +238,9 @@ const RECONCILE_RETRY_DELAY_MS: u64 = 2_000;
 #[cfg(all(feature = "datasource-rpc", test))]
 const RECONCILE_RETRY_DELAY_MS: u64 = 10;
 
-/// Whether another attempt could plausibly clear this failure.
-///
-/// Two can. A custody-versus-ledger mismatch may be explained by rows the next fill pulls
-/// in. A custody reading from behind our own ledger is a node that has not caught up, and
-/// a fresh read usually lands ahead of it. Everything else, a supply breach included,
-/// compares the same numbers however many times it runs, so it stops the boot on the spot.
+/// Whether another attempt could clear this: a mismatch the next fill may explain, or a
+/// custody read from a node not yet caught up (behind the ledger, stale or unsettled).
+/// Anything else, a supply breach included, compares the same numbers every time.
 #[cfg(feature = "datasource-rpc")]
 fn reconcile_error_may_clear(error: &IndexerError) -> bool {
     matches!(
@@ -231,6 +249,7 @@ fn reconcile_error_may_clear(error: &IndexerError) -> bool {
             ReconciliationError::MismatchExceedsThreshold { .. }
                 | ReconciliationError::CustodyBehindLedger { .. }
                 | ReconciliationError::CustodySlotUnsettled { .. }
+                | ReconciliationError::CustodyStale { .. }
         )
     )
 }
@@ -560,6 +579,8 @@ pub async fn run(
     // `common`, the block source it must differ from depends on the datasource.
     crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::reject_placeholder_instance(common_config.escrow_instance_id)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // The binary validates too; repeated so embedders get the same refusal before storage opens.
     common_config
@@ -568,6 +589,8 @@ pub async fn run(
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
     indexer_config
         .validate()
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+    crate::config::validate_withdraw_datasource(&common_config, &indexer_config)
         .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // 1. Initialize storage
@@ -609,6 +632,16 @@ pub async fn run(
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
 
+    // The withdraw indexer DB must never be ahead of the channel. Checked once, before any
+    // block is read. A restore done while it runs is not caught: every service must be stopped.
+    if common_config.program_type == ProgramType::Withdraw {
+        under_live_lock(
+            &live_lock_lost,
+            verify_fence_at_boot(&storage, &common_config, &indexer_config),
+        )
+        .await?;
+    }
+
     // 2. Validate the escrow reconciliation wiring before doing any work.
     //
     // Only the config check runs here. The reconciliation itself compares on-chain
@@ -628,7 +661,32 @@ pub async fn run(
                 },
             ));
         }
-        (ProgramType::Escrow, Some(_)) => {}
+        // rpc_url is Solana for the escrow indexer, where the instance lives.
+        (ProgramType::Escrow, Some(instance)) => {
+            let solana_rpc = crate::operator::utils::RpcClientWithRetry::with_retry_config(
+                common_config.rpc_url.clone(),
+                crate::operator::utils::RetryConfig::default(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            );
+            under_live_lock(&live_lock_lost, async {
+                use crate::operator::utils::InstanceCheckError;
+                crate::operator::utils::verify_escrow_instance(&solana_rpc, &instance)
+                    .await
+                    .map_err(|e| {
+                        IndexerError::from(match e {
+                            InstanceCheckError::Unreadable(reason) => {
+                                DataSourceError::Rpc(crate::error::DataSourceRpcError::Protocol {
+                                    reason,
+                                })
+                            }
+                            InstanceCheckError::Invalid(reason) => {
+                                DataSourceError::InvalidConfig { reason }
+                            }
+                        })
+                    })
+            })
+            .await?;
+        }
         _ => {
             info!("Startup reconciliation skipped (non-escrow program)");
         }
@@ -756,9 +814,15 @@ pub async fn run(
                             // A sweep that never settled on one slot gets the same second
                             // chance a mismatch does: the node was moving under it, and the
                             // next sweep may catch it still. Anything else is fatal here.
+                            // Custody may not be older than what the ledger already holds.
+                            let ledger_floor =
+                                get_last_checkpoint(&storage, common_config.program_type)
+                                    .await?
+                                    .unwrap_or(0);
                             let snapshot = match capture_custody_snapshot(
                                 &common_config.rpc_url,
                                 &instance_id,
+                                ledger_floor,
                             )
                             .await
                             {
@@ -935,164 +999,185 @@ pub async fn run(
         }
     }
 
-    // 6. Start datasource
-    let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
-        #[cfg(feature = "datasource-rpc")]
-        DatasourceType::RpcPolling => {
-            let rpc_config = indexer_config.rpc_polling.as_ref().ok_or_else(|| {
-                DataSourceError::InvalidConfig {
-                    reason: "RPC polling config required for RpcPolling datasource".to_string(),
-                }
-            })?;
-
-            // A fill is what recovers slots below wherever the stream starts. Without one
-            // the stream is the only producer, so it has to resume from the checkpoint
-            // rather than the tip it would otherwise default to.
-            let live_start_slot = match rpc_live_start_slot {
-                Some(resolved) => Some(resolved),
-                None => {
-                    let checkpoint =
-                        get_last_checkpoint(&storage, common_config.program_type).await?;
-                    start_floor(
-                        RPC_POLLING_START_SETTING,
-                        common_config.program_type,
-                        checkpoint,
-                        rpc_config.from_slot,
-                    )?;
-                    live_resume_slot(checkpoint, rpc_config.from_slot)
-                }
-            };
-
-            let mut source = RpcPollingSource::new(
-                common_config.rpc_url.clone(),
-                live_start_slot,
-                rpc_config.poll_interval_ms,
-                rpc_config.error_retry_interval_ms,
-                rpc_config.batch_size,
-                rpc_config.encoding,
-                rpc_config.commitment,
-                common_config.program_type,
-                common_config.escrow_instance_id,
-                common_config.fallback_rpc_url.clone(),
-            );
-            if let Some(h) = health.clone() {
-                source = source.with_health(h);
-            }
-            Box::new(source)
-        }
-
-        #[cfg(feature = "datasource-yellowstone")]
-        DatasourceType::Yellowstone => {
-            let yellowstone_config = indexer_config.yellowstone.as_ref().ok_or_else(|| {
-                DataSourceError::InvalidConfig {
-                    reason: "Yellowstone config required for Yellowstone datasource".to_string(),
-                }
-            })?;
-
-            info!(
-                "Starting Yellowstone datasource from {} (commitment: {})",
-                yellowstone_config.endpoint, yellowstone_config.commitment
-            );
-
-            let source = YellowstoneSource::new(
-                yellowstone_config.endpoint.clone(),
-                yellowstone_config.x_token.clone(),
-                yellowstone_config.commitment.clone(),
-                common_config.program_type,
-                common_config.escrow_instance_id,
-            );
-
+    // 6. Build and start the datasource. The Yellowstone build writes the startup anchor while
+    //    the writers above run, so a lock lost here stops them all without a drain.
+    let mut build_writers = vec![
+        processor_handle.abort_handle(),
+        checkpoint_handle.abort_handle(),
+    ];
+    if let Some(task) = &backfill_task {
+        build_writers.push(task.abort_handle());
+    }
+    let build = async {
+        let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
             #[cfg(feature = "datasource-rpc")]
-            let source = {
-                use solana_commitment_config::CommitmentLevel as SdkCommitmentLevel;
-                use solana_transaction_status::UiTransactionEncoding;
+            DatasourceType::RpcPolling => {
+                let rpc_config = indexer_config.rpc_polling.as_ref().ok_or_else(|| {
+                    DataSourceError::InvalidConfig {
+                        reason: "RPC polling config required for RpcPolling datasource".to_string(),
+                    }
+                })?;
 
-                let encoding = indexer_config
-                    .rpc_polling
-                    .as_ref()
-                    .map(|c| c.encoding)
-                    .unwrap_or(UiTransactionEncoding::Json);
-
-                let commitment = match yellowstone_config.commitment.to_lowercase().as_str() {
-                    "processed" => SdkCommitmentLevel::Processed,
-                    "finalized" => SdkCommitmentLevel::Finalized,
-                    _ => SdkCommitmentLevel::Confirmed,
+                // A fill is what recovers slots below wherever the stream starts. Without one
+                // the stream is the only producer, so it has to resume from the checkpoint
+                // rather than the tip it would otherwise default to.
+                let live_start_slot = match rpc_live_start_slot {
+                    Some(resolved) => Some(resolved),
+                    None => {
+                        let checkpoint =
+                            get_last_checkpoint(&storage, common_config.program_type).await?;
+                        start_floor(
+                            RPC_POLLING_START_SETTING,
+                            common_config.program_type,
+                            checkpoint,
+                            rpc_config.from_slot,
+                        )?;
+                        live_resume_slot(checkpoint, rpc_config.from_slot)
+                    }
                 };
 
-                let gap_rpc_poller = Arc::new(RpcPoller::new(
-                    indexer_config.backfill.rpc_url.clone(),
-                    encoding,
-                    commitment,
-                ));
+                let mut source = RpcPollingSource::new(
+                    common_config.rpc_url.clone(),
+                    live_start_slot,
+                    rpc_config.poll_interval_ms,
+                    rpc_config.error_retry_interval_ms,
+                    rpc_config.batch_size,
+                    rpc_config.encoding,
+                    rpc_config.commitment,
+                    common_config.program_type,
+                    common_config.escrow_instance_id,
+                    common_config.fallback_rpc_url.clone(),
+                );
+                if let Some(h) = health.clone() {
+                    source = source.with_health(h);
+                }
+                Box::new(source)
+            }
 
-                // The gap-fill is this datasource's only way back to a slot the stream
-                // failed closed on, and it runs unattended, so it gets the archival
-                // fallback. Empty means unset (env renders an unconfigured var as "").
-                let gap_fallback_poller = common_config
-                    .fallback_rpc_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|url| !url.is_empty())
-                    .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
+            #[cfg(feature = "datasource-yellowstone")]
+            DatasourceType::Yellowstone => {
+                let yellowstone_config = indexer_config.yellowstone.as_ref().ok_or_else(|| {
+                    DataSourceError::InvalidConfig {
+                        reason: "Yellowstone config required for Yellowstone datasource"
+                            .to_string(),
+                    }
+                })?;
 
                 info!(
-                    "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
-                    indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
+                    "Starting Yellowstone datasource from {} (commitment: {})",
+                    yellowstone_config.endpoint, yellowstone_config.commitment
                 );
 
-                // Reconnect repair replays from the durable checkpoint, so one has to exist
-                // before the stream can deliver anything. Failing here refuses to start,
-                // which beats streaming past a window that could never be recovered: once a
-                // later slot is checkpointed, the slots below it stop being reachable.
-                let anchor = ensure_startup_anchor(
-                    &storage,
+                let source = YellowstoneSource::new(
+                    yellowstone_config.endpoint.clone(),
+                    yellowstone_config.x_token.clone(),
+                    yellowstone_config.commitment.clone(),
                     common_config.program_type,
-                    &gap_rpc_poller,
-                    startup_anchor_hint,
-                )
-                .await?;
+                    common_config.escrow_instance_id,
+                );
 
-                // Startup owns everything below its live boundary, so the first stream only
-                // replays above it. With no backfill the anchor is that boundary itself.
-                let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
+                #[cfg(feature = "datasource-rpc")]
+                let source = {
+                    use solana_commitment_config::CommitmentLevel as SdkCommitmentLevel;
+                    use solana_transaction_status::UiTransactionEncoding;
 
-                source
-                    .with_startup_floor(startup_floor)
-                    .with_gap_detection(
-                        gap_rpc_poller,
-                        gap_fallback_poller,
-                        indexer_config.backfill.max_gap_slots,
-                        indexer_config.backfill.batch_size,
+                    let encoding = indexer_config
+                        .rpc_polling
+                        .as_ref()
+                        .map(|c| c.encoding)
+                        .unwrap_or(UiTransactionEncoding::Json);
+
+                    let commitment = match yellowstone_config.commitment.to_lowercase().as_str() {
+                        "processed" => SdkCommitmentLevel::Processed,
+                        "finalized" => SdkCommitmentLevel::Finalized,
+                        _ => SdkCommitmentLevel::Confirmed,
+                    };
+
+                    let gap_rpc_poller = Arc::new(RpcPoller::new(
+                        indexer_config.backfill.rpc_url.clone(),
+                        encoding,
+                        commitment,
+                    ));
+
+                    // The gap-fill is this datasource's only way back to a slot the stream
+                    // failed closed on, and it runs unattended, so it gets the archival
+                    // fallback. Empty means unset (env renders an unconfigured var as "").
+                    let gap_fallback_poller = common_config
+                        .fallback_rpc_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
+
+                    info!(
+                        "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
+                        indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
+                    );
+
+                    // Reconnect repair replays from the durable checkpoint, so one has to exist
+                    // before the stream can deliver anything. Failing here refuses to start,
+                    // which beats streaming past a window that could never be recovered: once a
+                    // later slot is checkpointed, the slots below it stop being reachable.
+                    let anchor = ensure_startup_anchor(
+                        &storage,
+                        common_config.program_type,
+                        &gap_rpc_poller,
+                        startup_anchor_hint,
                     )
-                    .with_storage(storage.clone())
-            };
+                    .await?;
 
-            let source = if let Some(h) = health.clone() {
-                source.with_health(h)
-            } else {
-                source
-            };
+                    // Startup owns everything below its live boundary, so the first stream only
+                    // replays above it. With no backfill the anchor is that boundary itself.
+                    let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
 
-            Box::new(source)
-        }
+                    source
+                        .with_startup_floor(startup_floor)
+                        .with_gap_detection(
+                            gap_rpc_poller,
+                            gap_fallback_poller,
+                            indexer_config.backfill.max_gap_slots,
+                            indexer_config.backfill.batch_size,
+                        )
+                        .with_storage(storage.clone())
+                };
 
-        // Catch-all for disabled features
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(DataSourceError::InvalidConfig {
-                reason: format!(
-                    "Datasource {:?} is not compiled. Rebuild with the appropriate feature flag",
-                    indexer_config.datasource_type
-                ),
+                let source = if let Some(h) = health.clone() {
+                    source.with_health(h)
+                } else {
+                    source
+                };
+
+                Box::new(source)
             }
-            .into());
-        }
-    };
 
-    info!("Starting datasource...");
-    let datasource_handle = datasource
-        .start(instruction_tx.clone(), cancellation_token.clone())
-        .await?;
+            // Catch-all for disabled features
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(DataSourceError::InvalidConfig {
+                    reason: format!(
+                        "Datasource {:?} is not compiled. Rebuild with the appropriate \
+                         feature flag",
+                        indexer_config.datasource_type
+                    ),
+                }
+                .into());
+            }
+        };
+
+        info!("Starting datasource...");
+        let datasource_handle = datasource
+            .start(instruction_tx.clone(), cancellation_token.clone())
+            .await?;
+        Ok::<_, IndexerError>((datasource, datasource_handle))
+    };
+    let (datasource, datasource_handle) =
+        drain_unless_lock_lost(&live_lock_lost, &cancellation_token, &build_writers, build)
+            .await??;
+    // Start the stall clock at the live handoff, so a source that never delivers reads as
+    // stalled. Not earlier, so slow boot steps with no slot traffic do not read as a stall.
+    if let Some(h) = &health {
+        h.record_progress();
+    }
 
     info!("Indexer started, waiting for shutdown signal...");
 
@@ -1278,6 +1363,45 @@ pub async fn run(
 mod tests {
     use super::*;
 
+    /// Embedders that call run() directly get the same placeholder refusal as the binary.
+    #[tokio::test]
+    async fn run_refuses_the_placeholder_instance() {
+        let common = PrivateChannelIndexerConfig {
+            program_type: crate::config::ProgramType::Escrow,
+            storage_type: crate::config::StorageType::Postgres,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            postgres: crate::config::PostgresConfig {
+                database_url: "postgres://127.0.0.1:1/none".to_string(),
+                max_connections: 1,
+            },
+            escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::default()),
+        };
+        let indexer = IndexerConfig {
+            datasource_type: crate::config::DatasourceType::RpcPolling,
+            rpc_polling: None,
+            yellowstone: None,
+            backfill: crate::config::BackfillConfig {
+                enabled: false,
+                batch_size: 10,
+                max_gap_slots: 10,
+                start_slot: None,
+                exit_after_backfill: false,
+                rpc_url: "http://127.0.0.2:1".to_string(),
+            },
+            reconciliation: crate::config::ReconciliationConfig::default(),
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(common, indexer, None),
+        )
+        .await
+        .expect("must refuse before connecting")
+        .unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "got: {err}");
+    }
+
     /// Only a balance mismatch earns another fill. Retrying the rest would repeat the
     /// whole range resolution and fill twice over before failing with the same error,
     /// and would log an infrastructure fault as if the books were out by a deposit.
@@ -1311,6 +1435,14 @@ mod tests {
                 ReconciliationError::CustodyBehindLedger {
                     snapshot_slot: 90,
                     committed: 100,
+                },
+                true,
+            ),
+            // So is a custody read the node could not give at a fresh enough slot.
+            (
+                ReconciliationError::CustodyStale {
+                    floor: 100,
+                    reason: String::new(),
                 },
                 true,
             ),
@@ -1927,10 +2059,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(
-            matches!(
-                result,
-                Err(IndexerError::Storage(StorageError::LiveStateLockLost))
-            ),
+            matches!(result, Err(StorageError::LiveStateLockLost)),
             "a lock lost mid-drain must report the lost lock"
         );
         assert!(

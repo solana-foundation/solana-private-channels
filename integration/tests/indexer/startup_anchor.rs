@@ -667,3 +667,56 @@ async fn failed_startup_fill_exits_and_restart_refills_yellowstone() {
     failed_startup_fill_exits_and_restart_refills(DatasourceType::Yellowstone, "failed_fill_ys")
         .await;
 }
+
+/// A live source that never finishes a slot must read as stalled once it has started. The
+/// withdraw indexer polls RPC, and every read after its start-up tip read fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_reports_stalled_when_the_live_source_never_delivers() {
+    init_tracing();
+    let (_pg, _pool, postgres) = start_postgres("stalled_live_source").await;
+    let mut rpc = MockitoServer::new_async().await;
+    let _slot = mock_get_slot(&mut rpc, TIP).await;
+
+    let backfill = BackfillConfig {
+        enabled: false,
+        exit_after_backfill: false,
+        rpc_url: rpc.url(),
+        batch_size: 100,
+        max_gap_slots: 1_000,
+        start_slot: None,
+    };
+    let indexer = fill_test_config(None, backfill);
+    let common = common_config(postgres, rpc.url());
+    let health = private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig {
+        max_pending: 50,
+        stale_threshold_secs: 1,
+        require_continuous_progress: true,
+    });
+    let run_health = health.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = run(common, indexer, Some(run_health)).await {
+            eprintln!("indexer run exited: {e}");
+        }
+    });
+
+    // Healthy until the source starts, then stalled one second later with no finished slot.
+    let stalled = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(
+                health.check(),
+                private_channel_metrics::HealthOutcome::Stalled { .. }
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        stalled.is_ok(),
+        "a live source that never delivers must read as stalled, got {:?}",
+        health.check()
+    );
+
+    handle.abort();
+}

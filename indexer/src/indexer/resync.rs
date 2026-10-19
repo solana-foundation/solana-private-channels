@@ -7,8 +7,8 @@ use crate::{
     },
     operator::{
         enumerate_consumed_mints, extend_with_mint_history, fetch_consumed_nonces,
-        find_withdrawal_bitmap_pda, ConsumedMintKind, ConsumedSet, RetryConfig, RpcClientWithRetry,
-        SourceEventId, CONSUMED_SET_PAGE_SIZE,
+        find_withdrawal_bitmap_pda, sender::wait_for_address_index, ConsumedMintKind, ConsumedSet,
+        RetryConfig, RpcClientWithRetry, SourceEventId, CONSUMED_SET_PAGE_SIZE,
     },
     shutdown_utils::WRITER_STOP_TIMEOUT,
     storage::common::models::{ResyncBlockers, ServicedRow},
@@ -31,10 +31,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-/// How far behind wall clock the bitmap RPC's finalized tip may sit and still count as
-/// evidence about the live chain. Generous next to Solana's finalization, because the
-/// failure it exists to catch is a node hours behind, not one a few slots behind.
-const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
+/// How far behind wall clock a finalized tip, the bitmap RPC's or the replay's, may sit and
+/// still count as evidence about the live chain. Generous next to Solana's finalization,
+/// because the failure it exists to catch is a node hours behind, not one a few slots behind.
+const MAX_RPC_TIP_LAG_SECS: i64 = 120;
 
 /// Metric label for the live-state lock this service holds.
 const RESYNC_LOCK_ROLE: &str = "resync";
@@ -77,7 +77,8 @@ fn first_unserviced(
 }
 
 /// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
-/// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
+/// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent,
+/// and a replay from slot 0.
 fn wipe_blocker(
     program: ProgramType,
     blockers: &ResyncBlockers,
@@ -85,6 +86,23 @@ fn wipe_blocker(
 ) -> Option<ReconciliationError> {
     if blockers.unsettled_work {
         return Some(ReconciliationError::UnsettledWork);
+    }
+    if program == ProgramType::Withdraw {
+        if blockers.failed_withdrawals {
+            return Some(ReconciliationError::ReleaseEvidenceRecorded {
+                what: "failed withdrawals",
+            });
+        }
+        if blockers.observed_releases {
+            return Some(ReconciliationError::ReleaseEvidenceRecorded {
+                what: "observed releases",
+            });
+        }
+        // Rows cannot bound the burns below a later genesis, so only a replay from 0 rebuilds
+        // them all. Checked before the row bound, which a withdraw genesis of 0 always passes.
+        if genesis_slot != 0 {
+            return Some(ReconciliationError::WithdrawGenesisNotZero { genesis_slot });
+        }
     }
     // The wipe deletes every own row but the rebuild replays only from genesis.
     if let Some(earliest_slot) = blockers.earliest_slot {
@@ -94,19 +112,6 @@ fn wipe_blocker(
                 earliest_slot,
             });
         }
-    }
-    if program != ProgramType::Withdraw {
-        return None;
-    }
-    if blockers.failed_withdrawals {
-        return Some(ReconciliationError::ReleaseEvidenceRecorded {
-            what: "failed withdrawals",
-        });
-    }
-    if blockers.observed_releases {
-        return Some(ReconciliationError::ReleaseEvidenceRecorded {
-            what: "observed releases",
-        });
     }
     None
 }
@@ -143,53 +148,16 @@ async fn ensure_unpruned(channel_rpc: &RpcClientWithRetry) -> Result<(), Indexer
 }
 
 /// Refuse unless the channel address index covers the block that was newest at the first
-/// read, so its history holds every mint landed before resync took the lock. A pinned
-/// target, not `getSlot` or a moving tip, so idle ticks and live traffic cannot outrun it.
-async fn ensure_index_caught_up(
+/// read, so its history holds every mint landed before resync took the lock.
+pub(crate) async fn ensure_index_caught_up(
     channel_rpc: &RpcClientWithRetry,
     budget: Duration,
 ) -> Result<(), IndexerError> {
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut target = None;
-    loop {
-        // One poll interval at least, so a zero budget still gets a real read.
-        let remaining = deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .max(INDEX_CATCH_UP_POLL);
-        let reply =
-            match tokio::time::timeout(remaining, channel_rpc.get_address_index_slot()).await {
-                Ok(reply) => reply.map_err(|e| e.to_string()),
-                Err(_) => Err(format!("no reply within {remaining:?}")),
-            };
-        let (watermark, latest_block) = reply.map_err(|e| {
-            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
-                reason: format!(
-                    "channel address index progress unreadable: {e}. The channel RPC must be \
-                     the operators' read node running a core that serves getAddressIndexSlot; \
-                     see docs/runbooks/resync_consumed_mint_mismatch.md"
-                ),
-            })
-        })?;
-        let target = *target.get_or_insert(latest_block);
-        if watermark >= target {
-            info!(watermark, target, "Channel address index is caught up");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(IndexerError::Reconciliation(
-                ReconciliationError::ConsumedSetUnavailable {
-                    reason: format!(
-                        "channel address index is at slot {watermark}, behind block {target}, \
-                         the newest when resync started waiting, so its history may miss serviced mints. The write \
-                         node must be running and the channel RPC must be the operators' read \
-                         node; rerun once it catches up, see \
-                         docs/runbooks/resync_consumed_mint_mismatch.md"
-                    ),
-                },
-            ));
-        }
-        tokio::time::sleep(INDEX_CATCH_UP_POLL).await;
-    }
+    wait_for_address_index(channel_rpc, budget, INDEX_CATCH_UP_POLL)
+        .await
+        .map_err(|reason| {
+            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable { reason })
+        })
 }
 
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
@@ -536,10 +504,10 @@ impl ResyncService {
             ))
         })?;
         let lag = chrono::Utc::now().timestamp().saturating_sub(tip_time);
-        if lag > MAX_BITMAP_RPC_TIP_LAG_SECS {
+        if lag > MAX_RPC_TIP_LAG_SECS {
             return Err(unverified(format!(
                 "the bitmap RPC's finalized tip (slot {ref_slot}) is {lag}s behind wall clock, \
-                 past the {MAX_BITMAP_RPC_TIP_LAG_SECS}s limit; a lagging node cannot show the \
+                 past the {MAX_RPC_TIP_LAG_SECS}s limit; a lagging node cannot show the \
                  chain has issued no nonce"
             )));
         }
@@ -574,6 +542,41 @@ impl ResyncService {
             ref_slot,
             "Withdrawal bitmap is fresh: generation 0, no set bits, read at the finalized tip"
         );
+        Ok(())
+    }
+
+    /// Refuse unless the source RPC's replay tip was recent when it was read at `tip_read_at`.
+    /// A lagging node ends the rebuild below events the channel may already have serviced,
+    /// and an empty or restored table has no row above the tip to catch them.
+    async fn refuse_if_tip_stale(
+        &self,
+        to_slot: u64,
+        tip_read_at: i64,
+    ) -> Result<(), IndexerError> {
+        let unverified = |reason: String| {
+            error!("Replay tip unverified; aborting resync before drop: {reason}");
+            IndexerError::Reconciliation(ReconciliationError::ReplayTipUnverified {
+                to_slot,
+                reason,
+            })
+        };
+        // The endpoint the rebuild replays from, so the proof covers the slot it stops at.
+        let rpc = RpcClientWithRetry::with_retry_config(
+            self.backfill_config_base.rpc_url.clone(),
+            RetryConfig::default(),
+            CommitmentConfig::finalized(),
+        );
+        let tip_time = rpc.get_block_time(to_slot).await.map_err(|e| {
+            unverified(format!(
+                "it has no block time, so its freshness cannot be shown: {e}"
+            ))
+        })?;
+        let lag = tip_read_at.saturating_sub(tip_time);
+        if lag > MAX_RPC_TIP_LAG_SECS {
+            return Err(unverified(format!(
+                "it was {lag}s behind wall clock when read, past the {MAX_RPC_TIP_LAG_SECS}s limit"
+            )));
+        }
         Ok(())
     }
 
@@ -695,6 +698,9 @@ impl ResyncService {
             error!("Failed to fetch current slot before resync backfill: {}", e);
             IndexerError::DataSource(e.into())
         })?;
+        // The tip's age is judged at this read. Workers are already locked out, so the node's
+        // lag now is what bounds the rebuild; resync's own work afterwards is not lag.
+        let tip_read_at = chrono::Utc::now().timestamp();
         if genesis_slot > current_slot {
             error!(
                 "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
@@ -732,6 +738,40 @@ impl ResyncService {
             .fixed_range(genesis_slot, current_slot)
             .await?;
 
+        // Pre-flight 5a: an empty range rebuilds nothing and records no checkpoint, so the
+        // check after the wipe would fail with the marker and halt set.
+        if to_slot <= from_slot {
+            error!(
+                "Invalid genesis_slot {}: no block produced after slot {} up to current_slot {}",
+                genesis_slot, from_slot, current_slot
+            );
+            return Err(IndexerError::from(DataSourceError::InvalidConfig {
+                reason: format!(
+                    "no block was produced after slot {from_slot} up to current_slot \
+                     {current_slot}, so the rebuild would record nothing. Aborted before any \
+                     delete, the database is intact. Rerun once the chain produces a block at \
+                     or above genesis_slot {genesis_slot}"
+                ),
+            }));
+        }
+
+        // Pre-flight 5b: the rebuild stops at to_slot, so it must be recent.
+        self.refuse_if_tip_stale(to_slot, tip_read_at).await?;
+
+        // Pre-flight 5c: the wipe deletes every own row but the rebuild replays only up to
+        // to_slot, so a row above it would be lost and later caught up as new pending work.
+        // Checked before the replay passes, which are the longest steps here.
+        if let Some(latest_slot) = blockers.latest_slot {
+            if i128::from(to_slot) < i128::from(latest_slot) {
+                let refusal = ReconciliationError::TipBelowExistingRows {
+                    to_slot,
+                    latest_slot,
+                };
+                error!("Refusing to resync: {}", refusal);
+                return Err(refusal.into());
+            }
+        }
+
         let consumed = match (consumed, self.channel_reconcile.as_ref()) {
             (Some(consumed), Some(reconcile)) => {
                 // Pre-flight 6: every channel mint that names a rebuilt event must pay it.
@@ -763,8 +803,8 @@ impl ResyncService {
                 }
 
                 // Pre-flight 9: every serviced row must be in the final set. Pre-flight 2
-                // already refused rows below genesis, so every row checked here is one the
-                // rebuild re-creates.
+                // refused rows below genesis and pre-flight 5c rows above to_slot, so
+                // every row checked here is one the rebuild re-creates.
                 self.refuse_if_serviced_rows_missing(&consumed).await?;
                 Some(consumed)
             }
@@ -861,20 +901,21 @@ impl ResyncService {
                 }
             }
 
-            // Perform cleanup after backfill, with no completeness target to check. A rebuild
-            // resolves its range inside the backfill service and never surfaces the top slot,
-            // so there is nothing to compare against here. Leaving it unchecked is acceptable
-            // because a stale checkpoint after a rebuild heals itself: the next live start
-            // detects the gap below the tip and fills it.
+            // The writer only logs a failed flush, so read the durable checkpoint back and
+            // fail unless it reached the top slot. The error returns before the marker and
+            // halt are cleared.
             if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
                 checkpoint_handle,
                 checkpoint_tx,
                 storage,
-                None,
+                Some((self.program_type, to_slot)),
             )
             .await
             {
-                error!("Cleanup after resync backfill failed: {}", e);
+                error!(
+                    "Rebuild checkpoint not confirmed, keeping the resync marker and halt; rerun the resync: {}",
+                    e
+                );
                 // Returned as-is so the operator sees which stage failed, not a generic one.
                 return Err(e);
             }
@@ -930,6 +971,7 @@ mod tests {
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use crate::test_utils::rpc_mocks::{chain, mock_get_blocks, mock_get_slot};
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use std::sync::Arc;
@@ -1021,7 +1063,8 @@ mod tests {
     const REF_SLOT: u64 = 7;
 
     /// Mount the node's finalized tip: `getLatestBlockhash` at `REF_SLOT` and a
-    /// `getBlockTime` for it. `None` answers the block time with null.
+    /// `getBlockTime` for it. `None` answers the block time with null. The block time
+    /// answers any slot, so it also serves the replay tip check.
     fn mock_fresh_tip(server: &mut mockito::ServerGuard, block_time: Option<i64>) {
         server
             .mock("POST", "/")
@@ -1129,7 +1172,8 @@ mod tests {
                 id: n as i64 + 1,
                 signature: solana_sdk::signature::Signature::new_unique().to_string(),
                 trace_id: format!("trace-{n}"),
-                // The genesis these tests resync from, so the pre-genesis guard stays out of their way.
+                // At or above every genesis these tests resync from, so the pre-genesis guard
+                // stays out of their way.
                 slot: 100,
                 initiator: Pubkey::new_unique().to_string(),
                 recipient: Pubkey::new_unique().to_string(),
@@ -1226,7 +1270,7 @@ mod tests {
             Some("http://127.0.0.1:1".to_string()),
         );
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalNoncesReleased {
                 completed,
             })) => assert_eq!(completed, 2),
@@ -1245,7 +1289,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1268,7 +1312,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1291,7 +1335,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
                 generation,
                 set_bits,
@@ -1314,7 +1358,7 @@ mod tests {
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
                 generation,
                 set_bits,
@@ -1338,7 +1382,7 @@ mod tests {
         let (_mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::DataSource(_)) => {}
             other => {
                 panic!("a fresh bitmap must pass the check and reach the tip fetch, got: {other:?}")
@@ -1358,7 +1402,7 @@ mod tests {
             Some("http://127.0.0.1:1".to_string()),
         );
 
-        match service.run(100).await {
+        match service.run(0).await {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
@@ -1380,7 +1424,7 @@ mod tests {
         ] {
             let (mock, storage) = populated_storage();
             let service = withdraw_service(storage, instance, rpc);
-            match service.run(100).await {
+            match service.run(0).await {
                 Err(IndexerError::Reconciliation(
                     ReconciliationError::WithdrawalBitmapUnverified { .. },
                 )) => {}
@@ -1476,7 +1520,7 @@ mod tests {
     // ── pre-wipe gate ────────────────────────────────────────────────
 
     /// Escrow never touches nonces, so only in-flight work or pre-genesis rows block it; withdraw
-    /// also needs proof no nonce is spent.
+    /// also needs proof no nonce is spent and a replay from slot 0.
     #[test]
     fn wipe_blocker_matrix() {
         use crate::storage::common::models::ResyncBlockers;
@@ -1497,6 +1541,7 @@ mod tests {
             failed_withdrawals: true,
             observed_releases: true,
             earliest_slot: Some(1),
+            ..Default::default()
         };
         let rows_from = |slot| ResyncBlockers {
             earliest_slot: Some(slot),
@@ -1516,6 +1561,9 @@ mod tests {
                 genesis_slot: 100,
                 earliest_slot: 99,
             }) => "genesis",
+            Some(ReconciliationError::WithdrawGenesisNotZero { genesis_slot: 100 }) => {
+                "withdraw genesis"
+            }
             Some(other) => panic!("unexpected verdict {other:?}"),
         };
 
@@ -1524,7 +1572,12 @@ mod tests {
             (ProgramType::Escrow, unsettled, "unsettled"),
             (ProgramType::Escrow, failed, "none"),
             (ProgramType::Escrow, observed, "none"),
-            (ProgramType::Withdraw, ResyncBlockers::default(), "none"),
+            // An empty table proves nothing about burns below a later genesis.
+            (
+                ProgramType::Withdraw,
+                ResyncBlockers::default(),
+                "withdraw genesis",
+            ),
             (ProgramType::Withdraw, unsettled, "unsettled"),
             (ProgramType::Withdraw, failed, "failed"),
             (ProgramType::Withdraw, observed, "observed"),
@@ -1541,8 +1594,9 @@ mod tests {
             (ProgramType::Escrow, rows_from(99), "genesis"),
             (ProgramType::Escrow, rows_from(100), "none"),
             (ProgramType::Escrow, rows_from(101), "none"),
-            (ProgramType::Withdraw, rows_from(99), "genesis"),
-            (ProgramType::Withdraw, rows_from(100), "none"),
+            // The genesis-0 advice first, so an operator never gets two refusals in a row.
+            (ProgramType::Withdraw, rows_from(99), "withdraw genesis"),
+            (ProgramType::Withdraw, rows_from(100), "withdraw genesis"),
             (
                 ProgramType::Escrow,
                 ResyncBlockers {
@@ -1560,6 +1614,15 @@ mod tests {
                 "{program:?} with {blockers:?}"
             );
         }
+        assert_eq!(
+            label(wipe_blocker(
+                ProgramType::Withdraw,
+                &ResyncBlockers::default(),
+                0
+            )),
+            "none",
+            "a withdraw replay from slot 0 rebuilds every burn"
+        );
     }
 
     /// Escrow service with a scope set and every RPC on a dead port, so any network step errors.
@@ -1628,6 +1691,7 @@ mod tests {
     }
 
     /// Rows below the genesis would be wiped and never rebuilt, so both programs refuse locally.
+    /// Withdraw refuses any genesis above 0 first, so its operator gets one refusal, not two.
     #[tokio::test]
     async fn genesis_above_earliest_row_refuses_before_any_rpc_and_wipe() {
         let mock = MockStorage::new();
@@ -1663,9 +1727,8 @@ mod tests {
         mock.pending_transactions.lock().unwrap()[0].slot = 99;
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
         match service.run(100).await {
-            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawGenesisNotZero {
                 genesis_slot: 100,
-                earliest_slot: 99,
             })) => {}
             other => {
                 panic!("a withdrawal below genesis must block a withdraw resync, got: {other:?}")
@@ -1820,6 +1883,327 @@ mod tests {
         }
     }
 
+    /// A rebuild whose final checkpoint write fails leaves no durable boundary, so it keeps
+    /// its marker and halt. A rerun that records the top slot clears both.
+    #[tokio::test]
+    async fn lost_final_checkpoint_keeps_the_fence_until_a_rerun_records_it() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        let _blocks = chain(
+            &mut server,
+            genesis,
+            tip,
+            &[(101, 100), (102, 101), (103, 102)],
+        );
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
+        let mock = MockStorage::new();
+        // Relies on the writer's single flush when its channel closes: the run ends well
+        // before the 5s tick, so the one injected failure lands on that final write.
+        mock.set_fail_times("escrow", 1);
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )),
+            ProgramType::Escrow,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: server.url(),
+                batch_size: 10,
+                max_gap_slots: 500,
+                start_slot: None,
+            },
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO);
+
+        match service.run(genesis).await {
+            Err(IndexerError::BackfillIncomplete {
+                committed: None,
+                target,
+                ..
+            }) => assert_eq!(target, tip),
+            other => panic!("an unrecorded rebuild must not clear its fence, got: {other:?}"),
+        }
+        assert_eq!(
+            mock.unfinished_resync.lock().unwrap().as_deref(),
+            Some("escrow")
+        );
+        assert_eq!(
+            mock.reconciliation_halt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|halt| halt.reason.clone()),
+            Some(resync_halt_reason(ProgramType::Escrow))
+        );
+
+        service
+            .run(genesis)
+            .await
+            .expect("a rerun must finish the rebuild");
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("escrow"),
+            Some(&tip)
+        );
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
+        assert!(mock.reconciliation_halt.lock().unwrap().is_none());
+    }
+
+    /// A row above the rebuild's top slot would be wiped and never replayed, so resync refuses
+    /// before the wipe. The marker keeps that bound after an interrupted wipe deleted the row.
+    #[tokio::test]
+    async fn tip_below_latest_row_refuses_before_wipe() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        let _blocks = chain(
+            &mut server,
+            genesis,
+            tip,
+            &[(101, 100), (102, 101), (103, 102)],
+        );
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
+        let above_tip = 105;
+        // (case, row slot, deleted by an interrupted wipe first, refused)
+        let cases = [
+            ("live row above the tip", above_tip, false, true),
+            ("row an interrupted wipe deleted", above_tip, true, true),
+            ("row at the tip", tip as i64, false, false),
+        ];
+        for (case, row_slot, interrupted, refused) in cases {
+            let mock = MockStorage::new();
+            seed_row(
+                &mock,
+                1,
+                TransactionType::Deposit,
+                TransactionStatus::Pending,
+            );
+            mock.pending_transactions.lock().unwrap()[0].slot = row_slot;
+            if interrupted {
+                mock.wipe_program(ProgramType::Escrow).unwrap();
+            }
+            let wipes_before = mock.calls("wipe_program");
+            let service = ResyncService::new(
+                Arc::new(Storage::Mock(mock.clone())),
+                Arc::new(RpcPoller::new(
+                    server.url(),
+                    UiTransactionEncoding::Json,
+                    CommitmentLevel::Finalized,
+                )),
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: false,
+                    rpc_url: server.url(),
+                    batch_size: 10,
+                    max_gap_slots: 500,
+                    start_slot: None,
+                },
+                Some(Pubkey::new_unique()),
+            )
+            .with_stale_holder_grace(Duration::ZERO);
+
+            let result = service.run(genesis).await;
+            if !refused {
+                assert!(result.is_ok(), "{case}: must be rebuilt, got: {result:?}");
+                continue;
+            }
+            match result {
+                Err(IndexerError::Reconciliation(ReconciliationError::TipBelowExistingRows {
+                    to_slot,
+                    latest_slot,
+                })) => assert_eq!((to_slot, latest_slot), (tip, above_tip), "{case}"),
+                other => panic!("{case}: a row above the tip must refuse, got: {other:?}"),
+            }
+            assert_eq!(mock.calls("wipe_program"), wipes_before, "{case}");
+            if interrupted {
+                assert_eq!(
+                    mock.unfinished_resync.lock().unwrap().as_deref(),
+                    Some("escrow"),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(mock.pending_transactions.lock().unwrap().len(), 1, "{case}");
+            }
+        }
+    }
+
+    /// A lagging source node would end the rebuild below events the channel may already have
+    /// serviced, and an empty table has no row above the tip to catch them, so resync refuses.
+    #[tokio::test]
+    async fn stale_tip_refuses_before_wipe() {
+        let genesis = 101;
+        let tip = 103;
+        // (case, block time of the top slot, reason fragment)
+        let cases = [
+            (
+                "an hour behind",
+                Some(chrono::Utc::now().timestamp() - 3_600),
+                "behind wall clock",
+            ),
+            ("no block time", None, "block time"),
+        ];
+        for (case, block_time, fragment) in cases {
+            let mut server = mockito::Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, tip);
+            let _blocks = chain(
+                &mut server,
+                genesis,
+                tip,
+                &[(101, 100), (102, 101), (103, 102)],
+            );
+            mock_fresh_tip(&mut server, block_time);
+            let mock = MockStorage::new();
+            let service = ResyncService::new(
+                Arc::new(Storage::Mock(mock.clone())),
+                Arc::new(RpcPoller::new(
+                    server.url(),
+                    UiTransactionEncoding::Json,
+                    CommitmentLevel::Finalized,
+                )),
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: false,
+                    rpc_url: server.url(),
+                    batch_size: 10,
+                    max_gap_slots: 500,
+                    start_slot: None,
+                },
+                Some(Pubkey::new_unique()),
+            )
+            .with_stale_holder_grace(Duration::ZERO);
+
+            match service.run(genesis).await {
+                Err(IndexerError::Reconciliation(ReconciliationError::ReplayTipUnverified {
+                    to_slot,
+                    reason,
+                })) => {
+                    assert_eq!(to_slot, tip, "{case}");
+                    assert!(reason.contains(fragment), "{case}: {reason}");
+                }
+                other => panic!("{case}: an unproven tip must refuse, got: {other:?}"),
+            }
+            assert_eq!(mock.calls("wipe_program"), 0, "{case}");
+            assert!(mock.unfinished_resync.lock().unwrap().is_none(), "{case}");
+        }
+    }
+
+    /// The tip's age is taken when it was read. Resync's own work after that, here a slow
+    /// block time reply and in production the consumed-set build, is not the node's lag.
+    #[tokio::test]
+    async fn tip_age_is_measured_when_the_tip_is_read() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        let _blocks = chain(
+            &mut server,
+            genesis,
+            tip,
+            &[(101, 100), (102, 101), (103, 102)],
+        );
+        // Within the limit when the tip is read, past it once the slow reply lands.
+        let block_time = chrono::Utc::now().timestamp() - (MAX_RPC_TIP_LAG_SECS - 2);
+        let _block_time = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockTime""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                std::thread::sleep(Duration::from_secs(3));
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": block_time})
+                    .to_string()
+                    .into_bytes()
+            })
+            .create();
+        let mock = MockStorage::new();
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )),
+            ProgramType::Escrow,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: server.url(),
+                batch_size: 10,
+                max_gap_slots: 500,
+                start_slot: None,
+            },
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO);
+
+        service
+            .run(genesis)
+            .await
+            .expect("a tip fresh when read must pass, however long resync takes after");
+    }
+
+    /// A range with no block above genesis rebuilds nothing and records no checkpoint, so the
+    /// check after the wipe would fail with the marker and halt set. Resync refuses first.
+    #[tokio::test]
+    async fn empty_replay_range_refuses_before_wipe() {
+        let mut server = mockito::Server::new_async().await;
+        let genesis = 101;
+        let tip = 103;
+        let _slot = mock_get_slot(&mut server, tip);
+        // Only the slot below genesis holds a block, so the range above it is empty.
+        let _blocks = mock_get_blocks(&mut server, genesis - 1, tip, &[genesis - 1]);
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
+        let mock = MockStorage::new();
+        let checkpoint = 50;
+        mock.committed_checkpoints
+            .lock()
+            .unwrap()
+            .insert("escrow".to_string(), checkpoint);
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )),
+            ProgramType::Escrow,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: server.url(),
+                batch_size: 10,
+                max_gap_slots: 500,
+                start_slot: None,
+            },
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO);
+
+        match service.run(genesis).await {
+            Err(IndexerError::DataSource(DataSourceError::InvalidConfig { reason })) => {
+                assert!(reason.contains("no block"), "{reason}")
+            }
+            other => panic!("an empty replay range must refuse before the wipe, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
+        assert!(mock.reconciliation_halt.lock().unwrap().is_none());
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("escrow"),
+            Some(&checkpoint)
+        );
+    }
+
     /// A worker whose session just died may still be writing, so nothing is read inside the grace.
     #[tokio::test(start_paused = true)]
     async fn run_reads_nothing_until_stale_workers_have_had_time_to_stop() {
@@ -1938,9 +2322,10 @@ mod tests {
     const INDEX_CAUGHT_UP: &str =
         r#"{"jsonrpc":"2.0","id":1,"result":{"watermark":200,"latestBlock":200}}"#;
 
-    /// Escrow service over mock RPCs: a source tip with no event to replay, and an empty,
-    /// never-pruned channel answering `index_reply` for its index progress. Returns the
-    /// channel's history mock, expecting no read unless `history_read`.
+    /// Escrow service over mock RPCs: a source tip whose replay is genesis alone, unserved
+    /// until a caller mounts it, and an empty, never-pruned channel answering `index_reply`
+    /// for its index progress. Returns the channel's history mock, expecting no read unless
+    /// `history_read`.
     async fn reconciling_escrow_service(
         storage: Arc<Storage>,
         index_reply: &str,
@@ -1960,8 +2345,10 @@ mod tests {
             .with_status(200)
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":200}"#)
             .create();
-        // The last block at or below the tip is the slot before genesis, so the replay is empty.
-        crate::test_utils::rpc_mocks::mock_get_blocks(&mut source, 99, 200, &[99]);
+        // The last block at or below the tip is genesis itself, so the replay covers a row at
+        // genesis. That block is not served here: a test that reaches the replay mounts it.
+        crate::test_utils::rpc_mocks::mock_get_blocks(&mut source, 99, 200, &[100]);
+        mock_fresh_tip(&mut source, Some(chrono::Utc::now().timestamp()));
         let mut channel = mockito::Server::new_async().await;
         channel
             .mock("POST", "/")
@@ -2030,12 +2417,13 @@ mod tests {
             TransactionType::Deposit,
             TransactionStatus::Completed,
         );
-        let (service, _source, _channel, _history) = reconciling_escrow_service(
+        let (service, mut source, _channel, _history) = reconciling_escrow_service(
             Arc::new(Storage::Mock(mock.clone())),
             INDEX_CAUGHT_UP,
             true,
         )
         .await;
+        let _replay = chain(&mut source, 100, 100, &[(100, 99)]);
         match service.run(100).await {
             Err(IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
                 reason,
@@ -2060,18 +2448,50 @@ mod tests {
     async fn serviced_rows_read_error_refuses() {
         let mock = MockStorage::new();
         mock.set_should_fail("get_serviced_rows", true);
-        let (service, _source, _channel, _history) = reconciling_escrow_service(
+        let (service, mut source, _channel, _history) = reconciling_escrow_service(
             Arc::new(Storage::Mock(mock.clone())),
             INDEX_CAUGHT_UP,
             true,
         )
         .await;
+        let _replay = chain(&mut source, 100, 100, &[(100, 99)]);
         match service.run(100).await {
             Err(IndexerError::Storage(_)) => {}
             other => panic!("an unreadable serviced-row list must refuse, got: {other:?}"),
         }
         assert_eq!(mock.calls("wipe_program"), 0);
         assert!(mock.unfinished_resync.lock().unwrap().is_none());
+    }
+
+    /// A row above the tip refuses before the replay passes, so a lagging node is turned
+    /// away before the longest steps rather than after them.
+    #[tokio::test]
+    async fn tip_below_latest_row_refuses_before_the_replay_passes() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Pending,
+        );
+        let above_tip = 105;
+        mock.pending_transactions.lock().unwrap()[0].slot = above_tip;
+        let (service, _source, _channel, _history) = reconciling_escrow_service(
+            Arc::new(Storage::Mock(mock.clone())),
+            INDEX_CAUGHT_UP,
+            true,
+        )
+        .await;
+        // Block 100 is not mounted, so a replay pass would fail with a fetch error instead.
+        let genesis = 100;
+        match service.run(genesis).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::TipBelowExistingRows {
+                to_slot,
+                latest_slot,
+            })) => assert_eq!((to_slot, latest_slot), (genesis, above_tip)),
+            other => panic!("a row above the tip must refuse before any replay, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
     }
 
     /// A lagging or unreadable channel index refuses before any history read or wipe,

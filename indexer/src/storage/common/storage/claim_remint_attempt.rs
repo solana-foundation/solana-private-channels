@@ -9,6 +9,9 @@ pub enum RemintClaim {
     HeldElsewhere,
     /// The row is no longer `pending_remint`, so there is nothing left to refund.
     RowMoved,
+    /// The indexer has recorded a release for this withdrawal's nonce, so it was paid
+    /// out and must not be refunded. Nothing was written.
+    ReleaseObserved,
 }
 
 /// Claim the exclusive right to broadcast one remint attempt.

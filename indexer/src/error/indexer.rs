@@ -21,6 +21,16 @@ pub enum IndexerError {
 
     #[error("Startup backfill task panicked")]
     BackfillPanicked,
+    /// The channel proved it no longer holds the block this indexer DB was built on.
+    #[error(
+        "channel fence mismatch: {reason}. The channel no longer has the history this indexer \
+         database was built on; see docs/PITR.md"
+    )]
+    ChannelFence { reason: String },
+
+    /// The fence check could not reach a verdict yet, so the indexer refuses rather than guess.
+    #[error("channel fence not checked yet: {reason}")]
+    ChannelFenceUnchecked { reason: String },
 
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
@@ -40,7 +50,7 @@ pub enum IndexerError {
     #[error("Reconciliation failed: {0}")]
     Reconciliation(#[from] ReconciliationError),
 
-    /// A backfill-only run finished without durably recording its whole range.
+    /// A backfill-only run or resync rebuild finished without durably recording its whole range.
     /// `committed` is `None` when no checkpoint was ever written, which is not
     /// the same as a checkpoint that stalled part way and must stay
     /// distinguishable in the logs an operator reads after a failed repair.
@@ -107,6 +117,12 @@ pub enum ReconciliationError {
     /// lagging RPC node, which is why a re-read is worth trying before giving up.
     #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
     CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
+
+    /// The Solana node could not answer custody at or past `floor` (its newest recent block,
+    /// or the committed checkpoint), or its newest block is too old. A node catching up
+    /// clears this, so startup re-reads a few times before giving up.
+    #[error("custody could not be read fresh: {reason}; the Solana RPC is behind or not at a recent block")]
+    CustodyStale { floor: u64, reason: String },
 
     /// The escrow indexer never indexed up to the custody slot, so the ledger is missing
     /// deposits or releases custody already reflects and cannot be compared there.
@@ -213,6 +229,34 @@ pub enum ReconciliationError {
         genesis_slot: u64,
         earliest_slot: i64,
     },
+
+    /// The wipe deletes every row of the program but the rebuild only replays up to its
+    /// top slot, so rows above it would be lost and later caught up as new pending work.
+    #[error(
+        "the rebuild replays only up to slot {to_slot}, below this program's latest row at \
+         slot {latest_slot}; the wipe would delete rows the rebuild never replays. Aborted \
+         before any delete, the database is intact. Rerun once the source RPC's tip reaches \
+         slot {latest_slot}"
+    )]
+    TipBelowExistingRows { to_slot: u64, latest_slot: i64 },
+
+    /// A lagging source node ends the rebuild below events the channel may already have
+    /// serviced, which catch-up would later insert as new pending work.
+    #[error(
+        "the source RPC's replay tip at slot {to_slot} cannot be shown to be current: \
+         {reason}. Aborted before any delete, the database is intact. Point resync at a \
+         caught-up node and rerun"
+    )]
+    ReplayTipUnverified { to_slot: u64, reason: String },
+
+    /// Withdrawal rows cannot prove no burn exists below a later genesis, so an empty or
+    /// restored table would let the rebuild drop an unreleased withdrawal for good.
+    #[error(
+        "a withdraw resync must replay from genesis slot 0, not {genesis_slot}: withdrawal \
+         rows cannot prove no burn exists below a later genesis. Aborted before any delete, \
+         the database is intact. Rerun with --genesis-slot 0"
+    )]
+    WithdrawGenesisNotZero { genesis_slot: u64 },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

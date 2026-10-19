@@ -36,6 +36,22 @@ pub enum OperatorError {
     #[error("RPC error: {0}")]
     RpcError(String),
 
+    /// The channel proved it no longer holds the block the withdraw indexer's checkpoint was
+    /// built on.
+    #[error(
+        "channel fence mismatch: {reason}. The channel no longer has the history the indexer \
+         database was built on; see docs/PITR.md"
+    )]
+    ChannelFence { reason: String },
+
+    #[error("channel fence not checked yet: {reason}")]
+    ChannelFenceUnchecked { reason: String },
+
+    /// The channel mint history could not be read completely, so a row it may already
+    /// have paid cannot be told apart from a new one.
+    #[error("consumed set unavailable: {reason}")]
+    ConsumedSet { reason: String },
+
     #[error("Invalid config: {0}")]
     InvalidConfig(String),
 
@@ -57,6 +73,9 @@ pub enum OperatorError {
 
     /// A supervised worker exited on its own. Returned after the rest drain, so the process
     /// exits nonzero and its supervisor treats the stop as a failure.
-    #[error("Critical operator task {task} exited; the operator stopped")]
+    #[error("Critical operator task {task} exited unexpectedly")]
     CriticalTaskExited { task: &'static str },
+
+    #[error("The {program_type:?} sender lock was lost while running; stopped after the drain")]
+    SenderLockLost { program_type: crate::ProgramType },
 }

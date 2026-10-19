@@ -74,12 +74,14 @@ async fn seed_withdrawal(
         INSERT INTO transactions
             (signature, slot, initiator, recipient, mint, amount,
              transaction_type, status, withdrawal_nonce,
-             trace_id, processed_at, created_at, updated_at)
+             trace_id, processed_at, created_at, updated_at,
+             landed_remint_signature)
         VALUES
             ($1, 100, $2, $3, $4, 1000,
              'withdrawal'::transaction_type,
              $5::transaction_status, $6,
-             $7, $8, NOW(), NOW())
+             $7, $8, NOW(), NOW(),
+             $9)
         RETURNING id
         "#,
     )
@@ -91,6 +93,8 @@ async fn seed_withdrawal(
     .bind(nonce)
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(Utc::now())
+    // A reminted row must carry its landed remint (table CHECK).
+    .bind((status == "failed_reminted").then(|| Signature::new_unique().to_string()))
     .fetch_one(pool)
     .await?
     .get::<i64, _>(0);
@@ -145,12 +149,14 @@ async fn seed_failed_reminted(
         INSERT INTO transactions
             (signature, slot, initiator, recipient, mint, amount,
              transaction_type, status, withdrawal_nonce,
-             remint_signatures, trace_id, processed_at, created_at, updated_at)
+             remint_signatures, trace_id, processed_at, created_at, updated_at,
+             landed_remint_signature)
         VALUES
             ($1, 100, $2, $3, $4, 1000,
              'withdrawal'::transaction_type,
              'failed_reminted'::transaction_status, $5,
-             $6, $7, $8, NOW(), NOW())
+             $6, $7, $8, NOW(), NOW(),
+             $9)
         RETURNING id
         "#,
     )
@@ -162,6 +168,7 @@ async fn seed_failed_reminted(
     .bind(&sigs)
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(Utc::now())
+    .bind(Signature::new_unique().to_string())
     .fetch_one(pool)
     .await?
     .get::<i64, _>(0);
@@ -250,10 +257,6 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
-            "transfer-hook validation account missing for mint:",
-            "indexer/src/operator/processor.rs",
-        ),
-        (
             "transfer-hook validation account invalid for mint",
             "indexer/src/operator/processor.rs",
         ),
@@ -274,6 +277,28 @@ fn drill_1_error_message_contracts_present_in_source() {
         (
             "no signatures to verify, remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "remint attempt cap reached",
+            "indexer/src/operator/sender/remint.rs",
+        ),
+        // Pre-broadcast requeue cap (Path I). The marker text lives in
+        // recovery.rs; both escalation sites must keep using it.
+        (
+            "requeue cap reached before this attempt broadcast",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, build/sign failed",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, chain state unreadable",
+            "indexer/src/operator/sender/transaction.rs",
+        ),
+        (
+            "{PREBROADCAST_CAP_REACHED}, never handed to the sender",
+            "indexer/src/operator/processor.rs",
         ),
         // Withdrawal, recovery worker. The signatureless-row verdicts; the
         // proof-gated requeue never reaches manual review, so only the two
@@ -354,6 +379,11 @@ fn drill_1_error_message_contracts_present_in_source() {
         let content = join_continuations(
             &std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}")),
         );
+        // Production code only: a test asserting on the text must not satisfy the contract.
+        let content = content
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or_default();
         if content.contains(substr) {
             eprintln!("OK   {path}: {substr:?}");
         } else {
@@ -871,10 +901,13 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
         .bind(&sig)
         .execute(&pool)
         .await?;
-    sqlx::query("UPDATE transactions SET status='failed_reminted' WHERE id=$1")
-        .bind(to_failed_reminted)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "UPDATE transactions SET status='failed_reminted', landed_remint_signature=$2 WHERE id=$1",
+    )
+    .bind(to_failed_reminted)
+    .bind(Signature::new_unique().to_string())
+    .execute(&pool)
+    .await?;
     sqlx::query("UPDATE transactions SET status='manual_review' WHERE id=$1")
         .bind(to_manual_review)
         .execute(&pool)
@@ -2054,4 +2087,34 @@ async fn drill_18_halt_sweep_respects_nonce_floor() -> Result<(), Box<dyn std::e
 
     eprintln!("Nonce floor verified: sub-poison rows survive, poison and above are quarantined.");
     Ok(())
+}
+
+// ── Drill 19: a freshness miss at the processor requeue cap dispatches to J ──
+//
+// The processor's cap message carries the freshness error and also matches the
+// Path I row, so the J row must say it outranks I or triage loses J's steps.
+
+#[test]
+#[ignore]
+fn drill_19_freshness_cap_message_dispatches_to_path_j() {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Triage - freshness row outranks Path I",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let runbook = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root")
+        .join("docs/runbooks/withdrawal_manual_review.md");
+    let text = std::fs::read_to_string(&runbook).expect("read withdrawal_manual_review.md");
+
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("| `(freshness)`"))
+        .expect("the triage table must have a freshness row");
+    assert!(
+        row.contains("use this, not I"),
+        "the freshness row must outrank Path I: {row}"
+    );
 }

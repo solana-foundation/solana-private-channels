@@ -96,6 +96,8 @@ async fn run_sender_exits_on_processor_channel_close() {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             /* source_rpc_client */ None,
             SenderLockGuard::Noop,
+            private_channel_indexer::operator::solvency_fence::SolvencyFence::open_from_start(),
+            /* consumed */ None,
         ),
     )
     .await

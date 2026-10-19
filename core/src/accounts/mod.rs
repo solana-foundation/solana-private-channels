@@ -1,5 +1,6 @@
 pub mod address_index_repair;
 pub mod address_index_watermark;
+pub mod blockhash_window;
 pub mod bob;
 pub mod constants;
 pub mod counter;

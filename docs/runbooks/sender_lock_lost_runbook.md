@@ -54,11 +54,9 @@ cannot tell the two apart.
 
 - Grafana alert `sender-lock-lost`, severity critical.
 - The operator process restarts, once, shortly after the alert.
-- **`OPERATOR_TASK_EXIT` will normally be labelled `fetcher`, not `sender`.**
-  The supervision `select!` is `biased` and the sender is the one task that must
-  finish draining before it can exit, so another arm resolves first. Do not
-  treat a `fetcher` label as evidence that the fetcher was the problem, and do
-  not use `OPERATOR_TASK_EXIT{task="sender"}` as a lock-loss signal.
+- The operator exits with `The <role> sender lock was lost while running`.
+  `OPERATOR_TASK_EXIT` does not fire on this shutdown, so a task-exit sample
+  with no sender-lock-lost sample means a real task failure, not this case.
 
 ## Triage
 

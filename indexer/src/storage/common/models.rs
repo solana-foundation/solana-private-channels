@@ -21,6 +21,21 @@ pub struct IndexerState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Newest channel block at or below the withdraw checkpoint. A restored channel
+/// re-produces the same slots with different hashes, so a mismatch proves a rewind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelFence {
+    pub slot: u64,
+    pub blockhash: String,
+}
+
+/// The fence with the checkpoint flushed beside it, read in one statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceRecord {
+    pub fence: ChannelFence,
+    pub checkpoint: u64,
+}
+
 /// Status of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "transaction_status", rename_all = "lowercase")]
@@ -100,8 +115,7 @@ pub struct DbTransaction {
     /// identity so a CPI deposit/withdraw never collides with its parent's row.
     pub inner_index: Option<i32>,
     /// Confirmed remint signature, written in the same UPDATE that flips status
-    /// to FailedReminted. A crash before the async writer runs can no longer
-    /// leave a landed remint recorded only as PendingRemint (which would replay).
+    /// to FailedReminted, so a reminted row always carries the remint it landed.
     pub landed_remint_signature: Option<String>,
     /// Set when the program itself refused this row's release, which is direct
     /// proof no payout occurred and the only such proof that outlives a bitmap
@@ -172,6 +186,9 @@ pub struct ResyncBlockers {
     /// Lowest slot among the resync's own rows, or deleted by its unfinished wipe. The wipe
     /// deletes all of them, but the rebuild replays only from genesis.
     pub earliest_slot: Option<i64>,
+    /// Highest slot among the resync's own rows, or deleted by its unfinished wipe. The wipe
+    /// deletes all of them, but the rebuild replays only up to its top slot.
+    pub latest_slot: Option<i64>,
 }
 
 /// A row the channel has already serviced, identified by its source event coordinates.
@@ -276,6 +293,20 @@ pub struct DbObservedRelease {
     /// Raw tokens the release instruction moved. `None` on rows written before the
     /// column existed, where the withdrawal row's own amount is the only figure there is.
     pub amount: Option<TokenAmount>,
+}
+
+/// A channel mint a consumed-set walk authenticated, kept so a later boot whose walk stops
+/// higher still knows it. Rolls back with the DB, like the rows it explains.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DbConsumedMint {
+    pub source_event_id: String,
+    pub signature: String,
+    /// `deposit` or `remint`.
+    pub kind: String,
+    pub mint: String,
+    pub recipient_ata: String,
+    pub token_program: String,
+    pub amount: TokenAmount,
 }
 
 /// Resolved mint status at a particular slot, derived from `mint_status_history`.

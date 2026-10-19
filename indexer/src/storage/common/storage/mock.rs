@@ -1,8 +1,8 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
-    StoredSig, TransactionStatus, TransactionType,
+    ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease, DbTransaction,
+    FenceRecord, HaltInfo, MintDbBalance, MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal,
+    ResyncBlockers, ServicedRow, StoredSig, TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
@@ -28,6 +28,10 @@ type EnvelopeBounds = (Option<u64>, Option<u64>);
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
+    /// Mirrors the fence columns on the `indexer_state` rows, keyed by program.
+    pub channel_fences: std::sync::Arc<Mutex<HashMap<String, ChannelFence>>>,
+    /// Checkpoint reads answered in order before the stored value, for a ledger moving mid-test.
+    pub checkpoint_script: std::sync::Arc<Mutex<std::collections::VecDeque<u64>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
@@ -61,6 +65,8 @@ pub struct MockStorage {
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `consumed_channel_mints` table, keyed by source event.
+    pub consumed_mints: Arc<Mutex<HashMap<String, DbConsumedMint>>>,
     /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
     pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
     /// Nonce floors the rotation gate has asked for, oldest first. Tests read
@@ -88,6 +94,8 @@ pub struct MockStorage {
     pub unfinished_resync: Arc<Mutex<Option<String>>>,
     /// Mirrors `resync_state.earliest_slot`: the lowest slot an unfinished wipe deleted.
     pub resync_earliest_slot: Arc<Mutex<Option<i64>>>,
+    /// Mirrors `resync_state.latest_slot`: the highest slot an unfinished wipe deleted.
+    pub resync_latest_slot: Arc<Mutex<Option<i64>>>,
 }
 
 impl MockStorage {
@@ -131,11 +139,27 @@ impl MockStorage {
         Ok(())
     }
 
+    /// Answer the next committed-checkpoint reads with `slots`, in order, for any program.
+    pub fn script_checkpoints(&self, slots: Vec<u64>) {
+        self.checkpoint_script.lock().unwrap().extend(slots);
+    }
+
     pub fn set_checkpoint(&self, program_type: &str, slot: u64) {
         self.committed_checkpoints
             .lock()
             .unwrap()
             .insert(program_type.to_string(), slot);
+    }
+
+    /// Seed the channel fence the withdraw checkpoint row carries.
+    pub fn set_channel_fence(&self, slot: u64, blockhash: &str) {
+        self.channel_fences.lock().unwrap().insert(
+            "withdraw".to_string(),
+            ChannelFence {
+                slot,
+                blockhash: blockhash.to_string(),
+            },
+        );
     }
 
     pub fn set_should_fail(&self, program_type: &str, should_fail: bool) {
@@ -189,6 +213,8 @@ impl MockStorage {
         self.check_should_fail("drop_tables")?;
         self.pending_transactions.lock().unwrap().clear();
         self.mints.lock().unwrap().clear();
+        self.mint_status_history.lock().unwrap().clear();
+        self.consumed_mints.lock().unwrap().clear();
         self.committed_checkpoints.lock().unwrap().clear();
         Ok(())
     }
@@ -218,12 +244,15 @@ impl MockStorage {
         *marker = Some(key.clone());
         let own = program.owned_transaction_type();
         let mut rows = self.pending_transactions.lock().unwrap();
-        let deleted = rows
+        let deleted: Vec<i64> = rows
             .iter()
             .filter(|t| t.transaction_type == own)
-            .map(|t| t.slot);
-        let mut bound = self.resync_earliest_slot.lock().unwrap();
-        *bound = bound.iter().copied().chain(deleted).min();
+            .map(|t| t.slot)
+            .collect();
+        let mut floor = self.resync_earliest_slot.lock().unwrap();
+        *floor = floor.iter().chain(&deleted).copied().min();
+        let mut ceiling = self.resync_latest_slot.lock().unwrap();
+        *ceiling = ceiling.iter().chain(&deleted).copied().max();
         rows.retain(|t| t.transaction_type != own);
         self.committed_checkpoints.lock().unwrap().remove(&key);
         Ok(())
@@ -242,6 +271,7 @@ impl MockStorage {
         self.check_should_fail("clear_unfinished_resync")?;
         *self.unfinished_resync.lock().unwrap() = None;
         *self.resync_earliest_slot.lock().unwrap() = None;
+        *self.resync_latest_slot.lock().unwrap() = None;
         let reason = crate::storage::common::storage::resync_state::resync_halt_reason(program);
         let mut halt = self.reconciliation_halt.lock().unwrap();
         if halt.as_ref().is_some_and(|h| h.reason == reason) {
@@ -308,6 +338,7 @@ impl MockStorage {
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_and_lock_pending_transactions")?;
         // Same deposit gate as Postgres: only slots the escrow checkpoint covers.
         let escrow_checkpoint = self
             .committed_checkpoints
@@ -348,6 +379,9 @@ impl MockStorage {
         program_type: &str,
     ) -> Result<Option<u64>, StorageError> {
         self.check_should_fail("get_committed_checkpoint")?;
+        if let Some(slot) = self.checkpoint_script.lock().unwrap().pop_front() {
+            return Ok(Some(slot));
+        }
         Ok(self
             .committed_checkpoints
             .lock()
@@ -361,7 +395,26 @@ impl MockStorage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
+        self.update_committed_checkpoint_with_fence(program_type, slot, None)
+            .await
+    }
+
+    pub async fn update_committed_checkpoint_with_fence(
+        &self,
+        program_type: &str,
+        slot: u64,
+        fence: Option<&ChannelFence>,
+    ) -> Result<(), StorageError> {
         self.check_should_fail(program_type)?;
+        if let Some(fence) = fence {
+            let mut fences = self.channel_fences.lock().unwrap();
+            let newer = fences
+                .get(program_type)
+                .is_none_or(|stored| fence.slot > stored.slot);
+            if newer {
+                fences.insert(program_type.to_string(), fence.clone());
+            }
+        }
         // Mirrors postgres GREATEST(): monotonic, lower writes are ignored.
         // Use `set_checkpoint` to seed arbitrary values in tests.
         let mut map = self.committed_checkpoints.lock().unwrap();
@@ -391,13 +444,15 @@ impl MockStorage {
                 .unwrap()
                 .insert(transaction_id, sigs);
         }
-        // Mirror the Postgres status filter (Processing or PendingRemint only).
+        // Mirror the Postgres status filter (Processing or PendingRemint only),
+        // and its refusal to set FailedReminted.
         let mut pending = self.pending_transactions.lock().unwrap();
         let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
             if matches!(
                 txn.status,
                 TransactionStatus::Processing | TransactionStatus::PendingRemint
-            ) {
+            ) && status != TransactionStatus::FailedReminted
+            {
                 txn.status = status;
                 if counterpart_signature.is_some() {
                     txn.counterpart_signature = counterpart_signature.clone();
@@ -587,6 +642,43 @@ impl MockStorage {
             .collect())
     }
 
+    /// Mirrors the Postgres query: history mints, deposit mints and the mints of withdrawals with
+    /// an observed release, across every store, minus `mints`.
+    pub async fn get_unlisted_mints(&self) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_unlisted_mints")?;
+        let mut found: std::collections::BTreeSet<String> = self
+            .mint_status_history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.mint_address.clone())
+            .collect();
+        {
+            let pending = self.pending_transactions.lock().unwrap();
+            let singles = self.inserted_single_transactions.lock().unwrap();
+            let batches = self.inserted_transactions.lock().unwrap();
+            let released = self.observed_releases.lock().unwrap();
+            found.extend(
+                pending
+                    .iter()
+                    .chain(singles.iter())
+                    .chain(batches.iter().flatten())
+                    .filter(|t| match t.transaction_type {
+                        TransactionType::Deposit => true,
+                        TransactionType::Withdrawal => t
+                            .withdrawal_nonce
+                            .is_some_and(|nonce| released.contains_key(&nonce)),
+                    })
+                    .map(|t| t.mint.clone()),
+            );
+        }
+        let listed = self.mints.lock().unwrap();
+        Ok(found
+            .into_iter()
+            .filter(|mint| !listed.contains_key(mint))
+            .collect())
+    }
+
     pub async fn get_in_flight_amounts_by_mint(
         &self,
         deposits_after: Option<u64>,
@@ -594,8 +686,8 @@ impl MockStorage {
     ) -> Result<Vec<MintInFlightAmount>, StorageError> {
         self.check_should_fail("get_in_flight_amounts_by_mint")?;
         *self.last_envelope_bounds.lock().unwrap() = Some((deposits_after, withdrawals_after));
-        // Mirror the Postgres query: per mint, unsettled rows into the envelope and settled rows
-        // above their own type's bound into the adjustment, across every store, deduped by id.
+        // Mirror the Postgres query: per mint, unsettled deposits into the envelope and every other
+        // row above its own type's bound into the adjustment, across every store, deduped by id.
         let mut seen_ids = std::collections::HashSet::new();
         let mut sums: HashMap<String, (BigDecimal, BigDecimal)> = HashMap::new();
         {
@@ -610,13 +702,14 @@ impl MockStorage {
                 if !seen_ids.insert(t.id) {
                     continue;
                 }
-                let in_envelope = matches!(
-                    t.status,
-                    TransactionStatus::Pending
-                        | TransactionStatus::Processing
-                        | TransactionStatus::Parked
-                        | TransactionStatus::PendingRemint
-                );
+                let in_envelope = t.transaction_type == TransactionType::Deposit
+                    && matches!(
+                        t.status,
+                        TransactionStatus::Pending
+                            | TransactionStatus::Processing
+                            | TransactionStatus::Parked
+                            | TransactionStatus::PendingRemint
+                    );
                 let bound = match t.transaction_type {
                     TransactionType::Deposit => deposits_after,
                     TransactionType::Withdrawal => withdrawals_after,
@@ -647,6 +740,15 @@ impl MockStorage {
     }
 
     pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("set_reconciliation_halt")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("set_reconciliation_halt")?;
         *self.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
             reason: reason.to_string(),
@@ -682,11 +784,13 @@ impl MockStorage {
             TransactionType::Deposit => crate::config::ProgramType::Escrow,
             TransactionType::Withdrawal => crate::config::ProgramType::Withdraw,
         };
-        let marker_bound = match self.unfinished_resync.lock().unwrap().as_deref() {
-            Some(key) if key == crate::indexer::checkpoint::program_key(own_program) => {
-                *self.resync_earliest_slot.lock().unwrap()
-            }
-            _ => None,
+        let (marker_floor, marker_ceiling) = match self.unfinished_resync.lock().unwrap().as_deref()
+        {
+            Some(key) if key == crate::indexer::checkpoint::program_key(own_program) => (
+                *self.resync_earliest_slot.lock().unwrap(),
+                *self.resync_latest_slot.lock().unwrap(),
+            ),
+            _ => (None, None),
         };
         let journaled = |id: i64| {
             let has = |map: &Arc<Mutex<ReleaseSignatureMap>>| {
@@ -722,8 +826,14 @@ impl MockStorage {
                 .iter()
                 .filter(|t| t.transaction_type == own)
                 .map(|t| t.slot)
-                .chain(marker_bound)
+                .chain(marker_floor)
                 .min(),
+            latest_slot: rows
+                .iter()
+                .filter(|t| t.transaction_type == own)
+                .map(|t| t.slot)
+                .chain(marker_ceiling)
+                .max(),
         })
     }
 
@@ -846,6 +956,112 @@ impl MockStorage {
             .filter(|n| n >= &min_nonce && n < &max_nonce)
             .collect();
         Ok(nonces)
+    }
+
+    pub async fn get_channel_fence(&self) -> Result<Option<FenceRecord>, StorageError> {
+        self.check_should_fail("get_channel_fence")?;
+        let checkpoint = self
+            .committed_checkpoints
+            .lock()
+            .unwrap()
+            .get("withdraw")
+            .copied();
+        Ok(self
+            .channel_fences
+            .lock()
+            .unwrap()
+            .get("withdraw")
+            .map(|fence| FenceRecord {
+                checkpoint: checkpoint.unwrap_or(fence.slot).max(fence.slot),
+                fence: fence.clone(),
+            }))
+    }
+
+    pub async fn get_newest_known_mint_signatures(
+        &self,
+        mint: &str,
+        kind: TransactionType,
+    ) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_newest_known_mint_signatures")?;
+        let rows = self.pending_transactions.lock().unwrap();
+        let status = match kind {
+            TransactionType::Deposit => TransactionStatus::Completed,
+            TransactionType::Withdrawal => TransactionStatus::FailedReminted,
+        };
+        Ok(rows
+            .iter()
+            .filter(|t| t.mint == mint && t.transaction_type == kind && t.status == status)
+            .filter_map(|t| match kind {
+                TransactionType::Deposit => t.counterpart_signature.clone(),
+                TransactionType::Withdrawal => t.landed_remint_signature.clone(),
+            })
+            .next_back()
+            .into_iter()
+            .collect())
+    }
+
+    pub async fn insert_consumed_mints(
+        &self,
+        mints: &[DbConsumedMint],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_consumed_mints")?;
+        let mut store = self.consumed_mints.lock().unwrap();
+        for mint in mints {
+            store
+                .entry(mint.source_event_id.clone())
+                .or_insert_with(|| mint.clone());
+        }
+        Ok(())
+    }
+
+    pub async fn get_consumed_mints(&self) -> Result<Vec<DbConsumedMint>, StorageError> {
+        self.check_should_fail("get_consumed_mints")?;
+        Ok(self
+            .consumed_mints
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    pub async fn get_max_withdrawal_nonce(&self) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("get_max_withdrawal_nonce")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal)
+            .filter_map(|t| t.withdrawal_nonce)
+            .max()
+            .map(|nonce| nonce as u64))
+    }
+
+    pub async fn try_mark_reminted(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        remint_signature: String,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_mark_reminted")?;
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let Some(txn) = rows.iter_mut().find(|t| {
+            t.id == transaction_id
+                && matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::PendingRemint
+                )
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        let now = Utc::now();
+        txn.status = TransactionStatus::FailedReminted;
+        txn.landed_remint_signature = Some(remint_signature);
+        txn.processed_at = Some(now);
+        txn.updated_at = now;
+        Ok(true)
     }
 
     pub async fn get_withdrawal_by_nonce(
@@ -1175,6 +1391,34 @@ impl MockStorage {
             .get(&transaction_id)
             .is_some_and(|sigs| !sigs.is_empty());
         if !halted || journaled {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        txn.status = TransactionStatus::Pending;
+        txn.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    pub async fn requeue_unclaimed(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("requeue_unclaimed")?;
+        let journaled = self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .is_some_and(|sigs| !sigs.is_empty());
+        if journaled {
             return Ok(false);
         }
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -1531,6 +1775,15 @@ impl MockStorage {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("claim_and_persist_signature")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("claim_and_persist_signature")?;
         // Mirrors the SQL halt predicate; read before the row lock so the guards never nest.
         if self.reconciliation_halt.lock().unwrap().is_some() {
@@ -1543,6 +1796,7 @@ impl MockStorage {
                 t.id == transaction_id
                     && t.status == TransactionStatus::Processing
                     && t.updated_at == expected_updated_at
+                    && t.landed_remint_signature.is_none()
             });
             // CAS miss: Postgres updates no row and never reaches the insert.
             if !owned {
@@ -1673,7 +1927,7 @@ impl MockStorage {
 
     /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
     /// attempts, then take the one live slot the partial unique index allows.
-    /// A moved parent writes nothing at all, supersedes included.
+    /// A moved parent, or a release recorded for the row's nonce, writes nothing at all.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -1683,6 +1937,13 @@ impl MockStorage {
         superseded_signatures: &[String],
     ) -> Result<RemintClaim, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
+        let nonce = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .and_then(|t| t.withdrawal_nonce);
         if self
             .moved_remint_parents
             .lock()
@@ -1690,6 +1951,9 @@ impl MockStorage {
             .contains(&transaction_id)
         {
             return Ok(RemintClaim::RowMoved);
+        }
+        if nonce.is_some_and(|nonce| self.observed_releases.lock().unwrap().contains_key(&nonce)) {
+            return Ok(RemintClaim::ReleaseObserved);
         }
         let mut map = self.remint_signatures.lock().unwrap();
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();
@@ -1759,20 +2023,27 @@ impl MockStorage {
 
     pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
         self.check_should_fail("gc_stale_remint_signatures")?;
-        // Mirror the Postgres predicate: keep sigs whose parent is still
-        // `PendingRemint`; an unknown transaction id counts as non-pending.
+        // Mirror the Postgres predicate: reclaim only sigs whose parent is
+        // terminal; an unknown transaction id is kept, matching the subquery.
         // The SQL reads one table, so the live mirror wins over the rehydration
         // list for any row that appears in both.
         let live = self.pending_transactions.lock().unwrap();
         let rehydrate = self.pending_remint_transactions.lock().unwrap();
-        let pending_remint_ids: std::collections::HashSet<i64> = live
+        let terminal_ids: std::collections::HashSet<i64> = live
             .iter()
             .chain(
                 rehydrate
                     .iter()
                     .filter(|t| !live.iter().any(|l| l.id == t.id)),
             )
-            .filter(|t| t.status == TransactionStatus::PendingRemint)
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TransactionStatus::Completed
+                        | TransactionStatus::Failed
+                        | TransactionStatus::FailedReminted
+                )
+            })
             .map(|t| t.id)
             .collect();
         drop(live);
@@ -1780,11 +2051,11 @@ impl MockStorage {
         let mut map = self.remint_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {
-            if pending_remint_ids.contains(txn_id) {
-                true
-            } else {
+            if terminal_ids.contains(txn_id) {
                 removed += sigs.len() as u64;
                 false
+            } else {
+                true
             }
         });
         Ok(removed)

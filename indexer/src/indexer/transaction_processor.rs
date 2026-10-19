@@ -2,7 +2,7 @@ use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::ProgramType,
-    error::{IndexerError, ReconciliationError, StorageError},
+    error::{IndexerError, StorageError},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointUpdate},
         datasource::common::{
@@ -10,7 +10,9 @@ use crate::{
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
         },
     },
-    operator::{instruction_util::SourceEventId, ConsumedMint, ConsumedMintKind, ConsumedSet},
+    operator::{
+        instruction_util::SourceEventId, sender::check_consumed_mint, ConsumedMintKind, ConsumedSet,
+    },
     storage::{
         common::{
             amount::TokenAmount,
@@ -24,9 +26,7 @@ use crate::{
 };
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
-use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::{BTreeSet, HashMap};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -231,9 +231,14 @@ impl TransactionProcessor {
                         .or_default()
                         .push(instruction_meta);
                 }
-                ProcessorMessage::SlotComplete { slot, program_type } => {
+                ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type,
+                    blockhash,
+                } => {
                     let start = std::time::Instant::now();
-                    self.finalize_and_checkpoint(slot, program_type).await?;
+                    self.finalize_and_checkpoint(slot, program_type, blockhash)
+                        .await?;
                     metrics::INDEXER_SLOT_PROCESSING_DURATION
                         .with_label_values(&[program_type.as_label()])
                         .observe(start.elapsed().as_secs_f64());
@@ -286,6 +291,7 @@ impl TransactionProcessor {
         &mut self,
         slot: u64,
         program_type: ProgramType,
+        blockhash: Option<String>,
     ) -> Result<(), IndexerError> {
         let mut mints = Vec::new();
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
@@ -399,7 +405,11 @@ impl TransactionProcessor {
         // pipeline instead of retrying a closed channel.
         match send_guaranteed(
             &self.checkpoint_tx,
-            CheckpointMsg::Slot(CheckpointUpdate { program_type, slot }),
+            CheckpointMsg::Slot(CheckpointUpdate {
+                program_type,
+                slot,
+                blockhash,
+            }),
             "checkpoint",
         )
         .await
@@ -578,74 +588,6 @@ struct MintStatusChange {
     withdrawals_blocked: bool,
 }
 
-/// Check that `consumed_mint` paid this row: a marker of the row's kind, the row's mint and
-/// amount, into the ATA of the deposit recipient or, for a remint, the withdrawal
-/// initiator. Unparseable row keys never match. Shared by the pre-drop validation pass
-/// and the rebuild.
-fn check_consumed_mint(
-    consumed_mint: &ConsumedMint,
-    transaction: &DbTransaction,
-) -> Result<(), ReconciliationError> {
-    let reason = match (consumed_mint.kind, transaction.transaction_type) {
-        (ConsumedMintKind::Deposit, TransactionType::Deposit) => {
-            field_differences(consumed_mint, transaction, &transaction.recipient)
-        }
-        (ConsumedMintKind::Remint, TransactionType::Withdrawal) => {
-            field_differences(consumed_mint, transaction, &transaction.initiator)
-        }
-        (kind, transaction_type) => Some(format!(
-            "kind: channel {kind:?} marker, row {transaction_type:?}"
-        )),
-    };
-
-    match reason {
-        None => Ok(()),
-        Some(reason) => Err(ReconciliationError::ConsumedMintMismatch {
-            source_event_id: SourceEventId::from_row(transaction).to_string(),
-            source_signature: transaction.signature.clone(),
-            channel_signature: consumed_mint.signature.to_string(),
-            reason,
-        }),
-    }
-}
-
-/// Each field where `consumed_mint` differs from the row paid into `owner`'s ATA, as
-/// `field: channel X, row Y`, or `None` when they all agree.
-fn field_differences(
-    consumed_mint: &ConsumedMint,
-    transaction: &DbTransaction,
-    owner: &str,
-) -> Option<String> {
-    let (Ok(owner), Ok(mint)) = (Pubkey::from_str(owner), Pubkey::from_str(&transaction.mint))
-    else {
-        return Some(format!(
-            "row owner {owner} or mint {} is not a pubkey",
-            transaction.mint
-        ));
-    };
-    let expected_ata =
-        get_associated_token_address_with_program_id(&owner, &mint, &consumed_mint.token_program);
-
-    let mut differences = Vec::new();
-    if consumed_mint.mint != mint {
-        differences.push(format!("mint: channel {}, row {mint}", consumed_mint.mint));
-    }
-    if consumed_mint.recipient_ata != expected_ata {
-        differences.push(format!(
-            "recipient ATA: channel {}, row {expected_ata}",
-            consumed_mint.recipient_ata
-        ));
-    }
-    if consumed_mint.amount != transaction.amount.value() {
-        differences.push(format!(
-            "amount: channel {}, row {}",
-            consumed_mint.amount,
-            transaction.amount.value()
-        ));
-    }
-    (!differences.is_empty()).then(|| differences.join("; "))
-}
-
 /// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction,
 /// DbObservedRelease)` tuple, each element independently optional:
 /// - `AllowMint` → mints-row upsert + `"allowed"` transition.
@@ -815,15 +757,18 @@ fn convert_to_db_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ReconciliationError;
     use crate::indexer::checkpoint::CheckpointWriter;
     use crate::indexer::datasource::common::parser::{
         AllowMintAccounts, AllowMintData, AllowMintEvent, BlockMintAccounts, BlockMintData,
         DepositAccounts, DepositData, DepositEvent, ReleaseFundsAccounts, ReleaseFundsData,
         RotateBitmapAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
+    use crate::operator::ConsumedMint;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
     use solana_sdk::pubkey::Pubkey;
+    use spl_associated_token_account::get_associated_token_address_with_program_id;
 
     fn make_pubkey(i: u8) -> Pubkey {
         let mut bytes = [0u8; 32];
@@ -1388,7 +1333,7 @@ mod tests {
     async fn finalize_empty_slot_sends_checkpoint() {
         let (mut processor, mut checkpoint_rx) = make_processor_and_rx(deposit_instance());
         processor
-            .finalize_and_checkpoint(42, ProgramType::Escrow)
+            .finalize_and_checkpoint(42, ProgramType::Escrow, None)
             .await
             .unwrap();
         let cp = recv_slot(&mut checkpoint_rx).await;
@@ -1402,7 +1347,7 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         processor.buffer(make_deposit_instruction(100, Some("s1".to_string()), None));
         processor
-            .finalize_and_checkpoint(100, ProgramType::Escrow)
+            .finalize_and_checkpoint(100, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1422,7 +1367,7 @@ mod tests {
             make_processor_with_mock(allow_mint_instance());
         processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string()), 6));
         processor
-            .finalize_and_checkpoint(200, ProgramType::Escrow)
+            .finalize_and_checkpoint(200, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1450,7 +1395,7 @@ mod tests {
             live_decimals,
         ));
         processor
-            .finalize_and_checkpoint(live_slot, ProgramType::Escrow)
+            .finalize_and_checkpoint(live_slot, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1460,7 +1405,7 @@ mod tests {
             6,
         ));
         processor
-            .finalize_and_checkpoint(repaired_slot, ProgramType::Escrow)
+            .finalize_and_checkpoint(repaired_slot, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1480,7 +1425,7 @@ mod tests {
             6,
         ));
         processor
-            .finalize_and_checkpoint(200, ProgramType::Escrow)
+            .finalize_and_checkpoint(200, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1518,7 +1463,7 @@ mod tests {
             false,
         ));
         processor
-            .finalize_and_checkpoint(250, ProgramType::Escrow)
+            .finalize_and_checkpoint(250, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1557,7 +1502,7 @@ mod tests {
             ..make_block_mint_instruction(slot, Some("sig-block".to_string()), true, false)
         });
         processor
-            .finalize_and_checkpoint(slot, ProgramType::Escrow)
+            .finalize_and_checkpoint(slot, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -1627,7 +1572,7 @@ mod tests {
                 case.amount,
             ));
             processor
-                .finalize_and_checkpoint(case.slot, ProgramType::Escrow)
+                .finalize_and_checkpoint(case.slot, ProgramType::Escrow, None)
                 .await
                 .expect("the slot must finalize");
 
@@ -1672,7 +1617,7 @@ mod tests {
                 750,
             ));
             processor
-                .finalize_and_checkpoint(310, ProgramType::Escrow)
+                .finalize_and_checkpoint(310, ProgramType::Escrow, None)
                 .await
                 .expect("the slot must finalize");
             recv_slot(&mut checkpoint_rx).await;
@@ -1699,7 +1644,7 @@ mod tests {
             make_pubkey(99),
         ));
         processor
-            .finalize_and_checkpoint(320, ProgramType::Escrow)
+            .finalize_and_checkpoint(320, ProgramType::Escrow, None)
             .await
             .expect("the slot must finalize");
 
@@ -1724,7 +1669,7 @@ mod tests {
             750,
         ));
         let result = processor
-            .finalize_and_checkpoint(330, ProgramType::Escrow)
+            .finalize_and_checkpoint(330, ProgramType::Escrow, None)
             .await;
 
         assert!(
@@ -1748,7 +1693,7 @@ mod tests {
         ));
 
         processor
-            .finalize_and_checkpoint(401, ProgramType::Escrow)
+            .finalize_and_checkpoint(401, ProgramType::Escrow, None)
             .await
             .expect("transient failure should self-heal");
 
@@ -1774,7 +1719,7 @@ mod tests {
             6,
         ));
         let result = processor
-            .finalize_and_checkpoint(201, ProgramType::Escrow)
+            .finalize_and_checkpoint(201, ProgramType::Escrow, None)
             .await;
 
         assert!(result.is_err(), "permanent write failure is fatal");
@@ -1804,7 +1749,7 @@ mod tests {
             990,
         ));
         let result = processor
-            .finalize_and_checkpoint(202, ProgramType::Escrow)
+            .finalize_and_checkpoint(202, ProgramType::Escrow, None)
             .await;
 
         assert!(result.is_err(), "permanent write failure is fatal");
@@ -1824,7 +1769,7 @@ mod tests {
         mock.set_should_fail("upsert_mints_batch", true);
         processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string()), 6));
         let result = processor
-            .finalize_and_checkpoint(300, ProgramType::Escrow)
+            .finalize_and_checkpoint(300, ProgramType::Escrow, None)
             .await;
 
         assert!(result.is_err(), "permanent write failure is fatal");
@@ -1837,7 +1782,7 @@ mod tests {
         mock.set_should_fail("insert_db_transactions_batch", true);
         processor.buffer(make_deposit_instruction(400, Some("s4".to_string()), None));
         let result = processor
-            .finalize_and_checkpoint(400, ProgramType::Escrow)
+            .finalize_and_checkpoint(400, ProgramType::Escrow, None)
             .await;
 
         assert!(result.is_err(), "permanent write failure is fatal");
@@ -1854,6 +1799,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: 500,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -1895,6 +1841,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: 500,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -1949,12 +1896,14 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: SLOT_A,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
         tx.send(ProcessorMessage::SlotComplete {
             slot: SLOT_B,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -1999,6 +1948,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: LIVE_TIP,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2016,6 +1966,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: SLOT_S,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2124,7 +2075,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2158,7 +2109,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2190,7 +2141,7 @@ mod tests {
             Some(SERVICED_WITHDRAW_SIG.to_string()),
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2224,7 +2175,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2254,7 +2205,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2287,7 +2238,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2317,7 +2268,7 @@ mod tests {
             Some(SERVICED_WITHDRAW_SIG.to_string()),
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2349,7 +2300,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2386,7 +2337,7 @@ mod tests {
         ));
 
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2426,7 +2377,7 @@ mod tests {
         ));
 
         let result = processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await;
 
         assert!(
@@ -2488,7 +2439,7 @@ mod tests {
             None,
         ));
         processor
-            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow, None)
             .await
             .unwrap();
 
@@ -2526,6 +2477,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: N,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2556,6 +2508,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: N,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2569,6 +2522,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: N_NEXT,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2612,6 +2566,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2686,6 +2641,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: LIVE_TIP,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2695,6 +2651,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2752,6 +2709,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2762,6 +2720,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2811,6 +2770,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: T_GF,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2828,12 +2788,14 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: LIVE_TIP,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
         tx.send(ProcessorMessage::SlotComplete {
             slot: T_SUB,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2865,6 +2827,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2873,6 +2836,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: LIVE_TIP + 1,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -2913,6 +2877,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -2987,6 +2952,7 @@ mod tests {
             tx.send(ProcessorMessage::SlotComplete {
                 slot,
                 program_type: ProgramType::Escrow,
+                blockhash: None,
             })
             .await
             .unwrap();
@@ -3026,6 +2992,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: M,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -3040,6 +3007,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: N,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();
@@ -3054,6 +3022,7 @@ mod tests {
         tx.send(ProcessorMessage::SlotComplete {
             slot: N1,
             program_type: ProgramType::Escrow,
+            blockhash: None,
         })
         .await
         .unwrap();

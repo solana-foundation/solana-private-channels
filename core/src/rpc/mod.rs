@@ -88,15 +88,14 @@ mod tests {
         (db, container)
     }
 
-    // A non-default window so the assertion pins the value to the threaded
-    // config field rather than to any constant baked into the endpoint.
+    // A non-default window so the assertion pins the value to the published
+    // window rather than to any constant baked into the endpoint.
     const TEST_MAX_BLOCKHASHES: u64 = 200;
 
     fn make_read_deps(db: AccountsDB) -> ReadDeps {
         ReadDeps {
             accounts_db: db,
             admin_keys: vec![],
-            max_blockhashes: TEST_MAX_BLOCKHASHES,
             simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
             block_list_permits: tokio::sync::Semaphore::new(constants::block_list_slots(
                 crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,
@@ -210,6 +209,7 @@ mod tests {
         db.store_block(make_sparse_block_info(10, 3, Hash::new_unique()))
             .await
             .unwrap();
+        publish_window(&db, TEST_MAX_BLOCKHASHES).await;
         let mut rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
 
         // The deadline a client records when it signs against the current blockhash.
@@ -236,16 +236,20 @@ mod tests {
         assert!(height > last_valid_block_height);
     }
 
-    /// With the cache on, a status miss is answered by Postgres, which can lag the
-    /// cache. A cached height could then pass a deadline the store answering the null
-    /// has not reached, so getBlockHeight reads Postgres. getLatestBlockhash keeps the
-    /// cached height: its deadline must pair with the cached hash, or it comes out low.
+    /// With the cache on, getBlockHeight reads Postgres so it cannot pass a deadline the
+    /// store answering a status miss has not reached. getLatestBlockhash reads Postgres
+    /// too: the window lives there, and a lagging replica would pair it with a newer tip.
     #[tokio::test(flavor = "multi_thread")]
-    async fn block_height_reads_postgres_while_blockhash_deadline_reads_the_cache() {
+    async fn block_height_and_blockhash_deadline_read_postgres() {
         let postgres_height = 5;
         let cached_height = 10;
-        let cached_blockhash = Hash::new_unique();
+        let postgres_blockhash = Hash::new_unique();
         let (postgres_db, _pg) = start_test_postgres_raw().await;
+        publish_window(
+            &AccountsDB::Postgres(postgres_db.clone()),
+            TEST_MAX_BLOCKHASHES,
+        )
+        .await;
         let (mut redis_db, _redis) = start_stamped_redis(postgres_db.clone()).await;
         AccountsDB::Postgres(postgres_db)
             .write_batch(
@@ -254,7 +258,7 @@ mod tests {
                 Some(make_sparse_block_info(
                     50,
                     postgres_height,
-                    Hash::new_unique(),
+                    postgres_blockhash,
                 )),
             )
             .await
@@ -263,7 +267,11 @@ mod tests {
             &mut redis_db,
             &[],
             vec![],
-            Some(make_sparse_block_info(100, cached_height, cached_blockhash)),
+            Some(make_sparse_block_info(
+                100,
+                cached_height,
+                Hash::new_unique(),
+            )),
         )
         .await
         .unwrap();
@@ -281,11 +289,11 @@ mod tests {
             .await
             .unwrap()
             .value;
-        assert_eq!(latest.blockhash, cached_blockhash.to_string());
+        assert_eq!(latest.blockhash, postgres_blockhash.to_string());
         assert_eq!(
             latest.last_valid_block_height,
-            cached_height + TEST_MAX_BLOCKHASHES - 1,
-            "the deadline must pair with the cached hash"
+            postgres_height + TEST_MAX_BLOCKHASHES - 1,
+            "the hash, its height and the window must come from one store"
         );
     }
 
@@ -294,6 +302,11 @@ mod tests {
     async fn latest_blockhash_never_mixes_cache_and_postgres() {
         let postgres_blockhash = Hash::new_unique();
         let (postgres_db, _pg) = start_test_postgres_raw().await;
+        publish_window(
+            &AccountsDB::Postgres(postgres_db.clone()),
+            TEST_MAX_BLOCKHASHES,
+        )
+        .await;
         let (mut redis_db, _redis) = start_stamped_redis(postgres_db.clone()).await;
         AccountsDB::Postgres(postgres_db)
             .write_batch(
@@ -343,6 +356,7 @@ mod tests {
         db.write_batch(&[], vec![], Some(make_block_info(0, hash_of(0))))
             .await
             .unwrap();
+        publish_window(&db, TEST_MAX_BLOCKHASHES).await;
         let deps = Arc::new(make_read_deps(db.clone()));
 
         let writer = tokio::spawn(async move {
@@ -645,6 +659,7 @@ mod tests {
         db.store_block(make_block_info(10, blockhash))
             .await
             .unwrap();
+        publish_window(&db, TEST_MAX_BLOCKHASHES).await;
         let deps = make_read_deps(db);
         let resp = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
             .await
@@ -661,6 +676,7 @@ mod tests {
         db.store_block(make_sparse_block_info(40, 7, Hash::new_unique()))
             .await
             .unwrap();
+        publish_window(&db, TEST_MAX_BLOCKHASHES).await;
         let deps = make_read_deps(db);
         let resp = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
             .await
@@ -670,6 +686,52 @@ mod tests {
             7 + TEST_MAX_BLOCKHASHES - 1
         );
         assert_eq!(resp.context.slot, 40);
+    }
+
+    /// Publish the writer's window, as a write node does at boot.
+    async fn publish_window(db: &AccountsDB, max_blockhashes: u64) {
+        let AccountsDB::Postgres(pg) = db else {
+            panic!("the window lives in Postgres");
+        };
+        crate::accounts::blockhash_window::publish(pg.pool.as_ref(), max_blockhashes)
+            .await
+            .unwrap();
+    }
+
+    /// With no published window there is no deadline to give, so the call errors.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_latest_blockhash_errors_without_a_published_window() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(10, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        let err = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+            .await
+            .expect_err("no window, no deadline");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+        assert!(err.message().contains("max_blockhashes"), "{err:?}");
+    }
+
+    /// The window is read per call, so a writer restarted with a new one is followed at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_latest_blockhash_follows_a_republished_window() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_sparse_block_info(40, 7, Hash::new_unique()))
+            .await
+            .unwrap();
+        publish_window(&db, 200).await;
+        let deps = make_read_deps(db.clone());
+        let deadline = || async {
+            get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+                .await
+                .unwrap()
+                .value
+                .last_valid_block_height
+        };
+        assert_eq!(deadline().await, 7 + 199);
+        publish_window(&db, 5).await;
+        assert_eq!(deadline().await, 7 + 4);
     }
 
     // ── get_recent_blockhash ──────────────────────────────────────────────

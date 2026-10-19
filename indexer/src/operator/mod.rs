@@ -10,6 +10,7 @@ pub mod reconciliation;
 pub mod recovery;
 pub mod release_promotion;
 pub mod sender;
+pub mod solvency_fence;
 pub mod utils;
 
 pub use constants::*;

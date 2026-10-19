@@ -1,11 +1,13 @@
+use crate::channel_fence::{verify_channel_fence, FenceVerdict, FenceWait};
 use crate::config::OperatorConfig;
-use crate::error::{OperatorError, StorageError};
+use crate::error::OperatorError;
 use crate::metrics;
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, release_promotion, sender,
     DbTransactionWriter, RetryConfig, RpcClientWithRetry,
 };
-use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
+use crate::shutdown_utils::{drain_unless_lock_lost, shutdown_operator, stop_signal, StopReason};
 use crate::storage::common::storage::live_lock::{
     under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
 };
@@ -14,6 +16,7 @@ use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_commitment_config::CommitmentConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -56,17 +59,17 @@ pub async fn run(
         ));
     };
 
+    // Library callers skip the binary, so load signers here too; a second call is a no-op.
+    crate::operator::init_signers()
+        .await
+        .map_err(OperatorError::InvalidConfig)?;
+
     // Empty means unset (env renders "") and maps to None.
     let normalized_fallback_url = common_config
         .fallback_rpc_url
         .as_deref()
         .filter(|s| !s.is_empty());
     reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
-
-    // Library callers skip the binary, so load signers here too; a second call is a no-op.
-    crate::operator::init_signers()
-        .await
-        .map_err(OperatorError::InvalidConfig)?;
 
     let cancellation_token = CancellationToken::new();
 
@@ -158,6 +161,54 @@ pub async fn run(
         ))
     });
 
+    // The instance lives on Solana: the withdraw destination, the escrow operator's source.
+    let solana_rpc = match common_config.program_type {
+        crate::config::ProgramType::Withdraw => Some(&rpc_client),
+        crate::config::ProgramType::Escrow => source_rpc_client.as_ref(),
+    }
+    .ok_or_else(|| OperatorError::InvalidConfig("source_rpc_url required".to_string()))?;
+    under_live_lock(&live_lock_lost, async {
+        use crate::operator::utils::InstanceCheckError;
+        crate::operator::utils::verify_escrow_instance(solana_rpc, &escrow_instance)
+            .await
+            .map_err(|e| match e {
+                InstanceCheckError::Unreadable(msg) => OperatorError::RpcError(msg),
+                InstanceCheckError::Invalid(msg) => OperatorError::InvalidConfig(msg),
+            })
+    })
+    .await?;
+
+    // The chain the receipt mints live on: the escrow role mints there, the withdraw role
+    // burns there. The fence and the consumed set are both read from it.
+    let channel_rpc = match program_type_channel_rpc(
+        common_config.program_type,
+        &rpc_client,
+        source_rpc_client.as_ref(),
+    ) {
+        Some(rpc) => rpc,
+        None => {
+            return Err(OperatorError::InvalidConfig(
+                "source_rpc_url required for Withdraw operator".to_string(),
+            ))
+        }
+    };
+
+    // Refuse a channel restored behind the indexer DB before any row is touched. Every
+    // channel-behind skew is stopped here: stale pending rows, lost credits, re-withdrawals.
+    under_live_lock(
+        &live_lock_lost,
+        verify_fence_for_operator(&storage, &channel_rpc, common_config.program_type),
+    )
+    .await?;
+
+    // Rows an indexer restore re-created are checked against this before anything is sent.
+    let consumed = under_live_lock(
+        &live_lock_lost,
+        build_consumed_claims(&storage, &channel_rpc, common_config.program_type),
+    )
+    .await
+    .inspect_err(|e| error!("Operator refusing to start: {e}"))?;
+
     let (processor_tx, processor_rx) = mpsc::channel(config.channel_buffer_size);
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
@@ -184,7 +235,8 @@ pub async fn run(
     // locked, or processed.
     //
     // A database that claims a release the chain never made, or a check that could not
-    // run, refuses to start. A release the database never recorded is repaired in place.
+    // run, refuses to start. A release the database never recorded is repaired in place
+    // when its row's journal proves it, and refuses to start otherwise.
     if program_type == crate::config::ProgramType::Withdraw {
         // The main rpc_client is the chain where the instance and releases live.
         let preflight = under_live_lock(
@@ -223,7 +275,12 @@ pub async fn run(
         }
     }
 
+    // In memory rather than a row: a process that skipped its first clean reconciliation tick,
+    // or saw a confirmed breach whose halt write failed, must not move value either way.
+    let solvency_fence = SolvencyFence::for_role(program_type);
+
     // Start fetcher task
+    let fetcher_fence = solvency_fence.clone();
     let fetcher_storage = storage.clone();
     let fetcher_config = config.clone();
     let fetcher_token = cancellation_token.clone();
@@ -236,6 +293,7 @@ pub async fn run(
             common_config.program_type,
             fetcher_token,
             fetcher_health,
+            fetcher_fence,
         )
         .await
         {
@@ -253,6 +311,7 @@ pub async fn run(
     let processor_fallback_rpc = fallback_rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
     let processor_storage_tx = storage_tx.clone();
+    let processor_consumed = consumed.clone();
     let processor_handle = tokio::spawn(async move {
         processor::run_processor(
             processor_rx,
@@ -264,11 +323,13 @@ pub async fn run(
             processor_rpc,
             processor_fallback_rpc,
             processor_source_rpc,
+            Some(processor_consumed),
         )
         .await;
     });
 
     // Start sender task
+    let sender_fence = solvency_fence.clone();
     let sender_token = cancellation_token.clone();
     let sender_storage = storage.clone();
     let sender_commitment = config.rpc_commitment;
@@ -287,6 +348,8 @@ pub async fn run(
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
             sender_lock,
+            sender_fence,
+            Some(consumed),
         )
         .await
         {
@@ -312,6 +375,7 @@ pub async fn run(
                 let reconciliation_channel_rpc = rpc_client.clone();
                 let reconciliation_health = health.clone();
                 let reconciliation_token = cancellation_token.clone();
+                let reconciliation_fence = solvency_fence.clone();
                 tokio::spawn(async move {
                     if let Err(e) = reconciliation::run_reconciliation(
                         reconciliation_storage,
@@ -321,6 +385,7 @@ pub async fn run(
                         reconciliation_escrow,
                         reconciliation_health,
                         reconciliation_token,
+                        reconciliation_fence,
                     )
                     .await
                     {
@@ -408,8 +473,9 @@ pub async fn run(
 
     // Task supervision.
     //
-    // We race ctrl-c against each critical task's JoinHandle — whichever
-    // fires first wins — and fall through to the shutdown path either way.
+    // We race ctrl-c against each critical task's JoinHandle; whichever
+    // fires first wins, and every arm except a failed ctrl-c listener falls
+    // through to the one stop path below.
     // A task exit increments the OPERATOR_TASK_EXIT metric with a task
     // label so dashboards can tell which one failed without tailing logs.
     //
@@ -419,133 +485,304 @@ pub async fn run(
     // withdraw role, and reconciliation on the escrow role: a dead loop silently
     // stops every solvency check. The feepayer monitor is not watched.
     //
-    // Handles are polled by mutable reference so ownership stays here. A JoinHandle
-    // panics if polled again after it completed, so the one select joins is never
-    // handed to shutdown.
-    let mut fetcher_handle = fetcher_handle;
-    let mut processor_handle = processor_handle;
-    let mut sender_handle = sender_handle;
-    let mut storage_writer_handle = storage_writer_handle;
-    let mut recovery_handle = recovery_handle;
-    let mut promotion_handle = promotion_handle;
-    let mut reconciliation_handle = reconciliation_handle;
+    // Handles are polled by mutable reference so ownership stays here and they
+    // can still be moved into the stop path below.
+    let mut workers = OperatorWorkers {
+        fetcher: fetcher_handle,
+        processor: processor_handle,
+        sender: sender_handle,
+        storage_writer: storage_writer_handle,
+        recovery: recovery_handle,
+        promotion: promotion_handle,
+        reconciliation: reconciliation_handle,
+        feepayer: feepayer_monitor_handle,
+    };
     // The withdraw role's placeholder finishes at once, so only escrow watches it.
     let watch_reconciliation = program_type == crate::config::ProgramType::Escrow;
-    let pt_label = program_type.as_label();
+    let watch_promotion = program_type == crate::config::ProgramType::Withdraw;
 
     // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
     // branch, so a task ending at the same instant cannot turn a deliberate stop into a
     // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
     // an interrupt, which is what stop_signal settles.
-    // Yields the critical task select joined, with its join result.
-    let exited = tokio::select! {
+    let cause = tokio::select! {
         biased;
         reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
-            match reason.map_err(|_| OperatorError::ShutdownChannelSend)? {
-                // A lost live-state lock skips the graceful path entirely. Postgres frees
-                // the lock the instant our session dies, so a resync may already be
-                // dropping these tables; draining would broadcast and write into them.
-                // Stopping outright costs no more than an abrupt kill, which the recovery
-                // worker already handles.
-                StopReason::LiveLockLost => {
-                    stop_without_draining(
-                        &cancellation_token,
-                        &[
-                            fetcher_handle.abort_handle(),
-                            processor_handle.abort_handle(),
-                            sender_handle.abort_handle(),
-                            storage_writer_handle.abort_handle(),
-                            recovery_handle.abort_handle(),
-                            promotion_handle.abort_handle(),
-                            reconciliation_handle.abort_handle(),
-                            feepayer_monitor_handle.abort_handle(),
-                        ],
-                    )
-                    .await;
-                    return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
-                }
-                StopReason::Interrupted => {
-                    info!("Shutdown signal received, initiating graceful shutdown...");
-                }
+            // A lost lock needs nothing here: the stop path sees it before any drain starts.
+            if reason.map_err(|_| OperatorError::ShutdownChannelSend)? == StopReason::Interrupted {
+                info!("Shutdown signal received, initiating graceful shutdown...");
             }
-            None
+            StopCause::Requested
         }
-        joined = &mut fetcher_handle => Some((CriticalTask::Fetcher, joined)),
-        joined = &mut processor_handle => Some((CriticalTask::Processor, joined)),
-        joined = &mut sender_handle => Some((CriticalTask::Sender, joined)),
-        joined = &mut storage_writer_handle => Some((CriticalTask::StorageWriter, joined)),
-        joined = &mut recovery_handle => Some((CriticalTask::Recovery, joined)),
-        joined = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
-            Some((CriticalTask::ReleasePromotion, joined))
+        // Only a lost sender lock cancels this token while running; every task then exits on it.
+        _ = cancellation_token.cancelled() => StopCause::SenderLockLost(program_type),
+        joined = &mut workers.fetcher => worker_exited(Worker::Fetcher, joined),
+        joined = &mut workers.processor => worker_exited(Worker::Processor, joined),
+        joined = &mut workers.sender => worker_exited(Worker::Sender, joined),
+        joined = &mut workers.storage_writer => worker_exited(Worker::StorageWriter, joined),
+        joined = &mut workers.recovery => worker_exited(Worker::Recovery, joined),
+        joined = &mut workers.promotion, if watch_promotion => {
+            worker_exited(Worker::Promotion, joined)
         }
-        joined = &mut reconciliation_handle, if watch_reconciliation => {
-            Some((CriticalTask::Reconciliation, joined))
+        joined = &mut workers.reconciliation, if watch_reconciliation => {
+            worker_exited(Worker::Reconciliation, joined)
         }
     };
-    if let Some((task, joined)) = &exited {
-        critical_exit(pt_label, task.as_label());
-        // Logged here, since a lost lock or a failed drain below returns early.
-        if let Err(join_error) = joined {
-            error!(
-                task = task.as_label(),
-                "Critical operator task failed: {}", join_error
-            );
-        }
+    if let StopCause::Exited(task) = cause {
+        critical_exit(program_type.as_label(), task.label());
     }
 
-    // A critical task dying and the lock going are one failure when the database is what
-    // went away, so the exit path has to ask the same question the signal path did.
-    // Draining here would broadcast and flush into tables a resync may already be dropping.
-    if live_lock_lost.is_cancelled() {
-        stop_without_draining(
-            &cancellation_token,
-            &[
-                fetcher_handle.abort_handle(),
-                processor_handle.abort_handle(),
-                sender_handle.abort_handle(),
-                storage_writer_handle.abort_handle(),
-                recovery_handle.abort_handle(),
-                promotion_handle.abort_handle(),
-                reconciliation_handle.abort_handle(),
-                feepayer_monitor_handle.abort_handle(),
-            ],
-        )
-        .await;
-        return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
-    }
-
-    let joined = exited.as_ref().map(|(task, _)| *task);
-
-    // Graceful shutdown, on both the ctrl-c path and the critical-task-exit path. On the
-    // exit path the joined task gets a finished stand-in, so shutdown_operator only waits
-    // on the workers still running.
-    shutdown_operator(
+    shutdown_unless_lock_lost(
+        &live_lock_lost,
         cancellation_token,
         storage,
-        unless_joined(fetcher_handle, CriticalTask::Fetcher, joined),
-        unless_joined(processor_handle, CriticalTask::Processor, joined),
-        unless_joined(sender_handle, CriticalTask::Sender, joined),
-        unless_joined(storage_writer_handle, CriticalTask::StorageWriter, joined),
-        unless_joined(reconciliation_handle, CriticalTask::Reconciliation, joined),
-        feepayer_monitor_handle,
-        unless_joined(recovery_handle, CriticalTask::Recovery, joined),
+        workers,
+        cause,
         config.batch_size,
         config.db_poll_interval,
     )
-    .await
-    .map_err(|_| OperatorError::ShutdownChannelSend)?;
-    // Already cancelled by shutdown_operator; this only waits out the pass in progress.
-    if let Err(e) = unless_joined(promotion_handle, CriticalTask::ReleasePromotion, joined).await {
-        error!("Release promotion join error during shutdown: {}", e);
-    }
+    .await?;
 
     info!("Operator shutdown complete");
-    // A worker dying is a failure, so the process must exit nonzero for its supervisor.
-    match exited {
-        Some((task, _)) => Err(OperatorError::CriticalTaskExited {
-            task: task.as_label(),
-        }),
-        None => Ok(()),
+    Ok(())
+}
+
+/// Logs a worker's panic or cancellation here, since a lost lock or failed drain returns early.
+fn worker_exited(task: Worker, joined: Result<(), tokio::task::JoinError>) -> StopCause {
+    if let Err(join_error) = joined {
+        error!(
+            task = task.label(),
+            "Critical operator task failed: {}", join_error
+        );
+    }
+    StopCause::Exited(task)
+}
+
+/// The operator's long-running tasks, kept together so every stop path handles the same set.
+struct OperatorWorkers {
+    fetcher: JoinHandle<()>,
+    processor: JoinHandle<()>,
+    sender: JoinHandle<()>,
+    storage_writer: JoinHandle<()>,
+    recovery: JoinHandle<()>,
+    promotion: JoinHandle<()>,
+    reconciliation: JoinHandle<()>,
+    feepayer: JoinHandle<()>,
+}
+
+/// Why the running operator is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    /// An interrupt, or a lost live-state lock that the stop path itself handles.
+    Requested,
+    SenderLockLost(crate::config::ProgramType),
+    Exited(Worker),
+}
+
+/// A supervised operator task, named for the exit metric and error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Worker {
+    Fetcher,
+    Processor,
+    Sender,
+    StorageWriter,
+    Recovery,
+    Promotion,
+    Reconciliation,
+}
+
+impl Worker {
+    fn label(self) -> &'static str {
+        match self {
+            Worker::Fetcher => "fetcher",
+            Worker::Processor => "processor",
+            Worker::Sender => "sender",
+            Worker::StorageWriter => "storage_writer",
+            Worker::Recovery => "recovery",
+            Worker::Promotion => "release_promotion",
+            Worker::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+impl OperatorWorkers {
+    fn abort_handles(&self) -> [AbortHandle; 8] {
+        [
+            self.fetcher.abort_handle(),
+            self.processor.abort_handle(),
+            self.sender.abort_handle(),
+            self.storage_writer.abort_handle(),
+            self.recovery.abort_handle(),
+            self.promotion.abort_handle(),
+            self.reconciliation.abort_handle(),
+            self.feepayer.abort_handle(),
+        ]
+    }
+
+    fn handle_mut(&mut self, task: Worker) -> &mut JoinHandle<()> {
+        match task {
+            Worker::Fetcher => &mut self.fetcher,
+            Worker::Processor => &mut self.processor,
+            Worker::Sender => &mut self.sender,
+            Worker::StorageWriter => &mut self.storage_writer,
+            Worker::Recovery => &mut self.recovery,
+            Worker::Promotion => &mut self.promotion,
+            Worker::Reconciliation => &mut self.reconciliation,
+        }
+    }
+
+    /// Polling a JoinHandle again after it completed panics, and the stop path awaits
+    /// every handle, so the one select already joined is swapped for a finished stand-in.
+    fn replace_joined(&mut self, joined: Worker) {
+        *self.handle_mut(joined) = tokio::spawn(async {});
+    }
+}
+
+/// The one stop path for the running operator, whatever ended the select. It drains only
+/// while the lock is held; once lost, a resync may be dropping the tables the drain writes
+/// to, so every worker is aborted and awaited instead.
+async fn shutdown_unless_lock_lost(
+    lock_lost: &CancellationToken,
+    cancellation_token: CancellationToken,
+    storage: Arc<Storage>,
+    mut workers: OperatorWorkers,
+    cause: StopCause,
+    batch_size: u16,
+    db_poll_interval: Duration,
+) -> Result<(), OperatorError> {
+    if let StopCause::Exited(task) = cause {
+        workers.replace_joined(task);
+    }
+    let aborts = workers.abort_handles();
+    let token = cancellation_token.clone();
+    let OperatorWorkers {
+        fetcher,
+        processor,
+        sender,
+        storage_writer,
+        recovery,
+        promotion,
+        reconciliation,
+        feepayer,
+    } = workers;
+
+    let drained = drain_unless_lock_lost(lock_lost, &token, &aborts, async move {
+        shutdown_operator(
+            cancellation_token,
+            storage,
+            fetcher,
+            processor,
+            sender,
+            storage_writer,
+            reconciliation,
+            feepayer,
+            recovery,
+            batch_size,
+            db_poll_interval,
+        )
+        .await
+        .map_err(|_| OperatorError::ShutdownChannelSend)?;
+        // Already cancelled by shutdown_operator; this only waits out the pass in progress.
+        if let Err(e) = promotion.await {
+            error!("Release promotion join error during shutdown: {}", e);
+        }
+        Ok::<(), OperatorError>(())
+    })
+    .await;
+    // A stage that timed out only detached its task, so stop it before the lock guard drops.
+    crate::shutdown_utils::abort_and_await_writers(&aborts).await;
+    drained??;
+
+    // Still an error after a clean drain, so the supervisor restarts the operator.
+    match cause {
+        StopCause::Exited(task) => Err(OperatorError::CriticalTaskExited { task: task.label() }),
+        StopCause::SenderLockLost(program_type) => {
+            Err(OperatorError::SenderLockLost { program_type })
+        }
+        StopCause::Requested => Ok(()),
+    }
+}
+
+/// The channel endpoint for `program_type`: `rpc_url` for escrow, `source_rpc_url` for withdraw.
+fn program_type_channel_rpc(
+    program_type: crate::config::ProgramType,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    source_rpc_client: Option<&Arc<RpcClientWithRetry>>,
+) -> Option<Arc<RpcClientWithRetry>> {
+    match program_type {
+        crate::config::ProgramType::Escrow => Some(rpc_client.clone()),
+        crate::config::ProgramType::Withdraw => source_rpc_client.cloned(),
+    }
+}
+
+/// Build the claim-time consumed set from each receipt mint's channel history. The index
+/// must cover the newest block first, or a mint landed just before boot could be missing.
+async fn build_consumed_claims(
+    storage: &Arc<Storage>,
+    channel_rpc: &Arc<RpcClientWithRetry>,
+    program_type: crate::config::ProgramType,
+) -> Result<sender::ConsumedClaims, OperatorError> {
+    let role = match program_type {
+        crate::config::ProgramType::Escrow => crate::storage::TransactionType::Deposit,
+        crate::config::ProgramType::Withdraw => crate::storage::TransactionType::Withdrawal,
+    };
+    // With no mints yet the wait moves to the first lazy walk, so boot reads no channel RPC.
+    let index_ready = !storage.get_mint_addresses().await?.is_empty();
+    if index_ready {
+        sender::ensure_address_index(channel_rpc)
+            .await
+            .map_err(|reason| OperatorError::ConsumedSet { reason })?;
+    }
+    let cache = sender::ConsumedSetCache::build_at_boot(
+        channel_rpc,
+        storage,
+        crate::operator::CONSUMED_SET_PAGE_SIZE,
+        role,
+    )
+    .await
+    .map_err(|reason| OperatorError::ConsumedSet { reason })?;
+    Ok(sender::ConsumedClaims::new(
+        cache,
+        channel_rpc.clone(),
+        index_ready,
+    ))
+}
+
+/// How long boot waits for a lagging channel tip to reach the fence slot.
+const FENCE_WAIT: FenceWait = FenceWait::UntilTip {
+    poll: std::time::Duration::from_secs(1),
+    budget: std::time::Duration::from_secs(600),
+};
+
+/// Both roles read the fence from the withdraw indexer's checkpoint row: only that
+/// indexer sees channel blocks with their hashes.
+async fn verify_fence_for_operator(
+    storage: &Storage,
+    channel_rpc: &RpcClientWithRetry,
+    program_type: crate::config::ProgramType,
+) -> Result<(), OperatorError> {
+    let fence = storage.get_channel_fence().await?;
+    match verify_channel_fence(channel_rpc, fence.as_ref(), FENCE_WAIT).await {
+        FenceVerdict::Ok if fence.is_none() => {
+            // Expected once after an upgrade or a withdraw resync; persistent means no withdraw indexer.
+            warn!("No channel fence yet; a restored channel cannot be detected until the withdraw indexer writes one");
+            Ok(())
+        }
+        FenceVerdict::Ok => {
+            info!(?fence, "Channel fence verified");
+            Ok(())
+        }
+        FenceVerdict::Mismatch(reason) => {
+            metrics::CHANNEL_FENCE_MISMATCH
+                .with_label_values(&[program_type.as_label()])
+                .inc();
+            error!("Operator refusing to start: {reason}");
+            Err(OperatorError::ChannelFence { reason })
+        }
+        FenceVerdict::Unavailable(reason) => {
+            error!("Operator refusing to start, channel fence unchecked: {reason}");
+            Err(OperatorError::ChannelFenceUnchecked { reason })
+        }
     }
 }
 
@@ -615,7 +852,6 @@ async fn run_withdraw_preflight(
         rpc_client,
         fallback_rpc_client,
         Some(instance_pda),
-        storage_tx,
     )
     .await;
     match verdict {
@@ -748,11 +984,8 @@ async fn stop_boot_writer(
     }
 }
 
-/// Log + metric for a critical task that exited before cancellation.
-///
-/// We don't abort the process here: the caller falls through to `shutdown_operator`, so
-/// the workers still running get the usual graceful shutdown. `run` then returns
-/// `CriticalTaskExited`, so the process exits nonzero and the supervisor restarts it.
+/// Log + metric for a critical task that exited before cancellation. The caller still runs
+/// the stop path for the others, then returns an error so the supervisor restarts it.
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -763,49 +996,63 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
         .inc();
 }
 
-/// The workers supervision watches, named in logs and the task-exit metric.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CriticalTask {
-    Fetcher,
-    Processor,
-    Sender,
-    StorageWriter,
-    Recovery,
-    ReleasePromotion,
-    Reconciliation,
-}
-
-impl CriticalTask {
-    fn as_label(self) -> &'static str {
-        match self {
-            Self::Fetcher => "fetcher",
-            Self::Processor => "processor",
-            Self::Sender => "sender",
-            Self::StorageWriter => "storage_writer",
-            Self::Recovery => "recovery",
-            Self::ReleasePromotion => "release_promotion",
-            Self::Reconciliation => "reconciliation",
-        }
-    }
-}
-
-/// The handle shutdown may await. A JoinHandle panics if polled after it completed, so
-/// the one supervision already joined is swapped for a finished stand-in.
-fn unless_joined(
-    handle: JoinHandle<()>,
-    task: CriticalTask,
-    joined: Option<CriticalTask>,
-) -> JoinHandle<()> {
-    if joined == Some(task) {
-        tokio::spawn(async {})
-    } else {
-        handle
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The escrow operator has no checkpoint of its own with block hashes, so it reads the
+    /// withdraw row's fence: a mismatch there refuses its boot.
+    #[tokio::test]
+    async fn escrow_boot_reads_withdraw_fence_row() {
+        use crate::operator::RetryConfig;
+        use crate::storage::common::storage::mock::MockStorage;
+        use mockito::{Matcher, Server};
+        use serde_json::json;
+
+        let mut server = Server::new_async().await;
+        let _slot = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(json!({ "method": "getSlot" })))
+            .with_body(json!({ "jsonrpc": "2.0", "id": 1, "result": 500 }).to_string())
+            .create();
+        let _block = server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({ "method": "getBlock", "params": [300] }),
+            ))
+            .with_body(
+                json!({ "jsonrpc": "2.0", "id": 1, "result": {
+                    "blockhash": "Reproduced300", "parentSlot": 299
+                }})
+                .to_string(),
+            )
+            .create();
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+
+        let mock = MockStorage::new();
+        // An escrow checkpoint far ahead must not matter: only the withdraw fence does.
+        mock.set_checkpoint("escrow", 900);
+        mock.set_channel_fence(300, "Original300");
+        let storage = Storage::Mock(mock.clone());
+        let err = verify_fence_for_operator(&storage, &rpc, crate::config::ProgramType::Escrow)
+            .await
+            .expect_err("a re-produced fence block must refuse the escrow operator");
+        assert!(matches!(err, OperatorError::ChannelFence { .. }), "{err}");
+
+        // No fence yet (first boot after the upgrade) starts without a check.
+        let fresh = Storage::Mock(MockStorage::new());
+        verify_fence_for_operator(&fresh, &rpc, crate::config::ProgramType::Escrow)
+            .await
+            .expect("a null fence skips the check");
+    }
 
     /// Every worker must be stopped outright, not asked to finish, and be stopped by the
     /// time this returns: returning is what releases the lock, and a drain or a straggler
@@ -838,28 +1085,182 @@ mod tests {
         }
     }
 
-    /// Supervision consumes the handle it joins, and a JoinHandle panics if polled again,
-    /// so shutdown must get an awaitable stand-in for that one and the real handle for
-    /// every other worker.
-    #[tokio::test]
-    async fn shutdown_never_awaits_the_handle_supervision_joined() {
-        let mut fetcher = tokio::spawn(async {});
-        let processor = tokio::spawn(std::future::pending::<()>());
-        let processor_id = processor.id();
-        // Joined by mutable reference, as supervision does.
-        (&mut fetcher).await.expect("the fetcher ran");
+    /// How the sender stand-in behaves once cancelled.
+    #[derive(Clone, Copy)]
+    enum SenderStub {
+        /// Submits `n` queued items, then exits.
+        Drains(usize),
+        /// Keeps submitting until it is aborted.
+        DrainsForever,
+    }
 
-        let joined = Some(CriticalTask::Fetcher);
-        unless_joined(fetcher, CriticalTask::Fetcher, joined)
-            .await
-            .expect("the stand-in must be awaitable");
-        let processor = unless_joined(processor, CriticalTask::Processor, joined);
+    /// Workers that exit on cancel, except the sender, which keeps "submitting" queued work.
+    /// Returns the workers and the count of submissions the sender made after the cancel.
+    fn operator_workers(
+        token: &CancellationToken,
+        sender: SenderStub,
+    ) -> (OperatorWorkers, Arc<std::sync::atomic::AtomicUsize>) {
+        let stub = || {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancelled().await })
+        };
+        let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sender_token = token.clone();
+        let sender_submitted = Arc::clone(&submitted);
+        let sender = tokio::spawn(async move {
+            sender_token.cancelled().await;
+            let mut left = match sender {
+                SenderStub::Drains(n) => n,
+                SenderStub::DrainsForever => usize::MAX,
+            };
+            while left > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sender_submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                left -= 1;
+            }
+        });
+        let workers = OperatorWorkers {
+            fetcher: stub(),
+            processor: stub(),
+            sender,
+            storage_writer: stub(),
+            recovery: stub(),
+            promotion: stub(),
+            reconciliation: stub(),
+            feepayer: stub(),
+        };
+        (workers, submitted)
+    }
+
+    /// Bounds a stop path well below shutdown_operator's own 90 s process exit.
+    async fn stop_within_bound(
+        lock_lost: &CancellationToken,
+        token: CancellationToken,
+        workers: OperatorWorkers,
+        cause: StopCause,
+    ) -> Result<(), OperatorError> {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            shutdown_unless_lock_lost(
+                lock_lost,
+                token,
+                Arc::new(Storage::Mock(MockStorage::new())),
+                workers,
+                cause,
+                1,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("the stop path must finish")
+    }
+
+    /// With the lock held, an interrupt still gets the full drain.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_drains_while_the_lock_is_held() {
+        let token = CancellationToken::new();
+        let (workers, submitted) = operator_workers(&token, SenderStub::Drains(3));
+        let aborts = workers.abort_handles();
+
+        let result = stop_within_bound(
+            &CancellationToken::new(),
+            token,
+            workers,
+            StopCause::Requested,
+        )
+        .await;
+
+        assert!(result.is_ok(), "a held lock must stop cleanly: {result:?}");
         assert_eq!(
-            processor.id(),
-            processor_id,
-            "a running worker must keep its own handle"
+            submitted.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the sender must finish its drain"
         );
-        processor.abort();
+        assert!(aborts.iter().all(|a| a.is_finished()));
+    }
+
+    /// Once the lock is lost, before or during the stop, nothing may keep draining.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_does_not_drain_after_the_lock_is_lost() {
+        for lost_before_the_call in [true, false] {
+            let token = CancellationToken::new();
+            let lock_lost = CancellationToken::new();
+            let (workers, submitted) = operator_workers(&token, SenderStub::DrainsForever);
+            let aborts = workers.abort_handles();
+            if lost_before_the_call {
+                lock_lost.cancel();
+            } else {
+                let canceller = lock_lost.clone();
+                let seen = Arc::clone(&submitted);
+                tokio::spawn(async move {
+                    while seen.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    canceller.cancel();
+                });
+            }
+
+            let result = stop_within_bound(&lock_lost, token, workers, StopCause::Requested).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(OperatorError::Storage(
+                        crate::error::StorageError::LiveStateLockLost
+                    ))
+                ),
+                "lost before the call: {lost_before_the_call}: {result:?}"
+            );
+            assert!(
+                aborts.iter().all(|a| a.is_finished()),
+                "every worker must be stopped before the lock guard can drop"
+            );
+            let at_return = submitted.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                submitted.load(std::sync::atomic::Ordering::SeqCst),
+                at_return,
+                "the sender kept submitting after the stop returned"
+            );
+            if lost_before_the_call {
+                assert_eq!(at_return, 0, "a lock lost first must never start the drain");
+            }
+        }
+    }
+
+    /// A worker that select already joined must not be polled again, and the exit stays an error.
+    #[tokio::test(start_paused = true)]
+    async fn stop_path_survives_a_worker_that_already_exited() {
+        for task in [
+            Worker::Fetcher,
+            Worker::Processor,
+            Worker::Sender,
+            Worker::StorageWriter,
+            Worker::Recovery,
+            Worker::Promotion,
+            Worker::Reconciliation,
+        ] {
+            let token = CancellationToken::new();
+            let (mut workers, _) = operator_workers(&token, SenderStub::Drains(1));
+            let exited = workers.handle_mut(task);
+            exited.abort();
+            let _ = (&mut *exited).await;
+            let aborts = workers.abort_handles();
+
+            let result = stop_within_bound(
+                &CancellationToken::new(),
+                token,
+                workers,
+                StopCause::Exited(task),
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(OperatorError::CriticalTaskExited { task: t }) if t == task.label()),
+                "{task:?}: {result:?}"
+            );
+            assert!(aborts.iter().all(|a| a.is_finished()), "{task:?}");
+        }
     }
 
     /// A real storage writer on a mock, with one ManualReview update already queued.
@@ -998,7 +1399,6 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use private_channel_metrics::prometheus;
-    use serial_test::serial;
     use solana_keychain::SolanaSigner;
     use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
@@ -1061,7 +1461,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": 900},
                         "value": {
                             "owner": Pubkey::new_unique().to_string(),
                             "lamports": 1_000_000u64,
@@ -1084,7 +1484,7 @@ mod tests {
                 r#""method"\s*:\s*"getAccountInfo""#.into(),
             ))
             .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":900},"value":null}}"#)
             .create()
     }
 
@@ -1142,6 +1542,42 @@ mod tests {
         assert!(result.is_ok(), "agreeing state must start: {result:?}");
     }
 
+    /// A backend that ignores `minContextSlot` and answers from before the anchor is
+    /// refused, so the boot check never diffs the database against an old bitmap.
+    #[tokio::test]
+    async fn bitmap_read_on_a_backend_ignoring_min_context_slot_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
+        let bytes = bitmap_account_bytes(0, &[], 255);
+        let _stale = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 1},
+                    "value": {"owner": Pubkey::new_unique().to_string(), "lamports": 1u64,
+                        "data": [STANDARD.encode(&bytes), "base64"],
+                        "executable": false, "rentEpoch": 0}}})
+                .to_string(),
+            )
+            .create();
+
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::BitmapUnavailable { .. }
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
     /// A bitmap not yet on-chain with an empty database must start, or a fresh deployment
     /// would never come up.
     #[tokio::test]
@@ -1156,17 +1592,22 @@ mod tests {
         );
     }
 
-    /// Chain ahead of the database: the release landed and only the bookkeeping
-    /// is missing, so the operator repairs what it can and starts.
+    /// Chain ahead of the database with no row to explain the bit: after an indexer
+    /// restore the re-indexed burns are renumbered, so starting could pay one twice.
     #[tokio::test]
-    async fn preflight_starts_when_chain_is_ahead() {
+    async fn preflight_refuses_when_chain_is_ahead_unexplained() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
-            result.is_ok(),
-            "a landed-but-unrecorded release must not halt boot: {result:?}"
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
+                ))
+            ),
+            "an unexplained consumed nonce must refuse boot: {result:?}"
         );
     }
 
@@ -1433,13 +1874,11 @@ mod tests {
         );
     }
 
-    /// The unprovable case. Under the SMT this was a refuse-to-start, because
-    /// any root mismatch was. The bitmap narrows the halt to db-ahead only: a
-    /// consumed nonce the reconcile cannot attribute is a payout that really
-    /// happened, so boot continues and the row is escalated to manual_review
-    /// instead of being completed on a guess.
+    /// The unprovable case: a consumed nonce the reconcile cannot attribute. Boot
+    /// refuses and leaves the row alone, so a later boot can still prove it once the
+    /// status read works, instead of parking it in manual_review over an RPC blip.
     #[tokio::test]
-    async fn preflight_escalates_when_chain_ahead_survives_reconcile() {
+    async fn preflight_refuses_when_chain_ahead_survives_reconcile() {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
         let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
@@ -1455,14 +1894,19 @@ mod tests {
         .await;
 
         assert!(
-            result.is_ok(),
-            "an unattributable payout must not halt boot: {result:?}"
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::UnexplainedConsumedNonces { .. }
+                ))
+            ),
+            "an unattributable payout must refuse boot: {result:?}"
         );
         assert!(
-            updates
+            !updates
                 .iter()
                 .any(|u| u.status == TransactionStatus::ManualReview),
-            "the row must be escalated for a human, not left silent: {updates:?}"
+            "the gate itself writes no row status: {updates:?}"
         );
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,
@@ -1637,6 +2081,60 @@ mod tests {
         );
     }
 
+    /// The all-ones placeholder instance is refused like a missing one, before the schema.
+    #[tokio::test]
+    async fn operator_startup_refuses_the_placeholder_instance() {
+        for program_type in [ProgramType::Escrow, ProgramType::Withdraw] {
+            let mock = MockStorage::new();
+            let common_config = PrivateChannelIndexerConfig {
+                program_type,
+                storage_type: StorageType::Postgres,
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                fallback_rpc_url: None,
+                source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+                postgres: PostgresConfig {
+                    database_url: String::new(),
+                    max_connections: 1,
+                },
+                escrow_instance_id: Some(Pubkey::default()),
+            };
+            let config = OperatorConfig {
+                db_poll_interval: Duration::from_millis(50),
+                batch_size: 10,
+                retry_max_attempts: 3,
+                retry_base_delay: Duration::from_millis(100),
+                channel_buffer_size: 100,
+                rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+                alert_webhook_url: None,
+                reconciliation_interval: Duration::from_secs(300),
+                reconciliation_tolerance_bps: 10,
+                reconciliation_webhook_url: None,
+                feepayer_monitor_interval: Duration::from_secs(60),
+                confirmation_poll_interval_ms: 400,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                run(
+                    Arc::new(Storage::Mock(mock.clone())),
+                    common_config,
+                    config,
+                    None,
+                ),
+            )
+            .await
+            .expect("a placeholder instance must refuse, not start");
+            assert!(
+                matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("placeholder")),
+                "{program_type:?}: {result:?}"
+            );
+            assert!(!mock
+                .call_order
+                .lock()
+                .unwrap()
+                .contains(&"init_schema".to_string()));
+        }
+    }
+
     /// Without the escrow instance no ReleaseFunds can be built, so the withdraw operator
     /// must refuse before it takes the lock, migrates the schema or claims a burned row.
     #[tokio::test]
@@ -1713,7 +2211,8 @@ mod tests {
         .expect("a withdraw operator without an instance must refuse, not start");
 
         assert!(
-            matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("escrow_instance_id")),
+            matches!(&result, Err(OperatorError::InvalidConfig(msg))
+                if msg.contains("escrow_instance_id") && msg.contains("COMMON_ESCROW_INSTANCE_ID")),
             "missing instance must refuse to start: {result:?}"
         );
         assert!(
@@ -1832,11 +2331,9 @@ mod tests {
 
     /// The withdraw role never reads the webhook, so omitting it must pass the config
     /// gate. The run then proceeds to storage (and stalls on the unreachable RPC).
-    // Past the config gate `run` loads the signers, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn withdraw_without_a_webhook_passes_the_config_gate() {
+        // Past the config gate `run` loads the signers, so give it one.
         crate::operator::sender::test_support::ensure_test_signer();
         let (common, mut config) = startup_fixture(ProgramType::Withdraw);
         config.reconciliation_webhook_url = None;
@@ -1858,19 +2355,30 @@ mod tests {
     /// The withdraw role broadcasts releases to its rpc_url, so the monitor must watch
     /// their fee payer there, not on the source chain. Admin and operator share a key
     /// in this binary, so this pins the role and the RPC, not which signer pays.
-    /// Serial because the signer_util tests remove ADMIN_SIGNER while they run.
     #[tokio::test]
-    #[serial]
     async fn withdraw_operator_watches_the_fee_payer_on_its_destination_rpc() {
-        std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var(
-            "ADMIN_PRIVATE_KEY",
-            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
-        );
+        crate::operator::sender::test_support::ensure_test_signer();
         let fee_payer = TransactionBuilder::release_signers()[0].pubkey();
 
         let mut destination = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut destination);
+        // Startup refuses an instance that is not live on chain. Created before the bitmap
+        // mock, so mockito answers the instance read with this one.
+        let (instance, instance_data) = crate::operator::utils::account_util::live_instance();
+        let _instance = destination
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(instance.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":900}},"value":{{"owner":"{}","lamports":1,"data":["{}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                STANDARD.encode(&instance_data),
+            ))
+            .create_async()
+            .await;
         let _bitmap = mock_bitmap_not_found(&mut destination);
         let fee_payer_balance = destination
             .mock("POST", "/")
@@ -1897,6 +2405,7 @@ mod tests {
         let (mut common, config) = startup_fixture(ProgramType::Withdraw);
         common.rpc_url = destination.url();
         common.source_rpc_url = Some(source.url());
+        common.escrow_instance_id = Some(instance);
         let operator = tokio::spawn(run(
             Arc::new(Storage::Mock(MockStorage::new())),
             common,
@@ -1919,16 +2428,10 @@ mod tests {
 
     /// The alerts treat a missing series as healthy, so the monitor seeds it before its
     /// first read: an RPC that fails every getBalance still pages on the zero. Escrow label
-    /// because no other test writes it, so this cannot pass on test order. Serial for
-    /// ADMIN_SIGNER, as above.
+    /// because no other test writes it, so this cannot pass on test order.
     #[tokio::test]
-    #[serial]
     async fn feepayer_monitor_seeds_its_series_before_the_first_read() {
-        std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var(
-            "ADMIN_PRIVATE_KEY",
-            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
-        );
+        crate::operator::sender::test_support::ensure_test_signer();
         let (_, config) = startup_fixture(ProgramType::Escrow);
         let cancelled = CancellationToken::new();
         cancelled.cancel();

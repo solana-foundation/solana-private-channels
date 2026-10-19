@@ -1,12 +1,9 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    private_channel_core::{
-        accounts::{
-            postgres::PostgresAccountsDB,
-            truncate::{retention_floor_slots, truncate_slots, TruncateOptions, TruncateReport},
-        },
-        nodes::node::{DEFAULT_BLOCKTIME_MS, DEFAULT_MAX_BLOCKHASHES},
+    private_channel_core::accounts::{
+        postgres::PostgresAccountsDB,
+        truncate::{truncate_slots, ConsumerCheck, TruncateOptions, TruncateReport},
     },
     std::path::PathBuf,
     tracing::{error, info, warn},
@@ -19,7 +16,11 @@ use {
 )]
 struct Args {
     /// Accounts database connection URL (PostgreSQL only)
-    #[arg(long, env = "PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")]
+    #[arg(
+        long,
+        env = "PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL",
+        hide_env_values = true
+    )]
     accountsdb_connection_url: String,
 
     /// Log level (trace, debug, info, warn, error)
@@ -67,13 +68,39 @@ struct TruncateArgs {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// The node's max_blockhashes, to size the retention floor warning
-    #[arg(long, default_value_t = DEFAULT_MAX_BLOCKHASHES as u64, value_parser = clap::value_parser!(u64).range(1..))]
-    max_blockhashes: u64,
+    /// Deprecated and ignored: the window is read from the ledger, where the write node
+    /// publishes it. Still accepted so existing scripts parse.
+    #[arg(long, hide = true)]
+    max_blockhashes: Option<u64>,
 
-    /// The node's blocktime_ms, to size the retention floor warning
-    #[arg(long, default_value_t = DEFAULT_BLOCKTIME_MS, value_parser = clap::value_parser!(u64).range(1..))]
-    blocktime_ms: u64,
+    /// Deprecated and ignored, for the same reason as `--max-blockhashes`.
+    #[arg(long, hide = true)]
+    blocktime_ms: Option<u64>,
+
+    /// The withdraw indexer's database; truncation refuses to cut past its checkpoint
+    #[arg(
+        long,
+        env = "PRIVATE_CHANNEL_WITHDRAW_INDEXER_DB_URL",
+        hide_env_values = true,
+        required_unless_present = "skip_withdraw_indexer_check",
+        conflicts_with = "skip_withdraw_indexer_check"
+    )]
+    withdraw_indexer_db_url: Option<String>,
+
+    /// Truncate without checking a withdraw indexer; only for deployments that run none
+    #[arg(long, default_value_t = false)]
+    skip_withdraw_indexer_check: bool,
+}
+
+/// Clap refuses neither and both; if it ever let one through, the check still runs.
+fn consumer_check_from_args(url: Option<String>, skip: bool) -> Result<ConsumerCheck> {
+    match (url, skip) {
+        (Some(database_url), _) => Ok(ConsumerCheck::WithdrawIndexer { database_url }),
+        (None, true) => Ok(ConsumerCheck::Skip),
+        (None, false) => Err(anyhow!(
+            "pass --withdraw-indexer-db-url or --skip-withdraw-indexer-check"
+        )),
+    }
 }
 
 #[tokio::main]
@@ -116,21 +143,10 @@ async fn run(args: Args) -> Result<()> {
 
     match args.command {
         Command::Truncate(truncate_args) => {
-            // A warning, not a refusal: the floor is the idle worst case, and a
-            // node under steady load keeps its whole window in far fewer slots.
-            let floor = retention_floor_slots(
-                truncate_args.max_blockhashes as usize,
-                truncate_args.blocktime_ms,
-            );
-            if truncate_args.keep_slots < floor {
+            if truncate_args.max_blockhashes.is_some() || truncate_args.blocktime_ms.is_some() {
                 warn!(
-                    "keep_slots {} is below the retention floor of {} ({} blockhashes at {}ms blocktime); \
-                     a restart will rebuild the dedup window short and reject transactions still inside \
-                     their published deadline",
-                    truncate_args.keep_slots,
-                    floor,
-                    truncate_args.max_blockhashes,
-                    truncate_args.blocktime_ms
+                    "--max-blockhashes and --blocktime-ms are deprecated and ignored; the window \
+                     is read from the ledger"
                 );
             }
             if truncate_args.max_backup_age_hours.is_some() {
@@ -144,6 +160,10 @@ async fn run(args: Args) -> Result<()> {
                 pg_restore_bin: truncate_args.pg_restore_bin,
                 batch_size: truncate_args.batch_size,
                 dry_run: truncate_args.dry_run,
+                consumer_check: consumer_check_from_args(
+                    truncate_args.withdraw_indexer_db_url,
+                    truncate_args.skip_withdraw_indexer_check,
+                )?,
             };
             let report = truncate_slots(&db, &options).await?;
             print_report(&report, truncate_args.dry_run);
@@ -188,10 +208,11 @@ mod tests {
 
     const URL: &str = "--accountsdb-connection-url=postgres://x";
 
-    /// Scripts that still pass the old age flag keep parsing; a dump is now required.
-    #[test]
-    fn admin_accepts_deprecated_max_backup_age() {
-        let args = Args::try_parse_from([
+    const SKIP: &str = "--skip-withdraw-indexer-check";
+    const INDEXER_URL: &str = "--withdraw-indexer-db-url=postgres://indexer";
+
+    fn parse_truncate(extra: &[&str]) -> Result<TruncateArgs, clap::Error> {
+        let base = [
             "admin",
             URL,
             "truncate",
@@ -199,18 +220,74 @@ mod tests {
             "1",
             "--pg-dump-path",
             "x",
+        ];
+        let args = Args::try_parse_from(base.iter().chain(extra))?;
+        let Command::Truncate(truncate) = args.command;
+        Ok(truncate)
+    }
+
+    /// Scripts that still pass the old flags keep parsing; a dump is now required, and so
+    /// is a withdraw indexer URL or the explicit skip. The env var would count as a URL.
+    #[test]
+    fn admin_accepts_deprecated_max_backup_age() {
+        std::env::remove_var("PRIVATE_CHANNEL_WITHDRAW_INDEXER_DB_URL");
+
+        let truncate = parse_truncate(&[
             "--max-backup-age-hours",
             "24",
+            "--max-blockhashes",
+            "150",
+            "--blocktime-ms",
+            "100",
+            SKIP,
         ])
-        .expect("the deprecated flag must still parse");
-        let Command::Truncate(truncate) = args.command;
+        .expect("the deprecated flags must still parse");
         assert_eq!(truncate.max_backup_age_hours, Some(24));
+        assert_eq!(truncate.max_blockhashes, Some(150));
+        assert_eq!(truncate.blocktime_ms, Some(100));
         assert_eq!(truncate.pg_restore_bin, PathBuf::from("pg_restore"));
 
-        let missing_dump = Args::try_parse_from(["admin", URL, "truncate", "--keep-slots", "1"]);
+        let missing_dump =
+            Args::try_parse_from(["admin", URL, "truncate", "--keep-slots", "1", SKIP]);
         assert!(
             missing_dump.is_err(),
             "a truncation without a dump must not parse"
         );
+
+        assert!(
+            parse_truncate(&[]).is_err(),
+            "a run with neither the indexer URL nor the skip must not parse"
+        );
+        assert!(
+            parse_truncate(&[INDEXER_URL, SKIP]).is_err(),
+            "the URL and the skip are exclusive"
+        );
+
+        let gated = parse_truncate(&[INDEXER_URL]).unwrap();
+        assert_eq!(
+            consumer_check_from_args(
+                gated.withdraw_indexer_db_url,
+                gated.skip_withdraw_indexer_check
+            )
+            .unwrap(),
+            ConsumerCheck::WithdrawIndexer {
+                database_url: "postgres://indexer".to_string()
+            }
+        );
+        let skipped = parse_truncate(&[SKIP]).unwrap();
+        assert_eq!(
+            consumer_check_from_args(
+                skipped.withdraw_indexer_db_url,
+                skipped.skip_withdraw_indexer_check
+            )
+            .unwrap(),
+            ConsumerCheck::Skip
+        );
+        // Off the clap path the mapping fails closed: a URL wins and neither is an error.
+        assert!(matches!(
+            consumer_check_from_args(Some("postgres://indexer".into()), true),
+            Ok(ConsumerCheck::WithdrawIndexer { .. })
+        ));
+        assert!(consumer_check_from_args(None, false).is_err());
     }
 }

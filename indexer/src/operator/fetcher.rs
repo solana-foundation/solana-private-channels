@@ -2,6 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::metrics;
+use crate::operator::solvency_fence::SolvencyFence;
 use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
@@ -22,6 +23,7 @@ pub async fn run_fetcher(
     program_type: ProgramType,
     cancellation_token: CancellationToken,
     health: Option<Arc<HealthState>>,
+    fence: SolvencyFence,
 ) -> Result<(), OperatorError> {
     info!("Starting fetcher");
 
@@ -32,6 +34,8 @@ pub async fn run_fetcher(
     }
     // Set while deposits wait for the escrow checkpoint, so the reason is logged once per wait.
     let mut holding = false;
+    // Set while the solvency fence holds the poll, so the wait is logged once.
+    let mut fenced = false;
 
     loop {
         // Check for cancellation
@@ -94,6 +98,28 @@ pub async fn run_fetcher(
                 tokio::time::sleep(config.db_poll_interval).await;
                 continue;
             }
+        }
+
+        // In-process solvency gate: closed until the first clean reconciliation tick, shut for
+        // good on a confirmed breach. It holds even when the durable halt row never landed.
+        if !fence.is_open() {
+            if !fenced {
+                warn!(state = ?fence.state(), "Solvency fence not open; skipping fetch");
+                fenced = true;
+            }
+            // Progress only through the confirm window, since a health restart there would reset a
+            // breach still being confirmed. Past it, a closed fence is a real stall worth showing.
+            if let Some(h) = &health {
+                if fence.wait_counts_as_progress() {
+                    h.record_progress();
+                }
+            }
+            tokio::time::sleep(config.db_poll_interval).await;
+            continue;
+        }
+        if fenced {
+            info!("Solvency fence open; fetching");
+            fenced = false;
         }
 
         match storage
@@ -230,8 +256,16 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel(); // cancel immediately
 
-        let result =
-            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
+        let result = run_fetcher(
+            storage,
+            tx,
+            test_config(),
+            ProgramType::Escrow,
+            token,
+            None,
+            SolvencyFence::open_from_start(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -254,6 +288,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 None,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -295,6 +330,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 health_clone,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -331,6 +367,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 health_clone,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -380,6 +417,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 health_clone,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -451,6 +489,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 health_clone,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -503,6 +542,7 @@ mod tests {
                 ProgramType::Escrow,
                 token_clone,
                 health_clone,
+                SolvencyFence::open_from_start(),
             )
             .await
         });
@@ -529,6 +569,161 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
     }
 
+    /// Spawns a fetcher over `mock` with `fence`, polling every 50 ms, reporting into `health`.
+    fn spawn_fenced(
+        mock: &MockStorage,
+        fence: &SolvencyFence,
+        health: &Arc<private_channel_metrics::HealthState>,
+    ) -> (
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), OperatorError>>,
+        mpsc::Receiver<DbTransaction>,
+    ) {
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (tx, rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(run_fetcher(
+            storage,
+            tx,
+            test_config(),
+            ProgramType::Escrow,
+            token.clone(),
+            Some(health.clone()),
+            fence.clone(),
+        ));
+        (token, handle, rx)
+    }
+
+    /// A pending deposit the checkpoint covers, so only the fence can hold it.
+    fn mock_with_pending_deposit() -> MockStorage {
+        let mock = covered_mock();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(make_test_transaction("sig_fenced"));
+        mock
+    }
+
+    /// Lets the fetcher pass its boot progress record, then marks progress as long ago.
+    async fn reset_progress_after_boot(health: &private_channel_metrics::HealthState) {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        health
+            .last_progress_at()
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn progress(health: &private_channel_metrics::HealthState) -> i64 {
+        health
+            .last_progress_at()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    const LOCK: &str = "get_and_lock_pending_transactions";
+
+    #[tokio::test]
+    async fn fetcher_polls_nothing_while_the_fence_is_closed() {
+        use private_channel_metrics::HealthOutcome;
+        let mock = mock_with_pending_deposit();
+        let fence = SolvencyFence::closed();
+        let health = fast_stall_health();
+        let (token, handle, mut rx) = spawn_fenced(&mock, &fence, &health);
+        reset_progress_after_boot(&health).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(mock.calls(LOCK), 0, "no row is locked while closed");
+        assert!(rx.try_recv().is_err(), "nothing is forwarded while closed");
+        assert!(
+            progress(&health) > 1,
+            "a fresh closed fence counts as progress"
+        );
+        assert_eq!(health.check(), HealthOutcome::Healthy);
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetcher_starts_polling_once_the_fence_opens() {
+        let mock = mock_with_pending_deposit();
+        let fence = SolvencyFence::closed();
+        let health = fast_stall_health();
+        let (token, handle, mut rx) = spawn_fenced(&mock, &fence, &health);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(mock.calls(LOCK), 0);
+        fence.open();
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+        assert_eq!(received.signature, "sig_fenced");
+        assert!(mock.calls(LOCK) >= 1);
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// Past the confirmation window a closed fence is a real stall, so /health may show it.
+    #[tokio::test]
+    async fn closed_fence_counts_as_progress_only_for_three_ticks() {
+        use private_channel_metrics::HealthOutcome;
+        let mock = mock_with_pending_deposit();
+        let fence = SolvencyFence::closed();
+        for _ in 0..crate::operator::solvency_fence::CLOSED_TICKS_AS_PROGRESS {
+            fence.note_closed_tick();
+        }
+        let health = fast_stall_health();
+        let (token, handle, _rx) = spawn_fenced(&mock, &fence, &health);
+        reset_progress_after_boot(&health).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(mock.calls(LOCK), 0);
+        assert_eq!(progress(&health), 1, "no progress past the window");
+        assert!(
+            matches!(health.check(), HealthOutcome::Stalled { pending: 1, .. }),
+            "the backlog is still measured: {:?}",
+            health.check()
+        );
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetcher_stops_polling_once_the_fence_trips() {
+        let mock = mock_with_pending_deposit();
+        let fence = SolvencyFence::open_from_start();
+        let health = fast_stall_health();
+        let (token, handle, mut rx) = spawn_fenced(&mock, &fence, &health);
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+
+        fence.trip();
+        // Let any poll already past the gate finish before counting.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(make_test_transaction("sig_after_trip"));
+        let locks = mock.calls(LOCK);
+        health
+            .last_progress_at()
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(mock.calls(LOCK), locks, "no poll after the trip");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is forwarded after the trip"
+        );
+        assert_eq!(progress(&health), 1, "a tripped fence is never progress");
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn channel_closed_returns_error() {
         let mock = covered_mock();
@@ -541,8 +736,16 @@ mod tests {
 
         drop(rx); // close receiver
 
-        let result =
-            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
+        let result = run_fetcher(
+            storage,
+            tx,
+            test_config(),
+            ProgramType::Escrow,
+            token,
+            None,
+            SolvencyFence::open_from_start(),
+        )
+        .await;
 
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();

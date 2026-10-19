@@ -31,13 +31,18 @@ mint, each with its own consecutive-tick counter:
 
 On-chain supply is already net of burns (the program burns channel tokens at
 withdrawal initiation, not at release), so the supply check does **not** trust
-the DB ledger; it catches over-issuance. Its halt reason reads
+the DB ledger; it catches over-issuance. The in-flight envelope is the sum of
+unsettled deposits (`pending`, `processing`, `parked`, `pending_remint`). Withdrawals
+are not in it in any status: their burn is already in the supply reading, so an
+unsettled one can never explain supply above custody, and counting it would hide a
+real shortfall of that size. Its halt reason reads
 `... custody <C> short of supply by <GAP>, envelope <E> (adjustment <A>) tolerance <T> ...`.
 
 A snapshot can be older than a transfer that already settled: custody read below a
 completed deposit's Solana slot, or supply read below a released withdrawal's burn.
 So the allowance also counts settled deposits above the tick's lowest custody slot and
-settled withdrawals above the channel block the supply reads were checked against; that
+withdrawals in any status above the channel block the supply reads were checked against
+(a release can land before its row is `completed`); that
 part is the adjustment `<A>`, exported per mint as
 `private_channel_operator_reconciliation_envelope_adjustment_raw`. When the adjustment is
 the only thing keeping a mint from breaching, the operator logs
@@ -69,8 +74,19 @@ halt is still exported per mint as
 `private_channel_operator_reconciliation_liability_shortfall_raw`, because that
 is the state that refuses the next boot.
 
-The DB also supplies the mint universe (every `mints` row, so a blocked or
-not-held mint is still checked) and the in-flight envelope. Custody is read from
+The DB also supplies the mint universe and the in-flight envelope. The universe is
+every `mints` row (so a blocked or not-held mint is still checked) plus every mint
+that has `mint_status_history` or deposit rows but no `mints` row. That happens when
+the indexer started after the mint's `AllowMint`: a later `BlockMint` writes only
+history. Such an unlisted mint takes its token program from its on-chain
+`AllowedMint` account, read by address. Withdrawal rows join this set only once the
+escrow indexer has observed their release, because `ReleaseFunds` checks the
+`AllowedMint` while a burn on the channel can name any mint. If that account is
+absent or unreadable the
+mint gets no verdict from either check for the tick (its custody was never read),
+both checks hold its breach streak rather than reset it, and the tick counts as dark. The tick logs `Mints with history or deposits but no mints row`
+with their count, naming any it could not resolve; resyncing the escrow indexer from the `AllowMint` slot restores the
+rows. Custody is read from
 the escrow instance's associated token account (ATA) for each of those mints,
 using the mint's recorded token program. The escrow program only deposits into
 and releases from that ATA, so it is the whole backing; tokens sent to any other
@@ -95,18 +111,57 @@ defaulting to 0 so a boot tolerates nothing it is not configured to.
 
 When either check breaches for three consecutive ticks, the operator **halts**:
 
-1. Sets the durable `reconciliation_halt` flag (reason recorded).
-2. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
+1. Trips its in-process solvency fence (below), so this process moves nothing
+   more even if the next step fails.
+2. Forces its `/health` to 503 (pages orchestration) before any database write,
+   so a flag write stuck behind a lock cannot keep the service green: the breach
+   is proven either way.
+3. Sets the durable `reconciliation_halt` flag (reason recorded).
+4. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
    `manual_review`.
-3. Forces its `/health` to 503 (pages orchestration).
-4. Posts the halt webhook. This webhook is the only alert - there is no separate
+5. Posts the halt webhook. This webhook is the only alert - there is no separate
    sensitive alert layer; the alert fires together with the halt.
+
+### Solvency fence (escrow operator)
+
+Besides the durable flag, the escrow operator holds an in-memory solvency fence
+that its fetcher and its pre-broadcast claim both check. It starts **closed** at
+every boot and opens only after a reconciliation tick that read every required
+input, ran both checks with the ledger pinned at the custody slot, found no breach
+even suspected, and saw no halt flag. A tick whose liability check could not run
+(no escrow indexer checkpoint, or one behind the custody slot) is not proof and
+leaves the fence closed: a drained pending deposit passes the supply check alone.
+Until it opens no deposit is fetched or minted. The first tick runs at startup, and
+while the fence is closed the check is probed again every 15 s between the
+configured ticks, so a healthy boot waits seconds (up to about 30 s per tick while
+the escrow indexer's checkpoint lags the custody slot) and one failed first tick
+costs a probe, not a whole interval. A probe can open the fence but counts for
+nothing else: it never advances a breach or dark streak, never halts and never
+pages, and it is skipped whenever one more tick could cross a threshold, so every
+halt and alert still comes from a tick on the configured cadence.
+A confirmed breach **trips** the fence before the flag write is attempted,
+so a failing write cannot leave this process minting; a tripped fence never
+reopens until the process restarts. A builder refused by the fence is counted as
+`private_channel_operator_transaction_errors_total{error_reason="solvency_fence_closed"}`
+and its row goes back to `pending` without using a requeue attempt. The fence is
+checked once more after the claim write, so a trip that lands mid-claim still
+stops the send; that row keeps its persisted, never-broadcast signature in
+`processing` and recovery settles it. The state is
+exported as `private_channel_operator_solvency_fence_state` (0 closed, 1 open,
+2 tripped). A closed fence counts as progress for `/health` for the first three
+ticks only; after that, with deposits waiting, `/health` reports the stall. The
+withdraw operator runs no reconciliation, so its fence is always open and the
+durable flag stays its only gate; while an insolvency write keeps failing it keeps
+releasing, so treat a confirmed-breach page with the flag still unset as urgent and
+stop the withdraw process by hand; a withdraw-side fence fed by the escrow operator's
+health is a tracked follow-up.
 
 ### Inputs-dark halt
 
 The checks are only as good as their inputs. A tick that cannot read a required
 input (the DB mint set, custody, the in-flight envelope, a fresh channel supply
-for any mint, the escrow checkpoint, or the ledger rows) counts as a dark tick, exported as
+for any mint, the escrow checkpoint, the ledger rows, or the `AllowedMint` of a mint
+with no `mints` row) counts as a dark tick, exported as
 `private_channel_operator_reconciliation_input_dark_ticks`. Three dark ticks in
 a row (about 10 minutes at the default 5 minute interval) halt with the reason
 `reconciliation halt: required inputs unavailable for <N> consecutive ticks (last: <reason>)`.
@@ -152,7 +207,8 @@ tick dark instead of checking an old balance.
 
 The halt flag is read at the top of the shared fetcher loop, so it freezes
 **both** the escrow and withdraw operators, and it **survives restarts** - both
-re-read it at first poll and stay frozen until it is cleared. A fetcher that
+re-read it at first poll and stay frozen until it is cleared. The escrow
+operator's fetcher also waits on its solvency fence (above). A fetcher that
 cannot read the flag skips the poll too, counted as
 `private_channel_operator_transaction_errors_total{error_reason="halt_read_error"}`.
 
@@ -227,9 +283,12 @@ the halt reason:
    SELECT mint, COALESCE(SUM(amount),0) AS in_flight
    FROM transactions
    WHERE mint = '<MINT>'
+     AND transaction_type = 'deposit'
      AND status IN ('pending','processing','parked','pending_remint')
    GROUP BY mint;
    ```
+
+   Unsettled withdrawals do not belong here: their burn is already in the supply.
 
 4. **DB ledger liabilities.** The basis of a liability halt, and context for a
    supply halt (e.g. no deposits justify the minted amount). Use the slot from
@@ -252,6 +311,24 @@ the halt reason:
    withdrawal as released, since the operator writes that status only after the
    release confirms. A refusal there is a shortfall neither the chain nor the
    operator's own records explain.
+
+   A boot also refuses when it cannot read custody fresh, before any comparison:
+
+   - `CustodyStale` (`custody could not be read fresh: <cause>`): every custody
+     read must answer at or past the larger of Solana's newest finalized block and the
+     committed escrow checkpoint, and that block must be under 120 s old. A refusal
+     (-32016), an older answer or an old newest block is read up to three times in
+     all, 2 s apart, about 10 s in all, then the indexer exits for the supervisor to restart.
+     Fix the Solana RPC (lag, a backend replaying a snapshot, host clock). A
+     checkpoint above the node's tip (a DB restored from another cluster, or a
+     cluster reset) fails every restart by design: confirm the database belongs to
+     this cluster before anything else.
+   - `CustodyBehindLedger` with backfill off: the checkpoint is read again right
+     after custody, and a ledger that moved past the reading is refused and retried
+     the same way.
+   - `SupplyInvariantUnverified` also covers a channel whose newest block is over
+     120 s old, or whose supply stays behind that block after re-reads: check the
+     channel RPC as well as the gateway.
 
    For a liability halt, custody below `deposits - released` means tokens left
    escrow without a recorded release. Only `ReleaseFunds` is indexed as an
@@ -300,9 +377,14 @@ unfinished resync (see above):
 UPDATE reconciliation_halt SET halted = FALSE, halted_at = NOW() WHERE id = TRUE;
 ```
 
-Both operators' fetchers resume on their next poll (no restart required). The
-escrow operator's forced-unhealthy latch is in-memory, so restart it (or let the
-supervisor cycle it) to clear the 503 once the flag is down. Re-queue any rows
+The withdraw operator's fetcher resumes on its next poll (no restart required).
+The escrow operator resumes on its next poll if its fence is open, and on its
+next clean reconciliation tick if its fence is still closed (it booted under the
+halt, or saw dark inputs). If its fence tripped in process (it confirmed the breach
+itself) it must be restarted.
+Its forced-unhealthy latch is in-memory too, so restart it (or let the
+supervisor cycle it) to clear the 503 once the flag is down; a restart also
+starts a closed fence, which opens after one clean tick. Re-queue any rows
 left in `manual_review` per the relevant per-row runbook
 ([`withdrawal_manual_review.md`](withdrawal_manual_review.md)) after confirming
 each is safe.

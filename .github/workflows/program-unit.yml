@@ -9,7 +9,7 @@ on:
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
   pull_request:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit, audit/apex-audit-scan-remediation]
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"

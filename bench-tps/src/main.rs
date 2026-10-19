@@ -38,7 +38,7 @@ mod types;
 
 use {
     anyhow::Result,
-    args::{Cli, DerivePdaArgs, SubCommand},
+    args::{Cli, CreateInstanceArgs, DerivePdaArgs, SubCommand},
     background::{run_blockhash_poller, run_metrics_sampler, run_operator_mints_sampler},
     bench_metrics::{
         bench_metrics_init, {FLOW_DEPOSIT, FLOW_TRANSFER, FLOW_WITHDRAW},
@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         SubCommand::Deposit(args) => run_deposit(args).await,
         SubCommand::Withdraw(args) => run_withdraw(args).await,
         SubCommand::DerivePda(args) => run_derive_pda(args),
+        SubCommand::CreateInstance(args) => run_create_instance(args).await,
     }
 }
 
@@ -544,6 +545,24 @@ fn run_derive_pda(args: DerivePdaArgs) -> Result<()> {
     let (pda, _) = find_instance_pda(&keypair.pubkey());
     println!("{pda}");
     Ok(())
+}
+
+/// Creates the escrow instance for the seed keypair unless it already exists.
+async fn run_create_instance(args: CreateInstanceArgs) -> Result<()> {
+    init_logging("info");
+    let load = |path: &std::path::Path| {
+        load_keypair(path).map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))
+    };
+    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+        args.solana_rpc_url,
+        solana_commitment_config::CommitmentConfig::processed(),
+    );
+    setup_deposit::ensure_escrow_instance(
+        &rpc,
+        &load(&args.admin_keypair)?,
+        &load(&args.instance_seed_keypair)?,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

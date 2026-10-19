@@ -306,7 +306,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Zero in steady state. Any sample means the sender could not prove it still owns its advisory lock and cancelled the whole operator. reason=not_held is a successful probe proving the lock is gone; probe_error and probe_timeout are a failed or hung heartbeat on the pinned session; fenced_write is a sender-owned write that could not be proven to have run inside the lock's session. Note that OPERATOR_TASK_EXIT is normally labelled fetcher, not sender, on this shutdown.",
+      "description": "Zero in steady state. Any sample means the sender could not prove it still owns its advisory lock and cancelled the whole operator. reason=not_held is a successful probe proving the lock is gone; probe_error and probe_timeout are a failed or hung heartbeat on the pinned session; fenced_write is a sender-owned write that could not be proven to have run inside the lock's session. OPERATOR_TASK_EXIT does not fire on this shutdown.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },

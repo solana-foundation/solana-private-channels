@@ -470,7 +470,11 @@ pub(crate) async fn write_batch_redis(
         let serialized = stored_tx
             .to_bytes()
             .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-        pipe.set(key, serialized);
+        // Expires with the blocks, so the cache cannot outgrow the ledger's retention.
+        match db.block_ttl_secs() {
+            0 => pipe.set(key, serialized),
+            ttl => pipe.set_ex(key, serialized, ttl),
+        };
     }
 
     // Store block info and update latest slot
@@ -485,7 +489,7 @@ pub(crate) async fn write_batch_redis(
         pipe.set(BLOCK_HEIGHT_KEY, block.block_height.unwrap_or(block.slot));
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
-        // Only block entries expire. The tip keys the coherence check reads are
+        // Only block and transaction entries expire. The tip keys the coherence check reads are
         // never given a TTL, so an expiry can neither condemn the cache nor
         // trigger a rebuild.
         match db.block_ttl_secs() {
@@ -501,4 +505,61 @@ pub(crate) async fn write_batch_redis(
         .map_err(|e| format!("Redis batch write failed: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::test_helpers::{
+            create_test_sanitized_transaction, no_accounts_deltas, start_test_postgres_raw,
+            start_test_redis,
+        },
+        redis::AsyncCommands,
+        solana_sdk::signature::Keypair,
+        solana_svm::{
+            account_loader::LoadedTransaction,
+            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+        },
+        std::collections::HashMap,
+    };
+
+    /// Cached transactions expire like cached blocks, so the cache cannot outgrow the
+    /// ledger. A key gone from the cache is a miss that reads Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_transactions_carry_the_ttl() {
+        let (postgres_db, _pg) = start_test_postgres_raw().await;
+        let (mut redis_db, _redis) = start_test_redis(postgres_db).await;
+        let ttl_secs = 120;
+        redis_db.set_block_ttl_secs(ttl_secs);
+        let mut conn = redis_db.connection.clone();
+
+        let tx = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 1);
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction::default(),
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_deltas: Some(no_accounts_deltas()),
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        write_batch_redis(
+            &mut redis_db,
+            &[],
+            vec![(*tx.signature(), &tx, 7, 1_700_000_000, &processed)],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ttl: i64 = conn.ttl(format!("tx:{}", tx.signature())).await.unwrap();
+        assert!(
+            ttl > 0 && ttl <= ttl_secs as i64,
+            "the cached transaction must expire, got {ttl}"
+        );
+    }
 }

@@ -25,6 +25,7 @@ const BLOCKS: &str = "public.blocks";
 const TRANSACTIONS: &str = "public.transactions";
 const METADATA: &str = "public.metadata";
 const ACCOUNT_HISTORY: &str = "public.account_history";
+const ADDRESS_SIGNATURES: &str = "public.address_signatures";
 const DEPLOYMENT_ID_KEY: &[u8] = b"deployment_id";
 /// Most transaction rows one run may prove; each costs roughly 130 bytes of proof memory.
 pub const MAX_TRANSACTION_SIGNATURES: usize = 5_000_000;
@@ -158,7 +159,8 @@ fn drain(mut stderr: impl Read) -> Vec<u8> {
 
 /// A proof passes only if every check holds.
 fn decide(facts: &DumpFacts, live: &LiveLedger) -> Result<()> {
-    let mut required = vec![BLOCKS, TRANSACTIONS, METADATA];
+    // Truncation deletes index rows too, and no restore rebuilds them.
+    let mut required = vec![BLOCKS, TRANSACTIONS, METADATA, ADDRESS_SIGNATURES];
     if live.account_history_count.is_some() {
         required.push(ACCOUNT_HISTORY);
     }
@@ -587,6 +589,7 @@ mod tests {
              1\t\\\\x0a\n2\t\\\\x0b\n3\t\\\\x0c\n4\t\\\\x0d\n5\t\\\\x0e\n\\.\n\n\
              COPY public.transactions (signature, data) FROM stdin;\n\
              \\\\x{doomed}\t\\\\xaabb\n\\\\x{kept}\t\\\\x01\n\\.\n\n\
+             COPY public.address_signatures (address, slot, signature) FROM stdin;\n\\.\n\n\
              COPY public.account_history (id, slot, data) FROM stdin;\n\
              1\t1\t\\\\x01\n2\t2\t\\\\x02\n3\t3\t\\\\x03\n\\.\n\n\
              COPY public.metadata (key, value) FROM stdin;\n\
@@ -625,6 +628,7 @@ mod tests {
             "public.accounts",
             BLOCKS,
             TRANSACTIONS,
+            ADDRESS_SIGNATURES,
             ACCOUNT_HISTORY,
             METADATA,
         ]
@@ -737,6 +741,13 @@ mod tests {
         no_history.tables.remove(ACCOUNT_HISTORY);
         assert!(decide(&no_history, &live(2, Some(2))).is_err());
         assert!(decide(&no_history, &live(2, None)).is_ok());
+
+        let mut no_index = parse(&restore_sql(""), 3, 1).unwrap();
+        no_index.tables.remove(ADDRESS_SIGNATURES);
+        assert!(
+            decide(&no_index, &live(2, None)).is_err(),
+            "the address index is always required"
+        );
 
         let mut other = live(2, Some(2));
         other.deployment_id = vec![9];
