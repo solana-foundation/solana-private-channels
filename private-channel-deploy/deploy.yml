@@ -983,6 +983,7 @@
       - init-indexer-hba.sh
       - init-indexer-login.sql
       - yellowstone-config.json
+      - scripts/pg-backup.sh
 
     - name: Copy postgres init SQL to target
       ansible.builtin.copy:
@@ -1023,6 +1024,20 @@
         src: "{{ repo_root }}/init-indexer-login.sql"
         dest: "{{ target_config_dir }}/init-indexer-login.sql"
         mode: "0644"
+
+    # Both compose files mount it as the pg-backup sidecars' command. copy does not
+    # create a missing parent, and scripts/ exists on devnet targets only.
+    - name: Create the scripts dir on target
+      ansible.builtin.file:
+        path: "{{ target_config_dir }}/scripts"
+        state: directory
+        mode: "0755"
+
+    - name: Copy pg-backup script to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/pg-backup.sh"
+        dest: "{{ target_config_dir }}/scripts/pg-backup.sh"
+        mode: "0755"
 
     - name: Copy indexer/operator TOML configs to target
       ansible.builtin.copy:
