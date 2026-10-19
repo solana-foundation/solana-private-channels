@@ -42,15 +42,17 @@ SELECT signature, last_valid_block_height, blockhash_slot
  ORDER BY id;
 ```
 
-Classify them with one snapshot from the private channel read node, at the
-withdraw operator's `COMMON_SOURCE_RPC_URL`. The public gateway refuses this
-method without an operator JWT. It returns the statuses, block height and
-ledger floor from a single read, so a `null` is never older than the height
-it is judged against. Separate `solana` calls can mix states; do not use them
-here.
+Classify them with one snapshot from the private channel, at the withdraw
+operator's `COMMON_SOURCE_RPC_URL` (the gateway's internal listener, which serves
+it from the read node). The public gateway refuses this method without an
+operator JWT, and the internal listener is not published to the host, so run it
+from inside the withdraw operator's container. It returns the statuses, block
+height and ledger floor from a single read, so a `null` is never older than the
+height it is judged against. Separate `solana` calls can mix states; do not use
+them here.
 
 ```bash
-curl -s "$COMMON_SOURCE_RPC_URL" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSignatureStatusSnapshot","params":[["<sig1>","<sig2>"]]}'
+docker exec private-channel-operator-private-channel sh -c 'curl -s "$COMMON_SOURCE_RPC_URL" -H "content-type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignatureStatusSnapshot\",\"params\":[[\"<sig1>\",\"<sig2>\"]]}"'
 ```
 
 `value` is in signature order. Judge each entry against the `blockHeight`
