@@ -19,7 +19,10 @@ in [RELEASING.md](RELEASING.md). Per-release notes are in [CHANGELOG.md](CHANGEL
    ```
 
    The sidecar only prunes directories named `base_*`, so `pre-upgrade_*` survives
-   retention.
+   retention. It carries its own WAL (`-X stream`) and restores to the moment it was
+   taken, but it cannot be rolled forward: the sidecar prunes archived WAL older than its
+   oldest `base_*`, so the WAL after this backup is gone once those rotate past it. For a
+   later recovery target, use a `base_*` backup and `docs/PITR.md`.
 
 ## Kinds of upgrade
 
@@ -49,7 +52,8 @@ started by hand in this order:
 ```bash
 docker compose up -d write-node
 docker compose logs -f write-node                 # wait for "Redis cache aligned with Postgres"
-docker compose up -d read-node gateway auth
+docker compose up -d read-node gateway
+docker compose --profile auth up -d auth          # only when JWT_SECRET is set (gateway enforces JWT)
 docker compose up -d operator-private-channel
 docker compose logs -f operator-private-channel   # wait for "Withdrawal bitmap verification passed"
 docker compose up -d indexer-solana indexer-private-channel operator-solana
