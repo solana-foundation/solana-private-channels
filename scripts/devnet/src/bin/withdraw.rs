@@ -25,6 +25,9 @@ fn main() -> Result<()> {
         eprintln!("  - Docker: gateway:8899");
         eprintln!("\nThis burns tokens on PrivateChannel. The operator will then release funds on Solana.");
         eprintln!("The mint's withdraw fee is charged on top of <amount>, so the balance must cover both.");
+        eprintln!(
+            "Set PRIVATE_CHANNEL_READ_RPC_URL to the read node when the gateway enforces JWT."
+        );
         std::process::exit(1);
     }
 
@@ -64,11 +67,19 @@ fn main() -> Result<()> {
         &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     );
-    let withdraw_config_data = client
+    // With JWT on, the public gateway refuses account reads without a token, so a
+    // read node URL can be given for this one read; sending stays on the gateway.
+    let read_client = match env::var("PRIVATE_CHANNEL_READ_RPC_URL") {
+        Ok(url) if !url.trim().is_empty() => RpcClient::new(url),
+        _ => RpcClient::new(rpc_url.to_string()),
+    };
+    let withdraw_config_data = read_client
         .get_account_data(&withdraw_config_pda)
         .map_err(|e| {
             format!(
-                "No withdraw config for mint {} at {} ({}). Has a deposit of this mint been processed yet?",
+                "Could not read the withdraw config for mint {} at {} ({}). Either no deposit of \
+                 this mint has been processed yet, or the RPC refused the read (a gateway with \
+                 JWT on returns 401: set PRIVATE_CHANNEL_READ_RPC_URL to the read node)",
                 mint, withdraw_config_pda, e
             )
         })?;

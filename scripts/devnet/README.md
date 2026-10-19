@@ -80,6 +80,8 @@ cargo run --bin withdraw -- \
 ```
 Prints the mint's withdraw fee and minimum before sending, and stops if `<AMOUNT>` is below the minimum. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana. The operator admin withdraws without either.
 
+The tool reads the mint's withdraw config before sending. With JWT on (`JWT_SECRET` set) the public gateway refuses that read without a token, so point it at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`. Sending still goes through the gateway URL.
+
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script
 prints the current gates before sending and warns when a flag re-opens one.

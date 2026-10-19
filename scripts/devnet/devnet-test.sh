@@ -22,6 +22,8 @@
 #
 # Optional env vars:
 #   PRIVATE_CHANNEL_GATEWAY_URL      - Solana Private Channels gateway URL (default: http://localhost:8899)
+#   PRIVATE_CHANNEL_READ_RPC_URL     - Channel URL for account reads (default: the read node when
+#                                      JWT_SECRET is set, since the gateway then refuses them; else the gateway)
 #   ESCROW_ADMIN_KEYPAIR    - Path to escrow admin keypair (default: ./keypairs/escrow-admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
@@ -51,6 +53,13 @@ export ADMIN_SIGNER="${ADMIN_SIGNER:-memory}" OPERATOR_SIGNER="${OPERATOR_SIGNER
 
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
 PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
+# With JWT on, the gateway refuses account reads without a token; the read node does not.
+if [ -n "${JWT_SECRET:-}" ]; then
+  PRIVATE_CHANNEL_READ_RPC_URL="${PRIVATE_CHANNEL_READ_RPC_URL:-http://localhost:${PRIVATE_CHANNEL_READ_PORT:-8901}}"
+else
+  PRIVATE_CHANNEL_READ_RPC_URL="${PRIVATE_CHANNEL_READ_RPC_URL:-$PRIVATE_CHANNEL_GATEWAY_URL}"
+fi
+export PRIVATE_CHANNEL_READ_RPC_URL
 ESCROW_ADMIN_KEYPAIR="${ESCROW_ADMIN_KEYPAIR:-./keypairs/escrow-admin.json}"
 MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
@@ -342,7 +351,7 @@ INSTANCE_SOLANA_FINAL=$(get_token_balance "$INSTANCE_ID" "$MINT")
 
 # Get Solana Private Channels balance via RPC - need to derive ATA first (raw amount)
 USER_ATA=$(spl-token address --verbose --owner "$USER" --token "$MINT" 2>/dev/null | grep "Associated token address" | awk '{print $4}')
-USER_PRIVATE_CHANNEL_FINAL=$(curl -s -X POST "$PRIVATE_CHANNEL_GATEWAY_URL" \
+USER_PRIVATE_CHANNEL_FINAL=$(curl -s -X POST "$PRIVATE_CHANNEL_READ_RPC_URL" \
   -H "Content-Type: application/json" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountBalance\",\"params\":[\"$USER_ATA\"]}" \
   | jq -r '.result.value.amount // "0"')
