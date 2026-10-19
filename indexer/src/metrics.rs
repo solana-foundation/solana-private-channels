@@ -233,6 +233,15 @@ gauge_vec!(
     &["program_type"]
 );
 
+// A worker that loses a lock exits before its counters are scraped, so a restart is
+// only visible as a change in this value. Alerting keys off `changes()` on it.
+gauge_vec!(
+    PROCESS_START_TIME,
+    "private_channel_process_start_time_seconds",
+    "Unix time this indexer or operator process started",
+    &["program_type"]
+);
+
 gauge_vec!(
     OPERATOR_SOLVENCY_FENCE_STATE,
     "private_channel_operator_solvency_fence_state",
@@ -556,6 +565,13 @@ pub fn init_labels(program_type: &str) {
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS.with_label_values(&[program_type]);
     OPERATOR_RECONCILIATION_INPUT_DARK_TICKS.with_label_values(&[program_type]);
     OPERATOR_SOLVENCY_FENCE_STATE.with_label_values(&[program_type]);
+
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+    PROCESS_START_TIME
+        .with_label_values(&[program_type])
+        .set(started);
 }
 
 pub fn init() {
@@ -592,6 +608,7 @@ pub fn init() {
         OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
         OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
         OPERATOR_SOLVENCY_FENCE_STATE,
+        PROCESS_START_TIME,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
         OPERATOR_RECONCILIATION_ENVELOPE_ADJUSTMENT,
@@ -646,6 +663,7 @@ mod tests {
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_reconciliation_input_dark_ticks",
             "private_channel_operator_solvency_fence_state",
+            "private_channel_process_start_time_seconds",
         ];
 
         for name in single_label_metrics {
@@ -666,6 +684,12 @@ mod tests {
         assert!(
             !seeded_fee_payer,
             "init_labels must not seed the fee payer balance"
+        );
+
+        // A restart is visible only as a change in this value, so it must be a real time.
+        assert!(
+            PROCESS_START_TIME.with_label_values(&[program_type]).get() > 1_000_000_000.0,
+            "init_labels must stamp the process start time"
         );
     }
 
@@ -699,6 +723,7 @@ mod tests {
             "private_channel_operator_reopened_deposit_gate_total",
             "private_channel_operator_remint_claim_lost_total",
             "private_channel_operator_sender_lock_lost_total",
+            "private_channel_process_start_time_seconds",
         ];
 
         let families = prometheus::gather();

@@ -241,6 +241,42 @@ groups:
                     params: [0]
               refId: C
 
+      # A lock-loss exit restarts the process in under a second, before any scrape sees
+      # its lock-lost counter, so the start time changing is the reliable signal.
+      - uid: worker-restarted
+        title: "Indexer or operator restarted"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.program_type }}) started a new process in the last 10 minutes. Expected once per deploy or manual restart. Otherwise read the previous container's last log lines: 'Live-state lock lost; stopping without draining' (docs/runbooks/live_state_lock_runbook.md), a sender lock loss (docs/runbooks/sender_lock_lost_runbook.md), or a panic or task exit. The lock-lost counter alerts usually miss these exits, because the process is gone before the next scrape."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: changes(private_channel_process_start_time_seconds[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
   - orgId: 1
     name: feepayer-alerts
     folder: Solana Private Channels Alerts
