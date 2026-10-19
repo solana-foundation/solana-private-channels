@@ -68,6 +68,12 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - Backup sidecars can authenticate for replication, so base backups complete
 - Ansible starts the backup sidecars, and auth when the gateway enforces JWT
 - Alert when the escrow solvency fence trips
+- The withdraw operator sends remints through the gateway's internal listener; the read node refused them, so a failed release was never refunded
+- Postgres chowns its WAL archive mount at start, so archiving works on compose boots, not only after the Ansible chown
+- The replica recreates `replica_slot` on the primary when it is missing, as it is after a PITR restore
+- Alert when an indexer or operator restarts: a lock-loss exit beats the scrape of its counter
+- `sanity.sh` check 7 reads the solvency fence gauge; the log lines it looked for were never emitted
+- The devnet withdraw tool can read through the read node (`PRIVATE_CHANNEL_READ_RPC_URL`) when the gateway enforces JWT
 
 ### Docs and CI
 - Published images carry SBOM and provenance attestations
@@ -89,3 +95,6 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - Clients: unused writable keys and writable program ids are rejected with `-32602`; a `null` status past the deadline proves nothing unless `getFirstAvailableBlock` is at or below the signing `context.slot`.
 - `pg-backup-primary` logs in as `POSTGRES_REPLICATION_USER`, and `postgres-indexer` runs `init-indexer-hba.sh`. Both take effect on fresh volumes only.
 - Ansible always starts `pg-backup-primary` and `pg-backup-indexer`, and starts `auth-migrate` and `auth` when `gateway_enforce_jwt` is true.
+- `postgres-primary` and `postgres-indexer` have a new entrypoint, so the upgrade recreates both containers (a short database restart).
+- `operator-private-channel` now reaches the channel through `GATEWAY_INTERNAL_URL`, so it needs the gateway up as well as the read node.
+- After a PITR restore, reset the recovery settings before starting the replica (`docs/PITR.md` Step 5).
