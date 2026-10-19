@@ -131,7 +131,9 @@ if anything fails. It is guarded these ways.
    server may simply be slow, and the session still holds the lock while we retry, so
    the timeout is tolerated for 30s. An answer of "not held", or a dead session, is
    proof and stops the role at once. The indexer and operator also increment
-   `private_channel_live_state_lock_lost_total{role,reason}`, while resync, being a
+   `private_channel_live_state_lock_lost_total{role,reason}`, but exit before a scrape
+   usually sees it; the `worker-restarted` alert on
+   `private_channel_process_start_time_seconds` is what catches the exit. Resync, being a
    one-shot command with no metrics server, reports it as a failed command instead.
 3. **The reconciliation halt flag.** A halt means custody and the ledger disagree, so
    resync refuses while one is set rather than rebuilding over the evidence behind it.

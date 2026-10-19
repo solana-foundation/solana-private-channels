@@ -980,8 +980,10 @@
       - init-primary-hba.sh
       - init-auth-roles.sql
       - init-indexer-roles.sql
+      - init-indexer-hba.sh
       - init-indexer-login.sql
       - yellowstone-config.json
+      - scripts/pg-backup.sh
 
     - name: Copy postgres init SQL to target
       ansible.builtin.copy:
@@ -1009,6 +1011,12 @@
         dest: "{{ target_config_dir }}/init-indexer-roles.sql"
         mode: "0644"
 
+    - name: Copy postgres indexer HBA script to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/init-indexer-hba.sh"
+        dest: "{{ target_config_dir }}/init-indexer-hba.sh"
+        mode: "0755"
+
     # Creates the indexer cluster's own login on a data directory that predates
     # it; the entrypoint never would.
     - name: Copy postgres indexer-login SQL to target
@@ -1016,6 +1024,20 @@
         src: "{{ repo_root }}/init-indexer-login.sql"
         dest: "{{ target_config_dir }}/init-indexer-login.sql"
         mode: "0644"
+
+    # Both compose files mount it as the pg-backup sidecars' command. copy does not
+    # create a missing parent, and scripts/ exists on devnet targets only.
+    - name: Create the scripts dir on target
+      ansible.builtin.file:
+        path: "{{ target_config_dir }}/scripts"
+        state: directory
+        mode: "0755"
+
+    - name: Copy pg-backup script to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/pg-backup.sh"
+        dest: "{{ target_config_dir }}/scripts/pg-backup.sh"
+        mode: "0755"
 
     - name: Copy indexer/operator TOML configs to target
       ansible.builtin.copy:
@@ -1626,7 +1648,7 @@
   # `==== CHECK N: <name> ====` with PASS / FAIL / SKIP and a short reason.
   #
   # Active end-to-end testing (real deposit → indexer → withdraw → burn) is
-  # invoked manually post-deploy; see private-channel-deploy/SMOKE_TEST.md.
+  # invoked manually post-deploy; see docs/DEVNET_QUICKSTART.md steps 7 and 8.
   # =========================================================================
   - name: "==== PHASE 7: SANITY ===="
     ansible.builtin.debug:

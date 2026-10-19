@@ -49,6 +49,9 @@ services:
   postgres-primary:
     image: postgres:16-alpine
     container_name: private-channel-postgres-primary
+    # Docker creates the archive volume root-owned and postgres (uid 70) cannot write it.
+    # Best effort, so a host where root cannot chown still starts and logs the failure.
+    entrypoint: ["sh", "-c", "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' >&2; exec docker-entrypoint.sh \"$$@\"", "--"]
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -177,6 +180,8 @@ services:
         if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
           echo 'Setting up replica...'
           rm -rf /var/lib/postgresql/data/*
+          # Slots are not in base backups, so a restored primary has none; recreate it.
+          PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c \"SELECT pg_create_physical_replication_slot('replica_slot', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot')\"
           PGPASSWORD=${POSTGRES_REPLICATION_PASSWORD} pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U ${POSTGRES_REPLICATION_USER} -v -P -R -S replica_slot
 
           chmod 700 /var/lib/postgresql/data
@@ -445,6 +450,9 @@ services:
   postgres-indexer:
     image: postgres:16-alpine
     container_name: private-channel-postgres-indexer
+    # Docker creates the archive volume root-owned and postgres (uid 70) cannot write it.
+    # Best effort, so a host where root cannot chown still starts and logs the failure.
+    entrypoint: ["sh", "-c", "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' >&2; exec docker-entrypoint.sh \"$$@\"", "--"]
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -459,6 +467,7 @@ services:
       - postgres-indexer-data:/var/lib/postgresql/data
       - postgres-indexer-wal-archive:/wal_archive
       - ./init-indexer-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
+      - ./init-indexer-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
     command: |
       postgres
       -c wal_level=replica
@@ -652,9 +661,9 @@ services:
       # Mandatory fallback for the withdraw operator; same validator via its distinct
       # alias since local has no independent node. Use a real archival provider in prod.
       - COMMON_FALLBACK_RPC_URL=http://validator-fallback:8899
-      # source_rpc_url = channel read-node (source of withdrawal/burn state).
-      # Read-only, so it skips the gateway.
-      - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
+      # source_rpc_url = the channel: burn state reads, and remint MintTo writes.
+      # The internal listener routes writes to the write-node (the read-node refuses them).
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_INTERNAL_URL:-http://gateway:8904}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack). The operator alias is deliberate: both roles are
       # the same hot service identity. Both operator services must share this key:
@@ -704,14 +713,11 @@ services:
     depends_on:
       postgres-primary:
         condition: service_healthy
-    # TODO: pg_basebackup fails because POSTGRES_USER ("private_channel") lacks the
-    # REPLICATION attribute and isn't in pg_hba.conf for replication. Switch
-    # to POSTGRES_REPLICATION_USER/_PASSWORD (already used by the streaming
-    # replica). Pre-existing gap; backups currently never complete.
+    # The replication login, the one init-primary-hba.sh admits for replication.
     environment:
       - PGHOST=postgres-primary
-      - PGUSER=${POSTGRES_USER}
-      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - PGUSER=${POSTGRES_REPLICATION_USER}
+      - PGPASSWORD=${POSTGRES_REPLICATION_PASSWORD}
       - PG_BACKUP_INTERVAL_HOURS=${PG_BACKUP_INTERVAL_HOURS:-6}
       - PG_BACKUP_RETENTION_COUNT=${PG_BACKUP_RETENTION_COUNT:-3}
     volumes:
@@ -731,7 +737,7 @@ services:
     depends_on:
       postgres-indexer:
         condition: service_healthy
-    # TODO: same pg_hba/role mismatch as pg-backup-primary above.
+    # Superuser login, admitted for replication by init-indexer-hba.sh.
     environment:
       - PGHOST=postgres-indexer
       - PGUSER=${POSTGRES_INDEXER_USER}

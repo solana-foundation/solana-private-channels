@@ -52,8 +52,10 @@ cannot tell the two apart.
 
 ## Symptom
 
-- Grafana alert `sender-lock-lost`, severity critical.
-- The operator process restarts, once, shortly after the alert.
+- Grafana alert `worker-restarted` (warning), and sometimes `sender-lock-lost`
+  (critical). The operator exits within a second of the loss, usually before the
+  next scrape sees the counter, so `worker-restarted` is the one to rely on.
+- The operator process restarts, once.
 - The operator exits with `The <role> sender lock was lost while running`.
   `OPERATOR_TASK_EXIT` does not fire on this shutdown, so a task-exit sample
   with no sender-lock-lost sample means a real task failure, not this case.

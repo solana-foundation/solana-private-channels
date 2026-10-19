@@ -144,7 +144,10 @@ lost; that is Symptom 6.
 ## Symptom 6: `live-state-lock-lost` alert
 
 `private_channel_live_state_lock_lost_total` increased. A role could not prove it
-still owns the lock, so it stopped itself. `role` is `indexer` or `operator`;
+still owns the lock, so it stopped itself. The role exits within a second, usually
+before the next scrape sees the counter, so this alert often stays silent. The
+reliable signal is the `worker-restarted` warning: read the previous container's last
+log lines for `Live-state lock lost; stopping without draining`. `role` is `indexer` or `operator`;
 `reason` is `not_held`, `probe_error` or `probe_timeout`.
 
 `not_held` and `probe_error` fire on the first bad probe: the server answered that the

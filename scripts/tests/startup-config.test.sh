@@ -145,11 +145,49 @@ test_compose_interpolation() {
   pass "$start" "compose interpolation"
 }
 
+# Remints are channel writes, a restored primary has no replica slot, and Docker
+# creates the WAL archive volumes root-owned. Each must hold in both stacks.
+test_compose_release_fixes() {
+  local start=$failures
+  if ! docker compose version >/dev/null 2>&1 || ! command -v jq >/dev/null; then
+    skip "compose release fixes (docker compose or jq missing)"
+    return
+  fi
+  printf 'COMMON_ESCROW_INSTANCE_ID=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz\n' >"$TMP/instance.env"
+  local name json
+  for name in local devnet; do
+    if [[ $name == local ]]; then
+      json="$(compose_json docker-compose.yml --env-file .env.local)" \
+        || { fail "localnet compose config: $(cat "$TMP/err")"; continue; }
+    else
+      json="$(compose_json docker-compose.devnet.yml --env-file .env.devnet --env-file "$TMP/instance.env")" \
+        || { fail "devnet compose config: $(cat "$TMP/err")"; continue; }
+    fi
+
+    [[ "$(jq -r '.services["operator-private-channel"].environment.COMMON_SOURCE_RPC_URL' <<<"$json")" == http://gateway:8904 ]] \
+      || fail "$name operator-private-channel source is not the gateway internal listener (remints are writes)"
+
+    jq -r '.services["postgres-replica"].command | join(" ")' <<<"$json" | grep -q 'pg_create_physical_replication_slot' \
+      || fail "$name postgres-replica does not recreate a missing replica_slot"
+
+    local svc entry
+    for svc in postgres-primary postgres-indexer; do
+      entry="$(jq -r --arg s "$svc" '.services[$s].entrypoint // [] | join(" ")' <<<"$json")"
+      [[ "$entry" == *"chown postgres:postgres /wal_archive"* && "$entry" == *"exec docker-entrypoint.sh"* ]] \
+        || fail "$name $svc does not chown /wal_archive before the image entrypoint"
+      [[ "$(jq -r --arg s "$svc" '.services[$s].command[0]' <<<"$json")" == postgres ]] \
+        || fail "$name $svc command no longer starts with postgres"
+    done
+  done
+  pass "$start" "compose release fixes"
+}
+
 test_env_contract
 test_program_ids_are_the_compiled_ones
 test_compose_has_no_literal_signer_backend
 test_devnet_script_writes_the_one_instance_key
 test_compose_interpolation
+test_compose_release_fixes
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures failure(s)" >&2

@@ -210,11 +210,40 @@ docker compose up -d postgres-indexer
 docker compose logs -f postgres-indexer
 ```
 
+Wait until recovery has finished and the database is promoted. The log's "ready to accept
+connections" also appears earlier as a read-only line, so check the server instead. This
+must print `f` (use `private-channel-postgres-indexer` for the indexer):
+
+```bash
+docker exec private-channel-postgres-primary sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT pg_is_in_recovery()"'
+```
+
+Then remove the recovery settings Step 4 added. The promoted server ignores them, but
+`postgresql.auto.conf` is copied into every replica built from it, and a replica that
+inherits a recovery target in its own past refuses to start. Only after the `f` above: a
+reset during recovery followed by a restart would recover past the target. Each reset
+needs its own `-c`, since `ALTER SYSTEM` cannot run inside the transaction that one
+multi-statement `-c` opens. Do this for each restored database:
+
+```bash
+docker exec private-channel-postgres-primary sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "ALTER SYSTEM RESET restore_command" \
+  -c "ALTER SYSTEM RESET recovery_target_time" \
+  -c "ALTER SYSTEM RESET recovery_target_action"'
+# Expect no recovery lines left:
+docker exec private-channel-postgres-primary grep -E "restore_command|recovery_target" /var/lib/postgresql/data/postgresql.auto.conf
+```
+
 ### Step 6: Restart in order
+
+Start only once every restored database prints `f` for `pg_is_in_recovery()` (Step 5).
+The replica's wait loop and the primary's healthcheck both pass while it is still in
+recovery, so neither proves it.
 
 ```bash
 # After a primary restore: wipe the replica first. A standby left on the old timeline
-# keeps serving blocks from before the restore.
+# keeps serving blocks from before the restore. Replication slots are not part of a base
+# backup; the replica recreates `replica_slot` on the primary before it clones it.
 docker compose stop postgres-replica
 docker run --rm -v private-channel_postgres-replica-data:/data alpine sh -c "rm -rf /data/*"
 docker compose up -d postgres-replica pg-backup-primary
