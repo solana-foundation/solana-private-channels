@@ -1633,7 +1633,7 @@
   # `==== CHECK N: <name> ====` with PASS / FAIL / SKIP and a short reason.
   #
   # Active end-to-end testing (real deposit → indexer → withdraw → burn) is
-  # invoked manually post-deploy; see private-channel-deploy/SMOKE_TEST.md.
+  # invoked manually post-deploy; see docs/DEVNET_QUICKSTART.md steps 7 and 8.
   # =========================================================================
   - name: "==== PHASE 7: SANITY ===="
     ansible.builtin.debug:

@@ -8,8 +8,8 @@
 # Exit code: 0 when no FAIL, 1 otherwise. SKIPs are honest and do not fail —
 # they record what couldn't be verified (typically: no traffic on a fresh deploy).
 #
-# For deeper, transaction-driven validation, see private-channel-deploy/SMOKE_TEST.md
-# (parked but available for post-deploy testing).
+# For deeper, transaction-driven validation, run the deposit and withdraw flow in
+# docs/DEVNET_QUICKSTART.md steps 7 and 8.
 
 set -uo pipefail
 
@@ -20,7 +20,6 @@ PROMETHEUS_URL="${PROMETHEUS_URL:-http://127.0.0.1:9090}"
 INDEXER_LAG_MAX="${INDEXER_LAG_MAX:-50}"            # slots
 OPERATOR_BACKLOG_MAX="${OPERATOR_BACKLOG_MAX:-100}" # tx
 GATEWAY_ERROR_RATIO_MAX="${GATEWAY_ERROR_RATIO_MAX:-0.05}"
-RECONCILE_LOG_WINDOW="${RECONCILE_LOG_WINDOW:-10m}"
 PIPELINE_OBSERVE_SECS="${PIPELINE_OBSERVE_SECS:-10}"
 
 # ---------------------------------------------------------------------------
@@ -209,20 +208,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# CHECK 7: Reconciliation log signals
+# CHECK 7: Escrow solvency fence
 # ---------------------------------------------------------------------------
-banner 7 "operator-solana reconciliation logs (last ${RECONCILE_LOG_WINDOW})"
+# The escrow operator's fence opens after a clean reconciliation tick and trips on a
+# confirmed insolvency. Every worker seeds the gauge at 0, so read operator-solana only.
+banner 7 "escrow solvency fence (operator-solana)"
 
-logs=$(docker logs --since "$RECONCILE_LOG_WINDOW" private-channel-operator-solana 2>&1 || true)
-recon_err=$(echo "$logs" | grep -c "MismatchExceedsThreshold" || true)
-recon_ok=$(echo "$logs"  | grep -cE "Balance reconciliation OK|reconciliation succeeded|Reconciliation passed" || true)
-
-if [ "$recon_err" -gt 0 ]; then
-  no "$recon_err MismatchExceedsThreshold error(s) in last $RECONCILE_LOG_WINDOW — state desync between validator and indexer DB"
-elif [ "$recon_ok" -gt 0 ]; then
-  ok "$recon_ok reconciliation-OK line(s) in last $RECONCILE_LOG_WINDOW"
+if [[ "${SANITY_WORKERS_EXPECTED:-true}" == false ]]; then
+  sk "workers not deployed (SANITY_WORKERS_EXPECTED=false)"
 else
-  sk "no reconciliation lines in last $RECONCILE_LOG_WINDOW (interval may not have fired since deploy)"
+  fence=$(prom 'max(private_channel_operator_solvency_fence_state{program_type="escrow",job=~"(private-channel-)?operator-solana"})')
+  case "${fence%.*}" in
+    1) ok "fence open: a clean reconciliation tick has run" ;;
+    2) no "fence tripped: a confirmed insolvency halted value movement; see docs/runbooks/reconciliation_halt_runbook.md" ;;
+    0) sk "fence closed: no clean reconciliation tick yet (expected for about 30s after boot)" ;;
+    *) sk "fence gauge not found in Prometheus" ;;
+  esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -240,6 +241,6 @@ if [ "$fail" -gt 0 ]; then
 fi
 
 if [ "$skip" -gt 0 ]; then
-  echo "Sanity PASSED with ${skip} SKIPs (no traffic to observe yet — see SMOKE_TEST.md for active validation)."
+  echo "Sanity PASSED with ${skip} SKIPs (no traffic to observe yet; see docs/DEVNET_QUICKSTART.md steps 7 and 8 for active validation)."
 fi
 exit 0
