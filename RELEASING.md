@@ -6,8 +6,9 @@ Upgrading a running stack is in [UPGRADING.md](UPGRADING.md).
 ## Who may release
 
 Only the release owners may push a `v*` tag. The list lives in the repository's tag
-ruleset (no creation, update or deletion by anyone else). Each release names one owner
-and one reviewer for the go/no-go.
+ruleset (no creation, update or deletion by anyone else). A mainnet release names one
+owner and one reviewer for the go/no-go. On devnet the person who cuts the tag owns the
+go/no-go and the rollback call.
 
 ## Versioning
 
@@ -25,6 +26,10 @@ changed retry rule) is at least a minor bump.
 
 ## Release candidate flow
 
+Required for mainnet. A devnet release may skip it: smoke-test the signed
+`sha-<short>` image that `publish-image.yml` pushes for the release commit on `main`,
+then tag that same commit. The digest note below applies the same way.
+
 1. Tag `vX.Y.Z-rc.1` on the `main` commit to release.
 2. `publish-image.yml` builds, scans, pushes and signs
    `ghcr.io/solana-foundation/private-channel-app:vX.Y.Z-rc.1`.
@@ -33,8 +38,8 @@ changed retry rule) is at least a minor bump.
 5. Cut `vX.Y.Z` from the same commit as the last green rc.
 
 The tag build rebuilds the image from floating `rust:bookworm` and `debian:bookworm-slim`
-bases, so the final tag's digest can differ from the rc that was tested. Compare the two
-digests and rerun the smoke subset if they differ.
+bases, so the final tag's digest can differ from the rc (or `sha-<short>` image) that was
+tested. Compare the two digests and rerun the smoke subset if they differ.
 
 ## Flow
 
@@ -61,7 +66,7 @@ cosign verify ghcr.io/solana-foundation/private-channel-app:vX.Y.Z \
 Before the tag:
 
 - `main` clean, CI green on the release commit, CHANGELOG.md updated
-- last rc smoke test recorded with no open failures
+- last rc (or `sha-<short>`) smoke test recorded with no open failures
 - rollback criteria written down: which observation inside the watch window triggers a
   redeploy of the previous tag
 
