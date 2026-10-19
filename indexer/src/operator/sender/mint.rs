@@ -744,9 +744,9 @@ impl ConsumedSetCache {
         self.set.len()
     }
 
-    /// A walk that never met the newest known mint is accepted only when `truncate` pruned
-    /// history below it; a channel holding its whole history yet missing it was rewound.
-    /// Mints in the pruned range are not seen, which is why restore targets must stay above it.
+    /// Missing the newest known mint proves a rewind only on a channel holding its whole
+    /// history. After any `truncate` the miss looks like pruning and is accepted, so only the
+    /// channel fence catches a rewind then, and only one behind the fence slot.
     async fn accept_pruned_walk(
         &self,
         rpc: &RpcClientWithRetry,

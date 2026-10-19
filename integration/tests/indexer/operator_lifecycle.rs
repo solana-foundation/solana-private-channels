@@ -1416,7 +1416,7 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     Ok(())
 }
 
-/// An indexer restore past a release (Apex SOLA13-68): a bit is set with no row to explain
+/// An indexer restore past a release: a bit is set with no row to explain
 /// it and the restored sequence renumbers the next burn, so serving any withdrawal could
 /// pay twice. The operator refuses to start and the pending withdrawal is not touched.
 #[tokio::test(flavor = "multi_thread")]

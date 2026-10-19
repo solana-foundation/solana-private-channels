@@ -3840,7 +3840,7 @@ async fn rewind_rows_to_pending(db_url: &str, signatures: &[&str]) {
     }
 }
 
-/// Apex SOLA13-33 and SOLA13-269: after an indexer restore a minted deposit and a reminted
+/// After an indexer restore a minted deposit and a reminted
 /// withdrawal come back `pending`. The operators must find both in the channel's own mint
 /// history and close them with the original signatures: no second mint, no remint, no release.
 #[tokio::test(flavor = "multi_thread")]

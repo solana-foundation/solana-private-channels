@@ -2427,7 +2427,7 @@ mod tests {
 
     /// After an indexer restore past a release, re-indexed burns are renumbered and a
     /// set bit can no longer be tied to the burn it paid. Only a landed journaled
-    /// signature on the row explains a bit; anything else refuses boot (SOLA13-68).
+    /// signature on the row explains a bit; anything else refuses boot.
     #[tokio::test]
     async fn nonce_gate_matrix() {
         // (case, row status, stored signature, status answer, boots)

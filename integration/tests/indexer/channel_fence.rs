@@ -1,6 +1,6 @@
 //! Channel fence: a channel restored behind the indexer DB re-produces slots with new
-//! hashes, so the withdraw indexer must refuse to resume (SOLA13-99) and both operators,
-//! which read the same fence, must refuse to start too (SOLA13-164, 186, 212).
+//! hashes, so the withdraw indexer must refuse to resume and both operators, which read
+//! the same fence, must refuse to start too.
 
 #[path = "helpers/private_channel_node.rs"]
 mod private_channel_node;
@@ -147,7 +147,7 @@ async fn checkpoint_of(pool: &PgPool) -> Option<i64> {
     .flatten()
 }
 
-/// The Apex 99 shape: the channel was restored to before slot 100 and has since produced
+/// The channel was restored to before slot 100 and has since produced
 /// past it again. The fence block now has another hash, so the indexer refuses to start
 /// and never polls a slot above the checkpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -202,7 +202,7 @@ async fn mock_instance(server: &mut ServerGuard) -> mockito::Mock {
         .await
 }
 
-/// Apex 164: the channel was restored behind the indexer DB, so completed deposits lost
+/// The channel was restored behind the indexer DB, so completed deposits lost
 /// their credit. The escrow operator must refuse to start rather than keep minting there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escrow_operator_refuses_on_fence_mismatch() {

@@ -979,10 +979,7 @@ mod tests {
     /// The whole point of the driver: work waiting in the next generation with
     /// nothing left owing in this one is what a rotation is for, and no
     /// particular row has to survive for the driver to see it.
-    // Forces the admin-signer statics, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn originates_when_lowest_unreleased_is_in_a_later_generation() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);
@@ -1177,10 +1174,7 @@ mod tests {
 
     /// One rotation advances one generation, so a gap wider than that has to be
     /// closed by the driver firing again rather than by a single larger step.
-    // Forces the admin-signer statics, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn originates_again_after_a_rotation_when_the_gap_spans_generations() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);
@@ -1366,10 +1360,7 @@ mod tests {
 
     /// Nothing is known at boot, so the cache cannot be trusted to skip and the
     /// chain has to be read before the gate can answer either way.
-    // Forces the admin-signer statics, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn reads_fresh_when_the_cached_generation_is_none() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);
@@ -1522,10 +1513,7 @@ mod tests {
     /// so the gate has to look at the current window rather than at the lowest
     /// live nonce anywhere. Reachable on the first deploy, because the rotation
     /// this replaces fired regardless of what was unresolved below it.
-    // Forces the admin-signer statics, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn originates_despite_a_nonce_stranded_below_the_current_generation() {
         let mut server = mockito::Server::new_async().await;
         let _anchor = mock_finalized_anchor(&mut server, vec![1]);

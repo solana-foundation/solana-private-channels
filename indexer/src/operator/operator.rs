@@ -1001,7 +1001,7 @@ mod tests {
     use super::*;
 
     /// The escrow operator has no checkpoint of its own with block hashes, so it reads the
-    /// withdraw row's fence: a mismatch there refuses its boot (Apex SOLA13-164).
+    /// withdraw row's fence: a mismatch there refuses its boot.
     #[tokio::test]
     async fn escrow_boot_reads_withdraw_fence_row() {
         use crate::operator::RetryConfig;
@@ -1399,7 +1399,6 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use private_channel_metrics::prometheus;
-    use serial_test::serial;
     use solana_keychain::SolanaSigner;
     use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
@@ -2332,10 +2331,7 @@ mod tests {
 
     /// The withdraw role never reads the webhook, so omitting it must pass the config
     /// gate. The run then proceeds to storage (and stalls on the unreachable RPC).
-    // Past the config gate `run` loads the signers, and `signer_util`'s tests clear that
-    // env while they run, so this has to be ordered against them.
     #[tokio::test]
-    #[serial_test::serial]
     async fn withdraw_without_a_webhook_passes_the_config_gate() {
         // Past the config gate `run` loads the signers, so give it one.
         crate::operator::sender::test_support::ensure_test_signer();
@@ -2359,15 +2355,9 @@ mod tests {
     /// The withdraw role broadcasts releases to its rpc_url, so the monitor must watch
     /// their fee payer there, not on the source chain. Admin and operator share a key
     /// in this binary, so this pins the role and the RPC, not which signer pays.
-    /// Serial because the signer_util tests remove ADMIN_SIGNER while they run.
     #[tokio::test]
-    #[serial]
     async fn withdraw_operator_watches_the_fee_payer_on_its_destination_rpc() {
-        std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var(
-            "ADMIN_PRIVATE_KEY",
-            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
-        );
+        crate::operator::sender::test_support::ensure_test_signer();
         let fee_payer = TransactionBuilder::release_signers()[0].pubkey();
 
         let mut destination = mockito::Server::new_async().await;
@@ -2438,16 +2428,10 @@ mod tests {
 
     /// The alerts treat a missing series as healthy, so the monitor seeds it before its
     /// first read: an RPC that fails every getBalance still pages on the zero. Escrow label
-    /// because no other test writes it, so this cannot pass on test order. Serial for
-    /// ADMIN_SIGNER, as above.
+    /// because no other test writes it, so this cannot pass on test order.
     #[tokio::test]
-    #[serial]
     async fn feepayer_monitor_seeds_its_series_before_the_first_read() {
-        std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var(
-            "ADMIN_PRIVATE_KEY",
-            bs58::encode(solana_sdk::signer::keypair::Keypair::new().to_bytes()).into_string(),
-        );
+        crate::operator::sender::test_support::ensure_test_signer();
         let (_, config) = startup_fixture(ProgramType::Escrow);
         let cancelled = CancellationToken::new();
         cancelled.cancel();

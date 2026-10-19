@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     /// After an indexer restore a deposit the channel already minted comes back
-    /// pending. The channel's own mint history completes it, no second mint (SOLA13-33).
+    /// pending. The channel's own mint history completes it, no second mint.
     #[tokio::test]
     async fn deposit_claim_consumed_hit_completes() {
         let recipient = Pubkey::new_unique().to_string();
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     /// A withdrawal whose remint already landed comes back pending after an indexer
-    /// restore. Releasing it would pay the user twice (SOLA13-269), so it is closed.
+    /// restore. Releasing it would pay the user twice, so it is closed.
     #[tokio::test]
     async fn release_claim_consumed_remint_hit_marks_reminted() {
         let mock = MockStorage::new();

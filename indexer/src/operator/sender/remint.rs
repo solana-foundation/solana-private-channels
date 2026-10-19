@@ -970,8 +970,8 @@ async fn process_pending_remints_within(
         return;
     }
 
-    // Top up from the durable backlog. A read error must not stop the sender loop, and the
-    // cursor only moves on success, so the next tick retries the same page.
+    // Top up from the durable backlog. A read error must not stop the sender loop; a failed
+    // page leaves the cursor before the first row it could not load, so the next tick retries it.
     if state.queued_backlog_remints() < REMINT_HYDRATE_PAGE {
         if let Err(e) = state.hydrate_pending_remints(storage_tx).await {
             // Counted so a read that keeps failing raises an alert instead of stalling refunds quietly.
@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     /// A remint that already landed before an indexer restore is found in the channel's
-    /// mint history and recorded, not sent again (SOLA13-269).
+    /// mint history and recorded, not sent again.
     #[tokio::test]
     async fn remint_claim_consumed_hit_marks_reminted() {
         use crate::operator::sender::{ConsumedClaims, ConsumedSetCache};

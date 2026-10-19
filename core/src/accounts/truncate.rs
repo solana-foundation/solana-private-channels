@@ -342,8 +342,8 @@ async fn ensure_window_not_grown(conn: &mut PgConnection, approved: u64) -> Resu
     }
 }
 
-/// Refuse unless the withdraw indexer has committed every slot below the cut. Runs before
-/// the proof to fail fast and again right before deleting, since a resync can drop the row.
+/// Refuse unless the withdraw indexer has committed every slot below the cut and the cut
+/// keeps its channel fence block. Runs before the proof and again right before deleting.
 async fn ensure_withdraw_indexer_read_past(
     check: &ConsumerCheck,
     truncate_before_slot: u64,
@@ -356,21 +356,21 @@ async fn ensure_withdraw_indexer_read_past(
         }
     };
     // Bounded: the truncation lock is held, and a blackholed host would hold it for minutes.
-    let checkpoint = tokio::time::timeout(CONSUMER_CHECK_TIMEOUT, async {
+    let (checkpoint, fence_slot) = tokio::time::timeout(CONSUMER_CHECK_TIMEOUT, async {
         let mut conn = PgConnection::connect(database_url)
             .await
             .context("Failed to connect to the withdraw indexer database")?;
         // An undefined table is an error here, not an absent row: it means the wrong database.
-        let checkpoint = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
+        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT last_committed_slot, fence_slot FROM indexer_state \
+             WHERE program_type = 'withdraw'",
         )
         .fetch_optional(&mut conn)
         .await
-        .context("Failed to read the withdraw indexer checkpoint from indexer_state")?
-        .flatten();
+        .context("Failed to read the withdraw indexer checkpoint from indexer_state")?;
         // Best effort: the session is dropped either way, and the answer is already read.
         let _ = conn.close().await;
-        anyhow::Ok(checkpoint)
+        anyhow::Ok(row.unwrap_or((None, None)))
     })
     .await
     .map_err(|_| {
@@ -392,6 +392,16 @@ async fn ensure_withdraw_indexer_read_past(
              {truncate_before_slot}; let it catch up to slot {} or keep more slots",
             truncate_before_slot - 1
         ));
+    }
+    // The fence can trail the checkpoint, and both the withdraw indexer and the operator
+    // refuse to boot once the channel no longer serves its block.
+    if let Some(fence) = fence_slot {
+        if (fence.max(0) as u64) < truncate_before_slot {
+            return Err(anyhow!(
+                "this cut at slot {truncate_before_slot} deletes the channel fence block at \
+                 slot {fence}; keep slots from {fence} or let the withdraw indexer advance it"
+            ));
+        }
     }
     Ok(())
 }
@@ -1250,6 +1260,7 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS indexer_state (
                  program_type TEXT PRIMARY KEY,
                  last_committed_slot BIGINT,
+                 fence_slot BIGINT,
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
              );
              DELETE FROM indexer_state;",
@@ -1322,7 +1333,25 @@ mod tests {
             .unwrap();
         assert_eq!(report.blocks_deleted, 2);
 
+        // A fence block below the cut is deleted by it, however far the checkpoint is ahead.
         seed_withdraw_checkpoint(&db.pool, Some(Some(100))).await;
+        sqlx::query("UPDATE indexer_state SET fence_slot = 2")
+            .execute(db.pool.as_ref())
+            .await
+            .unwrap();
+        for dry_run in [true, false] {
+            let err = assert_refused(&url, &gated(&url, dry_run), &db.pool).await;
+            assert!(
+                err.contains("fence block at slot 2"),
+                "dry_run {dry_run}: {err}"
+            );
+        }
+
+        // A fence at the cut survives it.
+        sqlx::query("UPDATE indexer_state SET fence_slot = 3")
+            .execute(db.pool.as_ref())
+            .await
+            .unwrap();
         truncate_on_fresh_pool(&url, &gated(&url, false), &db.pool)
             .await
             .unwrap();
@@ -1390,7 +1419,7 @@ mod tests {
             "CREATE TABLE checkpoint_reads (n INT NOT NULL);
              INSERT INTO checkpoint_reads VALUES (0);
              CREATE FUNCTION withdraw_checkpoint()
-             RETURNS TABLE (program_type TEXT, last_committed_slot BIGINT)
+             RETURNS TABLE (program_type TEXT, last_committed_slot BIGINT, fence_slot BIGINT)
              LANGUAGE plpgsql AS $$
              DECLARE reads INT;
              BEGIN
@@ -1399,7 +1428,7 @@ mod tests {
                      PERFORM pg_terminate_backend(pid) FROM pg_locks
                      WHERE locktype = 'advisory';
                  END IF;
-                 RETURN QUERY SELECT 'withdraw'::TEXT, 100::BIGINT;
+                 RETURN QUERY SELECT 'withdraw'::TEXT, 100::BIGINT, NULL::BIGINT;
              END $$;
              CREATE VIEW indexer_state AS SELECT * FROM withdraw_checkpoint();",
         )

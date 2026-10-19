@@ -233,7 +233,8 @@ is restored. Pass `--withdraw-indexer-db-url` (env
 `PRIVATE_CHANNEL_WITHDRAW_INDEXER_DB_URL`) pointing at the indexer database
 (`postgres-indexer`, so the admin host must reach it); `truncate` refuses unless
 `indexer_state.last_committed_slot` for `withdraw` is at least the cut slot minus
-one. A missing row, an unset slot (an indexer that has never anchored), an
+one, and `fence_slot`, when set, is at or above the cut: the withdraw indexer and
+the operator both refuse to boot once the channel fence block is gone. A missing row, an unset slot (an indexer that has never anchored), an
 unreachable database and a database without `indexer_state` all refuse. A role
 with `SELECT` on `indexer_state` alone is enough and is preferred over
 `POSTGRES_INDEXER_USER`. A deployment with no withdraw indexer passes

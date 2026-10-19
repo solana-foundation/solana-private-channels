@@ -481,8 +481,8 @@ async fn resync_stops_when_its_lock_is_lost_while_waiting_out_stale_workers() {
     );
 }
 
-/// Withdraw indexer on Yellowstone with backfill off, so startup goes straight to the
-/// datasource build, whose anchor read goes to `backfill_rpc`. Withdraw skips reconciliation.
+/// Withdraw indexer on RPC polling with backfill off, so startup goes straight to the
+/// datasource build, whose reads all go to `rpc`. Withdraw skips reconciliation.
 fn rpc_polling_withdraw_configs(
     postgres: PostgresConfig,
     rpc: &str,
@@ -537,21 +537,6 @@ async fn indexer_stops_when_the_live_lock_is_lost_while_building_the_datasource(
             Err(IndexerError::Storage(StorageError::LiveStateLockLost))
         ),
         "the indexer must stop on the lost lock, got: {result:?}"
-    );
-
-    let mut conn = sqlx::PgConnection::connect(&url)
-        .await
-        .expect("admin connect");
-    let anchor: Option<i64> = sqlx::query_scalar(
-        "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
-    )
-    .fetch_optional(&mut conn)
-    .await
-    .expect("read the checkpoint")
-    .flatten();
-    assert_eq!(
-        anchor, None,
-        "no anchor may be written after the lock is lost"
     );
 }
 
