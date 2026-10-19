@@ -719,6 +719,7 @@ mod tests {
             .amount(100)
             .user(pk(12))
             .withdrawal_bitmap(pk(13))
+            .user_depositor_pda(pk(14))
             .transaction_nonce(42);
         TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder: inner.clone(),

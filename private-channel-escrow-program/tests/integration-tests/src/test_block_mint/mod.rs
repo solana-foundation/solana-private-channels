@@ -1,5 +1,5 @@
 use crate::{
-    pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
+    pda_utils::{find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda},
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_block_mint,
         assert_get_or_create_instance, assert_get_or_deposit, assert_get_or_release_funds,
@@ -396,6 +396,7 @@ fn test_block_mint_prevents_deposit() {
         .unwrap();
 
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -420,6 +421,8 @@ fn test_block_mint_prevents_deposit() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .recipient_depositor_pda(user_depositor_pda)
         .amount(1_000_000)
         .instruction();
 
@@ -514,6 +517,8 @@ fn test_block_unblock_keeps_min_deposit_amount() {
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
 
+    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
         .user(user.pubkey())
@@ -527,6 +532,8 @@ fn test_block_unblock_keeps_min_deposit_amount() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .recipient_depositor_pda(user_depositor_pda)
         .amount(min_deposit_amount - 1)
         .instruction();
 

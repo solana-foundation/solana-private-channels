@@ -7,6 +7,7 @@ pub const INSTANCE_SEED: &[u8] = b"instance";
 pub const OPERATOR_SEED: &[u8] = b"operator";
 pub const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 pub const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
+pub const DEPOSITOR_SEED: &[u8] = b"depositor";
 
 // Instance
 pub const INSTANCE_VERSION: u8 = 1;

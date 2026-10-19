@@ -27,6 +27,13 @@ export function updateInstructionBumps(privateChannelEscrowCodama: Codama): Coda
                     },
                 },
             },
+            addDepositor: {
+                arguments: {
+                    bump: {
+                        defaultValue: accountBumpValueNode('depositorPda'),
+                    },
+                },
+            },
         }),
     );
     return privateChannelEscrowCodama;

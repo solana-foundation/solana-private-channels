@@ -1,7 +1,7 @@
 use crate::utils::get_token_balance;
 use crate::utils::{TestContext, NONCES_PER_GENERATION, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use private_channel_escrow_program_client::{
-    accounts::Instance, AllowedMint, Operator, WithdrawalBitmap,
+    accounts::Instance, AllowedMint, Depositor, Operator, WithdrawalBitmap,
 };
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
@@ -26,6 +26,22 @@ pub fn assert_instance_account(
     assert_eq!(instance.admin, *expected_admin);
     assert_eq!(instance.bump, expected_bump);
     assert_eq!(instance.instance_seed, *expected_instance_seed);
+    assert!(!instance.whitelist_enabled, "whitelist starts off");
+}
+
+pub fn assert_whitelist_enabled(
+    context: &mut TestContext,
+    instance_pda: &Pubkey,
+    expected_enabled: bool,
+) {
+    let account = context
+        .get_account(instance_pda)
+        .expect("Instance account should exist");
+
+    let instance =
+        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+
+    assert_eq!(instance.whitelist_enabled, expected_enabled);
 }
 
 /// Decimals sit at offset 44 for both SPL Token and Token-2022 mints.
@@ -146,6 +162,23 @@ pub fn assert_add_operator_account(
         Operator::from_bytes(&account.data).expect("Should deserialize operator account");
 
     assert_eq!(operator.bump, expected_bump);
+}
+
+pub fn assert_add_depositor_account(
+    context: &mut TestContext,
+    depositor_pda: &Pubkey,
+    expected_bump: u8,
+) {
+    let account = context
+        .get_account(depositor_pda)
+        .expect("Depositor account should exist");
+
+    assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+
+    let depositor =
+        Depositor::from_bytes(&account.data).expect("Should deserialize depositor account");
+
+    assert_eq!(depositor.bump, expected_bump);
 }
 
 pub fn assert_remove_operator_account(

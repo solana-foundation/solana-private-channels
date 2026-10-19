@@ -36,6 +36,14 @@ export function appendPdaDerivers(privateChannelEscrowCodama: Codama): Codama {
                     ],
                 },
                 {
+                    name: 'depositor',
+                    seeds: [
+                        constantPdaSeedNode(stringTypeNode('utf8'), stringValueNode('depositor')),
+                        variablePdaSeedNode('instance', publicKeyTypeNode()),
+                        variablePdaSeedNode('wallet', publicKeyTypeNode()),
+                    ],
+                },
+                {
                     name: 'eventAuthority',
                     seeds: [constantPdaSeedNode(stringTypeNode('utf8'), stringValueNode('event_authority'))],
                 },

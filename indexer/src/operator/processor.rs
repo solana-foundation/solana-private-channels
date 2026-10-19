@@ -16,8 +16,8 @@ use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
 };
 use crate::operator::{
-    find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
-    MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
+    find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda, find_operator_pda,
+    find_withdrawal_bitmap_pda, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
 };
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::common::storage::RequeueOutcome;
@@ -641,6 +641,12 @@ fn build_release_funds(
         // release fails `verify_current_program` with IncorrectProgramId.
         .event_authority(release_funds_state.event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        // Read only while the instance whitelist is on. A refusal then fails the
+        // release like any other program error, and the remint path refunds it.
+        .user_depositor_pda(find_depositor_pda(
+            &release_funds_state.instance_pda,
+            &recipient,
+        ))
         .transaction_nonce(nonce);
 
     let amount = transaction.amount.value();
@@ -966,13 +972,14 @@ async fn check_withdrawal_preflights_inner(
 /// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
 /// `token_utils`, which codama does not export), but the transport binds first:
 /// the sender builds a legacy message with no lookup tables, and the 1232-byte
-/// packet holds 732 bytes of release plus 33 per extra, so 15 fit and 16 does
+/// packet holds 765 bytes of release plus 33 per extra, so 14 fit and 15 do
 /// not. Raise it toward 32 if the sender ever moves to versioned transactions
 /// with a lookup table, or to v1 transactions with their larger limit.
 ///
 /// The release grew by one account key plus its index byte, the same 33 bytes
-/// an extra costs, when ReleaseFunds gained its memo_program slot.
-const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 15;
+/// an extra costs, each time ReleaseFunds gained a slot: memo_program, then
+/// user_depositor_pda.
+const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 14;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
@@ -3305,7 +3312,9 @@ mod tests {
 
     /// The remint reverses a burn on the private channel, so it must credit the
     /// account that was debited (`initiator`), not the withdrawal's Solana
-    /// destination (`recipient`).
+    /// destination (`recipient`). The release leg is the reverse: the whitelist
+    /// entry it carries must be the destination's, which only the program checks
+    /// once an instance turns the whitelist on.
     #[tokio::test]
     async fn build_release_funds_remints_to_initiator_not_destination() {
         let mint_pubkey = Pubkey::new_unique();
@@ -3317,9 +3326,12 @@ mod tests {
         let allowed_mint = AllowedMint::from_bytes(&allowed_mint_bytes(false, false, false))
             .expect("the SPL allowlist bytes decode");
 
+        let release_funds_state = make_release_funds_state();
+        let instance_pda = release_funds_state.instance_pda;
+
         let processor_state = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
+            release_funds_state: Some(release_funds_state),
             mint_cache: crate::operator::MintCache::new(storage),
             consumed: None,
         };
@@ -3338,6 +3350,14 @@ mod tests {
         let TransactionBuilder::ReleaseFunds(release) = builder else {
             panic!("a withdrawal must build a ReleaseFunds builder");
         };
+
+        // Account 14 is user_depositor_pda, after memo_program.
+        assert_eq!(
+            release.builder.instruction().accounts[14].pubkey,
+            find_depositor_pda(&instance_pda, &destination),
+            "the release must carry the destination's whitelist entry, not the initiator's"
+        );
+
         let remint = release
             .remint_info
             .expect("a withdrawal must carry remint info");

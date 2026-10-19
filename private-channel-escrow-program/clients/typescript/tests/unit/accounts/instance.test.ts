@@ -8,7 +8,8 @@ const EXPECTED_SIZE =
     1 + // bump
     1 + // version
     32 + // instance_seed
-    32; // admin
+    32 + // admin
+    1; // whitelist_enabled
 
 describe('Instance Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -19,6 +20,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
+                whitelistEnabled: false,
             };
 
             // Test encoding
@@ -44,6 +46,7 @@ describe('Instance Account', () => {
                 version: 2,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                 admin: TEST_ADDRESSES.WALLET,
+                whitelistEnabled: true,
             };
 
             // Test combined codec
@@ -65,6 +68,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
+                    whitelistEnabled: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -86,6 +90,7 @@ describe('Instance Account', () => {
                     version,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
+                    whitelistEnabled: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -112,6 +117,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: addresses.instanceSeed as Address,
                     admin: addresses.admin as Address,
+                    whitelistEnabled: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -134,6 +140,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
+                whitelistEnabled: false,
             };
 
             // Verify all required fields are present
@@ -142,6 +149,7 @@ describe('Instance Account', () => {
             expect(testInstance).toHaveProperty('version');
             expect(testInstance).toHaveProperty('instanceSeed');
             expect(testInstance).toHaveProperty('admin');
+            expect(testInstance).toHaveProperty('whitelistEnabled');
         });
 
         it('should validate instance structure field types', () => {
@@ -151,6 +159,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
+                whitelistEnabled: false,
             };
 
             // Verify field types
@@ -159,6 +168,7 @@ describe('Instance Account', () => {
             expect(typeof testInstance.version).toBe('number');
             expect(typeof testInstance.instanceSeed).toBe('string');
             expect(typeof testInstance.admin).toBe('string');
+            expect(typeof testInstance.whitelistEnabled).toBe('boolean');
         });
 
         // Replay state moved to the WithdrawalBitmap account, so a decoder that
@@ -170,6 +180,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
+                whitelistEnabled: false,
             };
 
             const codec = getInstanceCodec();
@@ -181,7 +192,7 @@ describe('Instance Account', () => {
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (67 bytes)', () => {
+        it('should report correct account size (68 bytes)', () => {
             const accountSize = getInstanceEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -193,6 +204,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
+                whitelistEnabled: false,
             };
 
             const encoder = getInstanceEncoder();
@@ -210,6 +222,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
+                    whitelistEnabled: false,
                 },
                 {
                     discriminator: 255,
@@ -217,6 +230,7 @@ describe('Instance Account', () => {
                     version: 255,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                     admin: TEST_ADDRESSES.WALLET,
+                    whitelistEnabled: true,
                 },
                 {
                     discriminator: 127,
@@ -224,6 +238,7 @@ describe('Instance Account', () => {
                     version: 10,
                     instanceSeed: TEST_ADDRESSES.USDC_MINT,
                     admin: TEST_ADDRESSES.OPERATOR,
+                    whitelistEnabled: false,
                 },
             ];
 

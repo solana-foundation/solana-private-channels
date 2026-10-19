@@ -14,6 +14,7 @@ const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const OPERATOR_SEED: &[u8] = b"operator";
 const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
+const DEPOSITOR_SEED: &[u8] = b"depositor";
 
 /// Account-type tag the escrow program writes in the first byte of a bitmap.
 const WITHDRAWAL_BITMAP_DISCRIMINATOR: u8 = 3;
@@ -43,6 +44,16 @@ pub fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> Pubkey {
 pub fn find_operator_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[OPERATOR_SEED, instance_pda.as_ref(), wallet.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+    .0
+}
+
+/// A wallet's whitelist entry. ReleaseFunds always takes it; the escrow reads it
+/// only while the instance whitelist is on.
+pub fn find_depositor_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[DEPOSITOR_SEED, instance_pda.as_ref(), wallet.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
     .0
@@ -328,6 +339,7 @@ pub(crate) fn instance_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
         version: 1,
         instance_seed: seed,
         admin: Pubkey::new_unique(),
+        whitelist_enabled: false,
     })
     .unwrap()
 }

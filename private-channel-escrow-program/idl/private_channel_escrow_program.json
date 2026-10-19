@@ -102,6 +102,24 @@
                 "format": "u8",
                 "kind": "numberTypeNode"
               }
+            }
+          ],
+          "kind": "structTypeNode"
+        },
+        "kind": "accountNode",
+        "name": "depositor"
+      },
+      {
+        "data": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "bump",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
             },
             {
               "kind": "structFieldTypeNode",
@@ -124,6 +142,18 @@
               "name": "admin",
               "type": {
                 "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "whitelistEnabled",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
               }
             }
           ],
@@ -588,6 +618,107 @@
           ],
           "kind": "structTypeNode"
         }
+      },
+      {
+        "kind": "definedTypeNode",
+        "name": "addDepositorEvent",
+        "type": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "eventDiscriminator",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "instanceSeed",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositor",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            }
+          ],
+          "kind": "structTypeNode"
+        }
+      },
+      {
+        "kind": "definedTypeNode",
+        "name": "removeDepositorEvent",
+        "type": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "eventDiscriminator",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "instanceSeed",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositor",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            }
+          ],
+          "kind": "structTypeNode"
+        }
+      },
+      {
+        "kind": "definedTypeNode",
+        "name": "setWhitelistEnabledEvent",
+        "type": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "eventDiscriminator",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "instanceSeed",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "enabled",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            }
+          ],
+          "kind": "structTypeNode"
+        }
       }
     ],
     "errors": [
@@ -710,6 +841,18 @@
         "kind": "errorNode",
         "message": "Deposit received less than the mint's minimum deposit",
         "name": "belowMinimumDeposit"
+      },
+      {
+        "code": 20,
+        "kind": "errorNode",
+        "message": "Wallet is not on the instance whitelist",
+        "name": "walletNotAllowed"
+      },
+      {
+        "code": 21,
+        "kind": "errorNode",
+        "message": "Invalid depositor PDA provided",
+        "name": "invalidDepositorPda"
       }
     ],
     "instructions": [
@@ -1515,6 +1658,24 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "privateChannelEscrowProgram"
+          },
+          {
+            "docs": [
+              "Depositor PDA of user; read only while the whitelist is on"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "userDepositorPda"
+          },
+          {
+            "docs": [
+              "Depositor PDA of the recipient, or of user when none is given; read only while the whitelist is on"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "recipientDepositorPda"
           }
         ],
         "arguments": [
@@ -1694,6 +1855,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "memoProgram"
+          },
+          {
+            "docs": [
+              "Depositor PDA of user; read only while the whitelist is on"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "userDepositorPda"
           }
         ],
         "arguments": [
@@ -1847,6 +2017,303 @@
         ],
         "kind": "instructionNode",
         "name": "rotateBitmap"
+      },
+      {
+        "accounts": [
+          {
+            "docs": [
+              "Transaction fee payer"
+            ],
+            "isSigner": true,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "payer"
+          },
+          {
+            "docs": [
+              "Admin of Instance"
+            ],
+            "isSigner": true,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "admin"
+          },
+          {
+            "docs": [
+              "Instance PDA to validate admin authority"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "instance"
+          },
+          {
+            "docs": [
+              "Wallet to be added"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "depositor"
+          },
+          {
+            "docs": [
+              "Depositor PDA to be created"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "depositorPda"
+          },
+          {
+            "docs": [
+              "System program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "systemProgram"
+          },
+          {
+            "docs": [
+              "Event authority PDA for emitting events"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "eventAuthority"
+          },
+          {
+            "docs": [
+              "Current program for CPI"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "privateChannelEscrowProgram"
+          }
+        ],
+        "arguments": [
+          {
+            "defaultValue": {
+              "kind": "numberValueNode",
+              "number": 9
+            },
+            "defaultValueStrategy": "omitted",
+            "kind": "instructionArgumentNode",
+            "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "bump",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          }
+        ],
+        "discriminators": [
+          {
+            "kind": "fieldDiscriminatorNode",
+            "name": "discriminator",
+            "offset": 0
+          }
+        ],
+        "kind": "instructionNode",
+        "name": "addDepositor"
+      },
+      {
+        "accounts": [
+          {
+            "docs": [
+              "Transaction fee payer"
+            ],
+            "isSigner": true,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "payer"
+          },
+          {
+            "docs": [
+              "Admin of Instance"
+            ],
+            "isSigner": true,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "admin"
+          },
+          {
+            "docs": [
+              "Instance PDA to validate admin authority"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "instance"
+          },
+          {
+            "docs": [
+              "Wallet to be removed"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "depositor"
+          },
+          {
+            "docs": [
+              "Existing Depositor PDA"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "depositorPda"
+          },
+          {
+            "docs": [
+              "System program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "systemProgram"
+          },
+          {
+            "docs": [
+              "Event authority PDA for emitting events"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "eventAuthority"
+          },
+          {
+            "docs": [
+              "Current program for CPI"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "privateChannelEscrowProgram"
+          }
+        ],
+        "arguments": [
+          {
+            "defaultValue": {
+              "kind": "numberValueNode",
+              "number": 10
+            },
+            "defaultValueStrategy": "omitted",
+            "kind": "instructionArgumentNode",
+            "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          }
+        ],
+        "discriminators": [
+          {
+            "kind": "fieldDiscriminatorNode",
+            "name": "discriminator",
+            "offset": 0
+          }
+        ],
+        "kind": "instructionNode",
+        "name": "removeDepositor"
+      },
+      {
+        "accounts": [
+          {
+            "docs": [
+              "Transaction fee payer"
+            ],
+            "isSigner": true,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "payer"
+          },
+          {
+            "docs": [
+              "Admin of Instance"
+            ],
+            "isSigner": true,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "admin"
+          },
+          {
+            "docs": [
+              "Instance PDA to update"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "instance"
+          },
+          {
+            "docs": [
+              "Event authority PDA for emitting events"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "eventAuthority"
+          },
+          {
+            "docs": [
+              "Current program for CPI"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "privateChannelEscrowProgram"
+          }
+        ],
+        "arguments": [
+          {
+            "defaultValue": {
+              "kind": "numberValueNode",
+              "number": 11
+            },
+            "defaultValueStrategy": "omitted",
+            "kind": "instructionArgumentNode",
+            "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "enabled",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          }
+        ],
+        "discriminators": [
+          {
+            "kind": "fieldDiscriminatorNode",
+            "name": "discriminator",
+            "offset": 0
+          }
+        ],
+        "kind": "instructionNode",
+        "name": "setWhitelistEnabled"
       },
       {
         "accounts": [

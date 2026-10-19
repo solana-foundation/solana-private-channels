@@ -17,6 +17,9 @@ pub enum EventDiscriminators {
     Deposit = 6,
     ReleaseFunds = 7,
     RotateBitmap = 8,
+    AddDepositor = 9,
+    RemoveDepositor = 10,
+    SetWhitelistEnabled = 11,
 }
 
 #[derive(CodamaType)]
@@ -370,6 +373,96 @@ impl RotateBitmapEvent {
     }
 }
 
+#[derive(CodamaType)]
+pub struct AddDepositorEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Wallet added to the whitelist
+    pub depositor: Pubkey,
+}
+
+impl AddDepositorEvent {
+    pub fn new(instance_seed: Pubkey, depositor: Pubkey) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::AddDepositor as u8,
+            instance_seed,
+            depositor,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (depositor)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(73);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.depositor.as_ref());
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct RemoveDepositorEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Wallet removed from the whitelist
+    pub depositor: Pubkey,
+}
+
+impl RemoveDepositorEvent {
+    pub fn new(instance_seed: Pubkey, depositor: Pubkey) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::RemoveDepositor as u8,
+            instance_seed,
+            depositor,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (depositor)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(73);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.depositor.as_ref());
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct SetWhitelistEnabledEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Whether the whitelist is now enforced
+    pub enabled: bool,
+}
+
+impl SetWhitelistEnabledEvent {
+    pub fn new(instance_seed: Pubkey, enabled: bool) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::SetWhitelistEnabled as u8,
+            instance_seed,
+            enabled,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 1 (enabled)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(42);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.push(self.enabled as u8);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +683,19 @@ mod tests {
         assert_eq!(bytes.len(), 81);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::RotateBitmap as u8);
+    }
+
+    #[test]
+    fn test_set_whitelist_enabled_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let event = SetWhitelistEnabledEvent::new(instance_seed, true);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 1 (enabled)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 42);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::SetWhitelistEnabled as u8);
+        assert_eq!(&bytes[9..41], instance_seed.as_ref());
+        assert_eq!(bytes[41], 1);
     }
 }

@@ -98,6 +98,9 @@ pub struct AccountAddresses {
     pub user: AddressStorage,
     /// User's token account (ATA of the user keypair).
     pub user_ata: AddressStorage,
+    /// User's whitelist PDA: `["depositor", instance, user]`. Never created, since
+    /// the whitelist stays off; Deposit and ReleaseFunds still take the address.
+    pub user_depositor_pda: AddressStorage,
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -212,6 +215,14 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
     let user = accounts.user.insert(trident, None);
     let user_ata = get_associated_token_address_with_program_id(&user, &mint, &SPL_TOKEN_ID);
     accounts.user_ata.insert_with_address(user_ata);
+
+    let (user_depositor_pda, _) = Pubkey::find_program_address(
+        &[b"depositor", instance_pda.as_ref(), user.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
+    accounts
+        .user_depositor_pda
+        .insert_with_address(user_depositor_pda);
 
     let create_ata_ix = trident.initialize_associated_token_account(&payer, &mint, &user);
     assert!(trident

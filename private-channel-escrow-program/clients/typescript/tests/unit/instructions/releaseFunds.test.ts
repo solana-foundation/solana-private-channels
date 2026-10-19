@@ -5,6 +5,7 @@ import {
     RELEASE_FUNDS_DISCRIMINATOR,
     findOperatorPda,
     findAllowedMintPda,
+    findDepositorPda,
     findWithdrawalBitmapPda,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
@@ -195,7 +196,7 @@ describe('releaseFunds', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram', async () => {
+        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram, userDepositorPda', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
@@ -212,8 +213,8 @@ describe('releaseFunds', () => {
                 transactionNonce: TEST_TRANSACTION_NONCE,
             });
 
-            // Based on program instruction definition, ReleaseFunds should have 14 accounts
-            expect(instruction.accounts).toHaveLength(14);
+            // Based on program instruction definition, ReleaseFunds should have 15 accounts
+            expect(instruction.accounts).toHaveLength(15);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -272,6 +273,13 @@ describe('releaseFunds', () => {
             // Account 13: memoProgram (Readonly, defaulted by the client)
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.address).toBe(MEMO_PROGRAM_ADDRESS);
+
+            // Account 14: userDepositorPda (Readonly PDA - derived from the user argument)
+            const [expectedUserDepositorPda] = await findDepositorPda({
+                instance: TEST_ADDRESSES.INSTANCE,
+                wallet: testUser,
+            });
+            expect(instruction.accounts[14].address).toBe(expectedUserDepositorPda);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -345,6 +353,9 @@ describe('releaseFunds', () => {
             // Account 13: memoProgram - should be Readonly
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.role).toBe(AccountRole.READONLY);
+
+            // Account 14: userDepositorPda - should be Readonly
+            expect(instruction.accounts[14].role).toBe(AccountRole.READONLY);
         });
 
         it('should use correct program addresses', async () => {

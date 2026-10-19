@@ -5,6 +5,7 @@ use super::discriminator::{
 use crate::constants::{INSTANCE_SEED, INSTANCE_VERSION};
 use crate::error::PrivateChannelEscrowProgramError;
 use crate::processor::validate_pda_account;
+use crate::require_len;
 use crate::validate_discriminator;
 use crate::ID as PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use alloc::vec::Vec;
@@ -20,6 +21,8 @@ pub struct Instance {
     pub version: u8,
     pub instance_seed: Pubkey,
     pub admin: Pubkey,
+    /// When set, Deposit and ReleaseFunds only move funds between wallets with a Depositor entry.
+    pub whitelist_enabled: bool,
 }
 
 impl Discriminator for Instance {
@@ -34,6 +37,7 @@ impl AccountSerialize for Instance {
         data.push(self.version);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.admin.as_ref());
+        data.push(self.whitelist_enabled as u8);
         data
     }
 }
@@ -43,7 +47,8 @@ impl Instance {
         1 + // bump
         1 + // version
         32 + // instance_seed
-        32; // admin
+        32 + // admin
+        1; // whitelist_enabled
 
     pub fn new(bump: u8, instance_seed: Pubkey, admin: Pubkey) -> Self {
         Self {
@@ -51,6 +56,7 @@ impl Instance {
             version: INSTANCE_VERSION,
             instance_seed,
             admin,
+            whitelist_enabled: false,
         }
     }
 
@@ -74,6 +80,8 @@ impl Instance {
     pub fn try_from_bytes(data: &[u8]) -> Result<Self, ProgramError> {
         validate_discriminator!(data, Self::DISCRIMINATOR);
 
+        require_len!(data, Self::LEN);
+
         let mut offset: usize = 1;
 
         let bump = data[offset];
@@ -94,12 +102,21 @@ impl Instance {
                 .try_into()
                 .map_err(|_| ProgramError::InvalidAccountData)?,
         );
+        offset += 32;
+
+        // The Borsh client refuses any bool byte but 0 or 1, so we do too.
+        let whitelist_enabled = match data[offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProgramError::InvalidAccountData),
+        };
 
         Ok(Self {
             bump,
             version,
             instance_seed,
             admin,
+            whitelist_enabled,
         })
     }
 }
@@ -123,7 +140,8 @@ mod tests {
     fn test_serialization_roundtrip() {
         let admin = Pubkey::new_from_array([42u8; 32]);
         let instance_seed = Pubkey::new_from_array([7u8; 32]);
-        let instance = Instance::new(255, instance_seed, admin);
+        let mut instance = Instance::new(255, instance_seed, admin);
+        instance.whitelist_enabled = true;
 
         let bytes = instance.to_bytes();
         assert_eq!(bytes.len(), Instance::LEN);
@@ -134,6 +152,7 @@ mod tests {
         assert_eq!(deserialized.version, instance.version);
         assert_eq!(deserialized.instance_seed, instance.instance_seed);
         assert_eq!(deserialized.admin, instance.admin);
+        assert!(deserialized.whitelist_enabled);
     }
 
     // validate_admin should return Ok when the provided key matches the stored admin.

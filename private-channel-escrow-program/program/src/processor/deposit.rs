@@ -13,13 +13,13 @@ use crate::{
         verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
     require_len,
-    state::{AllowedMint, Instance},
+    state::{AllowedMint, Depositor, Instance},
     validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 /// Fixed account prefix; anything past it is transfer-hook extras.
-const FIXED_ACCOUNTS_LEN: usize = 12;
+const FIXED_ACCOUNTS_LEN: usize = 14;
 
 /// Processes the Deposit instruction.
 ///
@@ -36,6 +36,9 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// 9. `[]` associated_token_program - Associated Token program
 /// 10. `[]` event_authority - Event authority PDA for emitting events
 /// 11. `[]` private_channel_escrow_program - Current program for CPI
+/// 12. `[]` user_depositor_pda - Depositor PDA of `user`, read only while the whitelist is on
+/// 13. `[]` recipient_depositor_pda - Depositor PDA of the channel recipient (`recipient`,
+///     or `user` when none is given), read only while the whitelist is on
 ///
 /// Trailing accounts (variable): transfer-hook extras for the mint (hook
 /// program, validation PDA, and whatever its `ExtraAccountMetaList`
@@ -64,7 +67,7 @@ pub fn process_deposit(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
+    let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info, user_depositor_pda_info, recipient_depositor_pda_info] =
         fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -101,6 +104,23 @@ pub fn process_deposit(
 
     if allowed_mint.deposits_blocked {
         return Err(PrivateChannelEscrowProgramError::DepositsBlockedForMint.into());
+    }
+
+    let recipient = args.recipient.unwrap_or(*user_info.address());
+
+    // Both the wallet funding the deposit and the one credited in the channel must
+    // be listed. With no recipient they are the same wallet.
+    if instance.whitelist_enabled {
+        Depositor::verify_listed(
+            user_depositor_pda_info,
+            instance_info.address(),
+            user_info.address(),
+        )?;
+        Depositor::verify_listed(
+            recipient_depositor_pda_info,
+            instance_info.address(),
+            &recipient,
+        )?;
     }
 
     // A recreate at the same address can change any of these. Closing needs zero
@@ -163,7 +183,6 @@ pub fn process_deposit(
         return Err(PrivateChannelEscrowProgramError::BelowMinimumDeposit.into());
     }
 
-    let recipient = args.recipient.unwrap_or(*user_info.address());
     let event = DepositEvent::new(
         instance.instance_seed,
         *user_info.address(),

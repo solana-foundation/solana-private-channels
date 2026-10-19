@@ -5,6 +5,7 @@ import {
     pdaSeedValueNode,
     publicKeyTypeNode,
     accountValueNode,
+    argumentValueNode,
     variablePdaSeedNode,
     publicKeyValueNode,
     pdaLinkNode,
@@ -87,6 +88,30 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                 account: 'withdrawalBitmap',
                 defaultValue: pdaValueNode(pdaLinkNode('withdrawalBitmap'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
+                ]),
+            },
+            {
+                account: 'depositorPda',
+                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', accountValueNode('depositor')),
+                ]),
+            },
+            // No default for recipientDepositorPda: it follows the optional recipient argument.
+            {
+                account: 'userDepositorPda',
+                instruction: 'deposit',
+                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', accountValueNode('user')),
+                ]),
+            },
+            {
+                account: 'userDepositorPda',
+                instruction: 'releaseFunds',
+                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', argumentValueNode('user')),
                 ]),
             },
 

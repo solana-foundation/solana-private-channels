@@ -1,5 +1,8 @@
-use crate::assertions::{assert_deposit_balances, assert_release_funds_balances};
-use crate::pda_utils::{find_allowed_mint_pda, find_event_authority_pda};
+use crate::assertions::{
+    assert_account_lamports_gt, assert_add_depositor_account, assert_deposit_balances,
+    assert_release_funds_balances, assert_whitelist_enabled,
+};
+use crate::pda_utils::{find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda};
 use crate::utils::{
     assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT,
@@ -16,8 +19,9 @@ use crate::{
     utils::{TestContext, TOKEN_2022_PROGRAM_ID},
 };
 use private_channel_escrow_program_client::instructions::{
-    AddOperatorBuilder, AllowMintBuilder, BlockMintBuilder, CreateInstanceBuilder,
-    ReleaseFundsBuilder, RemoveOperatorBuilder, SetNewAdminBuilder,
+    AddDepositorBuilder, AddOperatorBuilder, AllowMintBuilder, BlockMintBuilder,
+    CreateInstanceBuilder, ReleaseFundsBuilder, RemoveDepositorBuilder, RemoveOperatorBuilder,
+    SetNewAdminBuilder, SetWhitelistEnabledBuilder,
 };
 use private_channel_escrow_program_client::instructions::{DepositBuilder, RotateBitmapBuilder};
 use private_channel_escrow_program_client::WithdrawalBitmap;
@@ -324,6 +328,147 @@ pub fn assert_get_or_remove_operator(
     Ok(())
 }
 
+pub fn assert_get_or_add_depositor(
+    context: &mut TestContext,
+    admin: &Keypair,
+    instance_pda: &Pubkey,
+    wallet: &Pubkey,
+    with_profiling: bool,
+) -> Result<(Pubkey, u8), Box<dyn std::error::Error>> {
+    context.airdrop_if_required(&admin.pubkey(), 1_000_000_000)?;
+
+    let (depositor_pda, bump) = find_depositor_pda(instance_pda, wallet);
+
+    assert_account_not_exists(context, &depositor_pda);
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = AddDepositorBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(*instance_pda)
+        .depositor(*wallet)
+        .depositor_pda(depositor_pda)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .instruction();
+
+    let transaction_metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[admin],
+            with_profiling,
+            None,
+        )
+        .expect("AddDepositor should succeed");
+
+    assert_add_depositor_account(context, &depositor_pda, bump);
+
+    // Assert AddDepositor event was emitted
+    assert_event_discriminator_present(
+        &transaction_metadata,
+        9, // AddDepositor discriminator
+    );
+
+    Ok((depositor_pda, bump))
+}
+
+pub fn assert_get_or_remove_depositor(
+    context: &mut TestContext,
+    admin: &Keypair,
+    instance_pda: &Pubkey,
+    wallet: &Pubkey,
+    with_profiling: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    context.airdrop_if_required(&admin.pubkey(), 1_000_000_000)?;
+
+    let (depositor_pda, _) = find_depositor_pda(instance_pda, wallet);
+
+    assert_account_exists(context, &depositor_pda);
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let previous_lamports_balance = context
+        .get_account(&context.payer.pubkey())
+        .unwrap()
+        .lamports;
+
+    let instruction = RemoveDepositorBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(*instance_pda)
+        .depositor(*wallet)
+        .depositor_pda(depositor_pda)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .instruction();
+
+    let transaction_metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[admin],
+            with_profiling,
+            None,
+        )
+        .expect("RemoveDepositor should succeed");
+
+    // The rent comes back to the payer, net of the transaction fee.
+    assert_account_not_exists(context, &depositor_pda);
+    let payer = context.payer.pubkey();
+    assert_account_lamports_gt(context, &payer, previous_lamports_balance);
+
+    // Assert RemoveDepositor event was emitted
+    assert_event_discriminator_present(
+        &transaction_metadata,
+        10, // RemoveDepositor discriminator
+    );
+
+    Ok(())
+}
+
+pub fn assert_get_or_set_whitelist_enabled(
+    context: &mut TestContext,
+    admin: &Keypair,
+    instance_pda: &Pubkey,
+    enabled: bool,
+    with_profiling: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    context.airdrop_if_required(&admin.pubkey(), 1_000_000_000)?;
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = SetWhitelistEnabledBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(*instance_pda)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .enabled(enabled)
+        .instruction();
+
+    let transaction_metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[admin],
+            with_profiling,
+            None,
+        )
+        .expect("SetWhitelistEnabled should succeed");
+
+    assert_whitelist_enabled(context, instance_pda, enabled);
+
+    // Assert SetWhitelistEnabled event was emitted
+    assert_event_discriminator_present(
+        &transaction_metadata,
+        11, // SetWhitelistEnabled discriminator
+    );
+
+    Ok(())
+}
+
 pub fn assert_get_or_set_new_admin(
     context: &mut TestContext,
     current_admin: &Keypair,
@@ -380,6 +525,9 @@ pub fn assert_get_or_deposit(
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(instance_pda, mint);
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (user_depositor_pda, _) = find_depositor_pda(instance_pda, &user.pubkey());
+    let (recipient_depositor_pda, _) =
+        find_depositor_pda(instance_pda, &recipient.unwrap_or(user.pubkey()));
 
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), mint, token_program);
@@ -403,6 +551,8 @@ pub fn assert_get_or_deposit(
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .recipient_depositor_pda(recipient_depositor_pda)
         .amount(amount);
 
     let instruction = if let Some(recipient) = recipient {
@@ -453,6 +603,7 @@ pub fn assert_get_or_release_funds(
     let (allowed_mint_pda, _) = find_allowed_mint_pda(instance_pda, mint);
     let (event_authority_pda, _) = find_event_authority_pda();
     let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(instance_pda);
+    let (user_depositor_pda, _) = find_depositor_pda(instance_pda, user);
 
     let user_ata = get_associated_token_address_with_program_id(user, mint, token_program);
     let instance_ata =
@@ -476,6 +627,7 @@ pub fn assert_get_or_release_funds(
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
         .amount(amount)
         .user(*user)
         .transaction_nonce(transaction_nonce)

@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**64 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **109 integration tests** (end-to-end behavior).
+**67 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **132 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -82,6 +82,27 @@
 - `test_remove_operator_invalid_instance_account_owner` — wrong owner rejected
 - `test_remove_operator_prevents_release_funds` — once an operator PDA is closed, release_funds using that PDA fails with InvalidAccountData
 
+### AddDepositor (5 integration tests)
+
+- `test_add_depositor_success` — happy path; the Depositor PDA stores its bump
+- `test_add_depositor_duplicate` — adding a listed wallet again fails
+- `test_add_depositor_invalid_pda` — an address that is not the wallet's PDA is rejected with InvalidDepositorPda
+- `test_add_depositor_invalid_admin_not_signer` — unsigned admin rejected
+- `test_add_depositor_invalid_admin` — wrong admin rejected
+
+### RemoveDepositor (4 integration tests)
+
+- `test_remove_depositor_success` — happy path with rent reclamation
+- `test_remove_depositor_nonexistent` — an unlisted wallet fails with InvalidAccountData
+- `test_remove_depositor_invalid_admin` — wrong admin rejected
+- `test_remove_depositor_other_wallets_pda_rejected` — another listed wallet's entry cannot be closed in its place; InvalidDepositorPda
+
+### SetWhitelistEnabled (3 integration tests)
+
+- `test_set_whitelist_enabled_on_then_off` — the flag is absolute; a new instance starts with it off
+- `test_set_whitelist_enabled_invalid_admin` — wrong admin rejected
+- `test_set_whitelist_enabled_invalid_admin_not_signer` — unsigned admin rejected
+
 ### SetNewAdmin (7 integration tests)
 
 - `test_set_new_admin_success` — happy path
@@ -92,7 +113,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (27 integration tests)
+### Deposit (34 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -121,8 +142,15 @@
 - `test_deposit_succeeds_after_freeze_authority_revoked` — the other direction; revoking leaves the mint strictly safer and must not strand deposits, so tightening the check into an equality breaks this
 - `test_deposit_succeeds_after_mint_gains_metadata` — an issuer writing metadata onto a live mint is routine, not a recreate; dropping the metadata and group bits from the exemption mask breaks this
 - `test_deposit_token_2022_memo_required_instance_ata_fails` — a deposit into an instance ATA carrying `MemoTransfer` fails, since `Deposit` emits no memo
+- `test_deposit_whitelist_listed_user_succeeds` — with no recipient the depositor is also the credited wallet, so being listed is enough
+- `test_deposit_whitelist_unlisted_user_rejected` — WalletNotAllowed, and no tokens move
+- `test_deposit_whitelist_listed_user_and_recipient_succeeds` — both wallets listed
+- `test_deposit_whitelist_unlisted_recipient_rejected` — a listed depositor cannot credit an unlisted recipient
+- `test_deposit_whitelist_unlisted_user_with_listed_recipient_rejected` — a listed recipient does not vouch for the funding wallet
+- `test_deposit_whitelist_other_wallets_pda_rejected` — another listed wallet's entry in either slot is rejected with InvalidDepositorPda
+- `test_deposit_whitelist_removed_user_rejected` — removing an entry blocks the next deposit
 
-### ReleaseFunds (24 integration tests)
+### ReleaseFunds (28 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -148,6 +176,10 @@
 - `test_release_funds_token_2022_memo_required_destination` — a destination ATA carrying `MemoTransfer` is released to, with the memo CPI emitted as the transfer's preceding sibling
 - `test_release_funds_token_2022_memo_with_transfer_hook` — memo and transfer hook on one release, so the memo sibling and the forwarded hook extras coexist
 - `test_release_funds_memo_required_wrong_memo_program_rejected` — the memo program account is only address-checked on the memo path; a wrong one there is rejected
+- `test_release_funds_whitelist_listed_destination_succeeds` — happy path with the whitelist on
+- `test_release_funds_whitelist_unlisted_destination_rejected` — WalletNotAllowed, and the nonce stays unspent so the operator can remint the burn
+- `test_release_funds_whitelist_other_wallets_pda_rejected` — another listed wallet's entry is rejected with InvalidDepositorPda
+- `test_release_funds_whitelist_removed_destination_rejected` — removing an entry blocks the next release to it
 
 ### RotateBitmap (6 integration tests)
 
@@ -163,7 +195,7 @@
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### Unit Tests (55 tests across processor and program modules)
+### Unit Tests (58 tests across processor and program modules)
 
 **Instruction data parsing** (processor modules):
 
@@ -173,6 +205,7 @@
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `rotate_bitmap`: 1 test (empty accounts)
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)
+- `set_whitelist_enabled`: 1 test (non-canonical flag byte rejected)
 
 **Withdrawal bitmap logic** (`state/withdrawal_bitmap.rs`):
 
@@ -182,8 +215,9 @@
 
 - `allowed_mint`: 8 tests (constructor stores bump and gates, serialize→deserialize roundtrip, wrong discriminator rejected, non-canonical gate byte rejected, empty data rejected, data too short rejected, profile comparison detects drift, profile comparison ignores issuer-addable extensions and a revoked freeze authority)
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
-- `instance`: 5 tests (constructor, serialization roundtrip with length check, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization)
-- `discriminator`: 2 tests (all 10 valid instruction discriminator bytes accepted, unmapped bytes rejected)
+- `depositor`: 1 test (wrong discriminator rejected, so no other escrow account passes as a whitelist entry)
+- `instance`: 5 tests (constructor, serialization roundtrip with length check and the whitelist flag, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization)
+- `discriminator`: 2 tests (all 13 valid instruction discriminator bytes accepted, unmapped bytes rejected)
 
 **Error ABI stability** (`error.rs`):
 
@@ -191,7 +225,7 @@
 
 **Event encoding** (`events.rs`):
 
-- 9 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix
+- 10 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap, SetWhitelistEnabled) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix. AddDepositor and RemoveDepositor share the operator events' layout and are asserted emitted by the integration tests
 
 ## Documented Gaps
 

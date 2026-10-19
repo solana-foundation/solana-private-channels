@@ -575,6 +575,7 @@ mod tests {
             .user_ata(pk)
             .instance_ata(pk)
             .token_program(spl_token::id())
+            .user_depositor_pda(pk)
             .user(pk)
             .amount(1000)
             .transaction_nonce(0);

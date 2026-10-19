@@ -4,6 +4,8 @@ pub mod state_utils;
 pub mod utils;
 
 #[cfg(test)]
+mod test_add_depositor;
+#[cfg(test)]
 mod test_add_operator;
 #[cfg(test)]
 mod test_allow_mint;
@@ -18,8 +20,12 @@ mod test_emit_event;
 #[cfg(test)]
 mod test_release_funds;
 #[cfg(test)]
+mod test_remove_depositor;
+#[cfg(test)]
 mod test_remove_operator;
 #[cfg(test)]
 mod test_rotate_bitmap;
 #[cfg(test)]
 mod test_set_new_admin;
+#[cfg(test)]
+mod test_set_whitelist_enabled;

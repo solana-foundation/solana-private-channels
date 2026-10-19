@@ -86,6 +86,14 @@ pub enum PrivateChannelEscrowProgramError {
     /// (19) Deposit landed less than the mint's minimum set at AllowMint
     #[error("Deposit received less than the mint's minimum deposit")]
     BelowMinimumDeposit,
+
+    /// (20) Whitelist is on and the wallet has no Depositor entry
+    #[error("Wallet is not on the instance whitelist")]
+    WalletNotAllowed,
+
+    /// (21) Depositor PDA does not belong to the wallet being checked
+    #[error("Invalid depositor PDA provided")]
+    InvalidDepositorPda,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -127,6 +135,8 @@ mod tests {
             (MintProfileChanged, 17),
             (ZeroAmount, 18),
             (BelowMinimumDeposit, 19),
+            (WalletNotAllowed, 20),
+            (InvalidDepositorPda, 21),
         ];
 
         for (error, expected_code) in cases {

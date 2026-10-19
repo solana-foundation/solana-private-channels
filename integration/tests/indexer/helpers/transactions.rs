@@ -2,7 +2,8 @@ use private_channel_escrow_program_client::{
     instructions::ReleaseFundsBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_indexer::operator::{
-    find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
+    find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda, find_operator_pda,
+    find_withdrawal_bitmap_pda,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -126,6 +127,7 @@ pub async fn release_funds_on_chain(
         .associated_token_program(spl_associated_token_account::id())
         .event_authority(find_event_authority_pda())
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(find_depositor_pda(&instance, &user))
         .amount(amount)
         .user(user)
         .transaction_nonce(nonce)
