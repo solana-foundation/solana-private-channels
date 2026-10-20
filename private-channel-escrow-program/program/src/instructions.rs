@@ -186,12 +186,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
         docs = "Current program for CPI"
     ))]
     #[codama(account(
-        name = "user_depositor_pda",
-        docs = "Depositor PDA of user; read only while the whitelist is on"
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while deposits are whitelisted"
     ))]
     #[codama(account(
-        name = "recipient_depositor_pda",
-        docs = "Depositor PDA of the recipient, or of user when none is given; read only while the whitelist is on"
+        name = "recipient_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of the recipient, or of user when none is given; read only while deposits are whitelisted"
     ))]
     Deposit {
         /// Amount of tokens to deposit
@@ -251,12 +251,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
         docs = "SPL Memo program; only used when user_ata requires a memo"
     ))]
     #[codama(account(
-        name = "user_depositor_pda",
-        docs = "Depositor PDA of user; read only while the whitelist is on"
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while withdrawals are whitelisted"
     ))]
     #[codama(account(
-        name = "withdrawer_depositor_pda",
-        docs = "Depositor PDA of withdrawer; read only while the whitelist is on"
+        name = "withdrawer_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of withdrawer; read only while withdrawals are whitelisted"
     ))]
     ReleaseFunds {
         /// Amount of tokens to release
@@ -296,12 +296,17 @@ pub enum PrivateChannelEscrowProgramInstruction {
         expected_generation: u64,
     } = 8,
 
-    /// Add a wallet to the instance whitelist (admin-only).
+    /// Add a wallet to the instance whitelist, or rewrite its flags (admin-only).
+    /// Blocking both directions is rejected; use RemoveAllowedWallet instead.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
-    #[codama(account(name = "depositor", docs = "Wallet to be added"))]
-    #[codama(account(name = "depositor_pda", docs = "Depositor PDA to be created", writable))]
+    #[codama(account(name = "wallet", docs = "Wallet to be added or updated"))]
+    #[codama(account(
+        name = "allowed_wallet_pda",
+        docs = "AllowedWallet PDA to be created or updated",
+        writable
+    ))]
     #[codama(account(name = "system_program", docs = "System program"))]
     #[codama(account(
         name = "event_authority",
@@ -311,17 +316,25 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    AddDepositor {
-        /// Bump for the depositor PDA
+    AddOrUpdateAllowedWallet {
+        /// Bump for the allowed wallet PDA
         bump: u8,
+        /// Refuse this wallet on Deposit while deposits are whitelisted
+        block_deposits: bool,
+        /// Refuse this wallet on ReleaseFunds while withdrawals are whitelisted
+        block_withdrawals: bool,
     } = 9,
 
     /// Remove a wallet from the instance whitelist (admin-only).
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
-    #[codama(account(name = "depositor", docs = "Wallet to be removed"))]
-    #[codama(account(name = "depositor_pda", docs = "Existing Depositor PDA", writable))]
+    #[codama(account(name = "wallet", docs = "Wallet to be removed"))]
+    #[codama(account(
+        name = "allowed_wallet_pda",
+        docs = "Existing AllowedWallet PDA",
+        writable
+    ))]
     #[codama(account(name = "system_program", docs = "System program"))]
     #[codama(account(
         name = "event_authority",
@@ -331,11 +344,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    RemoveDepositor {} = 10,
+    RemoveAllowedWallet {} = 10,
 
-    /// Turn the instance whitelist on or off (admin-only). While on, Deposit
-    /// requires the depositor and recipient to be listed, and ReleaseFunds the
-    /// withdrawer and destination.
+    /// Set which directions the instance whitelist gates (admin-only). While
+    /// deposits are whitelisted, Deposit requires the depositor and recipient to
+    /// be allowed to deposit; while withdrawals are, ReleaseFunds requires the
+    /// withdrawer and destination to be allowed to withdraw.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to update", writable))]
@@ -348,8 +362,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         docs = "Current program for CPI"
     ))]
     SetWhitelistEnabled {
-        /// Require whitelist entries on Deposit and ReleaseFunds
-        enabled: bool,
+        /// Require allowed wallets on Deposit
+        whitelist_deposits: bool,
+        /// Require allowed wallets on ReleaseFunds
+        whitelist_withdrawals: bool,
     } = 11,
 
     /// Invoked via CPI from another program to log event via instruction data.

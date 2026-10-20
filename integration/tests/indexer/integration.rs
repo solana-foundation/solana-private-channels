@@ -16,7 +16,7 @@ use helpers::{
     get_token_balance, operator_util, test_types::*, verify_database,
 };
 use private_channel_indexer::operator::bitmap_constants::NONCES_PER_GENERATION;
-use private_channel_indexer::operator::{find_depositor_pda, find_withdrawal_bitmap_pda};
+use private_channel_indexer::operator::{find_allowed_wallet_pda, find_withdrawal_bitmap_pda};
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
@@ -120,7 +120,7 @@ async fn setup_test_environments(
     for user_id in 0..3 {
         let user = &env.users[user_id];
         let amount = BASE_AMOUNT + (user_id as u64 * 1000);
-        let user_depositor_pda = find_depositor_pda(&env.instance, &user.pubkey());
+        let user_allowed_wallet_pda = find_allowed_wallet_pda(&env.instance, &user.pubkey());
 
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &user.pubkey(),
@@ -149,8 +149,8 @@ async fn setup_test_environments(
             .private_channel_escrow_program(
                 private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
             )
-            .user_depositor_pda(user_depositor_pda)
-            .recipient_depositor_pda(user_depositor_pda)
+            .user_allowed_wallet_pda(user_allowed_wallet_pda)
+            .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
             .amount(amount)
             .instruction();
 

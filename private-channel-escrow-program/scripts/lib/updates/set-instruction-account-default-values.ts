@@ -91,33 +91,33 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                 ]),
             },
             {
-                account: 'depositorPda',
-                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                account: 'allowedWalletPda',
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
-                    pdaSeedValueNode('wallet', accountValueNode('depositor')),
+                    pdaSeedValueNode('wallet', accountValueNode('wallet')),
                 ]),
             },
-            // No default for recipientDepositorPda: it follows the optional recipient argument.
+            // No default for recipientAllowedWalletPda: it follows the optional recipient argument.
             {
-                account: 'userDepositorPda',
+                account: 'userAllowedWalletPda',
                 instruction: 'deposit',
-                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
                     pdaSeedValueNode('wallet', accountValueNode('user')),
                 ]),
             },
             {
-                account: 'userDepositorPda',
+                account: 'userAllowedWalletPda',
                 instruction: 'releaseFunds',
-                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
                     pdaSeedValueNode('wallet', argumentValueNode('user')),
                 ]),
             },
             {
-                account: 'withdrawerDepositorPda',
+                account: 'withdrawerAllowedWalletPda',
                 instruction: 'releaseFunds',
-                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
                     pdaSeedValueNode('wallet', argumentValueNode('withdrawer')),
                 ]),

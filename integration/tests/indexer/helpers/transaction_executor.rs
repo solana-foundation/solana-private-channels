@@ -32,8 +32,8 @@ pub async fn execute_user_deposits(
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
     let instance_ata =
         get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID);
-    let (user_depositor_pda, _) = Pubkey::find_program_address(
-        &[b"depositor", instance.as_ref(), user.pubkey().as_ref()],
+    let (user_allowed_wallet_pda, _) = Pubkey::find_program_address(
+        &[b"allowed_wallet", instance.as_ref(), user.pubkey().as_ref()],
         &private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
 
@@ -56,8 +56,8 @@ pub async fn execute_user_deposits(
             .private_channel_escrow_program(
                 private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
             )
-            .user_depositor_pda(user_depositor_pda)
-            .recipient_depositor_pda(user_depositor_pda)
+            .user_allowed_wallet_pda(user_allowed_wallet_pda)
+            .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
             .amount(amount)
             .instruction();
 

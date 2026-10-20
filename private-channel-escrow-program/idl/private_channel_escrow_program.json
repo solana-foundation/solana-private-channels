@@ -102,12 +102,36 @@
                 "format": "u8",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
             }
           ],
           "kind": "structTypeNode"
         },
         "kind": "accountNode",
-        "name": "depositor"
+        "name": "allowedWallet"
       },
       {
         "data": {
@@ -146,7 +170,19 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "whitelistEnabled",
+              "name": "depositsWhitelisted",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsWhitelisted",
               "type": {
                 "kind": "booleanTypeNode",
                 "size": {
@@ -621,7 +657,7 @@
       },
       {
         "kind": "definedTypeNode",
-        "name": "addDepositorEvent",
+        "name": "addOrUpdateAllowedWalletEvent",
         "type": {
           "fields": [
             {
@@ -642,9 +678,33 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "depositor",
+              "name": "wallet",
               "type": {
                 "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
               }
             }
           ],
@@ -653,7 +713,7 @@
       },
       {
         "kind": "definedTypeNode",
-        "name": "removeDepositorEvent",
+        "name": "removeAllowedWalletEvent",
         "type": {
           "fields": [
             {
@@ -674,7 +734,7 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "depositor",
+              "name": "wallet",
               "type": {
                 "kind": "publicKeyTypeNode"
               }
@@ -706,7 +766,19 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "enabled",
+              "name": "depositsWhitelisted",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsWhitelisted",
               "type": {
                 "kind": "booleanTypeNode",
                 "size": {
@@ -845,14 +917,14 @@
       {
         "code": 20,
         "kind": "errorNode",
-        "message": "Wallet is not on the instance whitelist",
+        "message": "Wallet is not allowed by the instance whitelist",
         "name": "walletNotAllowed"
       },
       {
         "code": 21,
         "kind": "errorNode",
-        "message": "Invalid depositor PDA provided",
-        "name": "invalidDepositorPda"
+        "message": "Invalid allowed wallet PDA provided",
+        "name": "invalidAllowedWalletPda"
       }
     ],
     "instructions": [
@@ -1661,21 +1733,21 @@
           },
           {
             "docs": [
-              "Depositor PDA of user; read only while the whitelist is on"
+              "AllowedWallet PDA of user; read only while deposits are whitelisted"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "userDepositorPda"
+            "name": "userAllowedWalletPda"
           },
           {
             "docs": [
-              "Depositor PDA of the recipient, or of user when none is given; read only while the whitelist is on"
+              "AllowedWallet PDA of the recipient, or of user when none is given; read only while deposits are whitelisted"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "recipientDepositorPda"
+            "name": "recipientAllowedWalletPda"
           }
         ],
         "arguments": [
@@ -1858,21 +1930,21 @@
           },
           {
             "docs": [
-              "Depositor PDA of user; read only while the whitelist is on"
+              "AllowedWallet PDA of user; read only while withdrawals are whitelisted"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "userDepositorPda"
+            "name": "userAllowedWalletPda"
           },
           {
             "docs": [
-              "Depositor PDA of withdrawer; read only while the whitelist is on"
+              "AllowedWallet PDA of withdrawer; read only while withdrawals are whitelisted"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "withdrawerDepositorPda"
+            "name": "withdrawerAllowedWalletPda"
           }
         ],
         "arguments": [
@@ -2065,21 +2137,21 @@
           },
           {
             "docs": [
-              "Wallet to be added"
+              "Wallet to be added or updated"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "depositor"
+            "name": "wallet"
           },
           {
             "docs": [
-              "Depositor PDA to be created"
+              "AllowedWallet PDA to be created or updated"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "depositorPda"
+            "name": "allowedWalletPda"
           },
           {
             "docs": [
@@ -2132,6 +2204,30 @@
               "format": "u8",
               "kind": "numberTypeNode"
             }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockDeposits",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockWithdrawals",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
           }
         ],
         "discriminators": [
@@ -2142,7 +2238,7 @@
           }
         ],
         "kind": "instructionNode",
-        "name": "addDepositor"
+        "name": "addOrUpdateAllowedWallet"
       },
       {
         "accounts": [
@@ -2180,16 +2276,16 @@
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "depositor"
+            "name": "wallet"
           },
           {
             "docs": [
-              "Existing Depositor PDA"
+              "Existing AllowedWallet PDA"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "depositorPda"
+            "name": "allowedWalletPda"
           },
           {
             "docs": [
@@ -2243,7 +2339,7 @@
           }
         ],
         "kind": "instructionNode",
-        "name": "removeDepositor"
+        "name": "removeAllowedWallet"
       },
       {
         "accounts": [
@@ -2310,7 +2406,19 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "enabled",
+            "name": "whitelistDeposits",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "whitelistWithdrawals",
             "type": {
               "kind": "booleanTypeNode",
               "size": {

@@ -27,7 +27,7 @@ use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig},
     error::{CheckpointError, IndexerError},
     indexer::run,
-    operator::find_depositor_pda,
+    operator::find_allowed_wallet_pda,
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
     RpcPollingConfig, StorageType,
@@ -209,7 +209,7 @@ async fn execute_deposit(
 ) -> Result<(String, u64), Box<dyn std::error::Error>> {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(instance, mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let user_depositor_pda = find_depositor_pda(instance, &user.pubkey());
+    let user_allowed_wallet_pda = find_allowed_wallet_pda(instance, &user.pubkey());
 
     let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -237,8 +237,8 @@ async fn execute_deposit(
         .private_channel_escrow_program(
             private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
         )
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(amount)
         .instruction();
 

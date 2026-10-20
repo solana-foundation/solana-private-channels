@@ -6,7 +6,7 @@ const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const OPERATOR_SEED: &[u8] = b"operator";
 const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
-const DEPOSITOR_SEED: &[u8] = b"depositor";
+const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
 
 pub fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -33,9 +33,9 @@ pub fn find_operator_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8)
     )
 }
 
-pub fn find_depositor_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+pub fn find_allowed_wallet_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[DEPOSITOR_SEED, instance_pda.as_ref(), wallet.as_ref()],
+        &[ALLOWED_WALLET_SEED, instance_pda.as_ref(), wallet.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }

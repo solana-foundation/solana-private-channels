@@ -15,7 +15,7 @@ use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResul
 
 /// Processes the SetWhitelistEnabled instruction.
 ///
-/// The flag is absolute, so passing false turns the whitelist off. Entries are
+/// Both flags are absolute, so passing false turns that direction off. Entries are
 /// kept either way.
 ///
 /// # Account Layout
@@ -26,7 +26,8 @@ use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResul
 /// 4. `[]` private_channel_escrow_program - Current program for CPI
 ///
 /// # Instruction Data
-/// * `enabled` (bool) - Require whitelist entries on Deposit and ReleaseFunds
+/// * `whitelist_deposits` (bool) - Require allowed wallets on Deposit
+/// * `whitelist_withdrawals` (bool) - Require allowed wallets on ReleaseFunds
 pub fn process_set_whitelist_enabled(
     program_id: &Address,
     accounts: &[AccountView],
@@ -54,7 +55,8 @@ pub fn process_set_whitelist_enabled(
 
     instance.validate_admin(admin_info.address())?;
 
-    instance.whitelist_enabled = args.enabled;
+    instance.deposits_whitelisted = args.whitelist_deposits;
+    instance.withdrawals_whitelisted = args.whitelist_withdrawals;
 
     let updated_instance_data = instance.to_bytes();
 
@@ -63,7 +65,11 @@ pub fn process_set_whitelist_enabled(
     let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..updated_instance_data.len()].copy_from_slice(&updated_instance_data);
 
-    let event = SetWhitelistEnabledEvent::new(instance.instance_seed, instance.whitelist_enabled);
+    let event = SetWhitelistEnabledEvent::new(
+        instance.instance_seed,
+        instance.deposits_whitelisted,
+        instance.withdrawals_whitelisted,
+    );
     emit_event(
         program_id,
         event_authority_info,
@@ -75,20 +81,30 @@ pub fn process_set_whitelist_enabled(
 }
 
 struct SetWhitelistEnabledArgs {
-    enabled: bool,
+    whitelist_deposits: bool,
+    whitelist_withdrawals: bool,
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<SetWhitelistEnabledArgs, ProgramError> {
-    require_len!(data, 1);
+    require_len!(data, 2);
 
     // The Borsh client refuses any bool byte but 0 or 1, so we do too.
-    let enabled = match data[0] {
+    let whitelist_deposits = match data[0] {
         0 => false,
         1 => true,
         _ => return Err(ProgramError::InvalidInstructionData),
     };
 
-    Ok(SetWhitelistEnabledArgs { enabled })
+    let whitelist_withdrawals = match data[1] {
+        0 => false,
+        1 => true,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    Ok(SetWhitelistEnabledArgs {
+        whitelist_deposits,
+        whitelist_withdrawals,
+    })
 }
 
 #[cfg(test)]
@@ -100,7 +116,11 @@ mod tests {
     #[test]
     fn test_process_set_whitelist_enabled_instruction_data_non_canonical() {
         assert_eq!(
-            process_instruction_data(&[2]).err(),
+            process_instruction_data(&[2, 0]).err(),
+            Some(ProgramError::InvalidInstructionData)
+        );
+        assert_eq!(
+            process_instruction_data(&[0, 2]).err(),
             Some(ProgramError::InvalidInstructionData)
         );
     }

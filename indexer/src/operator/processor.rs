@@ -16,7 +16,7 @@ use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
 };
 use crate::operator::{
-    find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda, find_operator_pda,
+    find_allowed_mint_pda, find_allowed_wallet_pda, find_event_authority_pda, find_operator_pda,
     find_withdrawal_bitmap_pda, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
 };
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
@@ -648,14 +648,14 @@ fn build_release_funds(
         // release fails `verify_current_program` with IncorrectProgramId.
         .event_authority(release_funds_state.event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        // Read only while the instance whitelist is on, which then requires both
-        // wallets to be listed. A refusal fails the release like any other program
-        // error, and the remint path refunds it.
-        .user_depositor_pda(find_depositor_pda(
+        // Read only while the instance whitelists withdrawals, which then requires
+        // both wallets to be allowed to withdraw. A refusal fails the release like
+        // any other program error, and the remint path refunds it.
+        .user_allowed_wallet_pda(find_allowed_wallet_pda(
             &release_funds_state.instance_pda,
             &recipient,
         ))
-        .withdrawer_depositor_pda(find_depositor_pda(
+        .withdrawer_allowed_wallet_pda(find_allowed_wallet_pda(
             &release_funds_state.instance_pda,
             &initiator,
         ))
@@ -986,7 +986,7 @@ async fn check_withdrawal_preflights_inner(
 ///
 /// The release grew by one account key plus its index byte, the same 33 bytes
 /// an extra costs, each time ReleaseFunds gained a slot: memo_program, then
-/// user_depositor_pda, then withdrawer_depositor_pda. The withdrawer argument
+/// user_allowed_wallet_pda, then withdrawer_allowed_wallet_pda. The withdrawer argument
 /// added 32 bytes of data alongside the last one.
 const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 12;
 
@@ -3322,7 +3322,7 @@ mod tests {
     /// The remint reverses a burn on the private channel, so it must credit the
     /// account that was debited (`initiator`), not the withdrawal's Solana
     /// destination (`recipient`). The release carries whitelist entries for both,
-    /// which only the program checks once an instance turns the whitelist on, so
+    /// which only the program checks once an instance whitelists withdrawals, so
     /// a swap would pass every test that runs with it off.
     #[tokio::test]
     async fn build_release_funds_remints_to_initiator_not_destination() {
@@ -3360,19 +3360,19 @@ mod tests {
             panic!("a withdrawal must build a ReleaseFunds builder");
         };
 
-        // Accounts 14 and 15 are user_depositor_pda and withdrawer_depositor_pda,
+        // Accounts 14 and 15 are user_allowed_wallet_pda and withdrawer_allowed_wallet_pda,
         // after memo_program. The withdrawer argument follows discriminator (1),
         // amount (8), user (32) and transaction_nonce (8).
         const WITHDRAWER_DATA_OFFSET: usize = 49;
         let instruction = release.builder.instruction();
         assert_eq!(
             instruction.accounts[14].pubkey,
-            find_depositor_pda(&instance_pda, &destination),
+            find_allowed_wallet_pda(&instance_pda, &destination),
             "the destination slot must carry the destination's whitelist entry"
         );
         assert_eq!(
             instruction.accounts[15].pubkey,
-            find_depositor_pda(&instance_pda, &initiator),
+            find_allowed_wallet_pda(&instance_pda, &initiator),
             "the withdrawer slot must carry the initiator's whitelist entry"
         );
         assert_eq!(

@@ -21,8 +21,10 @@ pub struct Instance {
     pub version: u8,
     pub instance_seed: Pubkey,
     pub admin: Pubkey,
-    /// When set, Deposit and ReleaseFunds only move funds between wallets with a Depositor entry.
-    pub whitelist_enabled: bool,
+    /// When set, Deposit requires the depositor and recipient to be allowed to deposit.
+    pub deposits_whitelisted: bool,
+    /// When set, ReleaseFunds requires the withdrawer and destination to be allowed to withdraw.
+    pub withdrawals_whitelisted: bool,
 }
 
 impl Discriminator for Instance {
@@ -37,7 +39,8 @@ impl AccountSerialize for Instance {
         data.push(self.version);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.admin.as_ref());
-        data.push(self.whitelist_enabled as u8);
+        data.push(self.deposits_whitelisted as u8);
+        data.push(self.withdrawals_whitelisted as u8);
         data
     }
 }
@@ -48,7 +51,8 @@ impl Instance {
         1 + // version
         32 + // instance_seed
         32 + // admin
-        1; // whitelist_enabled
+        1 + // deposits_whitelisted
+        1; // withdrawals_whitelisted
 
     pub fn new(bump: u8, instance_seed: Pubkey, admin: Pubkey) -> Self {
         Self {
@@ -56,7 +60,8 @@ impl Instance {
             version: INSTANCE_VERSION,
             instance_seed,
             admin,
-            whitelist_enabled: false,
+            deposits_whitelisted: false,
+            withdrawals_whitelisted: false,
         }
     }
 
@@ -105,7 +110,14 @@ impl Instance {
         offset += 32;
 
         // The Borsh client refuses any bool byte but 0 or 1, so we do too.
-        let whitelist_enabled = match data[offset] {
+        let deposits_whitelisted = match data[offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProgramError::InvalidAccountData),
+        };
+        offset += 1;
+
+        let withdrawals_whitelisted = match data[offset] {
             0 => false,
             1 => true,
             _ => return Err(ProgramError::InvalidAccountData),
@@ -116,7 +128,8 @@ impl Instance {
             version,
             instance_seed,
             admin,
-            whitelist_enabled,
+            deposits_whitelisted,
+            withdrawals_whitelisted,
         })
     }
 }
@@ -141,7 +154,8 @@ mod tests {
         let admin = Pubkey::new_from_array([42u8; 32]);
         let instance_seed = Pubkey::new_from_array([7u8; 32]);
         let mut instance = Instance::new(255, instance_seed, admin);
-        instance.whitelist_enabled = true;
+        // Opposite values confirm the two flags are not read from the same byte.
+        instance.deposits_whitelisted = true;
 
         let bytes = instance.to_bytes();
         assert_eq!(bytes.len(), Instance::LEN);
@@ -152,7 +166,8 @@ mod tests {
         assert_eq!(deserialized.version, instance.version);
         assert_eq!(deserialized.instance_seed, instance.instance_seed);
         assert_eq!(deserialized.admin, instance.admin);
-        assert!(deserialized.whitelist_enabled);
+        assert!(deserialized.deposits_whitelisted);
+        assert!(!deserialized.withdrawals_whitelisted);
     }
 
     // validate_admin should return Ok when the provided key matches the stored admin.

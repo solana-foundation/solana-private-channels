@@ -7,7 +7,7 @@ This guide provides a reference for all client-side actions for calling Solana P
 The Solana Private Channels Escrow Program manages token deposits to and withdrawals from the Solana Private Channels payment channel. The program supports:
 
 - **Instance Management**: Create and configure escrow instances
-- **Access Control**: Manage admins, operators and the optional depositor whitelist
+- **Access Control**: Manage admins, operators and the optional wallet whitelist
 - **Token Whitelisting**: Control which tokens can be deposited
 - **Deposits**: Lock tokens on Mainnet for minting on the Solana Private Channels payment channel
 - **Withdrawals**: Release funds from escrow to user (note: this is handled by the Solana Private Channels Indexer/Operator and is not covered in this guide)
@@ -32,7 +32,7 @@ pnpm add private-channel-escrow-program @solana/kit
 5. [AddOperator](#addoperator) - Authorize a withdrawal operator
 6. [RemoveOperator](#removeoperator) - Remove an operator
 7. [SetNewAdmin](#setnewadmin) - Transfer admin control
-8. [Whitelist](#whitelist) - Restrict who can move funds in and out (AddDepositor, RemoveDepositor, SetWhitelistEnabled)
+8. [Whitelist](#whitelist) - Restrict who can deposit and who can withdraw (AddOrUpdateAllowedWallet, RemoveAllowedWallet, SetWhitelistEnabled)
 9. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
 10. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
@@ -265,67 +265,74 @@ const setAdminIx = getSetNewAdminInstruction({
 
 ## Whitelist
 
-Off by default. While on, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to have a Depositor entry, and `ReleaseFunds` requires both the wallet that withdrew in the channel and the Mainnet destination to. All three instructions are admin-only.
+Off by default, with one flag per direction. While deposits are whitelisted, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to be allowed to deposit. While withdrawals are whitelisted, `ReleaseFunds` requires both the wallet that withdrew in the channel and the Mainnet destination to be allowed to withdraw. A wallet is allowed in a direction when it has an AllowedWallet entry that does not block that direction. All three instructions are admin-only.
 
 ### TypeScript Example
 
 ```typescript
 import {
-  getAddDepositorInstructionAsync,
-  getRemoveDepositorInstructionAsync,
+  getAddOrUpdateAllowedWalletInstructionAsync,
+  getRemoveAllowedWalletInstructionAsync,
   getSetWhitelistEnabledInstruction,
 } from 'private-channel-escrow-program';
 
-const addDepositorIx = await getAddDepositorInstructionAsync({
+// Adds the wallet, or rewrites the flags of its existing entry
+const addOrUpdateIx = await getAddOrUpdateAllowedWalletInstructionAsync({
   payer,
   admin, // Must be instance admin
   instance: process.env.INSTANCE_ADDRESS,
-  depositor: walletAddress,
+  wallet: walletAddress,
+  blockDeposits: false,
+  blockWithdrawals: false,
 });
 
-const removeDepositorIx = await getRemoveDepositorInstructionAsync({
+const removeIx = await getRemoveAllowedWalletInstructionAsync({
   payer, // Receives the reclaimed rent
   admin,
   instance: process.env.INSTANCE_ADDRESS,
-  depositor: walletAddress,
+  wallet: walletAddress,
 });
 
 const enableIx = getSetWhitelistEnabledInstruction({
   payer,
   admin,
   instance: process.env.INSTANCE_ADDRESS,
-  enabled: true, // false turns it off; entries are kept
+  whitelistDeposits: true,
+  whitelistWithdrawals: false, // Each flag is set outright; entries are kept
 });
 
 // Sign and send with payer and admin as signers
 ```
 
 **Notes:**
-- An unlisted wallet fails with `WalletNotAllowed`; another wallet's entry in its place fails with `InvalidDepositorPda`
+- A wallet with no entry, or whose entry blocks the direction, fails with `WalletNotAllowed`; another wallet's entry in its place fails with `InvalidAllowedWalletPda`
+- Blocking both directions is rejected, since that entry would equal no entry; use `RemoveAllowedWallet` instead
 - A refused release is reminted to the withdrawer in the channel. The withdraw fee is not refunded
-- Each refusal raises a `failed_reminted` alert; see the [runbook](runbooks/withdrawal_failed_reminted.md)
+- Each refused release raises a `failed_reminted` alert; see the [runbook](runbooks/withdrawal_failed_reminted.md). A refused deposit just fails for the client
 - The operator names the withdrawer, as it already names the destination and amount
-- Not gated: transfers inside the channel. A removed wallet can still move its balance to a listed wallet, which can then withdraw it
-- Turning it on for a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the withdraw fee
+- While withdrawals are whitelisted, the operator admin (treasury) and its sweep destination must be allowed to withdraw. While deposits are whitelisted, the reprice or rotation deposit must come from an allowed wallet
+- Not gated: transfers inside the channel. A wallet that cannot withdraw can still move its balance to one that can
+- Whitelisting withdrawals on a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the withdraw fee
+- Whitelisting withdrawals but not deposits lets unlisted wallets deposit but not withdraw; each release they try is reminted, costs them the withdraw fee and raises an alert
 
-To derive a depositor PDA, refer to the [PDA Reference](#pda-reference) section.
+To derive an allowed wallet PDA, refer to the [PDA Reference](#pda-reference) section.
 
 ## Deposit
 
-Locks tokens in the Mainnet escrow for minting on the Solana Private Channels payment channel. Permissionless instruction — any user can deposit to any instance with allowed mints.
+Locks tokens in the Mainnet escrow for minting on the Solana Private Channels payment channel. Permissionless unless deposits are [whitelisted](#whitelist): any user can deposit to any instance with allowed mints.
 
 ### TypeScript Example
 
 ```typescript
-import { findDepositorPda, getDepositInstructionAsync } from 'private-channel-escrow-program';
+import { findAllowedWalletPda, getDepositInstructionAsync } from 'private-channel-escrow-program';
 import { address, none } from '@solana/kit';
 
 const user = await generateKeyPairSigner();
 const depositAmount = 100_000_000n; // 100 USDC (6 decimals)
 
-// Depositor PDA of whoever is credited: the recipient, or the user when none is given.
-// Read only while the whitelist is on; userDepositorPda is derived for you.
-const [recipientDepositorPda] = await findDepositorPda({
+// AllowedWallet PDA of whoever is credited: the recipient, or the user when none is given.
+// Read only while deposits are whitelisted; userAllowedWalletPda is derived for you.
+const [recipientAllowedWalletPda] = await findAllowedWalletPda({
   instance: process.env.INSTANCE_ADDRESS,
   wallet: user.address,
 });
@@ -337,7 +344,7 @@ const depositIx = await getDepositInstructionAsync({
   mint: process.env.ALLOWED_MINT_ADDRESS,
   amount: depositAmount,
   recipient: none(), // or address('RecipientAddress...') if you want to credit to a different address
-  recipientDepositorPda,
+  recipientAllowedWalletPda,
 });
 
 // Send and sign transaction with payer and user as signers
@@ -400,16 +407,16 @@ const [operatorPda] = await findOperatorPda({
 });
 ```
 
-### Depositor PDA
+### Allowed Wallet PDA
 
-The Depositor PDA is a wallet's [whitelist](#whitelist) entry. Its existence is the entry.
+The Allowed Wallet PDA is a wallet's [whitelist](#whitelist) entry, holding which directions it is blocked in.
 
-Seeds: `["depositor", instance_pda, wallet_pubkey]`
+Seeds: `["allowed_wallet", instance_pda, wallet_pubkey]`
 
 Derivation:
 
 ```typescript
-const [depositorPda] = await findDepositorPda({
+const [allowedWalletPda] = await findAllowedWalletPda({
   instance: instancePda,
   wallet: walletAddress,
 });

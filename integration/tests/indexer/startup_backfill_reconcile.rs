@@ -25,7 +25,7 @@ use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 // The indexer decides what counts as an escrow instruction by this constant, so a
 // synthetic block has to carry the same id or the fill sees nothing to import.
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
-use private_channel_indexer::operator::find_depositor_pda;
+use private_channel_indexer::operator::find_allowed_wallet_pda;
 use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig, RpcPollingConfig},
     error::{IndexerError, ReconciliationError},
@@ -111,7 +111,7 @@ async fn start_postgres(
 fn deposit_ix(user: &Keypair, instance: Pubkey, mint: Pubkey, amount: u64) -> Instruction {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let user_depositor_pda = find_depositor_pda(&instance, &user.pubkey());
+    let user_allowed_wallet_pda = find_allowed_wallet_pda(&instance, &user.pubkey());
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
     let instance_ata =
@@ -134,8 +134,8 @@ fn deposit_ix(user: &Keypair, instance: Pubkey, mint: Pubkey, amount: u64) -> In
                 .parse()
                 .expect("the parser's escrow program id must be a valid pubkey"),
         )
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(amount)
         .instruction()
 }

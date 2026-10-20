@@ -81,8 +81,8 @@ pub const ZERO_AMOUNT_ERROR: u32 = PrivateChannelEscrowProgramError::ZeroAmount 
 pub const BELOW_MINIMUM_DEPOSIT_ERROR: u32 =
     PrivateChannelEscrowProgramError::BelowMinimumDeposit as u32;
 pub const WALLET_NOT_ALLOWED_ERROR: u32 = PrivateChannelEscrowProgramError::WalletNotAllowed as u32;
-pub const INVALID_DEPOSITOR_PDA_ERROR: u32 =
-    PrivateChannelEscrowProgramError::InvalidDepositorPda as u32;
+pub const INVALID_ALLOWED_WALLET_PDA_ERROR: u32 =
+    PrivateChannelEscrowProgramError::InvalidAllowedWalletPda as u32;
 
 /// Withdraw fee every test AllowMint sets. The escrow records it but does not
 /// act on it.
@@ -1165,8 +1165,8 @@ fn get_operation_name(instruction: &Instruction) -> &'static str {
         6 => "Deposit",
         7 => "ReleaseFunds",
         8 => "RotateBitmap",
-        9 => "AddDepositor",
-        10 => "RemoveDepositor",
+        9 => "AddOrUpdateAllowedWallet",
+        10 => "RemoveAllowedWallet",
         11 => "SetWhitelistEnabled",
         _ => "Unknown",
     }

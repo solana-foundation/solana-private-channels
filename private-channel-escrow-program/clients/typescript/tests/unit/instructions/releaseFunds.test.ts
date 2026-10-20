@@ -5,7 +5,7 @@ import {
     RELEASE_FUNDS_DISCRIMINATOR,
     findOperatorPda,
     findAllowedMintPda,
-    findDepositorPda,
+    findAllowedWalletPda,
     findWithdrawalBitmapPda,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
@@ -206,7 +206,7 @@ describe('releaseFunds', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram, userDepositorPda, withdrawerDepositorPda', async () => {
+        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram, userAllowedWalletPda, withdrawerAllowedWalletPda', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
@@ -286,19 +286,19 @@ describe('releaseFunds', () => {
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.address).toBe(MEMO_PROGRAM_ADDRESS);
 
-            // Account 14: userDepositorPda (Readonly PDA - derived from the user argument)
-            const [expectedUserDepositorPda] = await findDepositorPda({
+            // Account 14: userAllowedWalletPda (Readonly PDA - derived from the user argument)
+            const [expectedUserAllowedWalletPda] = await findAllowedWalletPda({
                 instance: TEST_ADDRESSES.INSTANCE,
                 wallet: testUser,
             });
-            expect(instruction.accounts[14].address).toBe(expectedUserDepositorPda);
+            expect(instruction.accounts[14].address).toBe(expectedUserAllowedWalletPda);
 
-            // Account 15: withdrawerDepositorPda (Readonly PDA - derived from the withdrawer argument)
-            const [expectedWithdrawerDepositorPda] = await findDepositorPda({
+            // Account 15: withdrawerAllowedWalletPda (Readonly PDA - derived from the withdrawer argument)
+            const [expectedWithdrawerAllowedWalletPda] = await findAllowedWalletPda({
                 instance: TEST_ADDRESSES.INSTANCE,
                 wallet: testWithdrawer,
             });
-            expect(instruction.accounts[15].address).toBe(expectedWithdrawerDepositorPda);
+            expect(instruction.accounts[15].address).toBe(expectedWithdrawerAllowedWalletPda);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -374,7 +374,7 @@ describe('releaseFunds', () => {
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.role).toBe(AccountRole.READONLY);
 
-            // Accounts 14 and 15: the depositor PDAs - should be Readonly
+            // Accounts 14 and 15: the allowed wallet PDAs - should be Readonly
             expect(instruction.accounts[14].role).toBe(AccountRole.READONLY);
             expect(instruction.accounts[15].role).toBe(AccountRole.READONLY);
         });

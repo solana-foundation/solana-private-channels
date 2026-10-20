@@ -14,7 +14,7 @@ use crate::{
         verify_token_programs,
     },
     require_len,
-    state::{AllowedMint, Depositor, Instance, Operator, WithdrawalBitmap},
+    state::{AllowedMint, AllowedWallet, Direction, Instance, Operator, WithdrawalBitmap},
     validate_event_authority,
 };
 use pinocchio::{
@@ -46,9 +46,10 @@ const FIXED_ACCOUNTS_LEN: usize = 16;
 /// 11. `[]` event_authority - Event authority PDA for emitting events
 /// 12. `[]` private_channel_escrow_program - Current program for CPI
 /// 13. `[]` memo_program - SPL Memo program, used only when user_ata requires a memo
-/// 14. `[]` user_depositor_pda - Depositor PDA of `user`, read only while the whitelist is on
-/// 15. `[]` withdrawer_depositor_pda - Depositor PDA of `withdrawer`, read only while the
-///     whitelist is on
+/// 14. `[]` user_allowed_wallet_pda - AllowedWallet PDA of `user`, read only while
+///     withdrawals are whitelisted
+/// 15. `[]` withdrawer_allowed_wallet_pda - AllowedWallet PDA of `withdrawer`, read only
+///     while withdrawals are whitelisted
 ///
 /// Trailing accounts (variable): transfer-hook extras for the mint (hook
 /// program, validation PDA, and whatever its `ExtraAccountMetaList`
@@ -74,7 +75,7 @@ pub fn process_release_funds(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info, memo_program_info, user_depositor_pda_info, withdrawer_depositor_pda_info] =
+    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info, memo_program_info, user_allowed_wallet_pda_info, withdrawer_allowed_wallet_pda_info] =
         fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -125,14 +126,20 @@ pub fn process_release_funds(
     }
 
     // The channel lets a withdrawal name any destination, so the wallet that
-    // withdrew must be listed too. The operator supplies it, as it does `user`.
-    if instance.whitelist_enabled {
-        Depositor::verify_listed(
-            withdrawer_depositor_pda_info,
+    // withdrew must be allowed too. The operator supplies it, as it does `user`.
+    if instance.withdrawals_whitelisted {
+        AllowedWallet::verify_allowed(
+            withdrawer_allowed_wallet_pda_info,
             instance_info.address(),
             &args.withdrawer,
+            Direction::Withdraw,
         )?;
-        Depositor::verify_listed(user_depositor_pda_info, instance_info.address(), &args.user)?;
+        AllowedWallet::verify_allowed(
+            user_allowed_wallet_pda_info,
+            instance_info.address(),
+            &args.user,
+            Direction::Withdraw,
+        )?;
     }
 
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;

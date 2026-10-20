@@ -13,7 +13,7 @@ use crate::{
         verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
     require_len,
-    state::{AllowedMint, Depositor, Instance},
+    state::{AllowedMint, AllowedWallet, Direction, Instance},
     validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
@@ -36,9 +36,10 @@ const FIXED_ACCOUNTS_LEN: usize = 14;
 /// 9. `[]` associated_token_program - Associated Token program
 /// 10. `[]` event_authority - Event authority PDA for emitting events
 /// 11. `[]` private_channel_escrow_program - Current program for CPI
-/// 12. `[]` user_depositor_pda - Depositor PDA of `user`, read only while the whitelist is on
-/// 13. `[]` recipient_depositor_pda - Depositor PDA of the channel recipient (`recipient`,
-///     or `user` when none is given), read only while the whitelist is on
+/// 12. `[]` user_allowed_wallet_pda - AllowedWallet PDA of `user`, read only while deposits
+///     are whitelisted
+/// 13. `[]` recipient_allowed_wallet_pda - AllowedWallet PDA of the channel recipient
+///     (`recipient`, or `user` when none is given), read only while deposits are whitelisted
 ///
 /// Trailing accounts (variable): transfer-hook extras for the mint (hook
 /// program, validation PDA, and whatever its `ExtraAccountMetaList`
@@ -67,7 +68,7 @@ pub fn process_deposit(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info, user_depositor_pda_info, recipient_depositor_pda_info] =
+    let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info, user_allowed_wallet_pda_info, recipient_allowed_wallet_pda_info] =
         fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -109,17 +110,19 @@ pub fn process_deposit(
     let recipient = args.recipient.unwrap_or(*user_info.address());
 
     // Both the wallet funding the deposit and the one credited in the channel must
-    // be listed. With no recipient they are the same wallet.
-    if instance.whitelist_enabled {
-        Depositor::verify_listed(
-            user_depositor_pda_info,
+    // be allowed to deposit. With no recipient they are the same wallet.
+    if instance.deposits_whitelisted {
+        AllowedWallet::verify_allowed(
+            user_allowed_wallet_pda_info,
             instance_info.address(),
             user_info.address(),
+            Direction::Deposit,
         )?;
-        Depositor::verify_listed(
-            recipient_depositor_pda_info,
+        AllowedWallet::verify_allowed(
+            recipient_allowed_wallet_pda_info,
             instance_info.address(),
             &recipient,
+            Direction::Deposit,
         )?;
     }
 

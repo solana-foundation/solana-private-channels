@@ -12,7 +12,7 @@ pub enum PrivateChannelEscrowAccountDiscriminators {
     OperatorDiscriminator = 1,
     AllowedMintDiscriminator = 2,
     WithdrawalBitmapDiscriminator = 3,
-    DepositorDiscriminator = 4,
+    AllowedWalletDiscriminator = 4,
 }
 
 #[repr(u8)]
@@ -26,8 +26,8 @@ pub enum PrivateChannelEscrowInstructionDiscriminators {
     Deposit = 6,
     ReleaseFunds = 7,
     RotateBitmap = 8,
-    AddDepositor = 9,
-    RemoveDepositor = 10,
+    AddOrUpdateAllowedWallet = 9,
+    RemoveAllowedWallet = 10,
     SetWhitelistEnabled = 11,
     EmitEvent = 228,
 }
@@ -46,8 +46,8 @@ impl TryFrom<u8> for PrivateChannelEscrowInstructionDiscriminators {
             6 => Ok(Self::Deposit),
             7 => Ok(Self::ReleaseFunds),
             8 => Ok(Self::RotateBitmap),
-            9 => Ok(Self::AddDepositor),
-            10 => Ok(Self::RemoveDepositor),
+            9 => Ok(Self::AddOrUpdateAllowedWallet),
+            10 => Ok(Self::RemoveAllowedWallet),
             11 => Ok(Self::SetWhitelistEnabled),
             228 => Ok(Self::EmitEvent),
             _ => Err(()),

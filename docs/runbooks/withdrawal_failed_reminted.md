@@ -15,7 +15,7 @@ No funds are stranded. No recovery action needed.
 
 ## Expected cause: escrow whitelist
 
-With the instance whitelist on, the escrow refuses a release whose withdrawer or destination is unlisted. Only `custom program error: 0x14` in `error_message` proves it. Any other message, such as `None` or `recovered from persistent storage`, counts only once you confirm the whitelist is on and the withdrawer's or destination's Depositor PDA is missing. Then reconcile as usual, no ticket for repeats.
+While the instance whitelists withdrawals, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw. Only `custom program error: 0x14` in `error_message` proves it. Any other message, such as `None` or `recovered from persistent storage`, counts only once you confirm withdrawals are whitelisted and the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set. Then reconcile as usual, no ticket for repeats.
 
 **Exception:** if `error_message` contains `remint landed but the row is no
 longer pending_remint`, another writer moved the row while this remint

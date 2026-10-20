@@ -23,7 +23,7 @@ use private_channel_indexer::indexer::reconciliation::{
 };
 use private_channel_indexer::operator::escrow_sweep::fetch_escrow_balances_by_mint;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
-use private_channel_indexer::operator::{find_depositor_pda, RetryConfig, RpcClientWithRetry};
+use private_channel_indexer::operator::{find_allowed_wallet_pda, RetryConfig, RpcClientWithRetry};
 use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbTransactionBuilder, TransactionType,
@@ -313,7 +313,7 @@ async fn deposit(
 ) -> Result<Signature, Box<dyn std::error::Error>> {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let user_depositor_pda = find_depositor_pda(&instance, &user.pubkey());
+    let user_allowed_wallet_pda = find_allowed_wallet_pda(&instance, &user.pubkey());
 
     let deposit_ix = DepositBuilder::new()
         .payer(user.pubkey())
@@ -336,8 +336,8 @@ async fn deposit(
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(amount)
         .instruction();
 

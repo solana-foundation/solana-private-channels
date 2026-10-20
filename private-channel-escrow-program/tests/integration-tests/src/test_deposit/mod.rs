@@ -1,8 +1,9 @@
 use crate::{
-    pda_utils::{find_allowed_mint_pda, find_depositor_pda, find_event_authority_pda},
+    pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_event_authority_pda},
     state_utils::{
-        assert_get_or_add_depositor, assert_get_or_allow_mint, assert_get_or_create_instance,
-        assert_get_or_deposit, assert_get_or_remove_depositor, assert_get_or_set_whitelist_enabled,
+        assert_get_or_add_allowed_wallet, assert_get_or_allow_mint, assert_get_or_create_instance,
+        assert_get_or_deposit, assert_get_or_remove_allowed_wallet,
+        assert_get_or_set_whitelist_enabled,
     },
     utils::{
         assert_program_error, create_mint_2022_with_transfer_fee,
@@ -14,10 +15,11 @@ use crate::{
         set_token_2022_with_memo_account, set_token_balance, setup_hook_mint,
         setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
         BELOW_MINIMUM_DEPOSIT_ERROR, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
-        INVALID_DEPOSITOR_PDA_ERROR, INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR,
-        NOT_ENOUGH_ACCOUNT_KEYS_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT,
-        TEST_WITHDRAW_FEE, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
-        WALLET_NOT_ALLOWED_ERROR, ZERO_AMOUNT_ERROR,
+        INVALID_ALLOWED_WALLET_PDA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+        MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+        TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR, WALLET_NOT_ALLOWED_ERROR,
+        ZERO_AMOUNT_ERROR,
     },
 };
 
@@ -170,7 +172,7 @@ fn test_deposit_insufficient_funds() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -196,8 +198,8 @@ fn test_deposit_insufficient_funds() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -250,7 +252,7 @@ fn test_deposit_rejects_zero_amount() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -265,8 +267,8 @@ fn test_deposit_rejects_zero_amount() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(find_depositor_pda(&instance_pda, &recipient.pubkey()).0)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(find_allowed_wallet_pda(&instance_pda, &recipient.pubkey()).0)
         .amount(0)
         .recipient(recipient.pubkey())
         .instruction();
@@ -294,7 +296,7 @@ fn test_deposit_below_minimum_rejected_at_minimum_lands() {
 
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let instance_ata = get_associated_token_address_with_program_id(
         &instance_pda,
         &mint.pubkey(),
@@ -350,8 +352,8 @@ fn test_deposit_below_minimum_rejected_at_minimum_lands() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(min_deposit_amount - 1)
         .instruction();
 
@@ -392,7 +394,7 @@ fn test_deposit_minimum_repriced_by_reallow() {
 
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let instance_ata = get_associated_token_address_with_program_id(
         &instance_pda,
         &mint.pubkey(),
@@ -448,8 +450,8 @@ fn test_deposit_minimum_repriced_by_reallow() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(deposit_amount)
         .instruction();
 
@@ -527,7 +529,7 @@ fn test_deposit_mint_not_allowed() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -553,8 +555,8 @@ fn test_deposit_mint_not_allowed() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -695,7 +697,7 @@ fn test_deposit_token_2022_memo_required_instance_ata_fails() {
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -710,8 +712,8 @@ fn test_deposit_token_2022_memo_required_instance_ata_fails() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -793,7 +795,7 @@ fn test_deposit_token_2022_transfer_fee_success() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let user_balance_before = get_token_balance(&mut context, &user_ata);
     let instance_balance_before = get_token_balance(&mut context, &instance_ata);
@@ -811,8 +813,8 @@ fn test_deposit_token_2022_transfer_fee_success() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -902,7 +904,7 @@ fn test_deposit_rejects_zero_received_amount() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -917,8 +919,8 @@ fn test_deposit_rejects_zero_received_amount() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(deposit_amount)
         .instruction();
 
@@ -954,7 +956,7 @@ fn test_deposit_below_minimum_net_of_transfer_fee_rejected() {
 
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let instance_ata = get_associated_token_address_with_program_id(
         &instance_pda,
         &mint.pubkey(),
@@ -1016,8 +1018,8 @@ fn test_deposit_below_minimum_net_of_transfer_fee_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(min_deposit_amount)
         .instruction();
 
@@ -1091,7 +1093,7 @@ fn test_deposit_token_2022_transfer_hook_forwards_extras() {
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -1106,8 +1108,8 @@ fn test_deposit_token_2022_transfer_hook_forwards_extras() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
         .instruction();
@@ -1188,7 +1190,7 @@ fn test_deposit_token_2022_transfer_hook_without_extras_fails() {
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -1203,8 +1205,8 @@ fn test_deposit_token_2022_transfer_hook_without_extras_fails() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1283,7 +1285,7 @@ fn test_deposit_rejects_signer_bearing_hook_extra() {
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -1298,8 +1300,8 @@ fn test_deposit_rejects_signer_bearing_hook_extra() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .add_remaining_accounts(&malicious_hook_extras(
             &mint.pubkey(),
@@ -1367,7 +1369,7 @@ fn test_deposit_invalid_associated_token_program() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -1395,8 +1397,8 @@ fn test_deposit_invalid_associated_token_program() {
         .associated_token_program(wrong_ata_program) // Wrong ATA program
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1565,7 +1567,7 @@ fn test_deposit_wrong_user_ata() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     // user_ata belongs to other_user, not the signing user
     let wrong_user_ata = get_associated_token_address_with_program_id(
@@ -1592,8 +1594,8 @@ fn test_deposit_wrong_user_ata() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1648,7 +1650,7 @@ fn test_deposit_wrong_instance_ata() {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -1669,8 +1671,8 @@ fn test_deposit_wrong_instance_ata() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1724,7 +1726,7 @@ fn test_deposit_rejected_after_mint_decimals_change() {
     set_mint_with_decimals(&mut context, &mint.pubkey(), 9);
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -1749,8 +1751,8 @@ fn test_deposit_rejected_after_mint_decimals_change() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1795,7 +1797,7 @@ fn test_deposit_rejected_after_mint_token_program_change() {
     set_mint_2022_basic(&mut context, &mint.pubkey());
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -1820,8 +1822,8 @@ fn test_deposit_rejected_after_mint_token_program_change() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1877,7 +1879,7 @@ fn test_deposit_rejected_after_mint_gains_extension() {
     set_mint_2022_with_permanent_delegate(&mut context, &mint.pubkey());
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -1902,8 +1904,8 @@ fn test_deposit_rejected_after_mint_gains_extension() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -1956,7 +1958,7 @@ fn test_deposit_succeeds_after_mint_gains_metadata() {
     set_mint_2022_with_metadata(&mut context, &mint.pubkey());
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -1981,8 +1983,8 @@ fn test_deposit_succeeds_after_mint_gains_metadata() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -2035,7 +2037,7 @@ fn test_deposit_rejected_after_mint_gains_freeze_authority() {
     set_mint_with_freeze_authority(&mut context, &mint.pubkey(), &admin.pubkey());
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -2060,8 +2062,8 @@ fn test_deposit_rejected_after_mint_gains_freeze_authority() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -2115,7 +2117,7 @@ fn test_deposit_succeeds_after_freeze_authority_revoked() {
     set_mint(&mut context, &mint.pubkey());
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
         &mint.pubkey(),
@@ -2140,8 +2142,8 @@ fn test_deposit_succeeds_after_freeze_authority_revoked() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -2185,10 +2187,18 @@ fn test_deposit_whitelist_listed_user_succeeds() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("AddDepositor should succeed");
+    assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     assert_get_or_deposit(
         &mut context,
@@ -2237,7 +2247,7 @@ fn test_deposit_whitelist_unlisted_user_rejected() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
 
     context
@@ -2245,7 +2255,7 @@ fn test_deposit_whitelist_unlisted_user_rejected() {
         .unwrap();
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -2260,8 +2270,8 @@ fn test_deposit_whitelist_unlisted_user_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
@@ -2306,18 +2316,28 @@ fn test_deposit_whitelist_listed_user_and_recipient_succeeds() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("AddDepositor should succeed");
-    assert_get_or_add_depositor(
+    assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+    assert_get_or_add_allowed_wallet(
         &mut context,
         &admin,
         &instance_pda,
         &recipient.pubkey(),
         false,
+        false,
+        false,
     )
-    .expect("AddDepositor should succeed");
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     assert_get_or_deposit(
         &mut context,
@@ -2367,18 +2387,26 @@ fn test_deposit_whitelist_unlisted_recipient_rejected() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    let (user_depositor_pda, _) =
-        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-            .expect("AddDepositor should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (recipient_depositor_pda, _) = find_depositor_pda(&instance_pda, &recipient.pubkey());
+    let (recipient_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&instance_pda, &recipient.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -2393,8 +2421,8 @@ fn test_deposit_whitelist_unlisted_recipient_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(recipient_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(recipient_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .recipient(recipient.pubkey())
         .instruction();
@@ -2440,23 +2468,25 @@ fn test_deposit_whitelist_unlisted_user_with_listed_recipient_rejected() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    let (recipient_depositor_pda, _) = assert_get_or_add_depositor(
+    let (recipient_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
         &mut context,
         &admin,
         &instance_pda,
         &recipient.pubkey(),
         false,
+        false,
+        false,
     )
-    .expect("AddDepositor should succeed");
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
 
     let (event_authority_pda, _) = find_event_authority_pda();
-    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance_pda, &user.pubkey());
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -2471,8 +2501,8 @@ fn test_deposit_whitelist_unlisted_user_with_listed_recipient_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(recipient_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(recipient_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .recipient(recipient.pubkey())
         .instruction();
@@ -2519,19 +2549,28 @@ fn test_deposit_whitelist_other_wallets_pda_rejected() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    let (user_depositor_pda, _) =
-        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-            .expect("AddDepositor should succeed");
-    let (other_depositor_pda, _) = assert_get_or_add_depositor(
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+    let (other_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
         &mut context,
         &admin,
         &instance_pda,
         &other_wallet.pubkey(),
         false,
+        false,
+        false,
     )
-    .expect("AddDepositor should succeed");
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
@@ -2552,14 +2591,14 @@ fn test_deposit_whitelist_other_wallets_pda_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(other_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(other_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(in_user_slot, &[&user]);
 
-    assert_program_error(result, INVALID_DEPOSITOR_PDA_ERROR);
+    assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
 
     let in_recipient_slot = DepositBuilder::new()
         .payer(context.payer.pubkey())
@@ -2574,14 +2613,14 @@ fn test_deposit_whitelist_other_wallets_pda_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(other_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(other_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(in_recipient_slot, &[&user]);
 
-    assert_program_error(result, INVALID_DEPOSITOR_PDA_ERROR);
+    assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
 }
 
 #[test]
@@ -2618,11 +2657,18 @@ fn test_deposit_whitelist_removed_user_rejected() {
         0,
     );
 
-    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
         .expect("SetWhitelistEnabled should succeed");
-    let (user_depositor_pda, _) =
-        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-            .expect("AddDepositor should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
 
     assert_get_or_deposit(
         &mut context,
@@ -2636,8 +2682,8 @@ fn test_deposit_whitelist_removed_user_rejected() {
     )
     .expect("Deposit while listed should succeed");
 
-    assert_get_or_remove_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("RemoveDepositor should succeed");
+    assert_get_or_remove_allowed_wallet(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+        .expect("RemoveAllowedWallet should succeed");
 
     // The retried deposit is byte-identical to the one that landed, so without a
     // fresh blockhash it would be dropped as already processed.
@@ -2658,12 +2704,302 @@ fn test_deposit_whitelist_removed_user_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(user_depositor_pda)
-        .recipient_depositor_pda(user_depositor_pda)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(DEPOSIT_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+}
+
+// An entry blocked for deposits refuses the funding wallet, even with a listed recipient.
+#[test]
+fn test_deposit_whitelist_deposits_blocked_user_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        true,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+    let (recipient_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &recipient.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(recipient_allowed_wallet_pda)
+        .amount(DEPOSIT_AMOUNT)
+        .recipient(recipient.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+    assert_eq!(get_token_balance(&mut context, &user_ata), DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn test_deposit_whitelist_deposits_blocked_recipient_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+    let (recipient_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &recipient.pubkey(),
+        true,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(recipient_allowed_wallet_pda)
+        .amount(DEPOSIT_AMOUNT)
+        .recipient(recipient.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+}
+
+// Deposit reads only the deposit flag of an entry, so blocking withdrawals leaves deposits open.
+#[test]
+fn test_deposit_whitelist_withdrawals_blocked_entry_can_deposit() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
+        .expect("SetWhitelistEnabled should succeed");
+    assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        true,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit from a wallet blocked only for withdrawals should succeed");
+}
+
+// Whitelisting only withdrawals leaves deposits open to every wallet.
+#[test]
+fn test_deposit_whitelist_withdrawals_only_allows_unlisted_user() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, false, true, false)
+        .expect("SetWhitelistEnabled should succeed");
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit from an unlisted user should succeed with only withdrawals whitelisted");
 }

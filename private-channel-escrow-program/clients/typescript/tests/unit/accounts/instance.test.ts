@@ -9,7 +9,8 @@ const EXPECTED_SIZE =
     1 + // version
     32 + // instance_seed
     32 + // admin
-    1; // whitelist_enabled
+    1 + // deposits_whitelisted
+    1; // withdrawals_whitelisted
 
 describe('Instance Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -20,7 +21,8 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                whitelistEnabled: false,
+                depositsWhitelisted: false,
+                withdrawalsWhitelisted: false,
             };
 
             // Test encoding
@@ -46,7 +48,8 @@ describe('Instance Account', () => {
                 version: 2,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                 admin: TEST_ADDRESSES.WALLET,
-                whitelistEnabled: true,
+                depositsWhitelisted: true,
+                withdrawalsWhitelisted: false,
             };
 
             // Test combined codec
@@ -68,7 +71,8 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    whitelistEnabled: false,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -90,7 +94,8 @@ describe('Instance Account', () => {
                     version,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    whitelistEnabled: false,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -117,7 +122,8 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: addresses.instanceSeed as Address,
                     admin: addresses.admin as Address,
-                    whitelistEnabled: false,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: false,
                 };
 
                 const codec = getInstanceCodec();
@@ -140,7 +146,8 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                whitelistEnabled: false,
+                depositsWhitelisted: false,
+                withdrawalsWhitelisted: false,
             };
 
             // Verify all required fields are present
@@ -149,7 +156,8 @@ describe('Instance Account', () => {
             expect(testInstance).toHaveProperty('version');
             expect(testInstance).toHaveProperty('instanceSeed');
             expect(testInstance).toHaveProperty('admin');
-            expect(testInstance).toHaveProperty('whitelistEnabled');
+            expect(testInstance).toHaveProperty('depositsWhitelisted');
+            expect(testInstance).toHaveProperty('withdrawalsWhitelisted');
         });
 
         it('should validate instance structure field types', () => {
@@ -159,7 +167,8 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                whitelistEnabled: false,
+                depositsWhitelisted: false,
+                withdrawalsWhitelisted: false,
             };
 
             // Verify field types
@@ -168,7 +177,8 @@ describe('Instance Account', () => {
             expect(typeof testInstance.version).toBe('number');
             expect(typeof testInstance.instanceSeed).toBe('string');
             expect(typeof testInstance.admin).toBe('string');
-            expect(typeof testInstance.whitelistEnabled).toBe('boolean');
+            expect(typeof testInstance.depositsWhitelisted).toBe('boolean');
+            expect(typeof testInstance.withdrawalsWhitelisted).toBe('boolean');
         });
 
         // Replay state moved to the WithdrawalBitmap account, so a decoder that
@@ -180,7 +190,8 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                whitelistEnabled: false,
+                depositsWhitelisted: false,
+                withdrawalsWhitelisted: false,
             };
 
             const codec = getInstanceCodec();
@@ -192,7 +203,7 @@ describe('Instance Account', () => {
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (68 bytes)', () => {
+        it('should report correct account size (69 bytes)', () => {
             const accountSize = getInstanceEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -204,7 +215,8 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                whitelistEnabled: false,
+                depositsWhitelisted: false,
+                withdrawalsWhitelisted: false,
             };
 
             const encoder = getInstanceEncoder();
@@ -222,7 +234,8 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    whitelistEnabled: false,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: false,
                 },
                 {
                     discriminator: 255,
@@ -230,7 +243,8 @@ describe('Instance Account', () => {
                     version: 255,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                     admin: TEST_ADDRESSES.WALLET,
-                    whitelistEnabled: true,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: true,
                 },
                 {
                     discriminator: 127,
@@ -238,7 +252,8 @@ describe('Instance Account', () => {
                     version: 10,
                     instanceSeed: TEST_ADDRESSES.USDC_MINT,
                     admin: TEST_ADDRESSES.OPERATOR,
-                    whitelistEnabled: false,
+                    depositsWhitelisted: false,
+                    withdrawalsWhitelisted: false,
                 },
             ];
 

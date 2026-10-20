@@ -22,7 +22,8 @@ pub fn test_instance_account() -> Value {
         version: 1,
         instance_seed: TEST_INSTANCE_SEED,
         admin: Pubkey::new_unique(),
-        whitelist_enabled: false,
+        deposits_whitelisted: false,
+        withdrawals_whitelisted: false,
     })
     .unwrap();
     json!({

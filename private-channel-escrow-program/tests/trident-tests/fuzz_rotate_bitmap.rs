@@ -92,9 +92,9 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
-        let user_depositor_pda = self
+        let user_allowed_wallet_pda = self
             .fuzz_accounts
-            .user_depositor_pda
+            .user_allowed_wallet_pda
             .get(&mut self.trident)
             .unwrap();
         let ix = DepositBuilder::new()
@@ -105,8 +105,8 @@ impl FuzzTest {
             .allowed_mint(allowed_mint.client())
             .user_ata(user_ata.client())
             .instance_ata(instance_ata.client())
-            .user_depositor_pda(user_depositor_pda.client())
-            .recipient_depositor_pda(user_depositor_pda.client())
+            .user_allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .recipient_allowed_wallet_pda(user_allowed_wallet_pda.client())
             .amount(amount)
             .instruction()
             .to_trident();
@@ -167,9 +167,9 @@ impl FuzzTest {
         }
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
-        let user_depositor_pda = self
+        let user_allowed_wallet_pda = self
             .fuzz_accounts
-            .user_depositor_pda
+            .user_allowed_wallet_pda
             .get(&mut self.trident)
             .unwrap();
         let ix = ReleaseFundsBuilder::new()
@@ -183,8 +183,8 @@ impl FuzzTest {
             .user_ata(user_ata.client())
             .instance_ata(instance_ata.client())
             .amount(amount)
-            .user_depositor_pda(user_depositor_pda.client())
-            .withdrawer_depositor_pda(user_depositor_pda.client())
+            .user_allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda.client())
             .user(user.client())
             .withdrawer(user.client())
             .transaction_nonce(nonce)
@@ -253,9 +253,9 @@ impl FuzzTest {
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
-        let user_depositor_pda = self
+        let user_allowed_wallet_pda = self
             .fuzz_accounts
-            .user_depositor_pda
+            .user_allowed_wallet_pda
             .get(&mut self.trident)
             .unwrap();
         let ix = ReleaseFundsBuilder::new()
@@ -269,8 +269,8 @@ impl FuzzTest {
             .user_ata(user_ata.client())
             .instance_ata(instance_ata.client())
             .amount(1)
-            .user_depositor_pda(user_depositor_pda.client())
-            .withdrawer_depositor_pda(user_depositor_pda.client())
+            .user_allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda.client())
             .user(user.client())
             .withdrawer(user.client())
             .transaction_nonce(nonce)
@@ -399,9 +399,9 @@ impl FuzzTest {
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
-        let user_depositor_pda = self
+        let user_allowed_wallet_pda = self
             .fuzz_accounts
-            .user_depositor_pda
+            .user_allowed_wallet_pda
             .get(&mut self.trident)
             .unwrap();
         let ix = ReleaseFundsBuilder::new()
@@ -415,8 +415,8 @@ impl FuzzTest {
             .user_ata(user_ata.client())
             .instance_ata(instance_ata.client())
             .amount(1)
-            .user_depositor_pda(user_depositor_pda.client())
-            .withdrawer_depositor_pda(user_depositor_pda.client())
+            .user_allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda.client())
             .user(user.client())
             .withdrawer(user.client())
             .transaction_nonce(stale_nonce)
