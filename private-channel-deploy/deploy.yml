@@ -483,22 +483,24 @@
 
     # Sharing one value would give a compromised service every other login's
     # rights, which is exactly what separating them is for.
+    # Also tagged config_asserts: it probes no host, so the preflight test runs it.
     - name: Assert the postgres logins do not share a password
+      tags: [ config_asserts ]
+      vars:
+        candidates:
+          - "{{ postgres_password }}"
+          # Carries REPLICATION, so it can pg_basebackup the whole cluster,
+          # auth schema included, whatever the grants say.
+          - "{{ postgres_replication_password }}"
+          - "{{ postgres_runtime_password }}"
+          - "{{ postgres_auth_runtime_password }}"
+          - "{{ postgres_auth_owner_password }}"
+          - "{{ postgres_gateway_password }}"
+          - "{{ postgres_monitoring_password }}"
+          - "{{ postgres_grafana_password }}"
+          - "{{ postgres_indexer_password }}"
       ansible.builtin.assert:
         that: (candidates | unique | length) == (candidates | length)
-        vars:
-          candidates:
-            - "{{ postgres_password }}"
-            # Carries REPLICATION, so it can pg_basebackup the whole cluster,
-            # auth schema included, whatever the grants say.
-            - "{{ postgres_replication_password }}"
-            - "{{ postgres_runtime_password }}"
-            - "{{ postgres_auth_runtime_password }}"
-            - "{{ postgres_auth_owner_password }}"
-            - "{{ postgres_gateway_password }}"
-            - "{{ postgres_monitoring_password }}"
-            - "{{ postgres_grafana_password }}"
-            - "{{ postgres_indexer_password }}"
         fail_msg: |
           Two postgres logins share a password. Each needs its own, or a compromised service
           holds the others' rights. Fix: edit secrets.yml and give each one a distinct value.

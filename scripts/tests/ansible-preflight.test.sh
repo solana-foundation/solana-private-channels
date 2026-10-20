@@ -134,6 +134,7 @@ test_preflight_cases() {
   expect_refused placeholder "all-ones placeholder" "${common[@]}" -e escrow_instance_id=$PLACEHOLDER
   expect_refused custom_program_id "must equal the compiled" "${common[@]}" -e escrow_program_id=$INSTANCE
   expect_refused custom_withdraw_id "must equal the compiled" "${common[@]}" -e withdraw_program_id=$INSTANCE
+  expect_refused shared_password "share a password" "${common[@]}" -e postgres_gateway_password=p1
 
   expect_services localnet_no_instance no "${common[@]}"
   local kept=(-e reset_state=false -e validator_reset=false)
