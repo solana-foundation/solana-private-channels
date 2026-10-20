@@ -94,6 +94,7 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - `scripts/reconcile-escrow-balance.sh` is removed; use `indexer -c <escrow config> reconcile`.
 - Hand edits to `failed_reminted` rows must set `landed_remint_signature`.
 - Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument. `Instance` grew two bytes, so instances created before this must be recreated.
+- A release now fits 12 transfer-hook accounts, down from 15, whether or not the whitelist is on. Withdrawals of a hook mint that needs 13 to 15 park as `hook_unresolvable` instead of releasing.
 - Clients: unused writable keys and writable program ids are rejected with `-32602`; a `null` status past the deadline proves nothing unless `getFirstAvailableBlock` is at or below the signing `context.slot`.
 - `pg-backup-primary` logs in as `POSTGRES_REPLICATION_USER`, and `postgres-indexer` runs `init-indexer-hba.sh`. Both take effect on fresh volumes only.
 - Ansible always starts `pg-backup-primary` and `pg-backup-indexer`, and starts `auth-migrate` and `auth` when `gateway_enforce_jwt` is true.

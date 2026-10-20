@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**69 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **145 integration tests** (end-to-end behavior).
+**69 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **148 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -91,11 +91,12 @@
 - `test_add_or_update_allowed_wallet_invalid_admin_not_signer` — unsigned admin rejected
 - `test_add_or_update_allowed_wallet_invalid_admin` — wrong admin rejected
 
-### RemoveAllowedWallet (4 integration tests)
+### RemoveAllowedWallet (5 integration tests)
 
 - `test_remove_allowed_wallet_success` — happy path with rent reclamation
 - `test_remove_allowed_wallet_nonexistent` — an unlisted wallet fails with InvalidAccountData
 - `test_remove_allowed_wallet_invalid_admin` — wrong admin rejected
+- `test_remove_allowed_wallet_invalid_admin_not_signer` — unsigned admin rejected
 - `test_remove_allowed_wallet_other_wallets_pda_rejected` — another listed wallet's entry cannot be closed in its place; InvalidAllowedWalletPda
 
 ### SetWhitelistEnabled (4 integration tests)
@@ -115,7 +116,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (38 integration tests)
+### Deposit (39 integration tests)
 
 The whitelist tests below turn on only the deposit flag.
 
@@ -147,7 +148,7 @@ The whitelist tests below turn on only the deposit flag.
 - `test_deposit_succeeds_after_mint_gains_metadata` — an issuer writing metadata onto a live mint is routine, not a recreate; dropping the metadata and group bits from the exemption mask breaks this
 - `test_deposit_token_2022_memo_required_instance_ata_fails` — a deposit into an instance ATA carrying `MemoTransfer` fails, since `Deposit` emits no memo
 - `test_deposit_whitelist_listed_user_succeeds` — with no recipient the depositor is also the credited wallet, so being listed is enough
-- `test_deposit_whitelist_unlisted_user_rejected` — WalletNotAllowed, and no tokens move
+- `test_deposit_whitelist_unlisted_user_rejected` — WalletNotAllowed
 - `test_deposit_whitelist_listed_user_and_recipient_succeeds` — both wallets listed
 - `test_deposit_whitelist_unlisted_recipient_rejected` — a listed depositor cannot credit an unlisted recipient
 - `test_deposit_whitelist_unlisted_user_with_listed_recipient_rejected` — a listed recipient does not vouch for the funding wallet
@@ -157,8 +158,9 @@ The whitelist tests below turn on only the deposit flag.
 - `test_deposit_whitelist_deposits_blocked_recipient_rejected` — an entry blocked for deposits refuses the credited wallet
 - `test_deposit_whitelist_withdrawals_blocked_entry_can_deposit` — Deposit reads only the deposit flag of an entry
 - `test_deposit_whitelist_withdrawals_only_allows_unlisted_user` — whitelisting only withdrawals leaves deposits open
+- `test_deposit_whitelist_empty_wrong_account_rejected` — an empty account at the wrong address in a listed wallet's slot is InvalidAllowedWalletPda, not WalletNotAllowed
 
-### ReleaseFunds (35 integration tests)
+### ReleaseFunds (36 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -188,16 +190,17 @@ The whitelist tests below turn on only the deposit flag.
 The whitelist tests below turn on only the withdrawal flag, except where noted.
 
 - `test_release_funds_whitelist_listed_destination_succeeds` — happy path with withdrawals whitelisted
-- `test_release_funds_whitelist_unlisted_destination_rejected` — a listed withdrawer cannot release to an unlisted destination; WalletNotAllowed, and the nonce stays unspent so the operator can remint the burn
+- `test_release_funds_whitelist_unlisted_destination_rejected` — a listed withdrawer cannot release to an unlisted destination; WalletNotAllowed
 - `test_release_funds_whitelist_other_wallets_pda_rejected` — another listed wallet's entry is rejected with InvalidAllowedWalletPda
 - `test_release_funds_whitelist_removed_destination_rejected` — removing an entry blocks the next release to it, even from a listed withdrawer
-- `test_release_funds_whitelist_unlisted_withdrawer_rejected` — an unlisted wallet cannot get funds out by naming a listed destination; WalletNotAllowed, nothing moves and the nonce stays unspent
+- `test_release_funds_whitelist_unlisted_withdrawer_rejected` — an unlisted wallet cannot get funds out by naming a listed destination; WalletNotAllowed
 - `test_release_funds_whitelist_listed_withdrawer_to_other_listed_destination_succeeds` — withdrawer and destination differ and both are listed
 - `test_release_funds_whitelist_other_wallets_pda_in_withdrawer_slot_rejected` — the destination's entry in the withdrawer slot is rejected with InvalidAllowedWalletPda
-- `test_release_funds_whitelist_withdrawals_blocked_withdrawer_rejected` — an entry blocked for withdrawals refuses the withdrawer, even to a listed destination; the nonce stays unspent
-- `test_release_funds_whitelist_withdrawals_blocked_destination_rejected` — an entry blocked for withdrawals refuses the destination; the nonce stays unspent
+- `test_release_funds_whitelist_withdrawals_blocked_withdrawer_rejected` — an entry blocked for withdrawals refuses the withdrawer, even to a listed destination
+- `test_release_funds_whitelist_withdrawals_blocked_destination_rejected` — an entry blocked for withdrawals refuses the destination
 - `test_release_funds_whitelist_deposits_blocked_entry_can_withdraw` — ReleaseFunds reads only the withdrawal flag of an entry
 - `test_release_funds_whitelist_deposits_only_allows_unlisted_release` — deposit flag only; whitelisting only deposits leaves releases open
+- `test_release_funds_whitelist_empty_wrong_account_rejected` — an empty account at the wrong address in a listed withdrawer's slot is InvalidAllowedWalletPda, so an operator derivation bug is not mistaken for a whitelist refusal
 
 ### RotateBitmap (6 integration tests)
 

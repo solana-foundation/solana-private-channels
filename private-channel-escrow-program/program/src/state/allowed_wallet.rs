@@ -108,24 +108,33 @@ impl AllowedWallet {
     }
 
     /// Fails unless `account` is `wallet`'s entry on this instance and does not block
-    /// `direction`. An empty account means the wallet is not listed; anything else in
-    /// its place is the wrong PDA.
+    /// `direction`. The address is checked first, so any other account is
+    /// InvalidAllowedWalletPda and WalletNotAllowed always means the wallet itself.
     pub fn verify_allowed(
         account: &AccountView,
         instance_pda: &Address,
         wallet: &Address,
         direction: Direction,
     ) -> Result<(), ProgramError> {
+        let (expected_address, _) = Address::find_program_address(
+            &[ALLOWED_WALLET_SEED, instance_pda.as_ref(), wallet.as_ref()],
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        );
+        if account.address() != &expected_address {
+            return Err(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda.into());
+        }
+
         if account.is_data_empty() {
             return Err(PrivateChannelEscrowProgramError::WalletNotAllowed.into());
         }
 
+        // Mirrors validate_pda_account's owner check for a non-empty PDA.
+        if !account.owned_by(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID) {
+            return Err(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda.into());
+        }
+
         let data = account.try_borrow()?;
         let allowed_wallet = Self::try_from_bytes(&data)
-            .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedWalletPda)?;
-
-        allowed_wallet
-            .validate_pda(instance_pda, wallet, account)
             .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedWalletPda)?;
 
         let blocked = match direction {

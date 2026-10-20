@@ -13,10 +13,6 @@ the user's burned private channel tokens.
 
 No funds are stranded. No recovery action needed.
 
-## Expected cause: escrow whitelist
-
-While the instance whitelists withdrawals, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw. Only `custom program error: 0x14` in `error_message` proves it. Any other message, such as `None` or `recovered from persistent storage`, counts only once you confirm withdrawals are whitelisted and the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set. Then reconcile as usual, no ticket for repeats.
-
 **Exception:** if `error_message` contains `remint landed but the row is no
 longer pending_remint`, another writer moved the row while this remint
 landed, so the row's status does not show the refund. The user is refunded
@@ -28,6 +24,12 @@ by `remint_signature`. Check the row's status, then:
   [`withdrawal_manual_review.md`](withdrawal_manual_review.md).
 - If the row is `completed`, the release landed too:
   [escalate](_escalation.md) (Tier 1).
+
+## Expected cause: escrow whitelist
+
+While withdrawals are whitelisted, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw, with `custom program error: 0x14` (`WalletNotAllowed`). The message alone does not prove it: Token-2022 and transfer hooks can also return `0x14`, and a refusal can show as `None` or `recovered from persistent storage`. Confirm that withdrawals are whitelisted and the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set. If so, reconcile as usual; repeats need no ticket.
+
+`custom program error: 0x15` is never an expected refusal. With withdrawals whitelisted it most likely means `InvalidAllowedWalletPda`, an operator bug that passed the wrong account: [escalate](_escalation.md) (Tier 3).
 
 ## Reconciliation steps
 

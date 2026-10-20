@@ -305,15 +305,16 @@ const enableIx = getSetWhitelistEnabledInstruction({
 ```
 
 **Notes:**
-- A wallet with no entry, or whose entry blocks the direction, fails with `WalletNotAllowed`; another wallet's entry in its place fails with `InvalidAllowedWalletPda`
+- A wallet with no entry, or whose entry blocks the direction, fails with `WalletNotAllowed`; any other account in its place fails with `InvalidAllowedWalletPda`
 - Blocking both directions is rejected, since that entry would equal no entry; use `RemoveAllowedWallet` instead
 - A refused release is reminted to the withdrawer in the channel. The withdraw fee is not refunded
 - Each refused release raises a `failed_reminted` alert; see the [runbook](runbooks/withdrawal_failed_reminted.md). A refused deposit just fails for the client
 - The operator names the withdrawer, as it already names the destination and amount
 - While withdrawals are whitelisted, the operator admin (treasury) and its sweep destination must be allowed to withdraw. While deposits are whitelisted, the reprice or rotation deposit must come from an allowed wallet
 - Not gated: transfers inside the channel. A wallet that cannot withdraw can still move its balance to one that can
-- Whitelisting withdrawals on a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the withdraw fee
-- Whitelisting withdrawals but not deposits lets unlisted wallets deposit but not withdraw; each release they try is reminted, costs them the withdraw fee and raises an alert
+- Whitelisting withdrawals on a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the mint's withdraw fee, if it has one
+- Whitelisting withdrawals but not deposits lets unlisted wallets deposit but not withdraw; each release they try is reminted, costs them the mint's withdraw fee, if it has one, and raises an alert
+- While withdrawals are whitelisted, give every mint a nonzero withdraw fee. On a zero-fee mint nothing limits how often a refused wallet triggers remints and alerts
 
 To derive an allowed wallet PDA, refer to the [PDA Reference](#pda-reference) section.
 

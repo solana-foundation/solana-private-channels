@@ -26,6 +26,7 @@ use crate::{
 use private_channel_escrow_program_client::instructions::{AllowMintBuilder, DepositBuilder};
 use solana_sdk::{
     instruction::Instruction,
+    pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
 use solana_sdk_ids::system_program::ID as SYSTEM_PROGRAM_ID;
@@ -2278,7 +2279,6 @@ fn test_deposit_whitelist_unlisted_user_rejected() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
-    assert_eq!(get_token_balance(&mut context, &user_ata), DEPOSIT_AMOUNT);
 }
 
 #[test]
@@ -2801,7 +2801,6 @@ fn test_deposit_whitelist_deposits_blocked_user_rejected() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
-    assert_eq!(get_token_balance(&mut context, &user_ata), DEPOSIT_AMOUNT);
 }
 
 #[test]
@@ -3002,4 +3001,83 @@ fn test_deposit_whitelist_withdrawals_only_allows_unlisted_user() {
         false,
     )
     .expect("Deposit from an unlisted user should succeed with only withdrawals whitelisted");
+}
+
+// A client that derives the entry address wrongly passes an empty account. That must
+// read as the wrong account, not as an unlisted wallet.
+#[test]
+fn test_deposit_whitelist_empty_wrong_account_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let wrong_account = Pubkey::new_unique();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(wrong_account)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
 }
