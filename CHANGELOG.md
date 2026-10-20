@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.0] - 2026-10-20
 
 Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf`.
 
@@ -74,6 +74,8 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - Alert when an indexer or operator restarts: a lock-loss exit beats the scrape of its counter
 - `sanity.sh` check 7 reads the solvency fence gauge; the log lines it looked for were never emitted
 - The devnet withdraw tool can read through the read node (`PRIVATE_CHANNEL_READ_RPC_URL`) when the gateway enforces JWT
+- The runtime image applies Debian security updates, so the publish scan passes (#403)
+- The Ansible deploy completes: preflight, the secrets check and sanity no longer fail every run, and `RECONCILIATION_WEBHOOK_URL` follows `notify_webhook` (#404)
 
 ### Docs and CI
 - Published images carry SBOM and provenance attestations
@@ -98,3 +100,5 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - `postgres-primary` and `postgres-indexer` have a new entrypoint, so the upgrade recreates both containers (a short database restart).
 - `operator-private-channel` now reaches the channel through `GATEWAY_INTERNAL_URL`, so it needs the gateway up as well as the read node.
 - After a PITR restore, reset the recovery settings before starting the replica (`docs/PITR.md` Step 5).
+- `--transaction-expiration-ms` (`PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS`) is deprecated. When set it still overrides `--max-blockhashes` with `transaction_expiration_ms / blocktime_ms` and logs a warning; set `--max-blockhashes`, a block count, instead. It is removed after this release.
+- Ansible now sends reconciliation halts to `notify_webhook`; before, they went to a no-op.
