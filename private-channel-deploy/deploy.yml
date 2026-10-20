@@ -483,22 +483,24 @@
 
     # Sharing one value would give a compromised service every other login's
     # rights, which is exactly what separating them is for.
+    # Also tagged config_asserts: it probes no host, so the preflight test runs it.
     - name: Assert the postgres logins do not share a password
+      tags: [ config_asserts ]
+      vars:
+        candidates:
+          - "{{ postgres_password }}"
+          # Carries REPLICATION, so it can pg_basebackup the whole cluster,
+          # auth schema included, whatever the grants say.
+          - "{{ postgres_replication_password }}"
+          - "{{ postgres_runtime_password }}"
+          - "{{ postgres_auth_runtime_password }}"
+          - "{{ postgres_auth_owner_password }}"
+          - "{{ postgres_gateway_password }}"
+          - "{{ postgres_monitoring_password }}"
+          - "{{ postgres_grafana_password }}"
+          - "{{ postgres_indexer_password }}"
       ansible.builtin.assert:
         that: (candidates | unique | length) == (candidates | length)
-        vars:
-          candidates:
-            - "{{ postgres_password }}"
-            # Carries REPLICATION, so it can pg_basebackup the whole cluster,
-            # auth schema included, whatever the grants say.
-            - "{{ postgres_replication_password }}"
-            - "{{ postgres_runtime_password }}"
-            - "{{ postgres_auth_runtime_password }}"
-            - "{{ postgres_auth_owner_password }}"
-            - "{{ postgres_gateway_password }}"
-            - "{{ postgres_monitoring_password }}"
-            - "{{ postgres_grafana_password }}"
-            - "{{ postgres_indexer_password }}"
         fail_msg: |
           Two postgres logins share a password. Each needs its own, or a compromised service
           holds the others' rights. Fix: edit secrets.yml and give each one a distinct value.
@@ -954,10 +956,28 @@
     # This gives deploy and local-dev one shared env-completeness guard so both
     # enforce the identical contract (e.g. a blank POSTGRES_PASSWORD from an
     # undecrypted SOPS var is caught here rather than at container start).
+    # copy does not create a missing parent, and scripts/ exists on devnet targets only.
+    - name: Create the scripts dir on target
+      ansible.builtin.file:
+        path: "{{ target_config_dir }}/scripts"
+        state: directory
+        mode: "0755"
+
+    # check-required-env.sh sources env-resolve.sh from its own directory, and script:
+    # ships only the one file, so both are copied and run in place.
+    - name: Copy the env check scripts to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/{{ item }}"
+        dest: "{{ target_config_dir }}/scripts/{{ item }}"
+        mode: "0755"
+      loop:
+      - check-required-env.sh
+      - env-resolve.sh
+
     - name: Validate required secrets in rendered .env
-      ansible.builtin.script:
+      ansible.builtin.command:
         cmd: >-
-          {{ repo_root }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
+          bash {{ target_config_dir }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
       changed_when: false
 
     # The base compose file has bind mounts with relative `./` sources resolved
@@ -1025,14 +1045,7 @@
         dest: "{{ target_config_dir }}/init-indexer-login.sql"
         mode: "0644"
 
-    # Both compose files mount it as the pg-backup sidecars' command. copy does not
-    # create a missing parent, and scripts/ exists on devnet targets only.
-    - name: Create the scripts dir on target
-      ansible.builtin.file:
-        path: "{{ target_config_dir }}/scripts"
-        state: directory
-        mode: "0755"
-
+    # Both compose files mount it as the pg-backup sidecars' command.
     - name: Copy pg-backup script to target
       ansible.builtin.copy:
         src: "{{ repo_root }}/scripts/pg-backup.sh"
