@@ -956,10 +956,28 @@
     # This gives deploy and local-dev one shared env-completeness guard so both
     # enforce the identical contract (e.g. a blank POSTGRES_PASSWORD from an
     # undecrypted SOPS var is caught here rather than at container start).
+    # copy does not create a missing parent, and scripts/ exists on devnet targets only.
+    - name: Create the scripts dir on target
+      ansible.builtin.file:
+        path: "{{ target_config_dir }}/scripts"
+        state: directory
+        mode: "0755"
+
+    # check-required-env.sh sources env-resolve.sh from its own directory, and script:
+    # ships only the one file, so both are copied and run in place.
+    - name: Copy the env check scripts to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/{{ item }}"
+        dest: "{{ target_config_dir }}/scripts/{{ item }}"
+        mode: "0755"
+      loop:
+      - check-required-env.sh
+      - env-resolve.sh
+
     - name: Validate required secrets in rendered .env
-      ansible.builtin.script:
+      ansible.builtin.command:
         cmd: >-
-          {{ repo_root }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
+          bash {{ target_config_dir }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
       changed_when: false
 
     # The base compose file has bind mounts with relative `./` sources resolved
@@ -1027,14 +1045,7 @@
         dest: "{{ target_config_dir }}/init-indexer-login.sql"
         mode: "0644"
 
-    # Both compose files mount it as the pg-backup sidecars' command. copy does not
-    # create a missing parent, and scripts/ exists on devnet targets only.
-    - name: Create the scripts dir on target
-      ansible.builtin.file:
-        path: "{{ target_config_dir }}/scripts"
-        state: directory
-        mode: "0755"
-
+    # Both compose files mount it as the pg-backup sidecars' command.
     - name: Copy pg-backup script to target
       ansible.builtin.copy:
         src: "{{ repo_root }}/scripts/pg-backup.sh"
