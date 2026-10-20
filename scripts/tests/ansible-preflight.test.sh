@@ -197,6 +197,7 @@ test_env_render() {
   render "$TMP/var.env" -e escrow_instance_id=$INSTANCE
   render "$TMP/pda.env" -e escrow_instance_id_pda=$INSTANCE
   render "$TMP/both.env" -e escrow_instance_id=$INSTANCE -e escrow_instance_id_pda=$PLACEHOLDER
+  render "$TMP/hook.env" -e notify_webhook=https://hooks.invalid/x
 
   [[ "$(instance_line "$TMP/none.env")" == "COMMON_ESCROW_INSTANCE_ID=" ]] || fail "unset instance must render blank"
   [[ "$(instance_line "$TMP/var.env")" == "COMMON_ESCROW_INSTANCE_ID=$INSTANCE" ]] || fail "escrow_instance_id not rendered"
@@ -209,6 +210,9 @@ test_env_render() {
     grep -qx "ESCROW_PROGRAM_ID=$ESCROW_ID" "$f" || fail "$f: escrow program ID is not the compiled one"
     grep -qx "WITHDRAW_PROGRAM_ID=$WITHDRAW_ID" "$f" || fail "$f: withdraw program ID is not the compiled one"
   done
+  # Both runtime webhooks follow notify_webhook, and fall back to the no-op together.
+  grep -qx 'RECONCILIATION_WEBHOOK_URL=https://hooks.invalid/x' "$TMP/hook.env" || fail "reconciliation webhook not rendered from notify_webhook"
+  grep -qx 'RECONCILIATION_WEBHOOK_URL=http://localhost:9/no-op' "$TMP/none.env" || fail "reconciliation webhook must fall back to the no-op"
   echo "ok: env.j2 render"
 }
 
