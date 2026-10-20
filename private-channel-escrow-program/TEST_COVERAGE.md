@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**67 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **132 integration tests** (end-to-end behavior).
+**67 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **135 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -99,7 +99,7 @@
 
 ### SetWhitelistEnabled (3 integration tests)
 
-- `test_set_whitelist_enabled_on_then_off` — the flag is absolute; a new instance starts with it off
+- `test_set_whitelist_enabled_is_absolute` — enabling twice leaves it on, so the flag is set rather than toggled, then disabling turns it off; a new instance starts with it off
 - `test_set_whitelist_enabled_invalid_admin` — wrong admin rejected
 - `test_set_whitelist_enabled_invalid_admin_not_signer` — unsigned admin rejected
 
@@ -150,7 +150,7 @@
 - `test_deposit_whitelist_other_wallets_pda_rejected` — another listed wallet's entry in either slot is rejected with InvalidDepositorPda
 - `test_deposit_whitelist_removed_user_rejected` — removing an entry blocks the next deposit
 
-### ReleaseFunds (28 integration tests)
+### ReleaseFunds (31 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -177,9 +177,12 @@
 - `test_release_funds_token_2022_memo_with_transfer_hook` — memo and transfer hook on one release, so the memo sibling and the forwarded hook extras coexist
 - `test_release_funds_memo_required_wrong_memo_program_rejected` — the memo program account is only address-checked on the memo path; a wrong one there is rejected
 - `test_release_funds_whitelist_listed_destination_succeeds` — happy path with the whitelist on
-- `test_release_funds_whitelist_unlisted_destination_rejected` — WalletNotAllowed, and the nonce stays unspent so the operator can remint the burn
+- `test_release_funds_whitelist_unlisted_destination_rejected` — a listed withdrawer cannot release to an unlisted destination; WalletNotAllowed, and the nonce stays unspent so the operator can remint the burn
 - `test_release_funds_whitelist_other_wallets_pda_rejected` — another listed wallet's entry is rejected with InvalidDepositorPda
-- `test_release_funds_whitelist_removed_destination_rejected` — removing an entry blocks the next release to it
+- `test_release_funds_whitelist_removed_destination_rejected` — removing an entry blocks the next release to it, even from a listed withdrawer
+- `test_release_funds_whitelist_unlisted_withdrawer_rejected` — an unlisted wallet cannot get funds out by naming a listed destination; WalletNotAllowed, nothing moves and the nonce stays unspent
+- `test_release_funds_whitelist_listed_withdrawer_to_other_listed_destination_succeeds` — withdrawer and destination differ and both are listed
+- `test_release_funds_whitelist_other_wallets_pda_in_withdrawer_slot_rejected` — the destination's entry in the withdrawer slot is rejected with InvalidDepositorPda
 
 ### RotateBitmap (6 integration tests)
 

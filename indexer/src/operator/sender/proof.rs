@@ -576,7 +576,9 @@ mod tests {
             .instance_ata(pk)
             .token_program(spl_token::id())
             .user_depositor_pda(pk)
+            .withdrawer_depositor_pda(pk)
             .user(pk)
+            .withdrawer(pk)
             .amount(1000)
             .transaction_nonce(0);
         b

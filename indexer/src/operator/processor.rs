@@ -609,6 +609,13 @@ fn build_release_funds(
             pubkey: transaction.recipient.clone(),
             reason: e.to_string(),
         })?;
+    // The wallet whose channel burn this settles. The release names it so the
+    // escrow whitelist can check who withdrew, and the remint below credits it.
+    let initiator =
+        Pubkey::from_str(&transaction.initiator).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.initiator.clone(),
+            reason: e.to_string(),
+        })?;
 
     // A recreated mint can change token program, and AllowMint re-pins it here.
     let token_program = allowed_mint.token_program;
@@ -641,12 +648,18 @@ fn build_release_funds(
         // release fails `verify_current_program` with IncorrectProgramId.
         .event_authority(release_funds_state.event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        // Read only while the instance whitelist is on. A refusal then fails the
-        // release like any other program error, and the remint path refunds it.
+        // Read only while the instance whitelist is on, which then requires both
+        // wallets to be listed. A refusal fails the release like any other program
+        // error, and the remint path refunds it.
         .user_depositor_pda(find_depositor_pda(
             &release_funds_state.instance_pda,
             &recipient,
         ))
+        .withdrawer_depositor_pda(find_depositor_pda(
+            &release_funds_state.instance_pda,
+            &initiator,
+        ))
+        .withdrawer(initiator)
         .transaction_nonce(nonce);
 
     let amount = transaction.amount.value();
@@ -658,12 +671,7 @@ fn build_release_funds(
         .mint_cache
         .get_private_channel_token_program();
     // The burn debited the initiator, so the remint credits them, not `recipient`
-    // (the Solana destination, which only the release leg above uses).
-    let initiator =
-        Pubkey::from_str(&transaction.initiator).map_err(|e| OperatorError::InvalidPubkey {
-            pubkey: transaction.initiator.clone(),
-            reason: e.to_string(),
-        })?;
+    // (the Solana destination).
     let remint_user_ata = get_associated_token_address_with_program_id(
         &initiator,
         &mint,
@@ -972,14 +980,15 @@ async fn check_withdrawal_preflights_inner(
 /// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
 /// `token_utils`, which codama does not export), but the transport binds first:
 /// the sender builds a legacy message with no lookup tables, and the 1232-byte
-/// packet holds 765 bytes of release plus 33 per extra, so 14 fit and 15 do
+/// packet holds 830 bytes of release plus 33 per extra, so 12 fit and 13 do
 /// not. Raise it toward 32 if the sender ever moves to versioned transactions
 /// with a lookup table, or to v1 transactions with their larger limit.
 ///
 /// The release grew by one account key plus its index byte, the same 33 bytes
 /// an extra costs, each time ReleaseFunds gained a slot: memo_program, then
-/// user_depositor_pda.
-const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 14;
+/// user_depositor_pda, then withdrawer_depositor_pda. The withdrawer argument
+/// added 32 bytes of data alongside the last one.
+const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 12;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
@@ -3312,9 +3321,9 @@ mod tests {
 
     /// The remint reverses a burn on the private channel, so it must credit the
     /// account that was debited (`initiator`), not the withdrawal's Solana
-    /// destination (`recipient`). The release leg is the reverse: the whitelist
-    /// entry it carries must be the destination's, which only the program checks
-    /// once an instance turns the whitelist on.
+    /// destination (`recipient`). The release carries whitelist entries for both,
+    /// which only the program checks once an instance turns the whitelist on, so
+    /// a swap would pass every test that runs with it off.
     #[tokio::test]
     async fn build_release_funds_remints_to_initiator_not_destination() {
         let mint_pubkey = Pubkey::new_unique();
@@ -3351,11 +3360,25 @@ mod tests {
             panic!("a withdrawal must build a ReleaseFunds builder");
         };
 
-        // Account 14 is user_depositor_pda, after memo_program.
+        // Accounts 14 and 15 are user_depositor_pda and withdrawer_depositor_pda,
+        // after memo_program. The withdrawer argument follows discriminator (1),
+        // amount (8), user (32) and transaction_nonce (8).
+        const WITHDRAWER_DATA_OFFSET: usize = 49;
+        let instruction = release.builder.instruction();
         assert_eq!(
-            release.builder.instruction().accounts[14].pubkey,
+            instruction.accounts[14].pubkey,
             find_depositor_pda(&instance_pda, &destination),
-            "the release must carry the destination's whitelist entry, not the initiator's"
+            "the destination slot must carry the destination's whitelist entry"
+        );
+        assert_eq!(
+            instruction.accounts[15].pubkey,
+            find_depositor_pda(&instance_pda, &initiator),
+            "the withdrawer slot must carry the initiator's whitelist entry"
+        );
+        assert_eq!(
+            &instruction.data[WITHDRAWER_DATA_OFFSET..WITHDRAWER_DATA_OFFSET + 32],
+            initiator.as_ref(),
+            "the release must name the initiator as its withdrawer"
         );
 
         let remint = release

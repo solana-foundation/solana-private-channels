@@ -184,7 +184,9 @@ impl FuzzTest {
             .instance_ata(instance_ata.client())
             .amount(amount)
             .user_depositor_pda(user_depositor_pda.client())
+            .withdrawer_depositor_pda(user_depositor_pda.client())
             .user(user.client())
+            .withdrawer(user.client())
             .transaction_nonce(nonce)
             .instruction()
             .to_trident();
@@ -268,7 +270,9 @@ impl FuzzTest {
             .instance_ata(instance_ata.client())
             .amount(1)
             .user_depositor_pda(user_depositor_pda.client())
+            .withdrawer_depositor_pda(user_depositor_pda.client())
             .user(user.client())
+            .withdrawer(user.client())
             .transaction_nonce(nonce)
             .instruction()
             .to_trident();
@@ -412,7 +416,9 @@ impl FuzzTest {
             .instance_ata(instance_ata.client())
             .amount(1)
             .user_depositor_pda(user_depositor_pda.client())
+            .withdrawer_depositor_pda(user_depositor_pda.client())
             .user(user.client())
+            .withdrawer(user.client())
             .transaction_nonce(stale_nonce)
             .instruction()
             .to_trident();

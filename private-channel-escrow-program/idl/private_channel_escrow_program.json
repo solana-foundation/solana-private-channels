@@ -1864,6 +1864,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "userDepositorPda"
+          },
+          {
+            "docs": [
+              "Depositor PDA of withdrawer; read only while the whitelist is on"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "withdrawerDepositorPda"
           }
         ],
         "arguments": [
@@ -1904,6 +1913,13 @@
               "endian": "le",
               "format": "u64",
               "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "withdrawer",
+            "type": {
+              "kind": "publicKeyTypeNode"
             }
           }
         ],

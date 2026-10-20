@@ -13,6 +13,10 @@ the user's burned private channel tokens.
 
 No funds are stranded. No recovery action needed.
 
+## Expected cause: escrow whitelist
+
+With the instance whitelist on, the escrow refuses a release whose withdrawer or destination is unlisted. Only `custom program error: 0x14` in `error_message` proves it. Any other message, such as `None` or `recovered from persistent storage`, counts only once you confirm the whitelist is on and the withdrawer's or destination's Depositor PDA is missing. Then reconcile as usual, no ticket for repeats.
+
 **Exception:** if `error_message` contains `remint landed but the row is no
 longer pending_remint`, another writer moved the row while this remint
 landed, so the row's status does not show the refund. The user is refunded
@@ -48,7 +52,8 @@ by `remint_signature`. Check the row's status, then:
   `RetryPolicy::None` decision in `sender/remint.rs::attempt_remint` needs
   revisiting.
 - If multiple `failed_reminted` events fire within a short window, file a
-  ticket - the underlying RPC or program is unstable.
+  ticket - the underlying RPC or program is unstable. Whitelist refusals
+  (above) are the exception.
 
 ## Post-incident
 

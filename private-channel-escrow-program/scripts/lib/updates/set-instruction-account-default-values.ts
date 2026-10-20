@@ -114,6 +114,14 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                     pdaSeedValueNode('wallet', argumentValueNode('user')),
                 ]),
             },
+            {
+                account: 'withdrawerDepositorPda',
+                instruction: 'releaseFunds',
+                defaultValue: pdaValueNode(pdaLinkNode('depositor'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', argumentValueNode('withdrawer')),
+                ]),
+            },
 
             // CreateInstance instruction
             {

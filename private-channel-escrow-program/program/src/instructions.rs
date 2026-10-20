@@ -254,6 +254,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "user_depositor_pda",
         docs = "Depositor PDA of user; read only while the whitelist is on"
     ))]
+    #[codama(account(
+        name = "withdrawer_depositor_pda",
+        docs = "Depositor PDA of withdrawer; read only while the whitelist is on"
+    ))]
     ReleaseFunds {
         /// Amount of tokens to release
         amount: u64,
@@ -261,6 +265,8 @@ pub enum PrivateChannelEscrowProgramInstruction {
         user: Pubkey,
         /// Transaction nonce to consume from the withdrawal bitmap
         transaction_nonce: u64,
+        /// Wallet whose channel burn this release settles; may differ from user
+        withdrawer: Pubkey,
     } = 7,
 
     /// Rotate the withdrawal bitmap to the next generation (operator-only).
@@ -329,7 +335,7 @@ pub enum PrivateChannelEscrowProgramInstruction {
 
     /// Turn the instance whitelist on or off (admin-only). While on, Deposit
     /// requires the depositor and recipient to be listed, and ReleaseFunds the
-    /// destination.
+    /// withdrawer and destination.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to update", writable))]

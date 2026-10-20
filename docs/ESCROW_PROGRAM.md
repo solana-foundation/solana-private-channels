@@ -21,9 +21,12 @@
 | [`AddOperator`](#addoperator) | Add an operator to the instance (admin-only) | 3 |
 | [`RemoveOperator`](#removeoperator) | Remove an operator from the instance (admin-only) | 4 |
 | [`SetNewAdmin`](#setnewadmin) | Set a new admin for the instance (current admin only) | 5 |
-| [`Deposit`](#deposit) | Deposit tokens from user ATA to instance escrow ATA (permissionless) | 6 |
+| [`Deposit`](#deposit) | Deposit tokens from user ATA to instance escrow ATA (permissionless unless the instance whitelist is on) | 6 |
 | [`ReleaseFunds`](#releasefunds) | Release funds from escrow to user (operator-only) | 7 |
 | [`RotateBitmap`](#rotatebitmap) | Rotate the withdrawal bitmap to the next generation (operator-only) | 8 |
+| [`AddDepositor`](#adddepositor) | Add a wallet to the instance whitelist (admin-only) | 9 |
+| [`RemoveDepositor`](#removedepositor) | Remove a wallet from the instance whitelist (admin-only) | 10 |
+| [`SetWhitelistEnabled`](#setwhitelistenabled) | Turn the instance whitelist on or off (admin-only) | 11 |
 | [`EmitEvent`](#emitevent) | Emit event via CPI | 228 |
 
 ### Instruction Details
@@ -169,9 +172,9 @@ Discriminator: `5`
 | 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### Deposit
-Deposits tokens from user ATA to instance escrow ATA (permissionless).
+Deposits tokens from user ATA to instance escrow ATA (permissionless unless the instance whitelist is on).
 
-Fails with `ZeroAmount` when `amount` is 0 or the escrow receives nothing, and with `BelowMinimumDeposit` when the received amount is under the mint's `min_deposit_amount`.
+Fails with `ZeroAmount` when `amount` is 0 or the escrow receives nothing, and with `BelowMinimumDeposit` when the received amount is under the mint's `min_deposit_amount`. While the instance whitelist is on, fails with `WalletNotAllowed` unless `user` and the credited wallet (`recipient`, or `user`) are listed.
 
 Discriminator: `6`
 
@@ -196,9 +199,11 @@ Discriminator: `6`
 | 9 | `associated_token_program` | | | Associated Token program |
 | 10 | `event_authority` | | | Event authority PDA for emitting events |
 | 11 | `private_channel_escrow_program` | | | Current program for CPI |
+| 12 | `user_depositor_pda` | | | Depositor PDA of `user`; read only while the whitelist is on |
+| 13 | `recipient_depositor_pda` | | | Depositor PDA of the credited wallet; read only while the whitelist is on |
 
 #### ReleaseFunds
-Releases funds from escrow to user (operator-only).
+Releases funds from escrow to user (operator-only). While the instance whitelist is on, fails with `WalletNotAllowed` unless `withdrawer` and `user` are listed.
 
 Discriminator: `7`
 
@@ -208,6 +213,7 @@ Discriminator: `7`
 | `amount` | u64 | Amount of tokens to release |
 | `user` | Pubkey | User receiving the funds (wallet address, not the ATA) |
 | `transaction_nonce` | u64 | Transaction nonce to consume from the withdrawal bitmap |
+| `withdrawer` | Pubkey | Wallet whose channel burn this release settles; may differ from `user` |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -226,6 +232,8 @@ Discriminator: `7`
 | 11 | `event_authority` | | | Event authority PDA for emitting events |
 | 12 | `private_channel_escrow_program` | | | Current program for CPI |
 | 13 | `memo_program` | | | SPL Memo program; always required, but validated and invoked only when `user_ata` requires a memo |
+| 14 | `user_depositor_pda` | | | Depositor PDA of `user`; read only while the whitelist is on |
+| 15 | `withdrawer_depositor_pda` | | | Depositor PDA of `withdrawer`; read only while the whitelist is on |
 
 Replay protection is the bitmap alone: the nonce's bit must be clear, and the
 nonce must fall in the generation the bitmap currently covers. The instance is
@@ -261,6 +269,66 @@ Discriminator: `8`
 | 5 | `event_authority` | | | Event authority PDA for emitting events |
 | 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
+#### AddDepositor
+Adds a wallet to the instance whitelist (admin-only).
+
+Discriminator: `9`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bump` | u8 | PDA bump seed for depositor account |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | | Instance PDA to validate admin authority |
+| 3 | `depositor` | | | Wallet to be added |
+| 4 | `depositor_pda` | | ✓ | Depositor PDA to be created |
+| 5 | `system_program` | | | System program |
+| 6 | `event_authority` | | | Event authority PDA for emitting events |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### RemoveDepositor
+Removes a wallet from the instance whitelist (admin-only). Closes the Depositor PDA and returns its rent to the payer.
+
+Discriminator: `10`
+
+**Parameters:** None
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | | Instance PDA to validate admin authority |
+| 3 | `depositor` | | | Wallet to be removed |
+| 4 | `depositor_pda` | | ✓ | Existing Depositor PDA |
+| 5 | `system_program` | | | System program |
+| 6 | `event_authority` | | | Event authority PDA for emitting events |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### SetWhitelistEnabled
+Turns the instance whitelist on or off (admin-only). The flag is absolute, and entries are kept either way.
+
+Discriminator: `11`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `enabled` | bool | Require whitelist entries on `Deposit` and `ReleaseFunds` |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | ✓ | Instance PDA to update |
+| 3 | `event_authority` | | | Event authority PDA for emitting events |
+| 4 | `private_channel_escrow_program` | | | Current program for CPI |
+
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.
 
@@ -279,20 +347,22 @@ The program trusts each kind of signer for a fixed set of decisions.
 
 | Principal | Trusted for | Instructions |
 |-----------|-------------|--------------|
-| Admin | Instance configuration: the mint allowlist, the operator set, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `SetNewAdmin` |
-| Operator | Every release parameter (amount, recipient, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
-| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens | `CreateInstance`, `Deposit` |
+| Admin | Instance configuration: the mint allowlist, the operator set, the wallet whitelist, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `AddDepositor`, `RemoveDepositor`, `SetWhitelistEnabled`, `SetNewAdmin` |
+| Operator | Every release parameter (amount, recipient, withdrawer, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
+| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens (listed wallets only while the whitelist is on) | `CreateInstance`, `Deposit` |
 
-Beyond the mint allowlist, the program constrains an operator in two ways only.
+Beyond the mint allowlist, the program constrains an operator in three ways.
 Each nonce is released at most once, and only while the bitmap covers its
 generation. A rotation must name the current generation, so a replayed one
-cannot skip a generation.
+cannot skip a generation. While the whitelist is on, a release's withdrawer and
+destination must both be listed.
 
-The program does not check a release's amount, recipient or mint against the
-burn on the channel, and it does not check that a generation is finished before
-it is rotated. The operator in the indexer makes those decisions from its
-database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
-invariants in [INVARIANTS.md](INVARIANTS.md#operator). A rotation that lands
+The program does not check a release's amount, recipient, withdrawer or mint
+against the burn on the channel, and it does not check that a generation is
+finished before it is rotated. The operator in the indexer makes those decisions
+from its database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
+invariants in [INVARIANTS.md](INVARIANTS.md#operator). The whitelist's withdrawer
+check therefore trusts the operator to name the wallet that burned. A rotation that lands
 early makes every unreleased nonce in the closed generation unreleasable. The
 indexer then routes those withdrawals to its remint path. A row with earlier
 broadcast signatures enters the automatic remint flow, which remints only once
@@ -315,6 +385,7 @@ that is distinct from the admin key and kept outside that process.
 | Operator | Authorized operator for an instance that can release funds | 1 |
 | AllowedMint | Token mint allowed in an instance, holding its deposit and withdrawal gates | 2 |
 | WithdrawalBitmap | Withdrawal nonce replay protection for an instance | 3 |
+| Depositor | A wallet on the instance whitelist | 4 |
 
 ### Instance
 Represents an escrow instance that holds token funds and manages operators.
@@ -327,6 +398,7 @@ Represents an escrow instance that holds token funds and manages operators.
 | `version` | u8 | Instance version |
 | `instance_seed` | Pubkey | Unique seed for this instance |
 | `admin` | Pubkey | Authority that controls the instance |
+| `whitelist_enabled` | bool | `Deposit` and `ReleaseFunds` require Depositor entries; set by `SetWhitelistEnabled` |
 
 ### WithdrawalBitmap
 Withdrawal nonce replay protection: one bit per nonce in the current generation.
@@ -355,6 +427,15 @@ length varies with the `test-tree` feature.
 Represents an authorized operator for an instance that can release funds.
 
 **PDA Derivation**: `["operator", instance_pda, wallet_pubkey]`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bump` | u8 | PDA bump seed |
+
+### Depositor
+A wallet on the instance whitelist. The account existing is the entry.
+
+**PDA Derivation**: `["depositor", instance_pda, wallet_pubkey]`
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -424,6 +505,8 @@ The program defines the following custom errors:
 | 17 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
 | 18 | `ZeroAmount` | Deposit requested or received zero tokens |
 | 19 | `BelowMinimumDeposit` | Deposit received less than the mint's minimum deposit |
+| 20 | `WalletNotAllowed` | Whitelist is on and the wallet has no Depositor entry |
+| 21 | `InvalidDepositorPda` | Depositor PDA does not belong to the wallet being checked |
 
 ## Other Constants
 

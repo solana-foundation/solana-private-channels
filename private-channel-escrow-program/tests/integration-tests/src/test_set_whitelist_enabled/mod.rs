@@ -13,7 +13,7 @@ use solana_sdk::{
 };
 
 #[test]
-fn test_set_whitelist_enabled_on_then_off() {
+fn test_set_whitelist_enabled_is_absolute() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let instance_seed = Keypair::new();
@@ -24,6 +24,12 @@ fn test_set_whitelist_enabled_on_then_off() {
 
     assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, true)
         .expect("Enabling the whitelist should succeed");
+
+    // Enabling again must leave it on; a toggle would turn it off. Without a fresh
+    // blockhash the repeat is byte-identical and dropped before the program runs.
+    context.svm.expire_blockhash();
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+        .expect("Enabling an enabled whitelist should succeed");
 
     assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, false, false)
         .expect("Disabling the whitelist should succeed");

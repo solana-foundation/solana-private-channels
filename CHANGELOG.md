@@ -58,7 +58,7 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 
 ### Programs
 - Reject zero-value deposits on chain (Cantina 56; #342)
-- Optional per-instance whitelist: `Deposit` requires the depositor and channel recipient to be listed, `ReleaseFunds` the destination
+- Optional per-instance whitelist: `Deposit` requires the depositor and channel recipient to be listed, `ReleaseFunds` the channel withdrawer and the destination
 
 ### Deploy, compose and scripts
 - Env files written 0600, symlinks and foreign owners refused (Cantina 58; #350)
@@ -93,7 +93,7 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - `private-channel-admin truncate` needs `--withdraw-indexer-db-url` (or `--skip-withdraw-indexer-check`) and refuses a cut keeping fewer than two windows.
 - `scripts/reconcile-escrow-balance.sh` is removed; use `indexer -c <escrow config> reconcile`.
 - Hand edits to `failed_reminted` rows must set `landed_remint_signature`.
-- Escrow clients: `Deposit` takes `user_depositor_pda` and `recipient_depositor_pda`, and `ReleaseFunds` takes `user_depositor_pda`, after the existing accounts. `Instance` grew a byte, so instances created before this must be recreated.
+- Escrow clients: `Deposit` takes `user_depositor_pda` and `recipient_depositor_pda`, and `ReleaseFunds` takes `user_depositor_pda` and `withdrawer_depositor_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument. `Instance` grew a byte, so instances created before this must be recreated.
 - Clients: unused writable keys and writable program ids are rejected with `-32602`; a `null` status past the deadline proves nothing unless `getFirstAvailableBlock` is at or below the signing `context.slot`.
 - `pg-backup-primary` logs in as `POSTGRES_REPLICATION_USER`, and `postgres-indexer` runs `init-indexer-hba.sh`. Both take effect on fresh volumes only.
 - Ansible always starts `pg-backup-primary` and `pg-backup-indexer`, and starts `auth-migrate` and `auth` when `gateway_enforce_jwt` is true.

@@ -128,9 +128,12 @@ pub async fn release_funds_on_chain(
         .event_authority(find_event_authority_pda())
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(find_depositor_pda(&instance, &user))
+        // No channel withdrawal backs this release, so the destination stands in.
+        .withdrawer_depositor_pda(find_depositor_pda(&instance, &user))
         .amount(amount)
         .user(user)
         .transaction_nonce(nonce)
+        .withdrawer(user)
         .instruction();
 
     send_and_confirm_instructions(client, &[release_ix], admin, &[admin], "Release Funds").await

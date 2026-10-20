@@ -293,9 +293,11 @@ fn test_release_funds_not_operator() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&fake_operator]);
@@ -394,7 +396,7 @@ fn test_release_funds_operator_not_signer() {
         &TOKEN_PROGRAM_ID,
     );
 
-    // Create instruction where operator is NOT marked as signer (15 accounts)
+    // Create instruction where operator is NOT marked as signer (16 accounts)
     let accounts = vec![
         AccountMeta::new(context.payer.pubkey(), true), // payer (signer, writable)
         AccountMeta::new_readonly(operator.pubkey(), false), // operator (NOT signer)
@@ -411,12 +413,14 @@ fn test_release_funds_operator_not_signer() {
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
         AccountMeta::new_readonly(spl_memo::id(), false),                    // memo_program
         AccountMeta::new_readonly(user_depositor_pda, false),                // user_depositor_pda
+        AccountMeta::new_readonly(user_depositor_pda, false), // withdrawer_depositor_pda
     ];
 
     let mut data = vec![7]; // discriminator for ReleaseFunds
     data.extend_from_slice(&RELEASE_AMOUNT.to_le_bytes()); // amount (8 bytes)
     data.extend_from_slice(user.pubkey().as_ref()); // user (32 bytes)
     data.extend_from_slice(&TRANSACTION_NONCE.to_le_bytes()); // transaction_nonce (8 bytes)
+    data.extend_from_slice(user.pubkey().as_ref()); // withdrawer (32 bytes)
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -880,9 +884,11 @@ fn test_release_funds_wrong_user_ata() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&operator]);
@@ -1079,9 +1085,11 @@ fn test_release_funds_token_2022_transfer_fee_success() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     context
@@ -1370,9 +1378,11 @@ fn test_release_funds_foreign_bitmap_rejected() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&operator]);
@@ -1564,9 +1574,11 @@ fn test_release_funds_token_2022_transfer_hook_forwards_extras() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
         .instruction();
 
@@ -1683,9 +1695,11 @@ fn test_release_funds_rejects_signer_bearing_hook_extra() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .add_remaining_accounts(&malicious_hook_extras(
             &mint.pubkey(),
             &victim,
@@ -1800,9 +1814,11 @@ fn test_release_funds_token_2022_memo_required_destination() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     let metadata = context
@@ -1902,9 +1918,11 @@ fn test_release_funds_memo_required_wrong_memo_program_rejected() {
         // Anything but the Memo program in the slot the memo path reaches for.
         .memo_program(ATA_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&operator]);
@@ -2005,9 +2023,11 @@ fn test_release_funds_token_2022_memo_with_transfer_hook() {
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
         .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
         .instruction();
 
@@ -2105,6 +2125,7 @@ fn test_release_funds_whitelist_unlisted_destination_rejected() {
     let admin = Keypair::new();
     let operator = Keypair::new();
     let user = Keypair::new();
+    let withdrawer = Keypair::new();
     let mint = Keypair::new();
     let instance_seed = Keypair::new();
 
@@ -2114,7 +2135,7 @@ fn test_release_funds_whitelist_unlisted_destination_rejected() {
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
             .expect("CreateInstance should succeed");
 
-    assert_get_or_allow_mint(
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
         &mut context,
         &admin,
         &instance_pda,
@@ -2134,7 +2155,7 @@ fn test_release_funds_whitelist_unlisted_destination_rejected() {
     )
     .expect("AddOperator should succeed");
 
-    setup_test_balances(
+    let (user_ata, instance_ata) = setup_test_balances(
         &mut context,
         &user,
         &instance_pda,
@@ -2146,23 +2167,49 @@ fn test_release_funds_whitelist_unlisted_destination_rejected() {
 
     assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
         .expect("SetWhitelistEnabled should succeed");
-
-    let result = assert_get_or_release_funds(
+    let (withdrawer_depositor_pda, _) = assert_get_or_add_depositor(
         &mut context,
-        &operator,
+        &admin,
         &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT,
-        &user.pubkey(),
-        TRANSACTION_NONCE,
+        &withdrawer.pubkey(),
         false,
-    );
+    )
+    .expect("AddDepositor should succeed");
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+    let (user_depositor_pda, _) = find_depositor_pda(&instance_pda, &user.pubkey());
+
+    // The withdrawer is listed, so only the destination's missing entry can refuse it.
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(withdrawer_depositor_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(withdrawer.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
 
     assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
-
-    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
     assert_nonce_consumed(
         &mut context,
         &withdrawal_bitmap_pda,
@@ -2219,13 +2266,314 @@ fn test_release_funds_whitelist_other_wallets_pda_rejected() {
 
     assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
         .expect("SetWhitelistEnabled should succeed");
-    assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("AddDepositor should succeed");
+    let (user_depositor_pda, _) =
+        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+            .expect("AddDepositor should succeed");
     let (other_depositor_pda, _) = assert_get_or_add_depositor(
         &mut context,
         &admin,
         &instance_pda,
         &other_wallet.pubkey(),
+        false,
+    )
+    .expect("AddDepositor should succeed");
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    // The withdrawer passes, so the wrong entry in the destination slot is what fails.
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(other_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, INVALID_DEPOSITOR_PDA_ERROR);
+}
+
+#[test]
+fn test_release_funds_whitelist_removed_destination_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let withdrawer = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let second_nonce = TRANSACTION_NONCE + 1;
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        RELEASE_AMOUNT * 2,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_depositor_pda, _) =
+        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+            .expect("AddDepositor should succeed");
+    let (withdrawer_depositor_pda, _) = assert_get_or_add_depositor(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &withdrawer.pubkey(),
+        false,
+    )
+    .expect("AddDepositor should succeed");
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        TRANSACTION_NONCE,
+        false,
+    )
+    .expect("ReleaseFunds while listed should succeed");
+
+    assert_get_or_remove_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+        .expect("RemoveDepositor should succeed");
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    // The withdrawer is still listed, so only the destination's closed entry can refuse it.
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(withdrawer_depositor_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(second_nonce)
+        .withdrawer(withdrawer.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+}
+
+// The channel lets a withdrawal name any destination, so a removed wallet must not
+// get funds out by sending them to a listed one.
+#[test]
+fn test_release_funds_whitelist_unlisted_withdrawer_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let withdrawer = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_depositor_pda, _) =
+        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+            .expect("AddDepositor should succeed");
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+    let (withdrawer_depositor_pda, _) = find_depositor_pda(&instance_pda, &withdrawer.pubkey());
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(withdrawer_depositor_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(withdrawer.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+    assert_eq!(get_token_balance(&mut context, &user_ata), 0);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        false,
+    );
+}
+
+#[test]
+fn test_release_funds_whitelist_listed_withdrawer_to_other_listed_destination_succeeds() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let withdrawer = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_depositor_pda, _) =
+        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+            .expect("AddDepositor should succeed");
+    let (withdrawer_depositor_pda, _) = assert_get_or_add_depositor(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &withdrawer.pubkey(),
         false,
     )
     .expect("AddDepositor should succeed");
@@ -2251,26 +2599,30 @@ fn test_release_funds_whitelist_other_wallets_pda_rejected() {
         .associated_token_program(ATA_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .user_depositor_pda(other_depositor_pda)
+        .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(withdrawer_depositor_pda)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(withdrawer.pubkey())
         .instruction();
 
-    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+    context
+        .send_transaction_with_signers(instruction, &[&operator])
+        .expect("ReleaseFunds between listed wallets should succeed");
 
-    assert_program_error(result, INVALID_DEPOSITOR_PDA_ERROR);
+    assert_eq!(get_token_balance(&mut context, &user_ata), RELEASE_AMOUNT);
 }
 
 #[test]
-fn test_release_funds_whitelist_removed_destination_rejected() {
+fn test_release_funds_whitelist_other_wallets_pda_in_withdrawer_slot_rejected() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
     let user = Keypair::new();
+    let withdrawer = Keypair::new();
     let mint = Keypair::new();
     let instance_seed = Keypair::new();
-    let second_nonce = TRANSACTION_NONCE + 1;
 
     set_mint(&mut context, &mint.pubkey());
 
@@ -2278,7 +2630,7 @@ fn test_release_funds_whitelist_removed_destination_rejected() {
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
             .expect("CreateInstance should succeed");
 
-    assert_get_or_allow_mint(
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
         &mut context,
         &admin,
         &instance_pda,
@@ -2298,50 +2650,53 @@ fn test_release_funds_whitelist_removed_destination_rejected() {
     )
     .expect("AddOperator should succeed");
 
-    setup_test_balances(
+    let (user_ata, instance_ata) = setup_test_balances(
         &mut context,
         &user,
         &instance_pda,
         &mint.pubkey(),
         &TOKEN_PROGRAM_ID,
         0,
-        RELEASE_AMOUNT * 2,
+        RELEASE_AMOUNT,
     );
 
     assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false)
         .expect("SetWhitelistEnabled should succeed");
-    assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("AddDepositor should succeed");
+    let (user_depositor_pda, _) =
+        assert_get_or_add_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
+            .expect("AddDepositor should succeed");
 
-    assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT,
-        &user.pubkey(),
-        TRANSACTION_NONCE,
-        false,
-    )
-    .expect("ReleaseFunds while listed should succeed");
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
 
-    assert_get_or_remove_depositor(&mut context, &admin, &instance_pda, &user.pubkey(), false)
-        .expect("RemoveDepositor should succeed");
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
 
-    let result = assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT,
-        &user.pubkey(),
-        second_nonce,
-        false,
-    );
+    // The destination's entry stands in for the unlisted withdrawer's.
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_depositor_pda(user_depositor_pda)
+        .withdrawer_depositor_pda(user_depositor_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(withdrawer.pubkey())
+        .instruction();
 
-    assert_program_error(result, WALLET_NOT_ALLOWED_ERROR);
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, INVALID_DEPOSITOR_PDA_ERROR);
 }

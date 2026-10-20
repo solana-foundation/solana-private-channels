@@ -628,9 +628,13 @@ pub fn assert_get_or_release_funds(
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .user_depositor_pda(user_depositor_pda)
+        // The helper releases to the wallet that withdrew; tests that split the
+        // two build the instruction themselves.
+        .withdrawer_depositor_pda(user_depositor_pda)
         .amount(amount)
         .user(*user)
         .transaction_nonce(transaction_nonce)
+        .withdrawer(*user)
         .instruction();
 
     let transaction_metadata = context.send_transaction_with_signers_with_transaction_result(

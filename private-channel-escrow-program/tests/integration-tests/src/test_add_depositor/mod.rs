@@ -2,8 +2,9 @@ use crate::{
     pda_utils::{find_depositor_pda, find_event_authority_pda},
     state_utils::{assert_get_or_add_depositor, assert_get_or_create_instance},
     utils::{
-        assert_program_error, TestContext, INVALID_ADMIN_ERROR, INVALID_DEPOSITOR_PDA_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        assert_program_error, TestContext, INVALID_ACCOUNT_OWNER_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_DEPOSITOR_PDA_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::AddDepositorBuilder;
@@ -55,6 +56,11 @@ fn test_add_depositor_duplicate() {
     )
     .expect("First AddDepositor should succeed");
 
+    // Without this the second transaction is byte-identical to the first and
+    // gets dropped as an already-processed signature, so the program would
+    // never run and this would pass whatever the handler does.
+    context.svm.expire_blockhash();
+
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddDepositorBuilder::new()
@@ -71,7 +77,8 @@ fn test_add_depositor_duplicate() {
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
-    assert!(result.is_err(), "Duplicate AddDepositor should fail");
+    // The entry already exists, so the PDA is no longer a system account.
+    assert_program_error(result, INVALID_ACCOUNT_OWNER_ERROR);
 }
 
 #[test]

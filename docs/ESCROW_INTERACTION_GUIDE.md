@@ -104,7 +104,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
 
 **Security Notes:**
 - Supports Token Program and Token-2022
-- Token-2022 mints with the `TransferHook` extension are supported. `Deposit` and `ReleaseFunds` forward their trailing accounts to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. The client resolves those accounts (see [Transfer-hook mints](#transfer-hook-mints)). The program caps them at 32, but a legacy-transaction release fits 14, and the withdrawal operator parks anything past that rather than build a transaction it cannot send. A deposit's room depends on how the client builds the transaction; its two whitelist accounts take two of it
+- Token-2022 mints with the `TransferHook` extension are supported. `Deposit` and `ReleaseFunds` forward their trailing accounts to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. The client resolves those accounts (see [Transfer-hook mints](#transfer-hook-mints)). The program caps them at 32, but a legacy-transaction release fits 12, and the withdrawal operator parks anything past that rather than build a transaction it cannot send. A deposit's room depends on how the client builds the transaction; its two whitelist accounts take two of it
 - Token-2022 mints with `PermanentDelegate` or `PausableConfig` extensions are accepted; the operator enforces drain detection and pause state off-chain via a withdrawal pre-flight
 - Only the instance admin can allow mints
 - `withdrawFee` is required and may be `0`. It is charged on top of every channel withdrawal and paid to the operator admin, and is the only thing that pays for a release, successful or failed. The AllowMint admin owns sizing it to cover one release's SOL cost.
@@ -265,7 +265,7 @@ const setAdminIx = getSetNewAdminInstruction({
 
 ## Whitelist
 
-Off by default. While on, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to have a Depositor entry, and `ReleaseFunds` requires its destination to. All three instructions are admin-only.
+Off by default. While on, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to have a Depositor entry, and `ReleaseFunds` requires both the wallet that withdrew in the channel and the Mainnet destination to. All three instructions are admin-only.
 
 ### TypeScript Example
 
@@ -302,9 +302,11 @@ const enableIx = getSetWhitelistEnabledInstruction({
 
 **Notes:**
 - An unlisted wallet fails with `WalletNotAllowed`; another wallet's entry in its place fails with `InvalidDepositorPda`
-- A release refused for an unlisted destination is reminted to the withdrawer in the channel. The withdraw fee is not refunded
-- Not gated: transfers inside the channel, and who withdrew in the channel. `ReleaseFunds` only sees the Mainnet destination
-- Turning it on for a live instance stops unlisted wallets withdrawing to themselves; each attempt is reminted and costs them the withdraw fee
+- A refused release is reminted to the withdrawer in the channel. The withdraw fee is not refunded
+- Each refusal raises a `failed_reminted` alert; see the [runbook](runbooks/withdrawal_failed_reminted.md)
+- The operator names the withdrawer, as it already names the destination and amount
+- Not gated: transfers inside the channel. A removed wallet can still move its balance to a listed wallet, which can then withdraw it
+- Turning it on for a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the withdraw fee
 
 To derive a depositor PDA, refer to the [PDA Reference](#pda-reference) section.
 

@@ -2,8 +2,8 @@ use crate::{
     pda_utils::{find_event_authority_pda, find_operator_pda},
     state_utils::{assert_get_or_add_operator, assert_get_or_create_instance},
     utils::{
-        assert_program_error, TestContext, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
-        INVALID_INSTRUCTION_DATA_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        assert_program_error, TestContext, INVALID_ACCOUNT_DATA_ERROR, INVALID_ACCOUNT_OWNER_ERROR,
+        INVALID_ADMIN_ERROR, INVALID_INSTRUCTION_DATA_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
 };
@@ -60,6 +60,11 @@ fn test_add_operator_duplicate() {
     )
     .expect("First AddOperator should succeed");
 
+    // Without this the second transaction is byte-identical to the first and
+    // gets dropped as an already-processed signature, so the program would
+    // never run and this would pass whatever the handler does.
+    context.svm.expire_blockhash();
+
     // Second add operator with same wallet should fail
     let (operator_pda, bump) = find_operator_pda(&instance_pda, &operator_wallet.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
@@ -78,8 +83,8 @@ fn test_add_operator_duplicate() {
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
-    // Should fail because account already exists
-    assert!(result.is_err(), "Duplicate add operator should fail");
+    // The operator PDA already exists, so it is no longer a system account.
+    assert_program_error(result, INVALID_ACCOUNT_OWNER_ERROR);
 }
 
 #[test]
