@@ -60,6 +60,8 @@ cargo run --bin allow_mint -- \
 ```
 `<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin; size it to cover one release's SOL cost. `<MIN_WITHDRAW_AMOUNT>` is the smallest amount one withdrawal may move, also in base units, which limits how many releases a balance can queue at once. `0` is allowed for either, but a fee of `0` leaves the operator paying every release, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with new values, to or from `0`, to reprice; they apply from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). `<MIN_DEPOSIT_AMOUNT>` is the smallest amount a deposit must land in the escrow, in base units, `0` for none; the escrow enforces it from the moment `allow_mint` lands.
 
+Run `allow_mint` only once the stack is up and `indexer-solana` is healthy. With no backfill `start_slot` set, as in the shipped devnet config, a fresh escrow indexer starts at the chain tip and never indexes an earlier `AllowMint`, so the mint's first deposit is quarantined (`docs/runbooks/deposit_manual_review.md` Path F).
+
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash
 cargo run --bin deposit -- \

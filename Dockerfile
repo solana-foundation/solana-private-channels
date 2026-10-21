@@ -176,10 +176,11 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
     && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
 # Install runtime dependencies. curl is used by compose healthcheck probes
-# against the service's /health and /metrics endpoints.
+# against the service's /health and /metrics endpoints. The upgrade applies Debian
+# security fixes the base image tag may not carry yet, so the Trivy gate can pass.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y \
+    apt-get update && apt-get upgrade -y && apt-get install -y \
     ca-certificates \
     curl \
     libssl3
