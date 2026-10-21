@@ -34,6 +34,7 @@ describe('setWhitelistEnabled', () => {
             AccountRole.WRITABLE_SIGNER, // payer
             AccountRole.READONLY_SIGNER, // admin
             AccountRole.WRITABLE, // instance
+            AccountRole.READONLY, // systemProgram
             AccountRole.READONLY, // eventAuthority
             AccountRole.READONLY, // privateChannelEscrowProgram
         ]);

@@ -126,6 +126,22 @@
                   "kind": "numberTypeNode"
                 }
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "reserved",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 32
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -190,6 +206,22 @@
                   "format": "u8",
                   "kind": "numberTypeNode"
                 }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "reserved",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 64
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
               }
             }
           ],
@@ -2369,6 +2401,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "instance"
+          },
+          {
+            "docs": [
+              "System program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "systemProgram"
           },
           {
             "docs": [

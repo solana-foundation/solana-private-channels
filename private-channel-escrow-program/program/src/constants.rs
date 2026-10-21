@@ -9,8 +9,8 @@ pub const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 pub const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 pub const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
 
-// Instance
-pub const INSTANCE_VERSION: u8 = 1;
+// Instance. Version 1 is the 0.1.0 layout, which ends at the admin.
+pub const INSTANCE_VERSION: u8 = 2;
 
 // spl-token's native (wSOL) mint. Not `spl_token_2022::native_mint::ID`, which
 // is the Token-2022 native mint at a different address.

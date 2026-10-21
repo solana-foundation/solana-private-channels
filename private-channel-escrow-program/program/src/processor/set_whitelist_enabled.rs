@@ -1,29 +1,41 @@
 extern crate alloc;
 
 use crate::{
+    constants::INSTANCE_VERSION,
     error::PrivateChannelEscrowProgramError,
     events::SetWhitelistEnabledEvent,
     processor::{
-        shared::{account_check::verify_signer, event_utils::emit_event},
+        shared::{
+            account_check::{verify_signer, verify_system_program},
+            event_utils::emit_event,
+        },
         verify_current_program, verify_mutability,
     },
     require_len,
     state::{discriminator::AccountSerialize, Instance},
     validate_event_authority,
 };
-use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
+use pinocchio::{
+    account::AccountView,
+    error::ProgramError,
+    sysvars::{rent::Rent, Sysvar},
+    Address, ProgramResult,
+};
+use pinocchio_system::instructions::Transfer;
 
 /// Processes the SetWhitelistEnabled instruction.
 ///
 /// Both flags are absolute, so passing false turns that direction off. Entries are
-/// kept either way.
+/// kept either way. A 0.1.0 instance has no room for the flags, so it grows to the
+/// current layout, with the payer topping up its rent.
 ///
 /// # Account Layout
-/// 0. `[signer, writable]` payer - Pays for transaction fees
+/// 0. `[signer, writable]` payer - Pays for transaction fees and any rent top-up
 /// 1. `[signer]` admin - Admin of the instance
 /// 2. `[writable]` instance - Instance PDA to update
-/// 3. `[signer]` event_authority - Event authority PDA for emitting events
-/// 4. `[]` private_channel_escrow_program - Current program for CPI
+/// 3. `[]` system_program - System program, for the rent top-up
+/// 4. `[signer]` event_authority - Event authority PDA for emitting events
+/// 5. `[]` private_channel_escrow_program - Current program for CPI
 ///
 /// # Instruction Data
 /// * `whitelist_deposits` (bool) - Require allowed wallets on Deposit
@@ -34,7 +46,8 @@ pub fn process_set_whitelist_enabled(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
-    let [payer_info, admin_info, instance_info, event_authority_info, program_info] = accounts
+    let [payer_info, admin_info, instance_info, system_program_info, event_authority_info, program_info] =
+        accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -42,6 +55,7 @@ pub fn process_set_whitelist_enabled(
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
     verify_mutability(instance_info, true)?;
+    verify_system_program(system_program_info)?;
     verify_current_program(program_info)?;
 
     validate_event_authority!(event_authority_info);
@@ -57,10 +71,28 @@ pub fn process_set_whitelist_enabled(
 
     instance.deposits_whitelisted = args.whitelist_deposits;
     instance.withdrawals_whitelisted = args.whitelist_withdrawals;
+    // Written below in the current layout, whatever layout it was read from.
+    instance.version = INSTANCE_VERSION;
 
     let updated_instance_data = instance.to_bytes();
 
     drop(instance_data);
+
+    if instance_info.data_len() < Instance::LEN {
+        let rent = Rent::get()?;
+        let top_up = rent
+            .try_minimum_balance(Instance::LEN)?
+            .saturating_sub(instance_info.lamports());
+        if top_up > 0 {
+            Transfer {
+                from: payer_info,
+                to: instance_info,
+                lamports: top_up,
+            }
+            .invoke()?;
+        }
+        instance_info.resize(Instance::LEN)?;
+    }
 
     let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..updated_instance_data.len()].copy_from_slice(&updated_instance_data);

@@ -1,7 +1,7 @@
 use crate::utils::get_token_balance;
 use crate::utils::{TestContext, NONCES_PER_GENERATION, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use private_channel_escrow_program_client::{
-    accounts::Instance, AllowedMint, AllowedWallet, Operator, WithdrawalBitmap,
+    decode_instance, AllowedMint, AllowedWallet, Operator, WithdrawalBitmap,
 };
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
@@ -20,8 +20,7 @@ pub fn assert_instance_account(
 
     assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
 
     assert_eq!(instance.admin, *expected_admin);
     assert_eq!(instance.bump, expected_bump);
@@ -46,8 +45,7 @@ pub fn assert_whitelist_enabled(
         .get_account(instance_pda)
         .expect("Instance account should exist");
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
 
     assert_eq!(instance.deposits_whitelisted, expected_deposits_whitelisted);
     assert_eq!(
@@ -221,8 +219,7 @@ pub fn assert_instance_admin_updated(
 
     assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
 
     assert_eq!(instance.admin, *expected_new_admin);
 }

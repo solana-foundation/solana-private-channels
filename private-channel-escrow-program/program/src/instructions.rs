@@ -349,10 +349,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
     /// Set which directions the instance whitelist gates (admin-only). While
     /// deposits are whitelisted, Deposit requires the depositor and recipient to
     /// be allowed to deposit; while withdrawals are, ReleaseFunds requires the
-    /// withdrawer and destination to be allowed to withdraw.
+    /// withdrawer and destination to be allowed to withdraw. Grows a 0.1.0 instance
+    /// to the current layout, with the payer topping up its rent.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to update", writable))]
+    #[codama(account(name = "system_program", docs = "System program"))]
     #[codama(account(
         name = "event_authority",
         docs = "Event authority PDA for emitting events"

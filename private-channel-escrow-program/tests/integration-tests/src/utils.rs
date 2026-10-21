@@ -1,5 +1,6 @@
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_escrow_program_client::PrivateChannelEscrowProgramError;
+pub use private_channel_escrow_program_client::{INSTANCE_LEN, INSTANCE_V1_LEN};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_nullable::MaybeNull;
 use solana_program::pubkey;

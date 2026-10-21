@@ -32,20 +32,6 @@ in [RELEASING.md](RELEASING.md). Per-release notes are in [CHANGELOG.md](CHANGEL
 | Roles or Grafana admin on existing volumes | `scripts/migrate-stack.sh` (the Ansible deploy runs the same steps on every run). |
 | Resync | A change to the channel address index or the bitmap generation. The release notes name the command. |
 | On-chain program upgrade | `docs/DEVNET_QUICKSTART.md` step 0, then new images and clients, because program ids are compiled in. |
-| Escrow account layout change | Drain and recreate the instances, below. |
-
-## Escrow account layout changes
-
-When the upgrade notes say an escrow account changed layout, the upgraded program refuses
-every instruction on an instance created before it, `ReleaseFunds` included, and nothing
-else can move that instance's funds. Before upgrading the escrow program:
-
-1. List the instances on the program and check their escrow token balances.
-2. Drain each one that holds funds: `BlockMint` every mint with deposits blocked and
-   withdrawals open, then let every holder withdraw through the channel while the operator
-   releases. The admin cannot force a withdrawal, so hold the upgrade until the instance is
-   empty.
-3. Upgrade the program, create a new instance, and set `COMMON_ESCROW_INSTANCE_ID` to it.
 
 ## Stop order
 
@@ -79,7 +65,8 @@ published its blockhash window, so the writer always goes first.
 ## Rollback
 
 Redeploy the previous `image_tag`. That is the whole rollback when the release changed no
-schema.
+schema and no on-chain program. A release that changes a program says in its notes whether
+the program must be rolled back first.
 
 Schema changes are forward-only. A database restore is disaster recovery, not a rollback:
 `docs/PITR.md` forbids restoring the primary alone, requires the indexer database restored

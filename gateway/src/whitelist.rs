@@ -9,8 +9,7 @@ use hyper::body::Bytes;
 use hyper::{Request, Uri};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use private_channel_escrow_program_client::{
-    accounts::{AllowedWallet, Instance},
-    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    accounts::AllowedWallet, decode_instance, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_withdraw_program_client::{
     instructions::WITHDRAW_FUNDS_DISCRIMINATOR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
@@ -258,7 +257,7 @@ fn decide(wallets: &[Pubkey], accounts: &[Option<FetchedAccount>]) -> Verdict {
     let instance = instance_account
         .as_ref()
         .filter(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .and_then(|account| Instance::from_bytes(&account.data).ok());
+        .and_then(|account| decode_instance(&account.data).ok());
     let Some(instance) = instance else {
         return Verdict::Unchecked("the configured instance is not an escrow instance".to_string());
     };
@@ -294,7 +293,9 @@ fn decide(wallets: &[Pubkey], accounts: &[Option<FetchedAccount>]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+    use private_channel_escrow_program_client::{
+        INSTANCE_V1_LEN, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    };
     use private_channel_withdraw_program_client::{
         instructions::{
             WithdrawFundsBuilder, SET_WITHDRAW_CONFIG_DISCRIMINATOR, WITHDRAW_FUNDS_DISCRIMINATOR,
@@ -347,25 +348,29 @@ mod tests {
         })
     }
 
-    /// Discriminator, bump, version, seed, admin, then the deposit and withdrawal flags.
-    /// The deposit flag takes the opposite value, so reading the wrong byte fails.
+    /// Discriminator, bump, version, seed, admin, the deposit and withdrawal flags, then
+    /// the reserved bytes. The deposit flag takes the opposite value, so reading the wrong
+    /// byte fails.
     fn instance_data(withdrawals_whitelisted: bool) -> Vec<u8> {
-        let mut data = vec![0, 255, 1];
+        let mut data = vec![0, 255, 2];
         data.extend_from_slice(&[7; 32]);
         data.extend_from_slice(&[42; 32]);
         data.push(u8::from(!withdrawals_whitelisted));
         data.push(u8::from(withdrawals_whitelisted));
+        data.extend_from_slice(&[0; 64]);
         data
     }
 
-    /// Discriminator, bump, then the deposit and withdrawal blocks.
+    /// Discriminator, bump, the deposit and withdrawal blocks, then the reserved bytes.
     fn allowed_wallet_data(deposits_blocked: bool, withdrawals_blocked: bool) -> Vec<u8> {
-        vec![
+        let mut data = vec![
             4,
             255,
             u8::from(deposits_blocked),
             u8::from(withdrawals_blocked),
-        ]
+        ];
+        data.extend_from_slice(&[0; 32]);
+        data
     }
 
     #[test]
@@ -450,6 +455,17 @@ mod tests {
     fn unlisted_wallets_pass_while_withdrawals_are_not_whitelisted() {
         let withdrawer = Pubkey::new_unique();
         let accounts = [escrow_account(instance_data(false)), None];
+
+        assert_eq!(decide(&[withdrawer], &accounts), Verdict::Allowed);
+    }
+
+    // A 0.1.0 instance ends at the admin. It has no whitelist, so it passes rather than
+    // going unchecked.
+    #[test]
+    fn unlisted_wallets_pass_a_0_1_0_instance() {
+        let withdrawer = Pubkey::new_unique();
+        let instance_0_1_0 = instance_data(true)[..INSTANCE_V1_LEN].to_vec();
+        let accounts = [escrow_account(instance_0_1_0), None];
 
         assert_eq!(decide(&[withdrawer], &accounts), Verdict::Allowed);
     }

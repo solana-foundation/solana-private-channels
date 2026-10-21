@@ -10,7 +10,10 @@ const EXPECTED_SIZE =
     32 + // instance_seed
     32 + // admin
     1 + // deposits_whitelisted
-    1; // withdrawals_whitelisted
+    1 + // withdrawals_whitelisted
+    64; // reserved
+
+const RESERVED = new Array<number>(64).fill(0);
 
 describe('Instance Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -23,6 +26,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.ADMIN,
                 depositsWhitelisted: false,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             // Test encoding
@@ -50,6 +54,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.WALLET,
                 depositsWhitelisted: true,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             // Test combined codec
@@ -73,6 +78,7 @@ describe('Instance Account', () => {
                     admin: TEST_ADDRESSES.ADMIN,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: false,
+                    reserved: RESERVED,
                 };
 
                 const codec = getInstanceCodec();
@@ -96,6 +102,7 @@ describe('Instance Account', () => {
                     admin: TEST_ADDRESSES.ADMIN,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: false,
+                    reserved: RESERVED,
                 };
 
                 const codec = getInstanceCodec();
@@ -124,6 +131,7 @@ describe('Instance Account', () => {
                     admin: addresses.admin as Address,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: false,
+                    reserved: RESERVED,
                 };
 
                 const codec = getInstanceCodec();
@@ -148,6 +156,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.ADMIN,
                 depositsWhitelisted: false,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             // Verify all required fields are present
@@ -169,6 +178,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.ADMIN,
                 depositsWhitelisted: false,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             // Verify field types
@@ -192,6 +202,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.ADMIN,
                 depositsWhitelisted: false,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             const codec = getInstanceCodec();
@@ -203,7 +214,7 @@ describe('Instance Account', () => {
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (69 bytes)', () => {
+        it('should report correct account size (133 bytes)', () => {
             const accountSize = getInstanceEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -217,6 +228,7 @@ describe('Instance Account', () => {
                 admin: TEST_ADDRESSES.ADMIN,
                 depositsWhitelisted: false,
                 withdrawalsWhitelisted: false,
+                reserved: RESERVED,
             };
 
             const encoder = getInstanceEncoder();
@@ -236,6 +248,7 @@ describe('Instance Account', () => {
                     admin: TEST_ADDRESSES.ADMIN,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: false,
+                    reserved: RESERVED,
                 },
                 {
                     discriminator: 255,
@@ -245,6 +258,7 @@ describe('Instance Account', () => {
                     admin: TEST_ADDRESSES.WALLET,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: true,
+                    reserved: RESERVED,
                 },
                 {
                     discriminator: 127,
@@ -254,6 +268,7 @@ describe('Instance Account', () => {
                     admin: TEST_ADDRESSES.OPERATOR,
                     depositsWhitelisted: false,
                     withdrawalsWhitelisted: false,
+                    reserved: RESERVED,
                 },
             ];
 

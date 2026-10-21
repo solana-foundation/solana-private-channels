@@ -14,6 +14,9 @@ use codama::CodamaAccount;
 use pinocchio::account::AccountView;
 use pinocchio::{error::ProgramError, Address};
 
+/// Zeroed space for future fields, so adding one needs no new layout.
+const RESERVED_LEN: usize = 32;
+
 /// A wallet on the instance whitelist. Each flag is read only while the instance
 /// whitelists that direction.
 ///
@@ -24,6 +27,8 @@ pub struct AllowedWallet {
     pub bump: u8,
     pub deposits_blocked: bool,
     pub withdrawals_blocked: bool,
+    /// RESERVED_LEN, written out because codama drops a field whose size is a constant.
+    pub reserved: [u8; 32],
 }
 
 /// Which flag `AllowedWallet::verify_allowed` reads.
@@ -39,11 +44,13 @@ impl Discriminator for AllowedWallet {
 
 impl AccountSerialize for AllowedWallet {
     fn to_bytes_inner(&self) -> Vec<u8> {
-        vec![
+        let mut data = vec![
             self.bump,
             self.deposits_blocked as u8,
             self.withdrawals_blocked as u8,
-        ]
+        ];
+        data.extend_from_slice(&self.reserved);
+        data
     }
 }
 
@@ -51,13 +58,15 @@ impl AllowedWallet {
     pub const LEN: usize = 1 + // discriminator
         1 + // bump
         1 + // deposits_blocked
-        1; // withdrawals_blocked
+        1 + // withdrawals_blocked
+        RESERVED_LEN; // reserved
 
     pub fn new(bump: u8, deposits_blocked: bool, withdrawals_blocked: bool) -> Self {
         Self {
             bump,
             deposits_blocked,
             withdrawals_blocked,
+            reserved: [0; RESERVED_LEN],
         }
     }
 
@@ -84,11 +93,17 @@ impl AllowedWallet {
             1 => true,
             _ => return Err(ProgramError::InvalidAccountData),
         };
+        offset += 1;
+
+        let reserved = data[offset..offset + RESERVED_LEN]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
 
         Ok(Self {
             bump,
             deposits_blocked,
             withdrawals_blocked,
+            reserved,
         })
     }
 

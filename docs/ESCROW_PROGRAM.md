@@ -313,7 +313,7 @@ Discriminator: `10`
 | 7 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### SetWhitelistEnabled
-Sets which directions the instance whitelist gates (admin-only). Both flags are absolute, and entries are kept either way.
+Sets which directions the instance whitelist gates (admin-only). Both flags are absolute, and entries are kept either way. A 0.1.0 instance grows to the current layout, with the payer topping up its rent.
 
 Discriminator: `11`
 
@@ -329,8 +329,9 @@ Discriminator: `11`
 | 0 | `payer` | ✓ | ✓ | Transaction fee payer |
 | 1 | `admin` | ✓ | | Admin of Instance |
 | 2 | `instance` | | ✓ | Instance PDA to update |
-| 3 | `event_authority` | | | Event authority PDA for emitting events |
-| 4 | `private_channel_escrow_program` | | | Current program for CPI |
+| 3 | `system_program` | | | System program, for the rent top-up |
+| 4 | `event_authority` | | | Event authority PDA for emitting events |
+| 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.
@@ -398,11 +399,12 @@ Represents an escrow instance that holds token funds and manages operators.
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump seed |
-| `version` | u8 | Instance version |
+| `version` | u8 | Layout version: 1 for a 0.1.0 instance, which ends at `admin`, 2 for the current one |
 | `instance_seed` | Pubkey | Unique seed for this instance |
 | `admin` | Pubkey | Authority that controls the instance |
-| `deposits_whitelisted` | bool | `Deposit` requires allowed wallets; set by `SetWhitelistEnabled` |
-| `withdrawals_whitelisted` | bool | `ReleaseFunds` requires allowed wallets; set by `SetWhitelistEnabled` |
+| `deposits_whitelisted` | bool | `Deposit` requires allowed wallets; set by `SetWhitelistEnabled`. Off on a 0.1.0 instance |
+| `withdrawals_whitelisted` | bool | `ReleaseFunds` requires allowed wallets; set by `SetWhitelistEnabled`. Off on a 0.1.0 instance |
+| `reserved` | [u8; 64] | Zeroed, for future fields |
 
 ### WithdrawalBitmap
 Withdrawal nonce replay protection: one bit per nonce in the current generation.
@@ -446,6 +448,7 @@ A wallet on the instance whitelist. A wallet with no entry is refused in every w
 | `bump` | u8 | PDA bump seed |
 | `deposits_blocked` | bool | Refused on `Deposit` while deposits are whitelisted |
 | `withdrawals_blocked` | bool | Refused on `ReleaseFunds` while withdrawals are whitelisted |
+| `reserved` | [u8; 32] | Zeroed, for future fields |
 
 ### AllowedMint
 Represents a token mint that is allowed in an instance, its two gates, and the mint

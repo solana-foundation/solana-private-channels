@@ -14,9 +14,9 @@ use crate::{
         set_mint_with_freeze_authority, set_token_2022_with_hook_account,
         set_token_2022_with_memo_account, set_token_balance, setup_hook_mint,
         setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        BELOW_MINIMUM_DEPOSIT_ERROR, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
-        INVALID_ALLOWED_WALLET_PDA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
-        MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
+        BELOW_MINIMUM_DEPOSIT_ERROR, INCORRECT_PROGRAM_ID_ERROR, INSTANCE_V1_LEN,
+        INVALID_ACCOUNT_DATA_ERROR, INVALID_ALLOWED_WALLET_PDA_ERROR,
+        INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
         TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR, WALLET_NOT_ALLOWED_ERROR,
         ZERO_AMOUNT_ERROR,
@@ -81,6 +81,69 @@ fn test_deposit_success() {
         true,
     )
     .expect("Deposit should succeed");
+}
+
+// A 0.1.0 instance reads with the whitelist off, so deposits keep landing after the
+// program upgrade.
+#[test]
+fn test_deposit_into_a_0_1_0_instance_succeeds() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    // Cut the instance down to its 0.1.0 bytes, as the program upgrade finds it.
+    let mut instance_data = context.get_account_data(&instance_pda).unwrap();
+    instance_data.truncate(INSTANCE_V1_LEN);
+    instance_data[2] = 1; // version
+    let v1_lamports = context
+        .svm
+        .minimum_balance_for_rent_exemption(INSTANCE_V1_LEN);
+    context.create_account(
+        &instance_pda,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        instance_data,
+        v1_lamports,
+    );
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit into a 0.1.0 instance should succeed");
 }
 
 #[test]

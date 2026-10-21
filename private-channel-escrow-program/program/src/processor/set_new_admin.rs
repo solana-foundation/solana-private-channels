@@ -58,8 +58,11 @@ pub fn process_set_new_admin(
 
     drop(instance_data);
 
+    // A 0.1.0 instance is the current layout cut short, so it keeps its length and only
+    // the bytes it has are written. SetWhitelistEnabled is what grows it.
     let mut data_slice = instance_info.try_borrow_mut()?;
-    data_slice[..updated_instance_data.len()].copy_from_slice(&updated_instance_data);
+    let written = data_slice.len().min(updated_instance_data.len());
+    data_slice[..written].copy_from_slice(&updated_instance_data[..written]);
 
     let event = SetNewAdminEvent::new(instance.instance_seed, old_admin, instance.admin);
     emit_event(

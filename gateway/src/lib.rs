@@ -2813,14 +2813,18 @@ mod tests {
     /// A Mainnet `getMultipleAccounts` answer: an instance whitelisting withdrawals,
     /// then the withdrawer's entry, allowed both ways, or null for none.
     fn mainnet_accounts(withdrawer_listed: bool) -> &'static str {
-        // Discriminator, bump, version, seed, admin, deposits flag, withdrawals flag.
-        let mut instance = vec![0, 255, 1];
+        // Discriminator, bump, version, seed, admin, deposits flag, withdrawals flag, reserved.
+        let mut instance = vec![0, 255, 2];
         instance.extend_from_slice(&[7; 32]);
         instance.extend_from_slice(&[42; 32]);
         instance.extend_from_slice(&[0, 1]);
+        instance.extend_from_slice(&[0; 64]);
+        // Discriminator, bump, no blocks, reserved.
+        let mut allowed_wallet = vec![4, 255, 0, 0];
+        allowed_wallet.extend_from_slice(&[0; 32]);
         let owner = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
         let entry = if withdrawer_listed {
-            json!({ "owner": owner, "data": [BASE64.encode([4, 255, 0, 0]), "base64"] })
+            json!({ "owner": owner, "data": [BASE64.encode(allowed_wallet), "base64"] })
         } else {
             Value::Null
         };

@@ -61,7 +61,7 @@ solana program deploy target/deploy/private_channel_withdraw_program.so \
   --upgrade-authority <authority.json> --url devnet
 ```
 
-`declare_id!`, the indexer constants, and `.env` all keep pointing at the same IDs. If an upgrade changed an instruction layout or tightened validation, reset any existing on-chain instance afterward — `make docker-devnet-clean`, then re-create the instance in Step 3. If it changes an escrow account layout, drain the instance before deploying ([UPGRADING.md](../UPGRADING.md#escrow-account-layout-changes)). If the programs are already current, skip this; the canonical defaults work out of the box.
+`declare_id!`, the indexer constants, and `.env` all keep pointing at the same IDs. If an upgrade changed an instruction layout or tightened validation, reset any existing on-chain instance afterward — `make docker-devnet-clean`, then re-create the instance in Step 3. If the programs are already current, skip this; the canonical defaults work out of the box.
 
 > **When you must change the program ID (uncommon).** Upgrading reuses the same ID. You only mint a *new* program ID when you can't upgrade in place e.g if you don't hold the upgrade authority (`8Qhpz…` on devnet). Then change the ID everywhere it's compiled in — `declare_id!` in `private-channel-{escrow,withdraw}-program/program/src/lib.rs`, the constants in `indexer/src/indexer/datasource/common/parser/{escrow,withdraw}.rs`, and `core/src/bin/streamer.rs` — then `make build-devnet && make docker-devnet-build`, and deploy the fresh program. All of these must move together, or the indexer will watch an address nothing is deployed at.
 

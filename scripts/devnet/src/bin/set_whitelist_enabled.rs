@@ -1,5 +1,5 @@
 use private_channel_escrow_program_client::{
-    accounts::Instance,
+    decode_instance,
     instructions::{SetWhitelistEnabled, SetWhitelistEnabledInstructionArgs},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
@@ -9,6 +9,7 @@ use solana_sdk::{
     signature::{read_keypair_file, Signer},
     transaction::Transaction,
 };
+use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use std::{env, error::Error, str::FromStr};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -63,7 +64,7 @@ fn main() -> Result<()> {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instance_account = client.get_account(&instance_id)?;
-    let current = Instance::from_bytes(&instance_account.data)
+    let current = decode_instance(&instance_account.data)
         .map_err(|e| format!("Failed to decode Instance: {}", e))?;
 
     println!("\nSetting whitelist flags...");
@@ -85,6 +86,7 @@ fn main() -> Result<()> {
         payer: admin_keypair.pubkey(),
         admin: admin_keypair.pubkey(),
         instance: instance_id,
+        system_program: SYSTEM_PROGRAM_ID,
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     }

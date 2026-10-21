@@ -119,7 +119,15 @@ cargo run --bin add_or_update_allowed_wallet -- \
   <BLOCK_DEPOSITS> \
   <BLOCK_WITHDRAWALS>
 ```
-See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) before turning on withdrawals.
+Remove a wallet; its rent goes back to the admin.
+```bash
+cargo run --bin remove_allowed_wallet -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <WALLET_PUBKEY>
+```
+See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) before turning on withdrawals or removing a wallet.
 
 ## Monitor
 ```bash

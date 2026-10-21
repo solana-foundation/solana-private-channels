@@ -6,9 +6,9 @@ use crate::{
     },
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT,
-        TEST_WITHDRAW_FEE,
+        INSTANCE_V1_LEN, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
     },
 };
 use private_channel_escrow_program_client::instructions::{AllowMintBuilder, SetNewAdminBuilder};
@@ -313,4 +313,39 @@ fn test_set_new_admin_existing_operators_still_valid() {
         false,
     )
     .expect("Operator should still be valid after admin change");
+}
+
+// SetNewAdmin cannot grow an instance, so a 0.1.0 one keeps its length.
+#[test]
+fn test_set_new_admin_keeps_a_0_1_0_instance_at_its_length() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let new_admin = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    // Cut the instance down to its 0.1.0 bytes, as the program upgrade finds it.
+    let mut instance_data = context.get_account_data(&instance_pda).unwrap();
+    instance_data.truncate(INSTANCE_V1_LEN);
+    instance_data[2] = 1; // version
+    let v1_lamports = context
+        .svm
+        .minimum_balance_for_rent_exemption(INSTANCE_V1_LEN);
+    context.create_account(
+        &instance_pda,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        instance_data,
+        v1_lamports,
+    );
+
+    assert_get_or_set_new_admin(&mut context, &admin, &instance_pda, &new_admin, false)
+        .expect("SetNewAdmin should succeed on a 0.1.0 instance");
+
+    assert_eq!(
+        context.get_account_data(&instance_pda).unwrap().len(),
+        INSTANCE_V1_LEN
+    );
 }
