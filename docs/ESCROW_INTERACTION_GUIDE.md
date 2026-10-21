@@ -265,7 +265,7 @@ const setAdminIx = getSetNewAdminInstruction({
 
 ## Whitelist
 
-Off by default, with one flag per direction. While deposits are whitelisted, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to be allowed to deposit. While withdrawals are whitelisted, `ReleaseFunds` requires both the wallet that withdrew in the channel and the Mainnet destination to be allowed to withdraw. A wallet is allowed in a direction when it has an AllowedWallet entry that does not block that direction. All three instructions are admin-only.
+Off by default, with one flag per direction. While deposits are whitelisted, `Deposit` requires both the depositor (`user`) and the wallet credited in the channel (`recipient`, or `user` when none is given) to be allowed to deposit. While withdrawals are whitelisted, `ReleaseFunds` requires both the wallet that withdrew in the channel and the Mainnet destination to be allowed to withdraw. A wallet is allowed in a direction when it has an AllowedWallet entry that does not block that direction. The check runs at release, not at burn, so turning on withdrawal whitelisting, or removing or blocking an entry, also refuses withdrawals already burned and waiting to release. Each is reminted without its withdraw fee and fires a `failed_reminted` alert, so add entries before turning the flag on. All three instructions are admin-only.
 
 ### TypeScript Example
 

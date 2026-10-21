@@ -3182,3 +3182,97 @@ fn test_release_funds_whitelist_empty_wrong_account_rejected() {
 
     assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
 }
+
+// The destination slot is checked on its own, after the withdrawer's.
+#[test]
+fn test_release_funds_whitelist_empty_wrong_destination_account_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, false, true, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+    let wrong_account = Pubkey::new_unique();
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(wrong_account)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
+}

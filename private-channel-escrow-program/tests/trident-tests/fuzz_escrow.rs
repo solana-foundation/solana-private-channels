@@ -11,13 +11,17 @@
 //!   blocking a mint from stranding the balances already in it.
 //! - **Gates never move tokens**: neither setting a gate nor re-allowing a mint
 //!   may change an escrow balance.
+//! - **Whitelist**: while a direction is whitelisted, only a user whose entry exists
+//!   and does not block that direction can deposit or release. Setting the flags or
+//!   the entry never moves tokens.
 
 mod shared;
 
 use std::collections::HashMap;
 
 use private_channel_escrow_program_client::instructions::{
-    AllowMintBuilder, BlockMintBuilder, DepositBuilder, ReleaseFundsBuilder,
+    AddOrUpdateAllowedWalletBuilder, AllowMintBuilder, BlockMintBuilder, DepositBuilder,
+    ReleaseFundsBuilder, RemoveAllowedWalletBuilder, SetWhitelistEnabledBuilder,
 };
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::pubkey::Pubkey;
@@ -64,6 +68,14 @@ pub struct FuzzTest {
     /// one that governs it.
     deposits_blocked: bool,
     withdrawals_blocked: bool,
+    /// Mirror of the instance's whitelist flags and the user's entry. The user is
+    /// depositor, recipient, destination and withdrawer, so one entry decides every
+    /// whitelist check.
+    deposits_whitelisted: bool,
+    withdrawals_whitelisted: bool,
+    user_listed: bool,
+    user_deposits_blocked: bool,
+    user_withdrawals_blocked: bool,
 }
 
 #[flow_executor]
@@ -81,6 +93,12 @@ impl FuzzTest {
         // AllowMint leaves both gates open.
         self.deposits_blocked = false;
         self.withdrawals_blocked = false;
+        // A new instance has the whitelist off and no entries.
+        self.deposits_whitelisted = false;
+        self.withdrawals_whitelisted = false;
+        self.user_listed = false;
+        self.user_deposits_blocked = false;
+        self.user_withdrawals_blocked = false;
     }
 
     // ── Flows ─────────────────────────────────────────────────────────────────
@@ -129,10 +147,12 @@ impl FuzzTest {
 
         let res = self.trident.process_transaction(&[ix], Some("deposit"));
 
-        if self.deposits_blocked {
+        let whitelist_refuses =
+            self.deposits_whitelisted && (!self.user_listed || self.user_deposits_blocked);
+        if self.deposits_blocked || whitelist_refuses {
             assert!(
                 !res.is_success(),
-                "deposit landed while the mint's deposit gate was closed"
+                "deposit landed with the deposit gate closed or the user not allowed to deposit"
             );
             assert_eq!(
                 token_amount(&mut self.trident, &instance_ata),
@@ -209,8 +229,11 @@ impl FuzzTest {
         } else {
             Pubkey::new_unique()
         };
+        let whitelist_refuses =
+            self.withdrawals_whitelisted && (!self.user_listed || self.user_withdrawals_blocked);
         let should_succeed = use_valid
             && !self.withdrawals_blocked
+            && !whitelist_refuses
             && !self.successful_releases.contains_key(&nonce)
             && amount <= instance_bal_before;
 
@@ -388,6 +411,168 @@ impl FuzzTest {
 
         self.deposits_blocked = false;
         self.withdrawals_blocked = false;
+    }
+
+    /// Set both whitelist flags to a random combination. Like the gates, the flags
+    /// are absolute, the admin can always set them, and setting them never moves
+    /// tokens.
+    #[flow]
+    fn fuzz_set_whitelist(&mut self) {
+        let whitelist_deposits = self.trident.random_from_range(0..=1u8) == 0;
+        let whitelist_withdrawals = self.trident.random_from_range(0..=1u8) == 0;
+
+        let admin = self.fuzz_accounts.admin.get(&mut self.trident).unwrap();
+        let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let instance_ata = self
+            .fuzz_accounts
+            .instance_ata
+            .get(&mut self.trident)
+            .unwrap();
+
+        let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
+
+        let ix = SetWhitelistEnabledBuilder::new()
+            .payer(self.trident.payer().pubkey().client())
+            .admin(admin.client())
+            .instance(instance.client())
+            .whitelist_deposits(whitelist_deposits)
+            .whitelist_withdrawals(whitelist_withdrawals)
+            .instruction()
+            .to_trident();
+
+        let res = self
+            .trident
+            .process_transaction(&[ix], Some("set_whitelist"));
+        assert!(
+            res.is_success(),
+            "admin must always be able to set the whitelist: {}",
+            res.logs()
+        );
+        assert_eq!(
+            token_amount(&mut self.trident, &instance_ata),
+            instance_bal_before,
+            "setting the whitelist moved escrowed tokens"
+        );
+
+        self.deposits_whitelisted = whitelist_deposits;
+        self.withdrawals_whitelisted = whitelist_withdrawals;
+    }
+
+    /// Create the user's entry, or rewrite its blocks, with a random combination.
+    /// Neither moves tokens. Blocking both ways is refused, since that is no entry.
+    #[flow]
+    fn fuzz_add_or_update_allowed_wallet(&mut self) {
+        let block_deposits = self.trident.random_from_range(0..=1u8) == 0;
+        let block_withdrawals = self.trident.random_from_range(0..=1u8) == 0;
+
+        let admin = self.fuzz_accounts.admin.get(&mut self.trident).unwrap();
+        let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let user = self.fuzz_accounts.user.get(&mut self.trident).unwrap();
+        let user_allowed_wallet_pda = self
+            .fuzz_accounts
+            .user_allowed_wallet_pda
+            .get(&mut self.trident)
+            .unwrap();
+        let instance_ata = self
+            .fuzz_accounts
+            .instance_ata
+            .get(&mut self.trident)
+            .unwrap();
+
+        let (_, allowed_wallet_bump) = Pubkey::find_program_address(
+            &[b"allowed_wallet", instance.as_ref(), user.as_ref()],
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        );
+
+        let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
+
+        let ix = AddOrUpdateAllowedWalletBuilder::new()
+            .payer(self.trident.payer().pubkey().client())
+            .admin(admin.client())
+            .instance(instance.client())
+            .wallet(user.client())
+            .allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .bump(allowed_wallet_bump)
+            .block_deposits(block_deposits)
+            .block_withdrawals(block_withdrawals)
+            .instruction()
+            .to_trident();
+
+        let res = self
+            .trident
+            .process_transaction(&[ix], Some("add_or_update_allowed_wallet"));
+        assert_eq!(
+            token_amount(&mut self.trident, &instance_ata),
+            instance_bal_before,
+            "adding or updating an entry moved escrowed tokens"
+        );
+
+        if block_deposits && block_withdrawals {
+            assert!(
+                !res.is_success(),
+                "an entry blocked both ways must be refused"
+            );
+            return;
+        }
+        assert!(
+            res.is_success(),
+            "admin must be able to add or update an entry: {}",
+            res.logs()
+        );
+
+        self.user_listed = true;
+        self.user_deposits_blocked = block_deposits;
+        self.user_withdrawals_blocked = block_withdrawals;
+    }
+
+    /// Remove the user's entry. Succeeds only when the entry exists, since the
+    /// program refuses an empty account, and never moves tokens.
+    #[flow]
+    fn fuzz_remove_allowed_wallet(&mut self) {
+        let admin = self.fuzz_accounts.admin.get(&mut self.trident).unwrap();
+        let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let user = self.fuzz_accounts.user.get(&mut self.trident).unwrap();
+        let user_allowed_wallet_pda = self
+            .fuzz_accounts
+            .user_allowed_wallet_pda
+            .get(&mut self.trident)
+            .unwrap();
+        let instance_ata = self
+            .fuzz_accounts
+            .instance_ata
+            .get(&mut self.trident)
+            .unwrap();
+
+        let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
+
+        let ix = RemoveAllowedWalletBuilder::new()
+            .payer(self.trident.payer().pubkey().client())
+            .admin(admin.client())
+            .instance(instance.client())
+            .wallet(user.client())
+            .allowed_wallet_pda(user_allowed_wallet_pda.client())
+            .instruction()
+            .to_trident();
+
+        let res = self
+            .trident
+            .process_transaction(&[ix], Some("remove_allowed_wallet"));
+        if self.user_listed {
+            assert!(
+                res.is_success(),
+                "removing an existing entry must succeed: {}",
+                res.logs()
+            );
+        } else {
+            assert!(!res.is_success(), "removing a missing entry must fail");
+        }
+        assert_eq!(
+            token_amount(&mut self.trident, &instance_ata),
+            instance_bal_before,
+            "removing an entry moved escrowed tokens"
+        );
+
+        self.user_listed = false;
     }
 
     /// Replay an already-processed release verbatim — must be rejected.

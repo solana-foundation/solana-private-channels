@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Gateway and auth
+- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned
+
+### Programs
+- Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
+
+### Upgrade notes
+- Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument. `Instance` grew two bytes, and the upgraded escrow program refuses every instruction on a 0.1.0 instance, `ReleaseFunds` included. Drain each instance before upgrading the program, then create a new one (UPGRADING.md).
+- A 0.1.0 client's `Deposit` fails: `NotEnoughAccountKeys`, or with hook extras a Token-2022 error, as its first two extras fill the whitelist slots.
+- A release now fits 12 transfer-hook accounts, down from 15, whether or not the whitelist is on. Withdrawals of a hook mint that needs 13 to 15 park as `hook_unresolvable` instead of releasing.
+
 ## [0.1.0] - 2026-10-20
 
 Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf`.
@@ -55,11 +68,9 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - Bind account-gated reads to the snapshot they were authorized on (Cantina 35; #373)
 - Delegate access needs a nonzero allowance (Cantina 41; #388)
 - Unlinking a wallet revokes its outstanding challenge (Apex SOLA13-39; #394)
-- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned
 
 ### Programs
 - Reject zero-value deposits on chain (Cantina 56; #342)
-- Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
 
 ### Deploy, compose and scripts
 - Env files written 0600, symlinks and foreign owners refused (Cantina 58; #350)
@@ -96,8 +107,6 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - `private-channel-admin truncate` needs `--withdraw-indexer-db-url` (or `--skip-withdraw-indexer-check`) and refuses a cut keeping fewer than two windows.
 - `scripts/reconcile-escrow-balance.sh` is removed; use `indexer -c <escrow config> reconcile`.
 - Hand edits to `failed_reminted` rows must set `landed_remint_signature`.
-- Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument. `Instance` grew two bytes, so instances created before this must be recreated.
-- A release now fits 12 transfer-hook accounts, down from 15, whether or not the whitelist is on. Withdrawals of a hook mint that needs 13 to 15 park as `hook_unresolvable` instead of releasing.
 - Clients: unused writable keys and writable program ids are rejected with `-32602`; a `null` status past the deadline proves nothing unless `getFirstAvailableBlock` is at or below the signing `context.slot`.
 - `pg-backup-primary` logs in as `POSTGRES_REPLICATION_USER`, and `postgres-indexer` runs `init-indexer-hba.sh`. Both take effect on fresh volumes only.
 - Ansible always starts `pg-backup-primary` and `pg-backup-indexer`, and starts `auth-migrate` and `auth` when `gateway_enforce_jwt` is true.

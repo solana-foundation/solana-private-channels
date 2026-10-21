@@ -210,4 +210,20 @@ mod tests {
 
         assert_eq!(result.err(), Some(ProgramError::InvalidAccountData));
     }
+
+    // A 0.1.0 instance is two bytes short of the whitelist flags. try_from_bytes must
+    // refuse it, not index past the end.
+    #[test]
+    fn test_try_from_bytes_rejects_a_0_1_0_instance() {
+        let instance = Instance::new(
+            1,
+            Pubkey::new_from_array([7u8; 32]),
+            Pubkey::new_from_array([42u8; 32]),
+        );
+        let bytes = instance.to_bytes();
+
+        let result = Instance::try_from_bytes(&bytes[..Instance::LEN - 2]);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
 }

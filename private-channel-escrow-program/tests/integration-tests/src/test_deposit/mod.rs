@@ -3081,3 +3081,81 @@ fn test_deposit_whitelist_empty_wrong_account_rejected() {
 
     assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
 }
+
+// The recipient slot is checked on its own, after the user's.
+#[test]
+fn test_deposit_whitelist_empty_wrong_recipient_account_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    assert_get_or_set_whitelist_enabled(&mut context, &admin, &instance_pda, true, false, false)
+        .expect("SetWhitelistEnabled should succeed");
+    let (user_allowed_wallet_pda, _) = assert_get_or_add_allowed_wallet(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let wrong_account = Pubkey::new_unique();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(wrong_account)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INVALID_ALLOWED_WALLET_PDA_ERROR);
+}

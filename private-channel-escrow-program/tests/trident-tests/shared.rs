@@ -98,8 +98,8 @@ pub struct AccountAddresses {
     pub user: AddressStorage,
     /// User's token account (ATA of the user keypair).
     pub user_ata: AddressStorage,
-    /// User's whitelist PDA: `["allowed_wallet", instance, user]`. Never created, since
-    /// the whitelist stays off; Deposit and ReleaseFunds still take the address.
+    /// User's whitelist PDA: `["allowed_wallet", instance, user]`. Only fuzz_escrow's
+    /// whitelist flows create it; Deposit and ReleaseFunds take the address either way.
     pub user_allowed_wallet_pda: AddressStorage,
 }
 
