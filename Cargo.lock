@@ -6288,13 +6288,16 @@ dependencies = [
  "hyper-util",
  "jsonrpsee",
  "jsonwebtoken",
+ "private-channel-escrow-program-client",
  "private-channel-metrics",
+ "private-channel-withdraw-program-client",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
  "socket2 0.6.3",
  "solana-pubkey 4.2.1",
+ "solana-sdk",
  "spl-associated-token-account",
  "sqlx",
  "testcontainers",
@@ -6303,6 +6306,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wincode",
 ]
 
 [[package]]

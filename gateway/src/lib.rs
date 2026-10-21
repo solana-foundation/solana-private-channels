@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod db;
 pub mod metrics;
+pub mod whitelist;
 
 use crate::auth::{
     auth_unavailable_body, authority_is_in_account_data, check_account_data_ownership,
@@ -9,6 +10,7 @@ use crate::auth::{
     role_check_error_body, token_account_amount, verify_bearer, AuthDecision, DataSlice, Role,
 };
 use crate::db::get_user_role;
+use crate::whitelist::{wallet_not_allowed_body, Verdict, WithdrawWhitelist};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use clap::Parser;
@@ -54,6 +56,9 @@ const AUTH_TIMEOUT: &str = "auth_timeout";
 
 /// Metric label for a public read shed because `Limits::max_forwarded_reads` was reached.
 const READ_CAPACITY: &str = "read_capacity";
+
+/// Metric label for a public withdrawal refused by the escrow whitelist check.
+const WALLET_NOT_ALLOWED: &str = "wallet_not_allowed";
 
 /// Methods that scan the blocks table and so share the block listing slots.
 const BLOCK_LIST_METHODS: &[&str] = &["getBlocks", "getBlocksWithLimit"];
@@ -167,6 +172,17 @@ pub struct Args {
     /// check, so this should be sized to match expected peak concurrency.
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
     pub auth_database_max_connections: NonZeroU32,
+
+    /// Mainnet RPC the withdraw whitelist check reads. Set together with
+    /// GATEWAY_WHITELIST_INSTANCE to refuse public withdrawals the escrow would
+    /// refuse. Unset or blank leaves the check off.
+    #[arg(long, env = "GATEWAY_WHITELIST_RPC_URL")]
+    pub whitelist_rpc_url: Option<String>,
+
+    /// Escrow instance PDA whose whitelist public withdrawals are checked against.
+    /// Set together with GATEWAY_WHITELIST_RPC_URL.
+    #[arg(long, env = "GATEWAY_WHITELIST_INSTANCE")]
+    pub whitelist_instance: Option<String>,
 
     /// Maximum number of concurrent client connections per listener. Connections
     /// beyond this are dropped so a flood cannot exhaust file descriptors or memory.
@@ -373,6 +389,8 @@ pub struct Gateway {
     block_list_slots: Arc<Semaphore>,
     /// Listing slots each client holds, capped by `Limits::block_lists_per_ip`.
     block_list_ip_counts: IpConnCounts,
+    /// Checks public withdrawals against the escrow whitelist. `None` when not configured.
+    withdraw_whitelist: Option<WithdrawWhitelist>,
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +961,7 @@ impl Gateway {
                 Limits::default().max_forwarded_block_lists.get(),
             )),
             block_list_ip_counts: Arc::new(Mutex::new(HashMap::new())),
+            withdraw_whitelist: None,
         }
     }
 
@@ -951,6 +970,15 @@ impl Gateway {
         self.limits = limits;
         self.read_slots = Arc::new(Semaphore::new(limits.max_forwarded_reads.get()));
         self.block_list_slots = Arc::new(Semaphore::new(limits.max_forwarded_block_lists.get()));
+        self
+    }
+
+    /// Turns on the withdraw whitelist check for public sends.
+    pub fn with_withdraw_whitelist(
+        mut self,
+        withdraw_whitelist: Option<WithdrawWhitelist>,
+    ) -> Self {
+        self.withdraw_whitelist = withdraw_whitelist;
         self
     }
 
@@ -1943,6 +1971,41 @@ impl Gateway {
             }
         };
 
+        // Refused here, the withdrawal never burns. The escrow still checks every release.
+        if access == Access::Public && method == "sendTransaction" {
+            if let Some(withdraw_whitelist) = &self.withdraw_whitelist {
+                match withdraw_whitelist
+                    .check(&self.client, &params, deadline)
+                    .await
+                {
+                    Verdict::Allowed => {}
+                    Verdict::Refused(wallet) => {
+                        info!(
+                            "Refused a withdrawal: {} is not allowed to withdraw",
+                            wallet
+                        );
+                        metrics::GATEWAY_REJECTED_TOTAL
+                            .with_label_values(&[WALLET_NOT_ALLOWED])
+                            .inc();
+                        Self::record_metrics(
+                            Some(WALLET_NOT_ALLOWED),
+                            method_label,
+                            "none",
+                            "403",
+                            start.elapsed().as_secs_f64(),
+                        );
+                        return Ok(self.error_response(
+                            StatusCode::FORBIDDEN,
+                            Some(wallet_not_allowed_body(&wallet)),
+                        ));
+                    }
+                    Verdict::Unchecked(reason) => {
+                        warn!("Withdraw whitelist not checked, forwarding: {}", reason);
+                    }
+                }
+            }
+        }
+
         let uri = match target_url.parse::<hyper::Uri>() {
             Ok(uri) => uri,
             Err(e) => {
@@ -2347,6 +2410,20 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Only one of the two settings is a misconfiguration, refused here like the one above.
+    let withdraw_whitelist = WithdrawWhitelist::from_config(
+        args.whitelist_rpc_url.as_deref(),
+        args.whitelist_instance.as_deref(),
+    )?;
+    info!(
+        "  Withdraw whitelist check: {}",
+        if withdraw_whitelist.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
     // Connect to the auth DB if a URL was provided.
     // This pool is used for per-request wallet ownership checks.
     let auth_db = match args.auth_database_url {
@@ -2376,7 +2453,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.jwt_secret,
             auth_db,
         )
-        .with_limits(limits),
+        .with_limits(limits)
+        .with_withdraw_whitelist(withdraw_whitelist),
     );
 
     let public = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], args.port))).await?;
@@ -2398,7 +2476,15 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+    use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
     use serde_json::json;
+    use solana_pubkey::Pubkey;
+    use solana_sdk::{
+        hash::Hash,
+        signature::{Keypair, Signer},
+        transaction::{Transaction, VersionedTransaction},
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -2653,6 +2739,185 @@ mod tests {
         // Both URLs point to a closed port — gateway must attempt forwarding and return 502
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 502);
+    }
+
+    /// What the mock write node answers, so a response carrying it was forwarded.
+    const FORWARDED: &str = r#"{"jsonrpc":"2.0","id":1,"result":"forwarded"}"#;
+
+    /// Spawn a gateway on `access` whose withdraw whitelist reads `mainnet_url`.
+    async fn start_whitelist_gateway(
+        write_url: &str,
+        mainnet_url: &str,
+        access: Access,
+    ) -> SocketAddr {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let instance = Pubkey::new_unique().to_string();
+        let withdraw_whitelist =
+            WithdrawWhitelist::from_config(Some(mainnet_url), Some(instance.as_str()))
+                .expect("the whitelist settings are valid");
+        let gateway = Arc::new(
+            Gateway::new(
+                write_url.to_string(),
+                "http://127.0.0.1:1".to_string(),
+                "*".to_string(),
+                None,
+                None,
+            )
+            .with_withdraw_whitelist(withdraw_whitelist),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway, access).await;
+        });
+
+        addr
+    }
+
+    /// A raw `sendTransaction` carrying one WithdrawFunds signed by `withdrawer`.
+    fn withdraw_request(withdrawer: &Keypair) -> String {
+        let instruction = WithdrawFundsBuilder::new()
+            .user(withdrawer.pubkey())
+            .mint(Pubkey::new_unique())
+            .token_account(Pubkey::new_unique())
+            .token_program(Pubkey::new_unique())
+            .associated_token_program(Pubkey::new_unique())
+            .withdraw_config(Pubkey::new_unique())
+            .treasury_token_account(Pubkey::new_unique())
+            .amount(1_000)
+            .instruction();
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&withdrawer.pubkey()),
+            &[withdrawer],
+            Hash::default(),
+        );
+        let encoded = BASE64.encode(
+            wincode::serialize(&VersionedTransaction::from(transaction))
+                .expect("the transaction serializes"),
+        );
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{encoded}",{{"encoding":"base64"}}]}}"#
+        );
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A Mainnet `getMultipleAccounts` answer: an instance whitelisting withdrawals,
+    /// then the withdrawer's entry, allowed both ways, or null for none.
+    fn mainnet_accounts(withdrawer_listed: bool) -> &'static str {
+        // Discriminator, bump, version, seed, admin, deposits flag, withdrawals flag.
+        let mut instance = vec![0, 255, 1];
+        instance.extend_from_slice(&[7; 32]);
+        instance.extend_from_slice(&[42; 32]);
+        instance.extend_from_slice(&[0, 1]);
+        let owner = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        let entry = if withdrawer_listed {
+            json!({ "owner": owner, "data": [BASE64.encode([4, 255, 0, 0]), "base64"] })
+        } else {
+            Value::Null
+        };
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": { "slot": 1 },
+                "value": [{ "owner": owner, "data": [BASE64.encode(&instance), "base64"] }, entry],
+            },
+        })
+        .to_string()
+        .leak()
+    }
+
+    #[tokio::test]
+    async fn public_withdrawal_by_an_unlisted_wallet_is_refused() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(false)).await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+        )
+        .await;
+        let withdrawer = Keypair::new();
+
+        let response = send_raw(addr, withdraw_request(&withdrawer).as_bytes()).await;
+
+        assert_status(&response, 403);
+        assert!(
+            response.contains(&withdrawer.pubkey().to_string()),
+            "the refusal must name the wallet, got: {response}"
+        );
+        assert!(
+            !response.contains("forwarded"),
+            "a refused withdrawal must not reach the write node"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_withdrawal_by_a_listed_wallet_is_forwarded() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(true)).await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+        )
+        .await;
+
+        let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+
+        assert_status(&response, 200);
+        assert!(response.contains("forwarded"), "got: {response}");
+    }
+
+    // The check has its own short timeout, so a hung Mainnet RPC costs seconds
+    // rather than the whole upstream timeout.
+    #[tokio::test]
+    async fn withdrawal_is_forwarded_when_mainnet_does_not_answer() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let mainnet = start_black_hole_backend().await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+        )
+        .await;
+        let started = Instant::now();
+
+        let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+
+        assert_status(&response, 200);
+        assert!(response.contains("forwarded"), "got: {response}");
+        assert!(
+            started.elapsed() < Limits::default().upstream_timeout,
+            "the check must give up well before the upstream timeout"
+        );
+    }
+
+    // Operator services use the internal listener and never withdraw.
+    #[tokio::test]
+    async fn internal_withdrawal_is_not_checked() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(false)).await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Internal,
+        )
+        .await;
+
+        let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+
+        assert_status(&response, 200);
+        assert!(response.contains("forwarded"), "got: {response}");
     }
 
     /// A method missing from KNOWN_RPC_METHODS still routes, but its RPC metrics

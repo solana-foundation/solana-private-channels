@@ -259,6 +259,10 @@ services:
       # against, and the two ledger tables core grants it. No writes anywhere.
       - AUTH_DATABASE_URL=postgres://private_channel_gateway:${POSTGRES_GATEWAY_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
+      # Optional, both or neither: refuse public withdrawals the escrow whitelist
+      # would refuse. Blank leaves the check off.
+      - GATEWAY_WHITELIST_RPC_URL=${GATEWAY_WHITELIST_RPC_URL:-}
+      - GATEWAY_WHITELIST_INSTANCE=${GATEWAY_WHITELIST_INSTANCE:-}
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
     command: ["/usr/local/bin/gateway"]

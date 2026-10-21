@@ -216,7 +216,7 @@ const withdrawIx = await getWithdrawFundsInstructionAsync({
 - Executing the `WithdrawFunds` instruction will burn tokens from the Solana Private Channels payment channel immediately.
 - **Withdraw fee**: Charged on top of `amount` and paid to the treasury (the operator admin), who withdraws fee-free. It is never refunded: if the release on Mainnet fails, only `amount` is reminted. A mint whose withdraw config does not exist yet (no deposit processed) cannot be withdrawn.
 - **Minimum amount**: An `amount` below the mint's `minWithdrawAmount` fails with `AmountBelowMinimum` and nothing is burned. The treasury has no minimum.
-- **Whitelist**: If the instance whitelists withdrawals, the release goes through only when both the burning wallet and the destination are allowed to withdraw. Otherwise only `amount` is reminted, and the withdraw fee is not refunded.
+- **Whitelist**: If the instance whitelists withdrawals, the release goes through only when both the burning wallet and the destination are allowed to withdraw. With the gateway check on, the `sendTransaction` is refused with a 403 (`-32006`) and nothing is burned. Without it, or if the check cannot run, only `amount` is reminted and the withdraw fee is not refunded.
 
 ### Related Documentation
 - [Escrow Interaction Guide](ESCROW_INTERACTION_GUIDE.md)

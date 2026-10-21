@@ -309,6 +309,7 @@ const enableIx = getSetWhitelistEnabledInstruction({
 - Blocking both directions is rejected, since that entry would equal no entry; use `RemoveAllowedWallet` instead
 - A refused release is reminted to the withdrawer in the channel. The withdraw fee is not refunded
 - Each refused release raises a `failed_reminted` alert; see the [runbook](runbooks/withdrawal_failed_reminted.md). A refused deposit just fails for the client
+- The gateway can refuse these withdrawals before anything is burned, with no fee, remint or alert: set `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` (see [CONFIG.md](CONFIG.md#gateway)). It covers only the gateway's public port, so the escrow's check stays the guarantee
 - The operator names the withdrawer, as it already names the destination and amount
 - While withdrawals are whitelisted, the operator admin (treasury) and its sweep destination must be allowed to withdraw. While deposits are whitelisted, the reprice or rotation deposit must come from an allowed wallet
 - Not gated: transfers inside the channel. A wallet that cannot withdraw can still move its balance to one that can

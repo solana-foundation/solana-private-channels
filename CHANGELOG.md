@@ -55,6 +55,7 @@ Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf
 - Bind account-gated reads to the snapshot they were authorized on (Cantina 35; #373)
 - Delegate access needs a nonzero allowance (Cantina 41; #388)
 - Unlinking a wallet revokes its outstanding challenge (Apex SOLA13-39; #394)
+- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned
 
 ### Programs
 - Reject zero-value deposits on chain (Cantina 56; #342)

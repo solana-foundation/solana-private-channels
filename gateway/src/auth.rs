@@ -763,6 +763,8 @@ pub fn verify_bearer(auth_header: Option<&str>, decoding_key: &DecodingKey) -> O
 //   -32003  Forbidden   — method requires operator role
 //   -32603  Internal    — a DB lookup (ownership or role) failed
 //   -32004  Unavailable — ownership check could not reach the read node
+//   -32005  Rate limited — too many requests from this client
+//   -32006  Forbidden   — the escrow whitelist would refuse this withdrawal (whitelist.rs)
 // ---------------------------------------------------------------------------
 
 fn unauthorized_body() -> Bytes {

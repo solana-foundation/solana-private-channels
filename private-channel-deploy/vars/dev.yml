@@ -65,6 +65,12 @@ gateway_enforce_jwt: true
 # keep free connection slots. Must stay below 1024. Default 768 in vars/common.yml.
 # gateway_max_forwarded_reads: 768
 
+# gateway_whitelist_rpc_url / gateway_whitelist_instance: optional, both or neither.
+# A Mainnet RPC only the gateway uses, and the same instance as escrow_instance_id.
+# Public withdrawals the escrow whitelist would refuse then get a 403. Unset: off.
+# gateway_whitelist_rpc_url: https://<mainnet-rpc>
+# gateway_whitelist_instance: <escrow instance PDA>
+
 # === Escrow instance =======================================================
 # escrow_instance_id: the on-chain escrow instance the indexer/operator watch,
 # rendered as COMMON_ESCROW_INSTANCE_ID in .env. Without it, a redeploy keeps the
