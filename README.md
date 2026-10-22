@@ -15,7 +15,9 @@ Solana Private Channels is a payment channel with direct access to Solana Mainne
 
 > ## ⚠️ SECURITY NOTICE
 >
-> **This code has not been audited and is under active development. Use at your own risk.**
+> **Under active development. Use at your own risk.**
+>
+> Three independent security assessments by OtterSec (Otter Audits, LLC), dated September 2, 2026, cover the on-chain programs, the off-chain components and the service layer separately. The reports, the components in scope and the audited commits are listed in [`audits/`](audits/). **Changes merged after the audited commits have not been reviewed.**
 >
 > Not recommended for production use with real funds without a thorough security review. The authors and contributors are not responsible for any loss of funds or damages resulting from the use of this library.
 
