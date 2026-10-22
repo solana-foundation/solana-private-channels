@@ -2485,6 +2485,7 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::{Transaction, VersionedTransaction},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -2535,14 +2536,22 @@ mod tests {
     /// Spawn a minimal HTTP/1.1 backend that replies with a static 200 response body.
     /// Accepts multiple requests in a loop to handle tests that may send more than one request.
     async fn start_mock_http_backend(response_body: &'static str) -> SocketAddr {
+        start_counting_backend(response_body).await.0
+    }
+
+    /// `start_mock_http_backend`, plus the number of requests it has answered.
+    async fn start_counting_backend(response_body: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let answered = requests.clone();
 
         tokio::spawn(async move {
             // Accept with timeout to prevent indefinite blocking when test exits
             while let Ok(Ok((mut stream, _))) =
                 tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
             {
+                answered.fetch_add(1, Ordering::SeqCst);
                 let mut buf = vec![0u8; 4096];
                 let _ = stream.read(&mut buf).await;
                 // Close after one reply so the pooled client never reuses a socket this mock drops.
@@ -2555,7 +2564,7 @@ mod tests {
             }
         });
 
-        addr
+        (addr, requests)
     }
 
     /// Send raw bytes to the test gateway and return the response as a string.
@@ -2810,14 +2819,14 @@ mod tests {
         )
     }
 
-    /// A Mainnet `getMultipleAccounts` answer: an instance whitelisting withdrawals,
-    /// then the withdrawer's entry, allowed both ways, or null for none.
-    fn mainnet_accounts(withdrawer_listed: bool) -> &'static str {
+    /// A Mainnet `getMultipleAccounts` answer: the instance, then the withdrawer's entry,
+    /// allowed both ways, or null for none.
+    fn mainnet_accounts(withdrawals_whitelisted: bool, withdrawer_listed: bool) -> &'static str {
         // Discriminator, bump, version, seed, admin, deposits flag, withdrawals flag, reserved.
         let mut instance = vec![0, 255, 2];
         instance.extend_from_slice(&[7; 32]);
         instance.extend_from_slice(&[42; 32]);
-        instance.extend_from_slice(&[0, 1]);
+        instance.extend_from_slice(&[0, u8::from(withdrawals_whitelisted)]);
         instance.extend_from_slice(&[0; 64]);
         // Discriminator, bump, no blocks, reserved.
         let mut allowed_wallet = vec![4, 255, 0, 0];
@@ -2843,7 +2852,7 @@ mod tests {
     #[tokio::test]
     async fn public_withdrawal_by_an_unlisted_wallet_is_refused() {
         let write_node = start_mock_http_backend(FORWARDED).await;
-        let mainnet = start_mock_http_backend(mainnet_accounts(false)).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(true, false)).await;
         let addr = start_whitelist_gateway(
             &format!("http://{write_node}"),
             &format!("http://{mainnet}"),
@@ -2868,7 +2877,7 @@ mod tests {
     #[tokio::test]
     async fn public_withdrawal_by_a_listed_wallet_is_forwarded() {
         let write_node = start_mock_http_backend(FORWARDED).await;
-        let mainnet = start_mock_http_backend(mainnet_accounts(true)).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(true, true)).await;
         let addr = start_whitelist_gateway(
             &format!("http://{write_node}"),
             &format!("http://{mainnet}"),
@@ -2910,7 +2919,7 @@ mod tests {
     #[tokio::test]
     async fn internal_withdrawal_is_not_checked() {
         let write_node = start_mock_http_backend(FORWARDED).await;
-        let mainnet = start_mock_http_backend(mainnet_accounts(false)).await;
+        let mainnet = start_mock_http_backend(mainnet_accounts(true, false)).await;
         let addr = start_whitelist_gateway(
             &format!("http://{write_node}"),
             &format!("http://{mainnet}"),
@@ -2922,6 +2931,49 @@ mod tests {
 
         assert_status(&response, 200);
         assert!(response.contains("forwarded"), "got: {response}");
+    }
+
+    // The first send's reads answer the same wallet's next send, missing entry included.
+    #[tokio::test]
+    async fn a_repeated_withdrawal_reads_mainnet_once() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let (mainnet, mainnet_requests) =
+            start_counting_backend(mainnet_accounts(true, false)).await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+        )
+        .await;
+        let withdrawer = Keypair::new();
+
+        for _ in 0..2 {
+            let response = send_raw(addr, withdraw_request(&withdrawer).as_bytes()).await;
+            assert_status(&response, 403);
+        }
+
+        assert_eq!(mainnet_requests.load(Ordering::SeqCst), 1);
+    }
+
+    // A cached instance that does not whitelist withdrawals answers every wallet.
+    #[tokio::test]
+    async fn no_entry_is_read_while_withdrawals_are_not_whitelisted() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let (mainnet, mainnet_requests) =
+            start_counting_backend(mainnet_accounts(false, false)).await;
+        let addr = start_whitelist_gateway(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+        )
+        .await;
+
+        for _ in 0..2 {
+            let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+            assert!(response.contains("forwarded"), "got: {response}");
+        }
+
+        assert_eq!(mainnet_requests.load(Ordering::SeqCst), 1);
     }
 
     /// A method missing from KNOWN_RPC_METHODS still routes, but its RPC metrics

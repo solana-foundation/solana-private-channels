@@ -18,18 +18,31 @@ use serde_json::Value;
 use solana_pubkey::Pubkey;
 use solana_sdk::message::v1::MAX_TRANSACTION_SIZE;
 use solana_sdk::transaction::VersionedTransaction;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
 /// Longest a public withdrawal waits on Mainnet before it is forwarded unchecked.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a Mainnet read answers later checks, so an admin change reaches the check
+/// up to this late. The escrow still checks every release.
+const CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Most accounts cached. Fresh wallets on every send would grow it without bound, so
+/// at the cap it starts over.
+const MAX_CACHED_ACCOUNTS: usize = 10_000;
+
 /// Seeds of an escrow AllowedWallet PDA: `[ALLOWED_WALLET_SEED, instance, wallet]`.
 const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
 
 /// Largest `getMultipleAccounts` answer read. A handful of small accounts fits many times.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// `getMultipleAccounts` takes at most 100 keys: the instance plus 99 entries.
+const MAX_WALLETS: usize = 99;
 
 /// The bound the write node's decoder sets (`core/src/rpc/decode.rs`): wincode reserves
 /// from a declared count, so a few bytes could otherwise reserve its 4 MiB default.
@@ -38,11 +51,15 @@ const PREALLOCATION_LIMIT: usize = MAX_TRANSACTION_SIZE * 64;
 type DecodeConfig = wincode::config::Configuration<true, PREALLOCATION_LIMIT>;
 
 /// An account as `getMultipleAccounts` returned it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FetchedAccount {
     owner: Pubkey,
     data: Vec<u8>,
 }
+
+/// Mainnet reads by address, each with when it was read. None is an account that
+/// does not exist.
+type AccountCache = HashMap<Pubkey, (Instant, Option<FetchedAccount>)>;
 
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
@@ -55,6 +72,7 @@ pub enum Verdict {
 pub struct WithdrawWhitelist {
     rpc_uri: Uri,
     instance: Pubkey,
+    cache: Mutex<AccountCache>,
 }
 
 impl WithdrawWhitelist {
@@ -75,6 +93,7 @@ impl WithdrawWhitelist {
                 instance: Pubkey::from_str(instance).map_err(|e| {
                     format!("GATEWAY_WHITELIST_INSTANCE is not a valid pubkey: {e}")
                 })?,
+                cache: Mutex::new(HashMap::new()),
             })),
             _ => Err(
                 "GATEWAY_WHITELIST_RPC_URL and GATEWAY_WHITELIST_INSTANCE must be set together"
@@ -95,29 +114,87 @@ impl WithdrawWhitelist {
         if wallets.is_empty() {
             return Verdict::Allowed;
         }
+        if wallets.len() > MAX_WALLETS {
+            return Verdict::Unchecked("too many withdraw wallets to check".to_string());
+        }
+
+        // While the cached instance does not whitelist withdrawals, no entry is read.
+        if let Some(instance) = self.cached(&self.instance) {
+            if whitelists_withdrawals(&instance) != Some(true) {
+                return decide(&wallets, &[instance]);
+            }
+        }
+
+        let mut keys = vec![self.instance];
+        for wallet in &wallets {
+            let (entry, _) = Pubkey::find_program_address(
+                &[ALLOWED_WALLET_SEED, self.instance.as_ref(), wallet.as_ref()],
+                &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            );
+            keys.push(entry);
+        }
 
         let check_deadline = deadline.min(Instant::now() + CHECK_TIMEOUT);
-        match tokio::time::timeout_at(check_deadline, self.fetch(client, &wallets)).await {
+        match tokio::time::timeout_at(check_deadline, self.fetch_cached(client, &keys)).await {
             Ok(Ok(accounts)) => decide(&wallets, &accounts),
             Ok(Err(reason)) => Verdict::Unchecked(reason),
             Err(_) => Verdict::Unchecked("Mainnet RPC did not answer in time".to_string()),
         }
     }
 
-    /// The instance, then each wallet's entry, in one `getMultipleAccounts` at confirmed.
+    /// `key`'s account while its cached read is younger than CACHE_TTL.
+    fn cached(&self, key: &Pubkey) -> Option<Option<FetchedAccount>> {
+        let cache = self.cache.lock().unwrap();
+        let (read_at, account) = cache.get(key)?;
+        (read_at.elapsed() < CACHE_TTL).then(|| account.clone())
+    }
+
+    /// The accounts at `keys`, from the cache where fresh and the rest in one Mainnet
+    /// call, which is then cached. A failed read caches nothing.
+    async fn fetch_cached(
+        &self,
+        client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+        keys: &[Pubkey],
+    ) -> Result<Vec<Option<FetchedAccount>>, String> {
+        let read_at = Instant::now();
+        let cached: Vec<Option<Option<FetchedAccount>>> =
+            keys.iter().map(|key| self.cached(key)).collect();
+        let missing: Vec<Pubkey> = keys
+            .iter()
+            .zip(&cached)
+            .filter(|(_, account)| account.is_none())
+            .map(|(key, _)| *key)
+            .collect();
+        let fetched = if missing.is_empty() {
+            Vec::new()
+        } else {
+            self.fetch(client, &missing).await?
+        };
+
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if cache.len() + missing.len() > MAX_CACHED_ACCOUNTS {
+                cache.clear();
+            }
+            for (key, account) in missing.iter().zip(&fetched) {
+                cache.insert(*key, (read_at, account.clone()));
+            }
+        }
+
+        let mut fetched = fetched.into_iter();
+        Ok(cached
+            .into_iter()
+            .map(|account| account.unwrap_or_else(|| fetched.next().flatten()))
+            .collect())
+    }
+
+    /// The accounts at `keys`, in one `getMultipleAccounts` at confirmed.
     async fn fetch(
         &self,
         client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
-        wallets: &[Pubkey],
+        keys: &[Pubkey],
     ) -> Result<Vec<Option<FetchedAccount>>, String> {
-        let mut keys = vec![self.instance.to_string()];
-        for wallet in wallets {
-            let (entry, _) = Pubkey::find_program_address(
-                &[ALLOWED_WALLET_SEED, self.instance.as_ref(), wallet.as_ref()],
-                &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-            );
-            keys.push(entry.to_string());
-        }
+        let keys: Vec<String> = keys.iter().map(Pubkey::to_string).collect();
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -197,8 +274,9 @@ pub fn wallet_not_allowed_body(wallet: &Pubkey) -> Bytes {
 }
 
 /// The withdrawer, then the destination, of every top-level WithdrawFunds, without
-/// repeats: the order ReleaseFunds checks them in. Empty for anything that does not
-/// decode, which the write node refuses on its own.
+/// repeats: the order ReleaseFunds checks them in. Empty for anything the write node
+/// refuses on its own: larger than a v1 transaction, or not decodable. No program the
+/// channel admits calls WithdrawFunds by CPI; one that did would skip this check.
 fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
     let Some(bytes) = params
         .get(0)
@@ -207,6 +285,9 @@ fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
     else {
         return Vec::new();
     };
+    if bytes.len() > MAX_TRANSACTION_SIZE {
+        return Vec::new();
+    }
     let Ok(transaction) =
         wincode::config::deserialize::<VersionedTransaction, _>(&bytes, DecodeConfig::new())
     else {
@@ -247,6 +328,15 @@ fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
     wallets
 }
 
+/// Whether `instance` whitelists withdrawals, or None when it is not an escrow instance.
+fn whitelists_withdrawals(instance: &Option<FetchedAccount>) -> Option<bool> {
+    instance
+        .as_ref()
+        .filter(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .and_then(|account| decode_instance(&account.data).ok())
+        .map(|instance| instance.withdrawals_whitelisted)
+}
+
 /// ReleaseFunds' rule while withdrawals are whitelisted: every wallet needs an entry
 /// that does not block withdrawals. `accounts` is the instance, then one entry per
 /// wallet. Anything the escrow could read differently is left to it.
@@ -254,14 +344,10 @@ fn decide(wallets: &[Pubkey], accounts: &[Option<FetchedAccount>]) -> Verdict {
     let Some((instance_account, entries)) = accounts.split_first() else {
         return Verdict::Unchecked("no instance account returned".to_string());
     };
-    let instance = instance_account
-        .as_ref()
-        .filter(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .and_then(|account| decode_instance(&account.data).ok());
-    let Some(instance) = instance else {
+    let Some(whitelisted) = whitelists_withdrawals(instance_account) else {
         return Verdict::Unchecked("the configured instance is not an escrow instance".to_string());
     };
-    if !instance.withdrawals_whitelisted {
+    if !whitelisted {
         return Verdict::Allowed;
     }
 
@@ -416,6 +502,18 @@ mod tests {
             withdraw_wallets(&params),
             vec![first_withdrawer.pubkey(), second_withdrawer.pubkey()]
         );
+    }
+
+    // The write node refuses a send this large, so none of it is read.
+    #[test]
+    fn a_send_over_the_size_limit_is_not_read() {
+        let withdrawer = Keypair::new();
+        let withdrawals: Vec<Instruction> = (0..20)
+            .map(|_| withdraw_funds(&withdrawer.pubkey(), Some(Pubkey::new_unique())))
+            .collect();
+        let params = send_params(&withdrawals, &[&withdrawer]);
+
+        assert!(withdraw_wallets(&params).is_empty());
     }
 
     #[test]
