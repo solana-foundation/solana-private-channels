@@ -184,6 +184,11 @@ pub struct Args {
     #[arg(long, env = "GATEWAY_WHITELIST_INSTANCE")]
     pub whitelist_instance: Option<String>,
 
+    /// Most Mainnet reads per second the withdraw whitelist check makes, across all
+    /// clients. Past it, a withdrawal that needs a read is forwarded unchecked.
+    #[arg(long, env = "GATEWAY_WHITELIST_READS_PER_SECOND", default_value = "20")]
+    pub whitelist_reads_per_second: NonZeroU32,
+
     /// Maximum number of concurrent client connections per listener. Connections
     /// beyond this are dropped so a flood cannot exhaust file descriptors or memory.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
@@ -2414,6 +2419,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let withdraw_whitelist = WithdrawWhitelist::from_config(
         args.whitelist_rpc_url.as_deref(),
         args.whitelist_instance.as_deref(),
+        Quota::per_second(args.whitelist_reads_per_second),
     )?;
     info!(
         "  Withdraw whitelist check: {}",
@@ -2759,13 +2765,24 @@ mod tests {
         mainnet_url: &str,
         access: Access,
     ) -> SocketAddr {
+        let reads = Quota::per_second(NonZeroU32::new(20).unwrap());
+        start_whitelist_gateway_with_reads(write_url, mainnet_url, access, reads).await
+    }
+
+    /// Spawn a gateway on `access` whose withdraw whitelist reads `mainnet_url` within `reads`.
+    async fn start_whitelist_gateway_with_reads(
+        write_url: &str,
+        mainnet_url: &str,
+        access: Access,
+        reads: Quota,
+    ) -> SocketAddr {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
         let instance = Pubkey::new_unique().to_string();
         let withdraw_whitelist =
-            WithdrawWhitelist::from_config(Some(mainnet_url), Some(instance.as_str()))
+            WithdrawWhitelist::from_config(Some(mainnet_url), Some(instance.as_str()), reads)
                 .expect("the whitelist settings are valid");
         let gateway = Arc::new(
             Gateway::new(
@@ -2933,16 +2950,18 @@ mod tests {
         assert!(response.contains("forwarded"), "got: {response}");
     }
 
-    // The first send's reads answer the same wallet's next send, missing entry included.
+    // The first send's reads answer the same wallet's next send, missing entry included,
+    // without spending the read budget.
     #[tokio::test]
     async fn a_repeated_withdrawal_reads_mainnet_once() {
         let write_node = start_mock_http_backend(FORWARDED).await;
         let (mainnet, mainnet_requests) =
             start_counting_backend(mainnet_accounts(true, false)).await;
-        let addr = start_whitelist_gateway(
+        let addr = start_whitelist_gateway_with_reads(
             &format!("http://{write_node}"),
             &format!("http://{mainnet}"),
             Access::Public,
+            Quota::per_hour(NonZeroU32::new(1).unwrap()),
         )
         .await;
         let withdrawer = Keypair::new();
@@ -2972,6 +2991,28 @@ mod tests {
             let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
             assert!(response.contains("forwarded"), "got: {response}");
         }
+
+        assert_eq!(mainnet_requests.load(Ordering::SeqCst), 1);
+    }
+
+    // Past the read budget, a fresh wallet is forwarded instead of read.
+    #[tokio::test]
+    async fn a_withdrawal_past_the_read_budget_is_forwarded() {
+        let write_node = start_mock_http_backend(FORWARDED).await;
+        let (mainnet, mainnet_requests) =
+            start_counting_backend(mainnet_accounts(true, false)).await;
+        let addr = start_whitelist_gateway_with_reads(
+            &format!("http://{write_node}"),
+            &format!("http://{mainnet}"),
+            Access::Public,
+            Quota::per_hour(NonZeroU32::new(1).unwrap()),
+        )
+        .await;
+
+        let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+        assert_status(&response, 403);
+        let response = send_raw(addr, withdraw_request(&Keypair::new()).as_bytes()).await;
+        assert!(response.contains("forwarded"), "got: {response}");
 
         assert_eq!(mainnet_requests.load(Ordering::SeqCst), 1);
     }

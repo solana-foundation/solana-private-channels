@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Gateway and auth
-- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned
+- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second; past that, withdrawals are forwarded unchecked
 
 ### Programs
 - Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw

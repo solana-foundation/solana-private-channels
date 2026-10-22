@@ -273,6 +273,8 @@ services:
       # would refuse. Blank leaves the check off.
       - GATEWAY_WHITELIST_RPC_URL=${GATEWAY_WHITELIST_RPC_URL:-}
       - GATEWAY_WHITELIST_INSTANCE=${GATEWAY_WHITELIST_INSTANCE:-}
+      # Max Mainnet reads per second the check makes; past it, withdrawals go unchecked.
+      - GATEWAY_WHITELIST_READS_PER_SECOND=${GATEWAY_WHITELIST_READS_PER_SECOND:-20}
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
     command: ["/usr/local/bin/gateway"]

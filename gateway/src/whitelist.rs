@@ -4,6 +4,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{Request, Uri};
@@ -31,8 +32,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// up to this late. The escrow still checks every release.
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// Most accounts cached. Fresh wallets on every send would grow it without bound, so
-/// at the cap it starts over.
+/// Most accounts cached. Expired reads are dropped on each insert; past the cap, a read
+/// is used but not cached.
 const MAX_CACHED_ACCOUNTS: usize = 10_000;
 
 /// Seeds of an escrow AllowedWallet PDA: `[ALLOWED_WALLET_SEED, instance, wallet]`.
@@ -73,6 +74,9 @@ pub struct WithdrawWhitelist {
     rpc_uri: Uri,
     instance: Pubkey,
     cache: Mutex<AccountCache>,
+    /// Mainnet calls across all clients, so fresh wallets from many addresses cannot
+    /// multiply them.
+    reads: DefaultDirectRateLimiter,
 }
 
 impl WithdrawWhitelist {
@@ -81,6 +85,7 @@ impl WithdrawWhitelist {
     pub fn from_config(
         rpc_url: Option<&str>,
         instance: Option<&str>,
+        reads: Quota,
     ) -> Result<Option<Self>, String> {
         let rpc_url = rpc_url.map(str::trim).filter(|value| !value.is_empty());
         let instance = instance.map(str::trim).filter(|value| !value.is_empty());
@@ -94,6 +99,7 @@ impl WithdrawWhitelist {
                     format!("GATEWAY_WHITELIST_INSTANCE is not a valid pubkey: {e}")
                 })?,
                 cache: Mutex::new(HashMap::new()),
+                reads: RateLimiter::direct(reads),
             })),
             _ => Err(
                 "GATEWAY_WHITELIST_RPC_URL and GATEWAY_WHITELIST_INSTANCE must be set together"
@@ -149,8 +155,22 @@ impl WithdrawWhitelist {
         (read_at.elapsed() < CACHE_TTL).then(|| account.clone())
     }
 
+    /// Caches `accounts`, read at `read_at` from `keys`.
+    fn remember(&self, read_at: Instant, keys: &[Pubkey], accounts: &[Option<FetchedAccount>]) {
+        let mut cache = self.cache.lock().unwrap();
+        // Drop expired reads, so the map holds only the last CACHE_TTL of them.
+        cache.retain(|_, (cached_at, _)| cached_at.elapsed() < CACHE_TTL);
+        // Every entry left is fresh: rather than drop them, this read goes uncached.
+        if cache.len() + keys.len() > MAX_CACHED_ACCOUNTS {
+            return;
+        }
+        for (key, account) in keys.iter().zip(accounts) {
+            cache.insert(*key, (read_at, account.clone()));
+        }
+    }
+
     /// The accounts at `keys`, from the cache where fresh and the rest in one Mainnet
-    /// call, which is then cached. A failed read caches nothing.
+    /// call within the read budget. A failed or refused read caches nothing.
     async fn fetch_cached(
         &self,
         client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
@@ -168,18 +188,13 @@ impl WithdrawWhitelist {
         let fetched = if missing.is_empty() {
             Vec::new()
         } else {
-            self.fetch(client, &missing).await?
+            self.reads
+                .check()
+                .map_err(|_| "Mainnet reads over GATEWAY_WHITELIST_READS_PER_SECOND".to_string())?;
+            let fetched = self.fetch(client, &missing).await?;
+            self.remember(read_at, &missing, &fetched);
+            fetched
         };
-
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if cache.len() + missing.len() > MAX_CACHED_ACCOUNTS {
-                cache.clear();
-            }
-            for (key, account) in missing.iter().zip(&fetched) {
-                cache.insert(*key, (read_at, account.clone()));
-            }
-        }
 
         let mut fetched = fetched.into_iter();
         Ok(cached
@@ -395,6 +410,7 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::{Transaction, VersionedTransaction},
     };
+    use std::num::NonZeroU32;
 
     /// A WithdrawFunds by `withdrawer`. Only the withdrawer and destination are read here.
     fn withdraw_funds(withdrawer: &Pubkey, destination: Option<Pubkey>) -> Instruction {
@@ -662,6 +678,7 @@ mod tests {
         let instance_pda = Pubkey::new_unique().to_string();
         let instance_pda = Some(instance_pda.as_str());
         let blank = Some("  ");
+        let reads = Quota::per_second(NonZeroU32::new(20).unwrap());
         // The last column is whether the check is on, or None when the gateway refuses to start.
         let cases = [
             (None, None, Some(false)),
@@ -673,7 +690,7 @@ mod tests {
         ];
 
         for (rpc_url_setting, instance_setting, expected) in cases {
-            let enabled = WithdrawWhitelist::from_config(rpc_url_setting, instance_setting)
+            let enabled = WithdrawWhitelist::from_config(rpc_url_setting, instance_setting, reads)
                 .map(|whitelist| whitelist.is_some())
                 .ok();
             assert_eq!(
@@ -681,5 +698,53 @@ mod tests {
                 "rpc_url={rpc_url_setting:?} instance={instance_setting:?}"
             );
         }
+    }
+
+    /// A whitelist with the check on and an empty cache.
+    fn enabled_whitelist() -> WithdrawWhitelist {
+        let instance = Pubkey::new_unique().to_string();
+        let reads = Quota::per_second(NonZeroU32::new(20).unwrap());
+        WithdrawWhitelist::from_config(Some("http://127.0.0.1:1"), Some(instance.as_str()), reads)
+            .expect("the whitelist settings are valid")
+            .expect("both settings are set")
+    }
+
+    #[test]
+    fn a_full_cache_drops_only_expired_reads() {
+        let whitelist = enabled_whitelist();
+        let fresh = Pubkey::new_unique();
+        {
+            let mut cache = whitelist.cache.lock().unwrap();
+            for _ in 1..MAX_CACHED_ACCOUNTS {
+                cache.insert(Pubkey::new_unique(), (Instant::now() - CACHE_TTL, None));
+            }
+            cache.insert(fresh, (Instant::now(), None));
+        }
+        let read = Pubkey::new_unique();
+
+        whitelist.remember(Instant::now(), &[read], &[None]);
+
+        let cache = whitelist.cache.lock().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&fresh));
+        assert!(cache.contains_key(&read));
+    }
+
+    #[test]
+    fn a_cache_full_of_fresh_reads_keeps_them() {
+        let whitelist = enabled_whitelist();
+        {
+            let mut cache = whitelist.cache.lock().unwrap();
+            for _ in 0..MAX_CACHED_ACCOUNTS {
+                cache.insert(Pubkey::new_unique(), (Instant::now(), None));
+            }
+        }
+        let read = Pubkey::new_unique();
+
+        whitelist.remember(Instant::now(), &[read], &[None]);
+
+        let cache = whitelist.cache.lock().unwrap();
+        assert_eq!(cache.len(), MAX_CACHED_ACCOUNTS);
+        assert!(!cache.contains_key(&read));
     }
 }
