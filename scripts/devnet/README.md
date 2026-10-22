@@ -98,6 +98,37 @@ cargo run --bin block_mint -- \
   <BLOCK_WITHDRAWALS>
 ```
 
+## Whitelist (optional)
+Set which directions require an allowed wallet. Both flags are absolute, and the
+script warns when a flag turns a direction off.
+```bash
+cargo run --bin set_whitelist_enabled -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <WHITELIST_DEPOSITS> \
+  <WHITELIST_WITHDRAWALS>
+```
+Add a wallet, or rewrite its flags. Blocking both directions is rejected.
+```bash
+cargo run --bin add_or_update_allowed_wallet -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <WALLET_PUBKEY> \
+  <BLOCK_DEPOSITS> \
+  <BLOCK_WITHDRAWALS>
+```
+Remove a wallet; its rent goes back to the admin.
+```bash
+cargo run --bin remove_allowed_wallet -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <WALLET_PUBKEY>
+```
+See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) before turning on withdrawals or removing a wallet.
+
 ## Monitor
 ```bash
 # Watch deposit processing

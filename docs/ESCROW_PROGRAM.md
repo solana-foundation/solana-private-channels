@@ -21,9 +21,12 @@
 | [`AddOperator`](#addoperator) | Add an operator to the instance (admin-only) | 3 |
 | [`RemoveOperator`](#removeoperator) | Remove an operator from the instance (admin-only) | 4 |
 | [`SetNewAdmin`](#setnewadmin) | Set a new admin for the instance (current admin only) | 5 |
-| [`Deposit`](#deposit) | Deposit tokens from user ATA to instance escrow ATA (permissionless) | 6 |
+| [`Deposit`](#deposit) | Deposit tokens from user ATA to instance escrow ATA (permissionless unless deposits are whitelisted) | 6 |
 | [`ReleaseFunds`](#releasefunds) | Release funds from escrow to user (operator-only) | 7 |
 | [`RotateBitmap`](#rotatebitmap) | Rotate the withdrawal bitmap to the next generation (operator-only) | 8 |
+| [`AddOrUpdateAllowedWallet`](#addorupdateallowedwallet) | Add a wallet to the instance whitelist, or rewrite its flags (admin-only) | 9 |
+| [`RemoveAllowedWallet`](#removeallowedwallet) | Remove a wallet from the instance whitelist (admin-only) | 10 |
+| [`SetWhitelistEnabled`](#setwhitelistenabled) | Set which directions the instance whitelist gates (admin-only) | 11 |
 | [`EmitEvent`](#emitevent) | Emit event via CPI | 228 |
 
 ### Instruction Details
@@ -169,9 +172,9 @@ Discriminator: `5`
 | 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### Deposit
-Deposits tokens from user ATA to instance escrow ATA (permissionless).
+Deposits tokens from user ATA to instance escrow ATA (permissionless unless deposits are whitelisted).
 
-Fails with `ZeroAmount` when `amount` is 0 or the escrow receives nothing, and with `BelowMinimumDeposit` when the received amount is under the mint's `min_deposit_amount`.
+Fails with `ZeroAmount` when `amount` is 0 or the escrow receives nothing, and with `BelowMinimumDeposit` when the received amount is under the mint's `min_deposit_amount`. While deposits are whitelisted, fails with `WalletNotAllowed` unless `user` and the credited wallet (`recipient`, or `user`) are allowed to deposit.
 
 Discriminator: `6`
 
@@ -196,9 +199,11 @@ Discriminator: `6`
 | 9 | `associated_token_program` | | | Associated Token program |
 | 10 | `event_authority` | | | Event authority PDA for emitting events |
 | 11 | `private_channel_escrow_program` | | | Current program for CPI |
+| 12 | `user_allowed_wallet_pda` | | | AllowedWallet PDA of `user`; read only while deposits are whitelisted |
+| 13 | `recipient_allowed_wallet_pda` | | | AllowedWallet PDA of the credited wallet; read only while deposits are whitelisted |
 
 #### ReleaseFunds
-Releases funds from escrow to user (operator-only).
+Releases funds from escrow to user (operator-only). While withdrawals are whitelisted, fails with `WalletNotAllowed` unless `withdrawer` and `user` are allowed to withdraw.
 
 Discriminator: `7`
 
@@ -208,6 +213,7 @@ Discriminator: `7`
 | `amount` | u64 | Amount of tokens to release |
 | `user` | Pubkey | User receiving the funds (wallet address, not the ATA) |
 | `transaction_nonce` | u64 | Transaction nonce to consume from the withdrawal bitmap |
+| `withdrawer` | Pubkey | Wallet whose channel burn this release settles; may differ from `user` |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -226,6 +232,8 @@ Discriminator: `7`
 | 11 | `event_authority` | | | Event authority PDA for emitting events |
 | 12 | `private_channel_escrow_program` | | | Current program for CPI |
 | 13 | `memo_program` | | | SPL Memo program; always required, but validated and invoked only when `user_ata` requires a memo |
+| 14 | `user_allowed_wallet_pda` | | | AllowedWallet PDA of `user`; read only while withdrawals are whitelisted |
+| 15 | `withdrawer_allowed_wallet_pda` | | | AllowedWallet PDA of `withdrawer`; read only while withdrawals are whitelisted |
 
 Replay protection is the bitmap alone: the nonce's bit must be clear, and the
 nonce must fall in the generation the bitmap currently covers. The instance is
@@ -261,6 +269,70 @@ Discriminator: `8`
 | 5 | `event_authority` | | | Event authority PDA for emitting events |
 | 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
+#### AddOrUpdateAllowedWallet
+Adds a wallet to the instance whitelist, or rewrites the flags of an existing entry (admin-only). Blocking both directions fails with `InvalidInstructionData`, since that entry would equal no entry; use `RemoveAllowedWallet` instead.
+
+Discriminator: `9`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bump` | u8 | PDA bump seed for the allowed wallet account |
+| `block_deposits` | bool | Refuse this wallet on `Deposit` while deposits are whitelisted |
+| `block_withdrawals` | bool | Refuse this wallet on `ReleaseFunds` while withdrawals are whitelisted |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | | Instance PDA to validate admin authority |
+| 3 | `wallet` | | | Wallet to be added or updated |
+| 4 | `allowed_wallet_pda` | | ✓ | AllowedWallet PDA to be created or updated |
+| 5 | `system_program` | | | System program |
+| 6 | `event_authority` | | | Event authority PDA for emitting events |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### RemoveAllowedWallet
+Removes a wallet from the instance whitelist (admin-only). Closes the AllowedWallet PDA and returns its rent to the payer.
+
+Discriminator: `10`
+
+**Parameters:** None
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | | Instance PDA to validate admin authority |
+| 3 | `wallet` | | | Wallet to be removed |
+| 4 | `allowed_wallet_pda` | | ✓ | Existing AllowedWallet PDA |
+| 5 | `system_program` | | | System program |
+| 6 | `event_authority` | | | Event authority PDA for emitting events |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### SetWhitelistEnabled
+Sets which directions the instance whitelist gates (admin-only). Both flags are absolute, and entries are kept either way. A 0.1.0 instance grows to the current layout, with the payer topping up its rent.
+
+Discriminator: `11`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `whitelist_deposits` | bool | Require allowed wallets on `Deposit` |
+| `whitelist_withdrawals` | bool | Require allowed wallets on `ReleaseFunds` |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | ✓ | Instance PDA to update |
+| 3 | `system_program` | | | System program, for the rent top-up |
+| 4 | `event_authority` | | | Event authority PDA for emitting events |
+| 5 | `private_channel_escrow_program` | | | Current program for CPI |
+
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.
 
@@ -279,20 +351,22 @@ The program trusts each kind of signer for a fixed set of decisions.
 
 | Principal | Trusted for | Instructions |
 |-----------|-------------|--------------|
-| Admin | Instance configuration: the mint allowlist, the operator set, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `SetNewAdmin` |
-| Operator | Every release parameter (amount, recipient, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
-| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens | `CreateInstance`, `Deposit` |
+| Admin | Instance configuration: the mint allowlist, the operator set, the wallet whitelist, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `AddOrUpdateAllowedWallet`, `RemoveAllowedWallet`, `SetWhitelistEnabled`, `SetNewAdmin` |
+| Operator | Every release parameter (amount, recipient, withdrawer, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
+| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens (allowed wallets only while deposits are whitelisted) | `CreateInstance`, `Deposit` |
 
-Beyond the mint allowlist, the program constrains an operator in two ways only.
+Beyond the mint allowlist, the program constrains an operator in three ways.
 Each nonce is released at most once, and only while the bitmap covers its
 generation. A rotation must name the current generation, so a replayed one
-cannot skip a generation.
+cannot skip a generation. While withdrawals are whitelisted, a release's
+withdrawer and destination must both be allowed to withdraw.
 
-The program does not check a release's amount, recipient or mint against the
-burn on the channel, and it does not check that a generation is finished before
-it is rotated. The operator in the indexer makes those decisions from its
-database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
-invariants in [INVARIANTS.md](INVARIANTS.md#operator). A rotation that lands
+The program does not check a release's amount, recipient, withdrawer or mint
+against the burn on the channel, and it does not check that a generation is
+finished before it is rotated. The operator in the indexer makes those decisions
+from its database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
+invariants in [INVARIANTS.md](INVARIANTS.md#operator). The whitelist's withdrawer
+check therefore trusts the operator to name the wallet that burned. A rotation that lands
 early makes every unreleased nonce in the closed generation unreleasable. The
 indexer then routes those withdrawals to its remint path. A row with earlier
 broadcast signatures enters the automatic remint flow, which remints only once
@@ -315,6 +389,7 @@ that is distinct from the admin key and kept outside that process.
 | Operator | Authorized operator for an instance that can release funds | 1 |
 | AllowedMint | Token mint allowed in an instance, holding its deposit and withdrawal gates | 2 |
 | WithdrawalBitmap | Withdrawal nonce replay protection for an instance | 3 |
+| AllowedWallet | A wallet on the instance whitelist, with per-direction blocks | 4 |
 
 ### Instance
 Represents an escrow instance that holds token funds and manages operators.
@@ -324,9 +399,12 @@ Represents an escrow instance that holds token funds and manages operators.
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump seed |
-| `version` | u8 | Instance version |
+| `version` | u8 | Layout version: 1 for a 0.1.0 instance, which ends at `admin`, 2 for the current one |
 | `instance_seed` | Pubkey | Unique seed for this instance |
 | `admin` | Pubkey | Authority that controls the instance |
+| `deposits_whitelisted` | bool | `Deposit` requires allowed wallets; set by `SetWhitelistEnabled`. Off on a 0.1.0 instance |
+| `withdrawals_whitelisted` | bool | `ReleaseFunds` requires allowed wallets; set by `SetWhitelistEnabled`. Off on a 0.1.0 instance |
+| `reserved` | [u8; 64] | Zeroed, for future fields |
 
 ### WithdrawalBitmap
 Withdrawal nonce replay protection: one bit per nonce in the current generation.
@@ -359,6 +437,18 @@ Represents an authorized operator for an instance that can release funds.
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump seed |
+
+### AllowedWallet
+A wallet on the instance whitelist. A wallet with no entry is refused in every whitelisted direction.
+
+**PDA Derivation**: `["allowed_wallet", instance_pda, wallet_pubkey]`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bump` | u8 | PDA bump seed |
+| `deposits_blocked` | bool | Refused on `Deposit` while deposits are whitelisted |
+| `withdrawals_blocked` | bool | Refused on `ReleaseFunds` while withdrawals are whitelisted |
+| `reserved` | [u8; 32] | Zeroed, for future fields |
 
 ### AllowedMint
 Represents a token mint that is allowed in an instance, its two gates, and the mint
@@ -424,6 +514,8 @@ The program defines the following custom errors:
 | 17 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
 | 18 | `ZeroAmount` | Deposit requested or received zero tokens |
 | 19 | `BelowMinimumDeposit` | Deposit received less than the mint's minimum deposit |
+| 20 | `WalletNotAllowed` | The direction is whitelisted and the wallet has no entry, or its entry blocks it |
+| 21 | `InvalidAllowedWalletPda` | AllowedWallet PDA does not belong to the wallet being checked |
 
 ## Other Constants
 

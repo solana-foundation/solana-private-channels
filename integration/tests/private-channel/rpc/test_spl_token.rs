@@ -446,6 +446,14 @@ async fn solana_deposit(
             token_program_id,
         );
         let user_ata_pubkey = Pubkey::from(user_solana_ata.to_bytes());
+        let (user_allowed_wallet_pda, _) = Pubkey::find_program_address(
+            &[
+                b"allowed_wallet",
+                instance_pda.as_ref(),
+                user_pubkey.as_ref(),
+            ],
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        );
 
         let deposit_ix = DepositBuilder::new()
             .payer(user_pubkey)
@@ -456,6 +464,8 @@ async fn solana_deposit(
             .token_program(*token_program_id)
             .user_ata(user_ata_pubkey)
             .instance_ata(instance_ata_pubkey)
+            .user_allowed_wallet_pda(user_allowed_wallet_pda)
+            .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
             .amount(amount)
             .instruction();
 

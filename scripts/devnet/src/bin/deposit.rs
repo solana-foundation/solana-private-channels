@@ -16,6 +16,14 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
+const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
+
+fn find_allowed_wallet_pda(instance: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[ALLOWED_WALLET_SEED, instance.as_ref(), wallet.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+}
 
 fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -65,6 +73,11 @@ fn main() -> Result<()> {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_id, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
+    // Only read while deposits are whitelisted, where both wallets must be allowed to deposit.
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&instance_id, &user_keypair.pubkey());
+    let (recipient_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&instance_id, &recipient.unwrap_or(user_keypair.pubkey()));
     // Detect the mint's token program (classic SPL Token vs Token-2022) so the
     // ATAs and the instruction's token_program account match the actual mint.
     let token_program = client
@@ -100,6 +113,8 @@ fn main() -> Result<()> {
         associated_token_program: spl_associated_token_account::ID,
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        user_allowed_wallet_pda,
+        recipient_allowed_wallet_pda,
     }
     .instruction(DepositInstructionArgs { amount, recipient });
 

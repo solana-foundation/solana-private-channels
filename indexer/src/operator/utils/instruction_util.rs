@@ -719,6 +719,9 @@ mod tests {
             .amount(100)
             .user(pk(12))
             .withdrawal_bitmap(pk(13))
+            .user_allowed_wallet_pda(pk(14))
+            .withdrawer_allowed_wallet_pda(pk(15))
+            .withdrawer(pk(16))
             .transaction_nonce(42);
         TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder: inner.clone(),

@@ -726,10 +726,9 @@ pub(super) async fn send_and_confirm(
         Ok(_) => {
             info!("Transaction sent with signature: {}", signature);
 
-            // Stash the in-flight signature only after a successful broadcast. A send
-            // that never reached the network (e.g. a failed simulation) thus leaves no
-            // stashed signature, so a permanent failure routes to ManualReview rather
-            // than a deferred remint, preserving the pre-existing failure semantics.
+            // In-memory bookkeeping only. A permanent failure reads the journal written
+            // before the send (claim_and_persist_or_abort above), so a send that never
+            // reached the network, e.g. a failed simulation, still goes to PendingRemint.
             if let Some(nonce) = ctx.withdrawal_nonce {
                 state
                     .pending_signatures

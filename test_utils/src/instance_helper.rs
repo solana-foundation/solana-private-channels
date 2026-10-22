@@ -19,9 +19,12 @@ pub fn test_instance_account() -> Value {
     let data = borsh::to_vec(&Instance {
         discriminator: 0,
         bump: 255,
-        version: 1,
+        version: 2,
         instance_seed: TEST_INSTANCE_SEED,
         admin: Pubkey::new_unique(),
+        deposits_whitelisted: false,
+        withdrawals_whitelisted: false,
+        reserved: [0; 64],
     })
     .unwrap();
     json!({

@@ -12,6 +12,7 @@ pub enum PrivateChannelEscrowAccountDiscriminators {
     OperatorDiscriminator = 1,
     AllowedMintDiscriminator = 2,
     WithdrawalBitmapDiscriminator = 3,
+    AllowedWalletDiscriminator = 4,
 }
 
 #[repr(u8)]
@@ -25,6 +26,9 @@ pub enum PrivateChannelEscrowInstructionDiscriminators {
     Deposit = 6,
     ReleaseFunds = 7,
     RotateBitmap = 8,
+    AddOrUpdateAllowedWallet = 9,
+    RemoveAllowedWallet = 10,
+    SetWhitelistEnabled = 11,
     EmitEvent = 228,
 }
 
@@ -42,6 +46,9 @@ impl TryFrom<u8> for PrivateChannelEscrowInstructionDiscriminators {
             6 => Ok(Self::Deposit),
             7 => Ok(Self::ReleaseFunds),
             8 => Ok(Self::RotateBitmap),
+            9 => Ok(Self::AddOrUpdateAllowedWallet),
+            10 => Ok(Self::RemoveAllowedWallet),
+            11 => Ok(Self::SetWhitelistEnabled),
             228 => Ok(Self::EmitEvent),
             _ => Err(()),
         }
@@ -64,11 +71,11 @@ pub trait AccountSerialize: Discriminator {
 mod tests {
     use super::*;
 
-    // All 10 defined instruction discriminators must parse successfully.
+    // All 13 defined instruction discriminators must parse successfully.
     // If a variant is added or removed, this test will catch the gap.
     #[test]
     fn test_instruction_discriminator_all_valid_values() {
-        for byte in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 228] {
+        for byte in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 228] {
             assert!(
                 PrivateChannelEscrowInstructionDiscriminators::try_from(byte).is_ok(),
                 "byte {byte} should be a valid discriminator"
@@ -80,7 +87,7 @@ mod tests {
     // The entrypoint relies on this to reject malformed instructions before dispatch.
     #[test]
     fn test_instruction_discriminator_invalid_values() {
-        for byte in [9u8, 10, 100, 227, 229, 255] {
+        for byte in [12u8, 13, 100, 227, 229, 255] {
             assert!(
                 PrivateChannelEscrowInstructionDiscriminators::try_from(byte).is_err(),
                 "byte {byte} should not map to a valid discriminator"

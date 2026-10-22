@@ -185,6 +185,14 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
+    #[codama(account(
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while deposits are whitelisted"
+    ))]
+    #[codama(account(
+        name = "recipient_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of the recipient, or of user when none is given; read only while deposits are whitelisted"
+    ))]
     Deposit {
         /// Amount of tokens to deposit
         amount: u64,
@@ -242,6 +250,14 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "memo_program",
         docs = "SPL Memo program; only used when user_ata requires a memo"
     ))]
+    #[codama(account(
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while withdrawals are whitelisted"
+    ))]
+    #[codama(account(
+        name = "withdrawer_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of withdrawer; read only while withdrawals are whitelisted"
+    ))]
     ReleaseFunds {
         /// Amount of tokens to release
         amount: u64,
@@ -249,6 +265,8 @@ pub enum PrivateChannelEscrowProgramInstruction {
         user: Pubkey,
         /// Transaction nonce to consume from the withdrawal bitmap
         transaction_nonce: u64,
+        /// Wallet whose channel burn this release settles; may differ from user
+        withdrawer: Pubkey,
     } = 7,
 
     /// Rotate the withdrawal bitmap to the next generation (operator-only).
@@ -277,6 +295,80 @@ pub enum PrivateChannelEscrowProgramInstruction {
         /// longer matches, so a replayed rotation cannot skip a generation.
         expected_generation: u64,
     } = 8,
+
+    /// Add a wallet to the instance whitelist, or rewrite its flags (admin-only).
+    /// Blocking both directions is rejected; use RemoveAllowedWallet instead.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
+    #[codama(account(name = "wallet", docs = "Wallet to be added or updated"))]
+    #[codama(account(
+        name = "allowed_wallet_pda",
+        docs = "AllowedWallet PDA to be created or updated",
+        writable
+    ))]
+    #[codama(account(name = "system_program", docs = "System program"))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    AddOrUpdateAllowedWallet {
+        /// Bump for the allowed wallet PDA
+        bump: u8,
+        /// Refuse this wallet on Deposit while deposits are whitelisted
+        block_deposits: bool,
+        /// Refuse this wallet on ReleaseFunds while withdrawals are whitelisted
+        block_withdrawals: bool,
+    } = 9,
+
+    /// Remove a wallet from the instance whitelist (admin-only).
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
+    #[codama(account(name = "wallet", docs = "Wallet to be removed"))]
+    #[codama(account(
+        name = "allowed_wallet_pda",
+        docs = "Existing AllowedWallet PDA",
+        writable
+    ))]
+    #[codama(account(name = "system_program", docs = "System program"))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    RemoveAllowedWallet {} = 10,
+
+    /// Set which directions the instance whitelist gates (admin-only). While
+    /// deposits are whitelisted, Deposit requires the depositor and recipient to
+    /// be allowed to deposit; while withdrawals are, ReleaseFunds requires the
+    /// withdrawer and destination to be allowed to withdraw. Grows a 0.1.0 instance
+    /// to the current layout, with the payer topping up its rent.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA to update", writable))]
+    #[codama(account(name = "system_program", docs = "System program"))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    SetWhitelistEnabled {
+        /// Require allowed wallets on Deposit
+        whitelist_deposits: bool,
+        /// Require allowed wallets on ReleaseFunds
+        whitelist_withdrawals: bool,
+    } = 11,
 
     /// Invoked via CPI from another program to log event via instruction data.
     #[codama(account(

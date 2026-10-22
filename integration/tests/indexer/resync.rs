@@ -44,7 +44,7 @@ use private_channel_indexer::{
         resync::{ChannelReconcileConfig, ResyncService},
     },
     operator::{
-        self,
+        self, find_allowed_wallet_pda,
         utils::instruction_util::{mint_idempotency_memo, remint_idempotency_memo, SourceEventId},
         ConsumedMintKind, CONSUMED_SET_PAGE_SIZE,
     },
@@ -892,6 +892,7 @@ async fn mint_row_count(db_url: &str, mint: &str) -> i64 {
 fn deposit_ix(user: &Keypair, instance: Pubkey, mint: Pubkey, amount: u64) -> Instruction {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
+    let user_allowed_wallet_pda = find_allowed_wallet_pda(&instance, &user.pubkey());
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
     let instance_ata =
@@ -909,6 +910,8 @@ fn deposit_ix(user: &Keypair, instance: Pubkey, mint: Pubkey, amount: u64) -> In
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(amount)
         .instruction()
 }

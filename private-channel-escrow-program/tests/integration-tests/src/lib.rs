@@ -6,6 +6,8 @@ pub mod utils;
 #[cfg(test)]
 mod test_add_operator;
 #[cfg(test)]
+mod test_add_or_update_allowed_wallet;
+#[cfg(test)]
 mod test_allow_mint;
 #[cfg(test)]
 mod test_block_mint;
@@ -18,8 +20,12 @@ mod test_emit_event;
 #[cfg(test)]
 mod test_release_funds;
 #[cfg(test)]
+mod test_remove_allowed_wallet;
+#[cfg(test)]
 mod test_remove_operator;
 #[cfg(test)]
 mod test_rotate_bitmap;
 #[cfg(test)]
 mod test_set_new_admin;
+#[cfg(test)]
+mod test_set_whitelist_enabled;

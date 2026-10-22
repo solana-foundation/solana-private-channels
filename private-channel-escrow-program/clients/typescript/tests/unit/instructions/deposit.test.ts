@@ -3,16 +3,33 @@ import {
     getDepositInstructionAsync,
     getDepositInstructionDataCodec,
     findAllowedMintPda,
+    findAllowedWalletPda,
     DEPOSIT_DISCRIMINATOR,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
 import { mockTransactionSigner, TEST_ADDRESSES, EXPECTED_PROGRAM_ADDRESS } from '../../setup/mocks';
-import { AccountRole } from '@solana/kit';
+import { AccountRole, type Address } from '@solana/kit';
 import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { TOKEN_PROGRAM_ADDRESS, ASSOCIATED_TOKEN_PROGRAM_ADDRESS, findAssociatedTokenPda } from '@solana-program/token';
 import { TOKEN_2022_PROGRAM_ADDRESS } from '@solana-program/token-2022';
 
 describe('deposit', () => {
+    // recipientAllowedWalletPda has no default, since it follows the optional recipient.
+    // Each call passes the PDA of the wallet credited in the channel.
+    let walletAllowedWalletPda: Address;
+    let adminAllowedWalletPda: Address;
+
+    beforeAll(async () => {
+        [walletAllowedWalletPda] = await findAllowedWalletPda({
+            instance: TEST_ADDRESSES.INSTANCE,
+            wallet: TEST_ADDRESSES.WALLET,
+        });
+        [adminAllowedWalletPda] = await findAllowedWalletPda({
+            instance: TEST_ADDRESSES.INSTANCE,
+            wallet: TEST_ADDRESSES.ADMIN,
+        });
+    });
+
     describe('Instruction data validation', () => {
         it('should encode instruction data with correct discriminator (6), amount, and recipient', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
@@ -28,6 +45,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 recipient: testRecipient,
+                recipientAllowedWalletPda: adminAllowedWalletPda,
             });
 
             const decodedData = getDepositInstructionDataCodec().decode(instruction.data);
@@ -66,6 +84,7 @@ describe('deposit', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     recipient: null,
+                    recipientAllowedWalletPda: walletAllowedWalletPda,
                 });
 
                 const decodedData = getDepositInstructionDataCodec().decode(instruction.data);
@@ -83,6 +102,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: numberAmount,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             const decodedData = getDepositInstructionDataCodec().decode(instruction.data);
@@ -103,6 +123,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             const decodedDataNull = getDepositInstructionDataCodec().decode(instructionWithNullRecipient.data);
@@ -118,6 +139,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 recipient: testRecipient,
+                recipientAllowedWalletPda: adminAllowedWalletPda,
             });
 
             const decodedDataSome = getDepositInstructionDataCodec().decode(instructionWithRecipient.data);
@@ -132,6 +154,10 @@ describe('deposit', () => {
             ];
 
             for (const recipient of testRecipients) {
+                const [recipientAllowedWalletPda] = await findAllowedWalletPda({
+                    instance: TEST_ADDRESSES.INSTANCE,
+                    wallet: recipient,
+                });
                 const instruction = await getDepositInstructionAsync({
                     payer,
                     user,
@@ -140,6 +166,7 @@ describe('deposit', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     recipient,
+                    recipientAllowedWalletPda,
                 });
 
                 const decodedData = getDepositInstructionDataCodec().decode(instruction.data);
@@ -162,6 +189,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 recipient: testRecipient,
+                recipientAllowedWalletPda: adminAllowedWalletPda,
             });
 
             // Decode the instruction data
@@ -186,6 +214,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             const decodedDataNull = getDepositInstructionDataCodec().decode(instructionNullRecipient.data);
@@ -206,7 +235,7 @@ describe('deposit', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, user, instance, mint, allowedMint, userAta, instanceAta, systemProgram, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram', async () => {
+        it('should include all required accounts: payer, user, instance, mint, allowedMint, userAta, instanceAta, systemProgram, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, userAllowedWalletPda, recipientAllowedWalletPda', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const user = mockTransactionSigner(TEST_ADDRESSES.WALLET);
 
@@ -218,10 +247,11 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
-            // Based on program instruction definition, Deposit should have 12 accounts
-            expect(instruction.accounts).toHaveLength(12);
+            // Based on program instruction definition, Deposit should have 14 accounts
+            expect(instruction.accounts).toHaveLength(14);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -271,6 +301,12 @@ describe('deposit', () => {
             const privateChannelEscrowProgramAccount = instruction.accounts[11];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
             expect(privateChannelEscrowProgramAccount.address).toBe(EXPECTED_PROGRAM_ADDRESS);
+
+            // Account 12: userAllowedWalletPda (Readonly PDA - auto-derived from user)
+            expect(instruction.accounts[12].address).toBe(walletAllowedWalletPda);
+
+            // Account 13: recipientAllowedWalletPda (Readonly - provided by the caller)
+            expect(instruction.accounts[13].address).toBe(walletAllowedWalletPda);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -285,6 +321,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Account 0: payer - should be WritableSigner
@@ -334,6 +371,10 @@ describe('deposit', () => {
             // Account 11: privateChannelEscrowProgram - should be Readonly
             const privateChannelEscrowProgramAccount = instruction.accounts[11];
             expect(privateChannelEscrowProgramAccount.role).toBe(AccountRole.READONLY);
+
+            // Accounts 12 and 13: the allowed wallet PDAs - should be Readonly
+            expect(instruction.accounts[12].role).toBe(AccountRole.READONLY);
+            expect(instruction.accounts[13].role).toBe(AccountRole.READONLY);
         });
 
         it('should use correct program addresses', async () => {
@@ -348,6 +389,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Verify the instruction uses the correct program address
@@ -390,6 +432,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Get expected allowedMint PDA using findAllowedMintPda
@@ -422,6 +465,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Verify the automatically derived instance ATA is defined
@@ -448,6 +492,7 @@ describe('deposit', () => {
                 tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Verify the automatically derived instance ATA is defined
@@ -476,6 +521,7 @@ describe('deposit', () => {
                 instanceAta: customInstanceAta,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Verify the provided addresses are used instead of auto-derived ones
@@ -499,6 +545,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Second combination: INSTANCE + WRAPPED_SOL
@@ -510,6 +557,7 @@ describe('deposit', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: 1000000n,
                 recipient: null,
+                recipientAllowedWalletPda: walletAllowedWalletPda,
             });
 
             // Verify different mints produce different allowedMint PDAs
