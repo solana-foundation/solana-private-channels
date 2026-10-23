@@ -57,8 +57,7 @@ jobs:
           source versions.env
           npm install -g "pnpm@${PNPM_VERSION}"
 
-      # Only devDependencies exist, so --prod would audit nothing. package.json ignores
-      # GHSA-vfj7-8cjw-p6xm: braces has no patched release, reached via jest>micromatch.
+      # Only devDependencies exist, so --prod would audit nothing.
       - name: Audit pnpm-lock.yaml
         working-directory: ${{ matrix.dir }}
         run: pnpm audit --audit-level high
