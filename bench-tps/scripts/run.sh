@@ -298,7 +298,13 @@ done
 for gw_key in GATEWAY_RATE_LIMIT_PER_SECOND GATEWAY_RATE_LIMIT_BURST \
               GATEWAY_MAX_CONNECTIONS GATEWAY_MAX_CONNECTIONS_PER_IP; do
     if [ -z "${!gw_key:-}" ]; then
-        patch_env "${gw_key}" "$(grep -m1 "^${gw_key}=" "${BENCH_DIR}/.env.sample" | cut -d= -f2-)"
+        gw_value="$(grep -m1 "^${gw_key}=" "${BENCH_DIR}/.env.sample" | cut -d= -f2-)"
+        # The gateway refuses a per-IP cap at or above a total the user already set.
+        if [ "${gw_key}" = GATEWAY_MAX_CONNECTIONS_PER_IP ] && [ -n "${GATEWAY_MAX_CONNECTIONS:-}" ] \
+            && [ "${gw_value}" -ge "${GATEWAY_MAX_CONNECTIONS}" ]; then
+            gw_value=$(( GATEWAY_MAX_CONNECTIONS - 1 ))
+        fi
+        patch_env "${gw_key}" "${gw_value}"
     fi
 done
 

@@ -162,7 +162,12 @@ pub async fn run_setup_withdraw_phase(
     // ------------------------------------------------------------------
     let t4 = Instant::now();
     // A repeat run on a live stack finds the operator already registered; re-adding it fails.
-    if solana_rpc.get_account(&operator_pda).await.is_ok() {
+    // Only the escrow program's own account counts; a funded PDA is still a system account.
+    if solana_rpc
+        .get_account(&operator_pda)
+        .await
+        .is_ok_and(|a| a.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    {
         info!(%operator_pda, "Operator already registered on Solana, skipping");
     } else {
         let add_op_sig = 'send: {
