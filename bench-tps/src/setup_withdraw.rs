@@ -161,55 +161,61 @@ pub async fn run_setup_withdraw_phase(
     // (which signs with the admin key) can call ReleaseFunds on this instance.
     // ------------------------------------------------------------------
     let t4 = Instant::now();
-    let add_op_sig = 'send: {
-        let mut last_err = String::new();
-        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match solana_rpc.get_latest_blockhash().await {
-                Err(e) => {
-                    warn!(attempt, err = %e,
+    // A repeat run on a live stack finds the operator already registered; re-adding it fails.
+    if solana_rpc.get_account(&operator_pda).await.is_ok() {
+        info!(%operator_pda, "Operator already registered on Solana, skipping");
+    } else {
+        let add_op_sig = 'send: {
+            let mut last_err = String::new();
+            for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
+                match solana_rpc.get_latest_blockhash().await {
+                    Err(e) => {
+                        warn!(attempt, err = %e,
                         "get_latest_blockhash failed (add_operator), retrying in {delay_secs}s");
-                    last_err = e.to_string();
-                }
-                Ok(blockhash) => {
-                    let add_op_ix = AddOperator {
-                        payer: admin_keypair.pubkey(),
-                        admin: admin_keypair.pubkey(),
-                        instance: instance_pda,
-                        operator: admin_keypair.pubkey(),
-                        operator_pda,
-                        system_program: program::id(),
-                        event_authority,
-                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                        last_err = e.to_string();
                     }
-                    .instruction(AddOperatorInstructionArgs {
-                        bump: operator_bump,
-                    });
-                    let tx = Transaction::new_signed_with_payer(
-                        &[add_op_ix],
-                        Some(&admin_keypair.pubkey()),
-                        &[admin_keypair.as_ref()],
-                        blockhash,
-                    );
-                    match solana_rpc.send_transaction(&tx).await {
-                        Ok(sig) => break 'send sig,
-                        Err(e) => {
-                            warn!(attempt, err = %e, "add_operator send failed, retrying");
-                            last_err = e.to_string();
+                    Ok(blockhash) => {
+                        let add_op_ix = AddOperator {
+                            payer: admin_keypair.pubkey(),
+                            admin: admin_keypair.pubkey(),
+                            instance: instance_pda,
+                            operator: admin_keypair.pubkey(),
+                            operator_pda,
+                            system_program: program::id(),
+                            event_authority,
+                            private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                        }
+                        .instruction(AddOperatorInstructionArgs {
+                            bump: operator_bump,
+                        });
+                        let tx = Transaction::new_signed_with_payer(
+                            &[add_op_ix],
+                            Some(&admin_keypair.pubkey()),
+                            &[admin_keypair.as_ref()],
+                            blockhash,
+                        );
+                        match solana_rpc.send_transaction(&tx).await {
+                            Ok(sig) => break 'send sig,
+                            Err(e) => {
+                                warn!(attempt, err = %e, "add_operator send failed, retrying");
+                                last_err = e.to_string();
+                            }
                         }
                     }
                 }
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            return Err(anyhow::anyhow!(
+                "add_operator: all retries exhausted: {last_err}"
+            ));
+        };
+        let retry =
+            poll_confirmations(&solana_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
+        if !retry.is_empty() {
+            return Err(anyhow::anyhow!("add_operator failed to confirm on-chain"));
         }
-        return Err(anyhow::anyhow!(
-            "add_operator: all retries exhausted: {last_err}"
-        ));
-    };
-    let retry = poll_confirmations(&solana_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
-    if !retry.is_empty() {
-        return Err(anyhow::anyhow!("add_operator failed to confirm on-chain"));
+        info!(%operator_pda, elapsed_ms = t4.elapsed().as_millis(), "Operator registered on Solana");
     }
-    info!(%operator_pda, elapsed_ms = t4.elapsed().as_millis(), "Operator registered on Solana");
 
     // ------------------------------------------------------------------
     // Task 5: Create Solana SPL mint

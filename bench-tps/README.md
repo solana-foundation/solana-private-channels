@@ -44,6 +44,35 @@ containers on exit.
 
 ---
 
+## Reference runs
+
+Commands and results of a 60 s run per flow, for comparing a new run against.
+Measured on commit `effd1fb3` (2026-10-23) on one 16 vCPU / 62 GB VM running the
+whole stack, the bench and `solana-test-validator` (services on cores 0-11, bench
+on 12-15). Results on other commits or hardware will differ.
+
+```bash
+./bench-tps/scripts/run.sh                                            # transfer
+./bench-tps/scripts/run.sh deposit  --threads 8 --sender-sleep-ms 0
+./bench-tps/scripts/run.sh withdraw --threads 4 --sender-sleep-ms 20
+```
+
+| Flow | Result |
+|------|--------|
+| `transfer` | ~5.4k TPS |
+| `deposit` | ~1.1k/s landed on Solana; ~200-270 mints/s end to end |
+| `withdraw` | ~640 burns/s; ~2.35 releases/s end to end |
+
+- Transfer drops to ~2.9k TPS on runs of 3 minutes or more, once the
+  address-index writer saturates.
+- Withdraw needs its flags: at the defaults (16 threads, no sleep) the node is
+  overloaded and burns fall to ~360/s. Releases stay at ~2.35/s either way, one
+  per Solana slot.
+- The gateway's per-IP limits (`GATEWAY_RATE_LIMIT_*`, `GATEWAY_MAX_CONNECTIONS*`
+  in `.env.sample`) must stay raised, or the bench measures the rate limiter.
+
+---
+
 ## Transfer flow
 
 ### What it does
