@@ -4,9 +4,9 @@ name: Cargo Audit
 on:
   push:
     branches: [main]
-    paths: ["**/Cargo.toml", "**/Cargo.lock", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "**/package.json", "**/pnpm-lock.yaml", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
   pull_request:
-    paths: ["**/Cargo.toml", "**/Cargo.lock", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "**/package.json", "**/pnpm-lock.yaml", ".cargo/audit.toml", ".github/workflows/cargo-audit.yml"]
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
@@ -26,7 +26,38 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-audit
+        id: install
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Audit Cargo.lock
         run: cargo audit
+
+      # Fuzz workspace, still on solana-sdk 2.x through trident-fuzz. h2 0.3 comes from
+      # trident-fuzz's reqwest 0.11 and has no 0.3 fix; ignored here only.
+      - name: Audit trident-tests Cargo.lock
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: cargo audit --file private-channel-escrow-program/tests/trident-tests/Cargo.lock --ignore RUSTSEC-2026-0258
+
+  pnpm-audit:
+    name: pnpm Audit (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [private-channel-escrow-program, private-channel-withdraw-program]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        run: |
+          source versions.env
+          npm install -g "pnpm@${PNPM_VERSION}"
+
+      # Only devDependencies exist, so --prod would audit nothing.
+      - name: Audit pnpm-lock.yaml
+        working-directory: ${{ matrix.dir }}
+        run: pnpm audit --audit-level high

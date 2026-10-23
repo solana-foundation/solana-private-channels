@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Docs and CI
+- ctutils bumped past RUSTSEC-2026-0385; it ships in core, indexer and auth (#406)
+- `cargo audit` also covers the trident fuzz lockfile, and `pnpm audit` fails both program lockfiles on high and critical advisories; testcontainers, handlebars, brace-expansion and trident's rustls bumped past their advisories (#406)
+
 ## [0.1.0] - 2026-10-20
 
 Apex SOLA13, Cantina reaudit and OtterSec remediation on top of `main` `acdbb4bf`.
