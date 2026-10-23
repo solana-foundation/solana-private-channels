@@ -135,8 +135,8 @@ spl-transfer-hook-interface = "2.1.0"
 spl-type-length-value = "0.9.1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 tempfile = "3.14"
-testcontainers = "0.25"
-testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 thiserror = "2.0.17"
 tokio = { version = ">=1.48", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
