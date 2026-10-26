@@ -2,9 +2,23 @@
 
 ## [Unreleased]
 
+### Gateway and auth
+- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second; past that, withdrawals are forwarded unchecked
+
+### Programs
+- Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
+
 ### Docs and CI
 - ctutils bumped past RUSTSEC-2026-0385; it ships in core, indexer and auth (#406)
 - `cargo audit` also covers the trident fuzz lockfile, and `pnpm audit` fails both program lockfiles on high and critical advisories; testcontainers, handlebars, brace-expansion and trident's rustls bumped past their advisories (#406)
+
+### Upgrade notes
+- Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument, and `SetWhitelistEnabled` takes `system_program`.
+- `Instance` is now 133 bytes, version 2: the whitelist flags plus 64 reserved bytes. A 0.1.0 instance (67 bytes) keeps working with the whitelist off; `SetWhitelistEnabled` grows it, with the payer topping up its rent. After the program upgrade, call `SetWhitelistEnabled` once on each 0.1.0 instance with both flags off, so every client can decode it. Rust callers decode either layout with `decode_instance`; the generated decoders, TypeScript's included, read only the new one.
+- A 0.1.0 client's `Deposit` fails. Without hook extras it gets `NotEnoughAccountKeys`. With them, its first two extras fill the whitelist slots, so it gets `InvalidAllowedWalletPda` (`0x15`) while deposits are whitelisted, and a Token-2022 error otherwise.
+- Upgrade: stop `operator-private-channel` before upgrading the escrow program, and start it on the new images. This program refuses the 0.1.0 operator's `ReleaseFunds`, so a release sent in between is reminted without its fee.
+- Rollback: redeploy the 0.1.0 escrow program before the 0.1.0 images. This program refuses the 0.1.0 operator's `ReleaseFunds`, and each refused release is reminted without its fee. The 0.1.0 program reads a grown instance but ignores the whitelist, so every wallet can deposit and withdraw until the next upgrade. The flags and entries survive and apply again then.
+- A release now fits 12 transfer-hook accounts, down from 15, whether or not the whitelist is on. Before upgrading, count each allowed hook mint's accounts: the hook program, its validation account and its `ExtraAccountMetaList` entries. If one needs 13 to 15, block its deposits and let its holders withdraw first, or hold the upgrade. Afterwards, each withdrawal of it parks in `ManualReview` (`hook_unresolvable`) after the burn.
 
 ## [0.1.0] - 2026-10-20
 

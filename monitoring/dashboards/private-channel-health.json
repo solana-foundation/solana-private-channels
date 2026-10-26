@@ -135,13 +135,13 @@
       "id": 9,
       "type": "stat",
       "title": "Gateway error ratio",
-      "description": "sum(private_channel_gateway_errors_total) / sum(private_channel_gateway_requests_total). Sanity threshold: < 0.05. Requires PRIVATE_CHANNEL_METRICS=true on the gateway.",
+      "description": "Gateway faults over requests, as sanity.sh counts them: refused tokens (auth_rejected) and whitelist refusals (wallet_not_allowed) are client errors and left out. Sanity threshold: < 0.05. Requires PRIVATE_CHANNEL_METRICS=true on the gateway.",
       "gridPos": { "h": 6, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(private_channel_gateway_errors_total) / clamp_min(sum(private_channel_gateway_requests_total), 1)",
+          "expr": "sum(private_channel_gateway_errors_total{error_type!~\"auth_rejected|wallet_not_allowed\"}) / clamp_min(sum(private_channel_gateway_requests_total), 1)",
           "instant": true
         }
       ],

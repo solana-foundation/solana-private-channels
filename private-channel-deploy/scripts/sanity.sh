@@ -171,9 +171,9 @@ fi
 banner 5 "gateway error ratio (< ${GATEWAY_ERROR_RATIO_MAX})"
 
 reqs=$(prom "sum(private_channel_gateway_requests_total)")
-# Refused tokens are client errors, not gateway faults, and the deploy's own
-# unauthenticated probe makes one on every JWT-on deploy.
-errs=$(prom 'sum(private_channel_gateway_errors_total{error_type!="auth_rejected"})')
+# Refused tokens and whitelist-refused withdrawals are client errors, not gateway
+# faults, and the deploy's own unauthenticated probe makes one on every JWT-on deploy.
+errs=$(prom 'sum(private_channel_gateway_errors_total{error_type!~"auth_rejected|wallet_not_allowed"})')
 
 if [ -z "$reqs" ] || [ "${reqs%.*}" = "0" ]; then
   sk "no gateway requests yet (fresh deploy; cannot compute error ratio)"

@@ -27,7 +27,7 @@ const ROTATE_BITMAP: u8 = 8;
 const CREATE_INSTANCE_ACCOUNTS: usize = 8;
 const BLOCK_MINT_ACCOUNTS: usize = 7;
 // ReleaseFunds reads only the 13 accounts every bitmap-era version shares; later ones
-// (memo program, hook extras) are version-specific and ignored. A new account the
+// (memo program, whitelist entries, hook extras) are version-specific and ignored. A new account the
 // indexer must read means parsing both layouts, as BlockMint does, not raising this.
 const RELEASE_FUNDS_MIN_ACCOUNTS: usize = 13;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
@@ -211,7 +211,8 @@ pub struct ReleaseFundsData {
 
 impl ReleaseFundsData {
     /// Parse ReleaseFundsData from raw bytes after the discriminator:
-    /// amount (8) + user (32) + transaction_nonce (8).
+    /// amount (8) + user (32) + transaction_nonce (8). A trailing withdrawer (32)
+    /// is ignored.
     pub fn from_bytes(data: &[u8]) -> Result<Self, ParserError> {
         let min_len = 8 + 32 + 8;
         if data.len() < min_len {
@@ -684,7 +685,7 @@ fn parse_deposit(
 }
 
 /// Parse ReleaseFunds in the bitmap-era layout. 13 accounts is safe to accept: the
-/// current program rejects fewer than 14, and failed transactions never reach here,
+/// current program rejects fewer than 16, and failed transactions never reach here,
 /// so a successful 13-account release can only be a pre-memo one.
 fn parse_release_funds(
     data: &[u8],

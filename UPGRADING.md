@@ -65,7 +65,8 @@ published its blockhash window, so the writer always goes first.
 ## Rollback
 
 Redeploy the previous `image_tag`. That is the whole rollback when the release changed no
-schema.
+schema and no on-chain program. A release that changes a program says in its notes whether
+the program must be rolled back first.
 
 Schema changes are forward-only. A database restore is disaster recovery, not a rollback:
 `docs/PITR.md` forbids restoring the primary alone, requires the indexer database restored

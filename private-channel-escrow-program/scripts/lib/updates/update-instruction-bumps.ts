@@ -27,6 +27,13 @@ export function updateInstructionBumps(privateChannelEscrowCodama: Codama): Coda
                     },
                 },
             },
+            addOrUpdateAllowedWallet: {
+                arguments: {
+                    bump: {
+                        defaultValue: accountBumpValueNode('allowedWalletPda'),
+                    },
+                },
+            },
         }),
     );
     return privateChannelEscrowCodama;

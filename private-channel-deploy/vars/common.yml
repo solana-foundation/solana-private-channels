@@ -68,6 +68,8 @@ gateway_internal_port: 8904
 gateway_upstream_timeout_secs: 30
 # Max public reads in flight to the read node; must stay below the gateway's 1024 max connections.
 gateway_max_forwarded_reads: 768
+# Max Mainnet reads per second the withdraw whitelist check makes; past it, withdrawals go unchecked.
+gateway_whitelist_reads_per_second: 20
 
 # --- Health phase tuning ---
 # Per-service probe budget. With backoff inside the retry loop this gives

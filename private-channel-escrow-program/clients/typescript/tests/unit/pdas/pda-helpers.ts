@@ -13,6 +13,7 @@ const ALLOWED_MINT_PDA_SEED = 'allowed_mint';
 const OPERATOR_PDA_SEED = 'operator';
 const EVENT_AUTHORITY_PDA_SEED = 'event_authority';
 const WITHDRAWAL_BITMAP_PDA_SEED = 'withdrawal_bitmap';
+const ALLOWED_WALLET_PDA_SEED = 'allowed_wallet';
 
 export async function expectedInstancePda(instanceSeed: Address): Promise<ProgramDerivedAddress> {
     return await getProgramDerivedAddress({
@@ -37,6 +38,17 @@ export async function expectedOperatorPda(instance: Address, wallet: Address): P
         programAddress: PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
         seeds: [
             getUtf8Encoder().encode(OPERATOR_PDA_SEED),
+            getAddressEncoder().encode(instance),
+            getAddressEncoder().encode(wallet),
+        ],
+    });
+}
+
+export async function expectedAllowedWalletPda(instance: Address, wallet: Address): Promise<ProgramDerivedAddress> {
+    return await getProgramDerivedAddress({
+        programAddress: PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
+        seeds: [
+            getUtf8Encoder().encode(ALLOWED_WALLET_PDA_SEED),
             getAddressEncoder().encode(instance),
             getAddressEncoder().encode(wallet),
         ],

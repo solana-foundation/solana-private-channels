@@ -386,6 +386,14 @@ async fn deposit_to_escrow(
         &[b"allowed_mint", instance_pda.as_ref(), mint.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     );
+    let (user_allowed_wallet_pda, _) = Pubkey::find_program_address(
+        &[
+            b"allowed_wallet",
+            instance_pda.as_ref(),
+            user.pubkey().as_ref(),
+        ],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), mint, &spl_token::ID);
     let instance_ata =
@@ -400,6 +408,8 @@ async fn deposit_to_escrow(
         .token_program(spl_token::ID)
         .user_ata(user_ata)
         .instance_ata(instance_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
         .amount(amount)
         .instruction();
 

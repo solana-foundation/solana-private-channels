@@ -49,6 +49,14 @@ fn build_deposit_tx(
 ) -> Transaction {
     let depositor_pubkey = depositor.pubkey();
     let user_ata = get_associated_token_address(&depositor_pubkey, &config.mint);
+    let (user_allowed_wallet_pda, _) = Pubkey::find_program_address(
+        &[
+            b"allowed_wallet",
+            config.instance_pda.as_ref(),
+            depositor_pubkey.as_ref(),
+        ],
+        &private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
 
     let accounts = Deposit {
         payer: depositor_pubkey,
@@ -64,6 +72,8 @@ fn build_deposit_tx(
         event_authority: config.event_authority,
         private_channel_escrow_program:
             private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        user_allowed_wallet_pda,
+        recipient_allowed_wallet_pda: user_allowed_wallet_pda,
     };
 
     let deposit_ix = accounts.instruction(DepositInstructionArgs {

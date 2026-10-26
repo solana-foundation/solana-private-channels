@@ -575,7 +575,10 @@ mod tests {
             .user_ata(pk)
             .instance_ata(pk)
             .token_program(spl_token::id())
+            .user_allowed_wallet_pda(pk)
+            .withdrawer_allowed_wallet_pda(pk)
             .user(pk)
+            .withdrawer(pk)
             .amount(1000)
             .transaction_nonce(0);
         b

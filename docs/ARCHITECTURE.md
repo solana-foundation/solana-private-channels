@@ -47,7 +47,8 @@ The core payment channel processes transactions through a five-stage pipeline op
 - `CreateInstance`: Initialize a new escrow instance with admin
 - `AllowMint`/`BlockMint`: Manage whitelisted SPL token mints, with independent deposit and withdrawal gates. `AllowMint` also sets the mint's withdraw fee
 - `AddOperator`/`RemoveOperator`: Manage authorized operators
-- `Deposit`: Lock user tokens in escrow (permissionless)
+- `AddOrUpdateAllowedWallet`/`RemoveAllowedWallet`/`SetWhitelistEnabled`: Manage the optional whitelist, with independent deposit and withdrawal flags
+- `Deposit`: Lock user tokens in escrow (permissionless unless deposits are whitelisted)
 - `ReleaseFunds`: Withdraw funds, consuming the nonce's bit in the withdrawal bitmap
 
 **Security**:

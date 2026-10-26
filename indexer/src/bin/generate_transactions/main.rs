@@ -23,6 +23,7 @@ use helpers::{generate_mint, mint_to_owner, send_and_confirm_instructions, setup
 const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
+const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
 /// Per-withdrawal fee in base units for the generated mint.
 const WITHDRAW_FEE: u64 = 1_000;
 /// Smallest withdrawal amount in base units for the generated mint.
@@ -44,6 +45,13 @@ fn find_event_authority_pda() -> (Pubkey, u8) {
 fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[ALLOWED_MINT_SEED, instance.as_ref(), mint.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+}
+
+fn find_allowed_wallet_pda(instance: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[ALLOWED_WALLET_SEED, instance.as_ref(), wallet.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
@@ -133,6 +141,9 @@ async fn send_deposit(
 ) -> Result<Signature, Box<dyn std::error::Error>> {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (user_allowed_wallet_pda, _) = find_allowed_wallet_pda(&instance, &user.pubkey());
+    let (recipient_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&instance, &recipient.unwrap_or(user.pubkey()));
 
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
@@ -153,6 +164,8 @@ async fn send_deposit(
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(recipient_allowed_wallet_pda)
         .amount(amount);
 
     let instruction = if let Some(recipient) = recipient {

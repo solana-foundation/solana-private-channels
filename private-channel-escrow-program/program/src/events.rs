@@ -17,6 +17,9 @@ pub enum EventDiscriminators {
     Deposit = 6,
     ReleaseFunds = 7,
     RotateBitmap = 8,
+    AddOrUpdateAllowedWallet = 9,
+    RemoveAllowedWallet = 10,
+    SetWhitelistEnabled = 11,
 }
 
 #[derive(CodamaType)]
@@ -370,6 +373,117 @@ impl RotateBitmapEvent {
     }
 }
 
+#[derive(CodamaType)]
+pub struct AddOrUpdateAllowedWalletEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Wallet whose entry was written
+    pub wallet: Pubkey,
+    /// Deposit flag after this instruction
+    pub deposits_blocked: bool,
+    /// Withdrawal flag after this instruction
+    pub withdrawals_blocked: bool,
+}
+
+impl AddOrUpdateAllowedWalletEvent {
+    pub fn new(
+        instance_seed: Pubkey,
+        wallet: Pubkey,
+        deposits_blocked: bool,
+        withdrawals_blocked: bool,
+    ) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::AddOrUpdateAllowedWallet as u8,
+            instance_seed,
+            wallet,
+            deposits_blocked,
+            withdrawals_blocked,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (wallet) + 1 + 1 (blocked flags)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(75);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.wallet.as_ref());
+        data.push(self.deposits_blocked as u8);
+        data.push(self.withdrawals_blocked as u8);
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct RemoveAllowedWalletEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Wallet removed from the whitelist
+    pub wallet: Pubkey,
+}
+
+impl RemoveAllowedWalletEvent {
+    pub fn new(instance_seed: Pubkey, wallet: Pubkey) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::RemoveAllowedWallet as u8,
+            instance_seed,
+            wallet,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (wallet)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(73);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.wallet.as_ref());
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct SetWhitelistEnabledEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Whether Deposit now requires allowed wallets
+    pub deposits_whitelisted: bool,
+    /// Whether ReleaseFunds now requires allowed wallets
+    pub withdrawals_whitelisted: bool,
+}
+
+impl SetWhitelistEnabledEvent {
+    pub fn new(
+        instance_seed: Pubkey,
+        deposits_whitelisted: bool,
+        withdrawals_whitelisted: bool,
+    ) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::SetWhitelistEnabled as u8,
+            instance_seed,
+            deposits_whitelisted,
+            withdrawals_whitelisted,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 1 + 1 (whitelist flags)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(43);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.push(self.deposits_whitelisted as u8);
+        data.push(self.withdrawals_whitelisted as u8);
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +704,41 @@ mod tests {
         assert_eq!(bytes.len(), 81);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::RotateBitmap as u8);
+    }
+
+    #[test]
+    fn test_add_or_update_allowed_wallet_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let wallet = Pubkey::new_from_array([2u8; 32]);
+        let event = AddOrUpdateAllowedWalletEvent::new(instance_seed, wallet, true, false);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (wallet) + 1 + 1 (blocked flags)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 75);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(
+            bytes[8],
+            EventDiscriminators::AddOrUpdateAllowedWallet as u8
+        );
+        assert_eq!(&bytes[41..73], wallet.as_ref());
+        // Opposite values pin the flag byte order.
+        assert_eq!(bytes[73], 1);
+        assert_eq!(bytes[74], 0);
+    }
+
+    #[test]
+    fn test_set_whitelist_enabled_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let event = SetWhitelistEnabledEvent::new(instance_seed, true, false);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 1 + 1 (whitelist flags)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 43);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::SetWhitelistEnabled as u8);
+        assert_eq!(&bytes[9..41], instance_seed.as_ref());
+        // Opposite values pin the flag byte order.
+        assert_eq!(bytes[41], 1);
+        assert_eq!(bytes[42], 0);
     }
 }

@@ -5,6 +5,7 @@ import {
     pdaSeedValueNode,
     publicKeyTypeNode,
     accountValueNode,
+    argumentValueNode,
     variablePdaSeedNode,
     publicKeyValueNode,
     pdaLinkNode,
@@ -87,6 +88,38 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                 account: 'withdrawalBitmap',
                 defaultValue: pdaValueNode(pdaLinkNode('withdrawalBitmap'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
+                ]),
+            },
+            {
+                account: 'allowedWalletPda',
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', accountValueNode('wallet')),
+                ]),
+            },
+            // No default for recipientAllowedWalletPda: it follows the optional recipient argument.
+            {
+                account: 'userAllowedWalletPda',
+                instruction: 'deposit',
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', accountValueNode('user')),
+                ]),
+            },
+            {
+                account: 'userAllowedWalletPda',
+                instruction: 'releaseFunds',
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', argumentValueNode('user')),
+                ]),
+            },
+            {
+                account: 'withdrawerAllowedWalletPda',
+                instruction: 'releaseFunds',
+                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                    pdaSeedValueNode('wallet', argumentValueNode('withdrawer')),
                 ]),
             },
 

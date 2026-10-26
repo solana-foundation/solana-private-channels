@@ -5,6 +5,7 @@ import {
     RELEASE_FUNDS_DISCRIMINATOR,
     findOperatorPda,
     findAllowedMintPda,
+    findAllowedWalletPda,
     findWithdrawalBitmapPda,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
@@ -25,11 +26,12 @@ const MEMO_PROGRAM_ADDRESS = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' as Ad
 // Token program addresses
 describe('releaseFunds', () => {
     describe('Instruction data validation', () => {
-        it('should encode instruction data with correct discriminator (7), amount, user, and transactionNonce', async () => {
+        it('should encode instruction data with correct discriminator (7), amount, user, transactionNonce, and withdrawer', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000); // 1 USDC (6 decimals)
             const testUser = TEST_ADDRESSES.WALLET;
+            const testWithdrawer = TEST_ADDRESSES.ADMIN;
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -40,6 +42,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testWithdrawer,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -59,6 +62,9 @@ describe('releaseFunds', () => {
             // Verify the nonce is correctly encoded: it is the only replay guard
             expect(decodedData.transactionNonce).toBe(BigInt(TEST_TRANSACTION_NONCE));
             expect(typeof decodedData.transactionNonce).toBe('bigint');
+
+            // Verify the withdrawer is encoded separately from the destination
+            expect(decodedData.withdrawer).toBe(testWithdrawer);
         });
 
         it('should handle amount parameter correctly (u64 as bigint)', async () => {
@@ -86,6 +92,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce: TEST_TRANSACTION_NONCE,
+                    withdrawer: testUser,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -117,6 +124,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce: TEST_TRANSACTION_NONCE,
+                    withdrawer: testUser,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -144,6 +152,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce,
+                    withdrawer: testUser,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -167,6 +176,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             // Decode the instruction data
@@ -189,17 +199,19 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
             expect(reEncodedData).toEqual(instruction.data);
         });
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram', async () => {
+        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram, userAllowedWalletPda, withdrawerAllowedWalletPda', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
+            const testWithdrawer = TEST_ADDRESSES.ADMIN as Address;
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -210,10 +222,11 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testWithdrawer,
             });
 
-            // Based on program instruction definition, ReleaseFunds should have 14 accounts
-            expect(instruction.accounts).toHaveLength(14);
+            // Based on program instruction definition, ReleaseFunds should have 16 accounts
+            expect(instruction.accounts).toHaveLength(16);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -272,6 +285,20 @@ describe('releaseFunds', () => {
             // Account 13: memoProgram (Readonly, defaulted by the client)
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.address).toBe(MEMO_PROGRAM_ADDRESS);
+
+            // Account 14: userAllowedWalletPda (Readonly PDA - derived from the user argument)
+            const [expectedUserAllowedWalletPda] = await findAllowedWalletPda({
+                instance: TEST_ADDRESSES.INSTANCE,
+                wallet: testUser,
+            });
+            expect(instruction.accounts[14].address).toBe(expectedUserAllowedWalletPda);
+
+            // Account 15: withdrawerAllowedWalletPda (Readonly PDA - derived from the withdrawer argument)
+            const [expectedWithdrawerAllowedWalletPda] = await findAllowedWalletPda({
+                instance: TEST_ADDRESSES.INSTANCE,
+                wallet: testWithdrawer,
+            });
+            expect(instruction.accounts[15].address).toBe(expectedWithdrawerAllowedWalletPda);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -289,6 +316,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             // Account 0: payer - should be WritableSigner
@@ -345,6 +373,10 @@ describe('releaseFunds', () => {
             // Account 13: memoProgram - should be Readonly
             const memoProgramAccount = instruction.accounts[13];
             expect(memoProgramAccount.role).toBe(AccountRole.READONLY);
+
+            // Accounts 14 and 15: the allowed wallet PDAs - should be Readonly
+            expect(instruction.accounts[14].role).toBe(AccountRole.READONLY);
+            expect(instruction.accounts[15].role).toBe(AccountRole.READONLY);
         });
 
         it('should use correct program addresses', async () => {
@@ -362,6 +394,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             // Verify the instruction uses the correct program address
@@ -405,6 +438,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
                 // Not providing operatorPda - should be auto-derived
             });
 
@@ -434,6 +468,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
                 // Not providing allowedMint - should be auto-derived
             });
 
@@ -463,6 +498,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
                 // Not providing instanceAta - should be auto-derived as ATA
             });
             // Verify instanceAta is derived (should be a valid address)
@@ -492,6 +528,7 @@ describe('releaseFunds', () => {
                 user: testUser,
                 tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
                 // Not providing instanceAta - should be auto-derived as ATA
             });
 
@@ -527,6 +564,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             // Verify the provided addresses are used instead of auto-derived ones
@@ -552,6 +590,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             // Verify operator account is a signer
@@ -582,6 +621,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce: TEST_TRANSACTION_NONCE,
+                    withdrawer: testUser,
                 });
 
                 // Verify operator account uses the correct address
@@ -618,6 +658,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce: TEST_TRANSACTION_NONCE,
+                    withdrawer: testUser,
                 });
 
                 // Verify operatorPda is derived correctly for this operator
@@ -643,6 +684,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -664,6 +706,7 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 transactionNonce: TEST_TRANSACTION_NONCE,
+                withdrawer: testUser,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -690,6 +733,7 @@ describe('releaseFunds', () => {
                     amount: testAmount,
                     user: testUser,
                     transactionNonce: TEST_TRANSACTION_NONCE,
+                    withdrawer: testUser,
                 });
 
                 const [expectedBitmapPda] = await findWithdrawalBitmapPda({ instance });

@@ -3,7 +3,7 @@ use crate::operator::bitmap_constants::{BITMAP_BYTES, NONCES_PER_GENERATION};
 use crate::operator::bitmap_layout::{ACCOUNT_LEN, BITS_OFFSET};
 use crate::operator::RpcClientWithRetry;
 use private_channel_escrow_program_client::{
-    programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance, WithdrawalBitmap,
+    decode_instance, programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance, WithdrawalBitmap,
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -14,6 +14,7 @@ const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const OPERATOR_SEED: &[u8] = b"operator";
 const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
+const ALLOWED_WALLET_SEED: &[u8] = b"allowed_wallet";
 
 /// Account-type tag the escrow program writes in the first byte of a bitmap.
 const WITHDRAWAL_BITMAP_DISCRIMINATOR: u8 = 3;
@@ -48,6 +49,16 @@ pub fn find_operator_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> Pubkey {
     .0
 }
 
+/// A wallet's whitelist entry. ReleaseFunds always takes it; the escrow reads it
+/// only while the instance whitelists withdrawals.
+pub fn find_allowed_wallet_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[ALLOWED_WALLET_SEED, instance_pda.as_ref(), wallet.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+    .0
+}
+
 /// One bitmap per instance, so the instance PDA is the only seed input.
 pub fn find_withdrawal_bitmap_pda(instance_pda: &Pubkey) -> Pubkey {
     find_withdrawal_bitmap_pda_with_bump(instance_pda).0
@@ -62,7 +73,7 @@ pub fn find_withdrawal_bitmap_pda_with_bump(instance_pda: &Pubkey) -> (Pubkey, u
 }
 
 pub fn parse_instance(instance_data: &[u8]) -> Result<Instance, std::io::Error> {
-    Instance::from_bytes(instance_data)
+    decode_instance(instance_data)
 }
 
 /// Why a configured instance was refused. An unreadable chain is not a config mistake.
@@ -325,9 +336,12 @@ pub(crate) fn instance_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
     borsh::to_vec(&Instance {
         discriminator,
         bump: 255,
-        version: 1,
+        version: 2,
         instance_seed: seed,
         admin: Pubkey::new_unique(),
+        deposits_whitelisted: false,
+        withdrawals_whitelisted: false,
+        reserved: [0; 64],
     })
     .unwrap()
 }
@@ -345,6 +359,7 @@ pub(crate) fn live_instance() -> (Pubkey, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use private_channel_escrow_program_client::INSTANCE_V1_LEN;
 
     #[test]
     fn instance_account_must_be_a_live_escrow_instance() {
@@ -353,6 +368,12 @@ mod tests {
         let escrow = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
         let good = instance_bytes(INSTANCE_DISCRIMINATOR, seed);
         assert_eq!(check_instance_account(&address, &escrow, &good), Ok(()));
+        // A 0.1.0 instance ends at the admin and keeps working after the upgrade.
+        let instance_0_1_0 = &good[..INSTANCE_V1_LEN];
+        assert_eq!(
+            check_instance_account(&address, &escrow, instance_0_1_0),
+            Ok(())
+        );
 
         let cases = [
             (

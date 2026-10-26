@@ -2,9 +2,11 @@ use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, 
 
 use crate::{
     processor::{
-        process_add_operator, process_allow_mint, process_block_mint, process_create_instance,
-        process_deposit, process_emit_event::process_emit_event, process_release_funds,
-        process_remove_operator, process_rotate_bitmap, process_set_new_admin,
+        process_add_operator, process_add_or_update_allowed_wallet, process_allow_mint,
+        process_block_mint, process_create_instance, process_deposit,
+        process_emit_event::process_emit_event, process_release_funds,
+        process_remove_allowed_wallet, process_remove_operator, process_rotate_bitmap,
+        process_set_new_admin, process_set_whitelist_enabled,
     },
     state::discriminator::PrivateChannelEscrowInstructionDiscriminators,
 };
@@ -50,6 +52,15 @@ pub fn process_instruction(
         }
         PrivateChannelEscrowInstructionDiscriminators::RotateBitmap => {
             process_rotate_bitmap(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::AddOrUpdateAllowedWallet => {
+            process_add_or_update_allowed_wallet(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::RemoveAllowedWallet => {
+            process_remove_allowed_wallet(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::SetWhitelistEnabled => {
+            process_set_whitelist_enabled(program_id, accounts, instruction_data)
         }
         PrivateChannelEscrowInstructionDiscriminators::EmitEvent => {
             process_emit_event(program_id, accounts)

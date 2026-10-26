@@ -14,6 +14,12 @@ dvp-swap-program-client = { path = "../dvp-swap-program/clients/rust" }
 # from "changed hands without leaving a row".
 spl-associated-token-account = { workspace = true }
 solana-pubkey = { workspace = true }
+# The withdraw whitelist check decodes a sendTransaction the way the write node
+# does, and reads program ids and escrow account layouts from the clients.
+solana-sdk = { workspace = true }
+wincode = { workspace = true }
+private-channel-escrow-program-client = { path = "../private-channel-escrow-program/clients/rust" }
+private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }

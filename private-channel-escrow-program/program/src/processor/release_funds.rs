@@ -14,7 +14,7 @@ use crate::{
         verify_token_programs,
     },
     require_len,
-    state::{AllowedMint, Instance, Operator, WithdrawalBitmap},
+    state::{AllowedMint, AllowedWallet, Direction, Instance, Operator, WithdrawalBitmap},
     validate_event_authority,
 };
 use pinocchio::{
@@ -23,11 +23,11 @@ use pinocchio::{
     error::ProgramError,
     Address, ProgramResult,
 };
-// amount (8) + user (32) + transaction_nonce (8)
-const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8;
+// amount (8) + user (32) + transaction_nonce (8) + withdrawer (32)
+const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8 + 32;
 
 /// Fixed account prefix; anything past it is transfer-hook extras.
-const FIXED_ACCOUNTS_LEN: usize = 14;
+const FIXED_ACCOUNTS_LEN: usize = 16;
 
 /// Processes the ReleaseFunds instruction.
 ///
@@ -46,6 +46,10 @@ const FIXED_ACCOUNTS_LEN: usize = 14;
 /// 11. `[]` event_authority - Event authority PDA for emitting events
 /// 12. `[]` private_channel_escrow_program - Current program for CPI
 /// 13. `[]` memo_program - SPL Memo program, used only when user_ata requires a memo
+/// 14. `[]` user_allowed_wallet_pda - AllowedWallet PDA of `user`, read only while
+///     withdrawals are whitelisted
+/// 15. `[]` withdrawer_allowed_wallet_pda - AllowedWallet PDA of `withdrawer`, read only
+///     while withdrawals are whitelisted
 ///
 /// Trailing accounts (variable): transfer-hook extras for the mint (hook
 /// program, validation PDA, and whatever its `ExtraAccountMetaList`
@@ -60,6 +64,7 @@ const FIXED_ACCOUNTS_LEN: usize = 14;
 /// * `amount` (u64) - Amount of tokens to release
 /// * `user` (Pubkey) - User receiving the funds
 /// * `transaction_nonce` (u64) - Transaction nonce to consume from the bitmap
+/// * `withdrawer` (Pubkey) - Wallet whose channel burn this release settles
 pub fn process_release_funds(
     program_id: &Address,
     accounts: &[AccountView],
@@ -70,7 +75,7 @@ pub fn process_release_funds(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info, memo_program_info] =
+    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info, memo_program_info, user_allowed_wallet_pda_info, withdrawer_allowed_wallet_pda_info] =
         fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -118,6 +123,23 @@ pub fn process_release_funds(
 
     if allowed_mint.withdrawals_blocked {
         return Err(PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint.into());
+    }
+
+    // The channel lets a withdrawal name any destination, so the wallet that
+    // withdrew must be allowed too. The operator supplies it, as it does `user`.
+    if instance.withdrawals_whitelisted {
+        AllowedWallet::verify_allowed(
+            withdrawer_allowed_wallet_pda_info,
+            instance_info.address(),
+            &args.withdrawer,
+            Direction::Withdraw,
+        )?;
+        AllowedWallet::verify_allowed(
+            user_allowed_wallet_pda_info,
+            instance_info.address(),
+            &args.user,
+            Direction::Withdraw,
+        )?;
     }
 
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
@@ -189,6 +211,7 @@ struct ReleaseFundsArgs {
     amount: u64,
     user: Address,
     transaction_nonce: u64,
+    withdrawer: Address,
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramError> {
@@ -212,11 +235,17 @@ fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramErro
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
+    offset += 8;
+
+    let mut withdrawer_bytes = [0u8; 32];
+    withdrawer_bytes.copy_from_slice(&data[offset..offset + 32]);
+    let withdrawer = Address::new_from_array(withdrawer_bytes);
 
     Ok(ReleaseFundsArgs {
         transaction_nonce,
         amount,
         user,
+        withdrawer,
     })
 }
 
@@ -229,6 +258,7 @@ mod tests {
     #[test]
     fn test_process_release_funds_instruction_data_valid() {
         let user_key = Address::new_from_array([7u8; 32]);
+        let withdrawer_key = Address::new_from_array([9u8; 32]);
         let transaction_nonce = 42u64;
         let amount = 1000u64;
 
@@ -236,6 +266,7 @@ mod tests {
         instruction_data.extend_from_slice(&amount.to_le_bytes());
         instruction_data.extend_from_slice(user_key.as_ref());
         instruction_data.extend_from_slice(&transaction_nonce.to_le_bytes());
+        instruction_data.extend_from_slice(withdrawer_key.as_ref());
 
         let result = process_instruction_data(&instruction_data);
 
@@ -244,6 +275,7 @@ mod tests {
         assert_eq!(args.transaction_nonce, transaction_nonce);
         assert_eq!(args.amount, amount);
         assert_eq!(args.user, user_key);
+        assert_eq!(args.withdrawer, withdrawer_key);
     }
 
     #[test]

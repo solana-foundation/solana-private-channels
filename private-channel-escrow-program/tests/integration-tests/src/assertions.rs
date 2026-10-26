@@ -1,7 +1,7 @@
 use crate::utils::get_token_balance;
 use crate::utils::{TestContext, NONCES_PER_GENERATION, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use private_channel_escrow_program_client::{
-    accounts::Instance, AllowedMint, Operator, WithdrawalBitmap,
+    decode_instance, AllowedMint, AllowedWallet, Operator, WithdrawalBitmap,
 };
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
@@ -20,12 +20,38 @@ pub fn assert_instance_account(
 
     assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
 
     assert_eq!(instance.admin, *expected_admin);
     assert_eq!(instance.bump, expected_bump);
     assert_eq!(instance.instance_seed, *expected_instance_seed);
+    assert!(
+        !instance.deposits_whitelisted,
+        "deposit whitelist starts off"
+    );
+    assert!(
+        !instance.withdrawals_whitelisted,
+        "withdrawal whitelist starts off"
+    );
+}
+
+pub fn assert_whitelist_enabled(
+    context: &mut TestContext,
+    instance_pda: &Pubkey,
+    expected_deposits_whitelisted: bool,
+    expected_withdrawals_whitelisted: bool,
+) {
+    let account = context
+        .get_account(instance_pda)
+        .expect("Instance account should exist");
+
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
+
+    assert_eq!(instance.deposits_whitelisted, expected_deposits_whitelisted);
+    assert_eq!(
+        instance.withdrawals_whitelisted,
+        expected_withdrawals_whitelisted
+    );
 }
 
 /// Decimals sit at offset 44 for both SPL Token and Token-2022 mints.
@@ -148,6 +174,30 @@ pub fn assert_add_operator_account(
     assert_eq!(operator.bump, expected_bump);
 }
 
+pub fn assert_allowed_wallet_account(
+    context: &mut TestContext,
+    allowed_wallet_pda: &Pubkey,
+    expected_bump: u8,
+    expected_deposits_blocked: bool,
+    expected_withdrawals_blocked: bool,
+) {
+    let account = context
+        .get_account(allowed_wallet_pda)
+        .expect("AllowedWallet account should exist");
+
+    assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+
+    let allowed_wallet = AllowedWallet::from_bytes(&account.data)
+        .expect("Should deserialize allowed wallet account");
+
+    assert_eq!(allowed_wallet.bump, expected_bump);
+    assert_eq!(allowed_wallet.deposits_blocked, expected_deposits_blocked);
+    assert_eq!(
+        allowed_wallet.withdrawals_blocked,
+        expected_withdrawals_blocked
+    );
+}
+
 pub fn assert_remove_operator_account(
     context: &mut TestContext,
     operator_pda: &Pubkey,
@@ -169,8 +219,7 @@ pub fn assert_instance_admin_updated(
 
     assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let instance = decode_instance(&account.data).expect("Should deserialize instance account");
 
     assert_eq!(instance.admin, *expected_new_admin);
 }
