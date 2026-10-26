@@ -293,6 +293,21 @@ for signer_key in ADMIN_SIGNER OPERATOR_SIGNER; do
     fi
 done
 
+# An older .env predates the gateway limits, so the gateway would keep its per-IP
+# defaults and cap the bench. Copy any missing ones from the sample.
+for gw_key in GATEWAY_RATE_LIMIT_PER_SECOND GATEWAY_RATE_LIMIT_BURST \
+              GATEWAY_MAX_CONNECTIONS GATEWAY_MAX_CONNECTIONS_PER_IP; do
+    if [ -z "${!gw_key:-}" ]; then
+        gw_value="$(grep -m1 "^${gw_key}=" "${BENCH_DIR}/.env.sample" | cut -d= -f2-)"
+        # The gateway refuses a per-IP cap at or above a total the user already set.
+        if [ "${gw_key}" = GATEWAY_MAX_CONNECTIONS_PER_IP ] && [ -n "${GATEWAY_MAX_CONNECTIONS:-}" ] \
+            && [ "${gw_value}" -ge "${GATEWAY_MAX_CONNECTIONS}" ]; then
+            gw_value=$(( GATEWAY_MAX_CONNECTIONS - 1 ))
+        fi
+        patch_env "${gw_key}" "${gw_value}"
+    fi
+done
+
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
 # --env-file in docker compose, so without this re-source the operator

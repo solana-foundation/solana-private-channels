@@ -8,6 +8,10 @@
 ### Programs
 - Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
 
+### Docs and CI
+- ctutils bumped past RUSTSEC-2026-0385; it ships in core, indexer and auth (#406)
+- `cargo audit` also covers the trident fuzz lockfile, and `pnpm audit` fails both program lockfiles on high and critical advisories; testcontainers, handlebars, brace-expansion and trident's rustls bumped past their advisories (#406)
+
 ### Upgrade notes
 - Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument, and `SetWhitelistEnabled` takes `system_program`.
 - `Instance` is now 133 bytes, version 2: the whitelist flags plus 64 reserved bytes. A 0.1.0 instance (67 bytes) keeps working with the whitelist off; `SetWhitelistEnabled` grows it, with the payer topping up its rent. After the program upgrade, call `SetWhitelistEnabled` once on each 0.1.0 instance with both flags off, so every client can decode it. Rust callers decode either layout with `decode_instance`; the generated decoders, TypeScript's included, read only the new one.

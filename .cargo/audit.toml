@@ -2,12 +2,8 @@
 # or why it cannot be bumped yet. Revisit when the upstream crate moves.
 [advisories]
 ignore = [
-    # astral-tokio-tar 0.5: testcontainers, integration tests only
-    "RUSTSEC-2026-0066",
-    "RUSTSEC-2026-0112",
-    "RUSTSEC-2026-0113",
-    "RUSTSEC-2026-0145",
-    # curve25519-dalek 3 / ed25519-dalek 1 / idna 0.1: solana-runtime and jsonrpc client, tests only
+    # curve25519-dalek 3 / ed25519-dalek 1 / idna 0.1: solana-runtime and jsonrpc client, tests only;
+    # in the trident fuzz workspace via solana-sdk 2.x
     "RUSTSEC-2024-0344",
     "RUSTSEC-2022-0093",
     "RUSTSEC-2024-0421",
