@@ -120,11 +120,9 @@ const T22_BURN: u8 = 8;
 const T22_TRANSFER_CHECKED: u8 = 12;
 const T22_BURN_CHECKED: u8 = 15;
 
-/// The delegate move in one top-level instruction, if any. Token-2022 honours a
-/// permanent delegate only on TransferChecked and the two burns (the others never read
-/// it), and Batch and the fee/permissioned variants are refused at ingress, so these
-/// three are the only seize paths. A source that is the delegate's own ATA is its own
-/// balance, not a seize. `accounts` are the instruction's resolved account keys.
+/// The delegate move in one top-level instruction, if any. Token-2022 honours a permanent
+/// delegate only on TransferChecked and the two burns, so these are the only seize paths.
+/// The delegate's own ATA as source is its own balance, not a seize.
 pub fn delegate_move(
     program_id: &Pubkey,
     accounts: &[Pubkey],
@@ -184,10 +182,8 @@ fn token_2022_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     )
 }
 
-/// Token-2022 instructions a channel mint can use: the classic token set (0..=24) and
-/// the permanent delegate init (35, admin only). Everything else is extension machinery
-/// our mints do not carry, plus Batch (255) which would hide inner instructions from
-/// the admin and seize checks, and the metadata and group interfaces.
+/// Token-2022 instructions a channel mint can use: the classic set (0..=24) and the
+/// permanent delegate init (35, admin only). Batch (255) and extension machinery are refused.
 fn is_allowed_token_2022_instruction(data: &[u8]) -> bool {
     matches!(
         data.first(),

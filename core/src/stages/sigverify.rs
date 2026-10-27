@@ -192,6 +192,12 @@ pub async fn sigverify_transaction(
         }
     }
 
+    // Verify signature
+    if let Err(e) = transaction.verify() {
+        return SigverifyResult::SigverifyFailed(e.to_string());
+    }
+
+    // After verify so the refusal alerts only fire on a real signature.
     // Both apply to every signer, admins included: an admin key is not the policed delegate.
     if rotates_delegate_away(transaction, policy) {
         return SigverifyResult::ForeignDelegateRotation;
@@ -203,11 +209,7 @@ pub async fn sigverify_transaction(
         return SigverifyResult::SeizeTargetRefused;
     }
 
-    // Verify signature
-    match transaction.verify() {
-        Ok(_) => SigverifyResult::Valid(transaction_type),
-        Err(e) => SigverifyResult::SigverifyFailed(e.to_string()),
-    }
+    SigverifyResult::Valid(transaction_type)
 }
 
 /// Start the signature verification worker pool
@@ -870,6 +872,47 @@ mod tests {
             matches!(result, SigverifyResult::SeizeTargetRefused),
             "{result}"
         );
+    }
+
+    /// Refusals raise alerts, so they must only fire once the signatures are proven.
+    #[tokio::test]
+    async fn delegate_refusals_need_a_valid_signature() {
+        let (delegate, mut policy, _, mint, victim) = seize_setup();
+        policy.admin_keys = vec![delegate.pubkey()];
+        let bad_move = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let bad_rotation = spl_token_2022::instruction::set_authority(
+            &spl_token_2022::id(),
+            &mint,
+            None,
+            AuthorityType::PermanentDelegate,
+            &delegate.pubkey(),
+            &[],
+        )
+        .unwrap();
+
+        for (label, ix) in [("seize", bad_move), ("rotation", bad_rotation)] {
+            let mut tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&delegate.pubkey()),
+                &[&delegate],
+                Hash::default(),
+            );
+            let mut sig_bytes = <[u8; 64]>::from(tx.signatures[0]);
+            sig_bytes[0] ^= 0xff;
+            tx.signatures[0] = Signature::from(sig_bytes);
+            let tx =
+                SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SigverifyFailed(_)),
+                "{label}: expected SigverifyFailed, got {result}"
+            );
+        }
     }
 
     /// Admitted delegate moves count once and refused ones count as rejections;

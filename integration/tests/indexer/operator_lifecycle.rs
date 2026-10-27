@@ -467,6 +467,18 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     assert_eq!(db_tx.status, "completed");
     assert!(db_tx.counterpart_signature.is_some());
 
+    // The operator JIT-created the channel mint on the real Token-2022 program.
+    use spl_token_2022::extension::{
+        permanent_delegate::PermanentDelegate, BaseStateWithExtensions, StateWithExtensions,
+    };
+    let channel_mint = RpcClient::new(pc_node.url.clone())
+        .get_account(&env.mint)
+        .await?;
+    assert_eq!(channel_mint.owner, spl_token_2022::id());
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&channel_mint.data)?;
+    let delegate = state.get_extension::<PermanentDelegate>()?.delegate;
+    assert_eq!(Option::<Pubkey>::from(delegate), Some(admin.pubkey()));
+
     operator_handle.shutdown().await;
     pc_node.shutdown().await;
 

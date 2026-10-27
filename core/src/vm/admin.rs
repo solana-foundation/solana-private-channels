@@ -344,7 +344,11 @@ impl AdminVm {
             debug!("[admin-vm] InitializePermanentDelegate: malformed");
             return Err(InstructionError::InvalidInstructionData);
         };
-        if self.delegate.is_none_or(|d| d.as_ref() != delegate) {
+        // Token-2022 refuses a zero delegate, so a zero-key config fails the same way.
+        if self
+            .delegate
+            .is_none_or(|d| d == Pubkey::default() || d.as_ref() != delegate)
+        {
             warn!("[admin-vm] InitializePermanentDelegate: delegate is not the configured key");
             return Err(InstructionError::InvalidArgument);
         }
@@ -661,10 +665,8 @@ mod tests {
         }
     }
 
-    /// Build a SanitizedTransaction with `[InitializePermanentDelegate(TEST_DELEGATE), data]`
-    /// on one mint under the given program_id, with the mint as the FIRST account
-    /// meta of the second ix (as `InitializeMint` expects). The ix under test is at
-    /// index 1. Returns the tx and the mint pubkey so tests can stub the callback.
+    /// Builds `[InitializePermanentDelegate(TEST_DELEGATE), data]` on one mint, the ix under
+    /// test at index 1 with the mint as its first account. Returns the tx and the mint.
     fn make_spl_tx_with_mint(
         program_id: Pubkey,
         data: Vec<u8>,
@@ -1701,6 +1703,26 @@ mod tests {
             );
             assert!(executed.loaded_transaction.accounts.is_empty(), "{label}");
         }
+    }
+
+    /// A zero-key delegate fails the tx like the real program, never panics the worker.
+    #[test]
+    fn zero_key_delegate_is_refused() {
+        let mint = Pubkey::new_unique();
+        let zero = Pubkey::default();
+        let tx = admin_tx(&[delegate_ix(mint, zero), init_mint2_ix(mint)]);
+        let executed = assert_executed_with_status(
+            run_admin_vm_as(
+                AdminVm::new(Some(zero)),
+                std::slice::from_ref(&tx),
+                &DummyCb,
+            ),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidArgument,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
     }
 
     /// With no delegate configured the VM creates no mint at all.
