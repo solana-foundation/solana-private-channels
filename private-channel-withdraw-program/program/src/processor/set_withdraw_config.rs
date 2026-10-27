@@ -6,7 +6,7 @@ use pinocchio::{
     Address, ProgramResult,
 };
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
-use pinocchio_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
+use pinocchio_token_2022::{state::Mint, ID as TOKEN_PROGRAM_ID};
 
 use crate::{
     error::PrivateChannelWithdrawProgramError,

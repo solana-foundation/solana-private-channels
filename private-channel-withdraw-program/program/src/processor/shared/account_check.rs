@@ -1,7 +1,7 @@
 use crate::error::PrivateChannelWithdrawProgramError;
 use pinocchio::{account::AccountView, error::ProgramError, Address};
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
-use pinocchio_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
+use pinocchio_token_2022::{state::Mint, ID as TOKEN_PROGRAM_ID};
 
 #[inline(always)]
 pub fn verify_signer(info: &AccountView, expect_writable: bool) -> Result<(), ProgramError> {
@@ -60,7 +60,8 @@ pub fn verify_mint_account(info: &AccountView) -> Result<(), ProgramError> {
     }
 
     let data = info.try_borrow()?;
-    if data.len() < Mint::LEN {
+    // Token-2022 mints carry extensions after the base layout, so only a floor is checked.
+    if data.len() < Mint::BASE_LEN {
         return Err(PrivateChannelWithdrawProgramError::InvalidMint.into());
     }
 

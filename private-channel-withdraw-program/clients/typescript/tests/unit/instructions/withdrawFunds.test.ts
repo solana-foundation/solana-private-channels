@@ -7,8 +7,11 @@ import {
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
 import { mockTransactionSigner, TEST_ADDRESSES } from '../../setup/mocks';
-import { AccountRole, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
-import { TOKEN_PROGRAM_ADDRESS, ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+import { AccountRole, address, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
+import { ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+
+// Channel token accounts live under Token-2022.
+const TOKEN_2022_PROGRAM_ADDRESS = address('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
 
 describe('withdraw_funds', () => {
     describe('Instruction data validation', () => {
@@ -224,7 +227,7 @@ describe('withdraw_funds', () => {
 
             // Account 3: tokenProgram (Readonly)
             const tokenProgramAccount = instruction.accounts[3];
-            expect(tokenProgramAccount.address).toBe(TOKEN_PROGRAM_ADDRESS);
+            expect(tokenProgramAccount.address).toBe(TOKEN_2022_PROGRAM_ADDRESS);
 
             // Account 4: associatedTokenProgram (Readonly)
             const associatedTokenProgramAccount = instruction.accounts[4];
@@ -299,7 +302,7 @@ describe('withdraw_funds', () => {
 
             // Verify tokenProgram uses the correct address
             const tokenProgramAccount = instruction.accounts[3];
-            expect(tokenProgramAccount.address).toBe(TOKEN_PROGRAM_ADDRESS);
+            expect(tokenProgramAccount.address).toBe(TOKEN_2022_PROGRAM_ADDRESS);
 
             // Verify associatedTokenProgram uses the correct address
             const associatedTokenProgramAccount = instruction.accounts[4];

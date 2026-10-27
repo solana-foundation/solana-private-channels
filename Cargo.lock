@@ -6456,7 +6456,7 @@ dependencies = [
  "pinocchio-associated-token-account",
  "pinocchio-log",
  "pinocchio-system",
- "pinocchio-token",
+ "pinocchio-token-2022",
  "serde_json",
  "solana-address 2.6.1",
  "thiserror 2.0.20",
@@ -14186,6 +14186,7 @@ dependencies = [
  "solana-sdk",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
 ]
 
 [[package]]

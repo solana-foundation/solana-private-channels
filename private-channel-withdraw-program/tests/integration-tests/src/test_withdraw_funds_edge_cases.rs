@@ -4,13 +4,12 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_associated_token_account::get_associated_token_address;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 
 use crate::utils::{
-    assert_program_error, set_mint, set_withdraw_config, setup_test_balances, TestContext,
-    ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR, INVALID_MINT_ERROR,
-    MISSING_REQUIRED_SIGNATURE_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
+    assert_program_error, channel_ata, set_mint, set_withdraw_config, setup_test_balances,
+    TestContext, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+    INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE,
 };
 
@@ -31,7 +30,7 @@ fn test_withdraw_funds_wrong_mint() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -62,7 +61,7 @@ fn test_withdraw_funds_non_signer_user() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     // Build canonical instruction, then strip the signer flag from user account
     let mut instruction = WithdrawFundsBuilder::new()
@@ -97,7 +96,7 @@ fn test_withdraw_funds_wrong_ata_program() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     // Build instruction with wrong ATA program
     let mut instruction = WithdrawFundsBuilder::new()
@@ -133,7 +132,7 @@ fn test_withdraw_funds_wrong_token_program() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     // Build instruction with wrong token program
     let mut instruction = WithdrawFundsBuilder::new()
@@ -197,7 +196,7 @@ fn test_withdraw_funds_invalid_discriminator() {
     set_mint(&mut context, &mint.pubkey());
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     // Build a raw instruction with invalid discriminator (byte 255)
     let mut data = vec![255u8]; // Invalid discriminator

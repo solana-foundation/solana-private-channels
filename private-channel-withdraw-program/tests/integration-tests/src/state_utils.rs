@@ -1,7 +1,7 @@
 use crate::{
     assertions::assert_balance_changed,
     utils::{
-        find_withdraw_config_pda, get_token_balance, get_withdraw_config, TestContext,
+        channel_ata, find_withdraw_config_pda, get_token_balance, get_withdraw_config, TestContext,
         ATA_PROGRAM_ID,
     },
 };
@@ -10,8 +10,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_associated_token_account::get_associated_token_address;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 
 pub fn assert_get_or_withdraw_funds(
     context: &mut TestContext,
@@ -23,7 +22,7 @@ pub fn assert_get_or_withdraw_funds(
 ) -> Result<(), Box<dyn std::error::Error>> {
     context.airdrop_if_required(&user.pubkey(), 1_000_000_000)?;
 
-    let user_ata = get_associated_token_address(&user.pubkey(), mint);
+    let user_ata = channel_ata(&user.pubkey(), mint);
     let (withdraw_config_pda, _) = find_withdraw_config_pda(mint);
     let withdraw_config = get_withdraw_config(context, &withdraw_config_pda);
     let treasury_token_account = withdraw_config.treasury_token_account;

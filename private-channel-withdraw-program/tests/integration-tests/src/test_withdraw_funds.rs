@@ -1,22 +1,22 @@
 use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
-use solana_program_pack::Pack;
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_associated_token_account::get_associated_token_address;
-use spl_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 
 use crate::{
     state_utils::assert_get_or_withdraw_funds,
     utils::{
-        assert_program_error, find_withdraw_config_pda, get_token_balance, set_mint,
-        set_token_balance, set_withdraw_config, set_withdraw_config_with_minimum,
-        setup_test_balances, TestContext, AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID,
+        assert_program_error, channel_ata, find_withdraw_config_pda, get_mint_supply,
+        get_permanent_delegate, get_token_balance, set_mint, set_token_balance,
+        set_withdraw_config, set_withdraw_config_with_minimum, setup_test_balances, TestContext,
+        AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR,
         INVALID_INSTRUCTION_DATA_ERROR, INVALID_TREASURY_ACCOUNT_ERROR,
-        INVALID_WITHDRAW_CONFIG_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE,
-        TOKEN_INSUFFICIENT_FUNDS_ERROR, WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR, ZERO_AMOUNT_ERROR,
+        INVALID_WITHDRAW_CONFIG_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        TEST_PERMANENT_DELEGATE, TEST_WITHDRAW_FEE, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR, ZERO_AMOUNT_ERROR,
     },
 };
 
@@ -37,9 +37,7 @@ fn test_withdraw_funds_success() {
     set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let supply_before = Mint::unpack(&context.get_account_data(&mint.pubkey()).unwrap())
-        .unwrap()
-        .supply;
+    let supply_before = get_mint_supply(&mut context, &mint.pubkey());
 
     assert_get_or_withdraw_funds(
         &mut context,
@@ -52,9 +50,7 @@ fn test_withdraw_funds_success() {
     .expect("Withdraw funds should succeed");
 
     // Only the amount is burned. The fee moves to the treasury and stays in supply.
-    let supply_after = Mint::unpack(&context.get_account_data(&mint.pubkey()).unwrap())
-        .unwrap()
-        .supply;
+    let supply_after = get_mint_supply(&mut context, &mint.pubkey());
     assert_eq!(supply_after, supply_before - WITHDRAW_AMOUNT);
 }
 
@@ -102,7 +98,7 @@ fn test_withdraw_funds_treasury_pays_no_fee() {
     );
     setup_test_balances(&mut context, &admin, &mint.pubkey(), INITIAL_BALANCE);
 
-    let admin_ata = get_associated_token_address(&admin.pubkey(), &mint.pubkey());
+    let admin_ata = channel_ata(&admin.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(admin.pubkey())
@@ -139,7 +135,7 @@ fn test_withdraw_funds_zero_fee() {
     let (withdraw_config, _) = set_withdraw_config(&mut context, &mint.pubkey(), 0, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -176,7 +172,7 @@ fn test_withdraw_funds_insufficient_funds() {
     // Set balance less than withdraw amount
     setup_test_balances(&mut context, &user, &mint.pubkey(), WITHDRAW_AMOUNT / 2);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -208,7 +204,7 @@ fn test_withdraw_funds_balance_covers_amount_but_not_fee() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), WITHDRAW_AMOUNT);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -248,7 +244,7 @@ fn test_withdraw_funds_below_minimum() {
     );
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -287,7 +283,7 @@ fn test_withdraw_funds_at_minimum() {
     );
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -367,7 +363,7 @@ fn test_withdraw_funds_zero_amount() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -397,9 +393,9 @@ fn test_withdraw_funds_withdraw_config_not_initialized() {
     set_mint(&mut context, &mint.pubkey());
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
     let (withdraw_config, _) = find_withdraw_config_pda(&mint.pubkey());
-    let treasury_token_account = get_associated_token_address(&admin, &mint.pubkey());
+    let treasury_token_account = channel_ata(&admin, &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -438,7 +434,7 @@ fn test_withdraw_funds_withdraw_config_wrong_address() {
     );
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -469,9 +465,9 @@ fn test_withdraw_funds_wrong_treasury_account() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
     // A valid token account of the same mint, just not the admin's.
-    let attacker_ata = get_associated_token_address(&attacker, &mint.pubkey());
+    let attacker_ata = channel_ata(&attacker, &mint.pubkey());
     set_token_balance(&mut context, &attacker_ata, &mint.pubkey(), &attacker, 0);
 
     let instruction = WithdrawFundsBuilder::new()
@@ -521,7 +517,7 @@ fn test_withdraw_funds_event_emission() {
         set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
-    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -553,5 +549,154 @@ fn test_withdraw_funds_event_emission() {
         "WithdrawFundsEvent not found in transaction logs.\nExpected: {}\nGot: {:#?}",
         expected_log,
         meta.logs,
+    );
+}
+
+/// A withdrawal on a Token-2022 channel mint burns the amount and pays the fee into the
+/// treasury's Token-2022 ATA, through the unchecked Burn and Transfer.
+#[test]
+fn test_withdraw_funds_on_token_2022_burns_and_pays_the_treasury() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+
+    set_mint(&mut context, &mint.pubkey());
+    assert_eq!(
+        get_permanent_delegate(&mut context, &mint.pubkey()),
+        Some(TEST_PERMANENT_DELEGATE)
+    );
+    let (_, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    assert_eq!(treasury_token_account, channel_ata(&admin, &mint.pubkey()));
+    set_token_balance(
+        &mut context,
+        &treasury_token_account,
+        &mint.pubkey(),
+        &admin,
+        0,
+    );
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+    let supply_before = get_mint_supply(&mut context, &mint.pubkey());
+
+    assert_get_or_withdraw_funds(
+        &mut context,
+        &user,
+        &mint.pubkey(),
+        WITHDRAW_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Withdraw funds should succeed");
+
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
+    assert_eq!(
+        get_token_balance(&mut context, &user_ata),
+        INITIAL_BALANCE - WITHDRAW_AMOUNT - TEST_WITHDRAW_FEE
+    );
+    assert_eq!(
+        get_token_balance(&mut context, &treasury_token_account),
+        TEST_WITHDRAW_FEE
+    );
+    assert_eq!(
+        get_mint_supply(&mut context, &mint.pubkey()),
+        supply_before - WITHDRAW_AMOUNT
+    );
+}
+
+/// The legacy SPL Token program is no longer a valid token program for withdrawals.
+#[test]
+fn test_withdraw_funds_refuses_the_spl_token_program() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+
+    set_mint(&mut context, &mint.pubkey());
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(channel_ata(&user.pubkey(), &mint.pubkey()))
+        .token_program(spl_token::ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury_token_account)
+        .amount(WITHDRAW_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+    assert_program_error(result, INCORRECT_PROGRAM_ID_ERROR);
+}
+
+/// The permanent delegate can move a user's balance on the token program, but it
+/// cannot withdraw it: the source must be the signer's own ATA.
+#[test]
+fn test_permanent_delegate_cannot_withdraw_a_users_balance() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let delegate = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+
+    set_mint(&mut context, &mint.pubkey());
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+    context
+        .airdrop_if_required(&delegate.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let user_ata = channel_ata(&user.pubkey(), &mint.pubkey());
+    let instruction = WithdrawFundsBuilder::new()
+        .user(delegate.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury_token_account)
+        .amount(WITHDRAW_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&delegate]);
+    assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+    assert_eq!(get_token_balance(&mut context, &user_ata), INITIAL_BALANCE);
+}
+
+/// The indexer and the gateway read WithdrawFunds accounts by position, and clients
+/// that omit the token program now get Token-2022.
+#[test]
+fn test_withdraw_funds_account_order_and_default_token_program() {
+    let accounts = [
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    ];
+    let (withdraw_config, treasury) = (Pubkey::new_unique(), Pubkey::new_unique());
+    let instruction = WithdrawFundsBuilder::new()
+        .user(accounts[0])
+        .mint(accounts[1])
+        .token_account(accounts[2])
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury)
+        .amount(1)
+        .instruction();
+
+    let keys: Vec<Pubkey> = instruction.accounts.iter().map(|m| m.pubkey).collect();
+    assert_eq!(
+        keys,
+        vec![
+            accounts[0],
+            accounts[1],
+            accounts[2],
+            TOKEN_PROGRAM_ID,
+            ATA_PROGRAM_ID,
+            withdraw_config,
+            treasury,
+        ]
     );
 }
