@@ -95,7 +95,7 @@ mod tests {
     fn make_read_deps(db: AccountsDB) -> ReadDeps {
         ReadDeps {
             accounts_db: db,
-            admin_keys: vec![],
+            ingress: Default::default(),
             simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
             block_list_permits: tokio::sync::Semaphore::new(constants::block_list_slots(
                 crate::accounts::postgres::DEFAULT_PG_MAX_CONNECTIONS,

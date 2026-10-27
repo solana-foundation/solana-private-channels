@@ -216,7 +216,7 @@ async fn case_c_system_allocate_rejected(ctx: &PrivateChannelContext) {
         .expect_err("System Allocate must be rejected at ingress");
     let msg = err.to_string();
     assert!(
-        msg.contains("Only SPL token") || msg.contains(&INVALID_PARAMS_CODE.to_string()),
+        msg.contains("Only Token-2022") || msg.contains(&INVALID_PARAMS_CODE.to_string()),
         "error must name the allowlist as the cause; got: {msg}"
     );
 
@@ -263,7 +263,7 @@ async fn case_d_system_transfer_rejected(ctx: &PrivateChannelContext) {
         .expect_err("System Transfer must be rejected at ingress");
     let msg = err.to_string();
     assert!(
-        msg.contains("Only SPL token"),
+        msg.contains("Only Token-2022"),
         "error must name the allowlist as the cause; got: {msg}"
     );
 

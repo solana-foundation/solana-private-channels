@@ -114,6 +114,16 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
+    /// Permanent delegate written into every channel mint (base58). Required in write
+    /// and aio modes. A bad value stops startup, unlike an admin key.
+    #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE", value_parser = parse_optional_pubkey)]
+    permanent_delegate: Option<Pubkey>,
+
+    /// Owner of the compliance ATAs, the only place the delegate may move balances to
+    /// (base58). Unset refuses every delegate move.
+    #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER", value_parser = parse_optional_pubkey)]
+    compliance_owner: Option<Pubkey>,
+
     /// Expiry in seconds on cached Redis block and transaction entries; 0 disables it
     #[arg(
         long,
@@ -154,6 +164,10 @@ struct Args {
     metrics: bool,
 }
 
+fn parse_optional_pubkey(value: &str) -> Result<Pubkey, String> {
+    Pubkey::from_str(value.trim()).map_err(|e| format!("invalid pubkey '{value}': {e}"))
+}
+
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
@@ -176,6 +190,10 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
     }
+    info!(
+        "Permanent delegate: {:?}, compliance owner: {:?}",
+        args.permanent_delegate, args.compliance_owner
+    );
 
     let metrics: Arc<dyn private_channel_core::stage_metrics::StageMetrics> = if args.metrics {
         let metrics_port = match std::env::var("PRIVATE_CHANNEL_METRICS_PORT") {
@@ -218,6 +236,8 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         redis_cache_url: args.redis_cache_url.filter(|url| !url.trim().is_empty()),
         redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
+        permanent_delegate: args.permanent_delegate,
+        compliance_owner: args.compliance_owner,
         max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
             args.max_blockhashes,
             args.transaction_expiration_ms,
@@ -340,5 +360,30 @@ mod tests {
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         assert!(err.to_string().contains("--mode"));
+    }
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec![
+            "private-channel-node",
+            "--mode",
+            "aio",
+            "--accountsdb-connection-url",
+            "postgres://localhost/private_channel",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    /// Unlike an admin key, a bad delegate or compliance key stops startup.
+    #[test]
+    fn seize_keys_must_be_valid_pubkeys() {
+        let key = Pubkey::new_unique().to_string();
+        let args = parse(&["--permanent-delegate", &key, "--compliance-owner", &key]).unwrap();
+        assert_eq!(args.permanent_delegate.map(|k| k.to_string()), Some(key));
+        for flag in ["--permanent-delegate", "--compliance-owner"] {
+            assert!(parse(&[flag, "not-a-key"]).is_err(), "{flag}");
+        }
+        let args = parse(&[]).unwrap();
+        assert!(args.permanent_delegate.is_none() && args.compliance_owner.is_none());
     }
 }

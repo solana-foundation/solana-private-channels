@@ -69,6 +69,8 @@ pub struct ExecutionArgs {
     /// The node's shared counters. The executor bumps `admissions` under the
     /// window's read guard, and the settler waits on them before cutting a block.
     pub blockhash_progress: Arc<BlockhashProgress>,
+    /// Delegate the admin VM writes into every mint it creates; None creates none.
+    pub permanent_delegate: Option<Pubkey>,
 }
 
 pub struct ExecutionDeps {
@@ -130,6 +132,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         heartbeat,
         live_blockhashes,
         blockhash_progress,
+        permanent_delegate,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -148,6 +151,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         )
         .await;
         execution_deps.blockhash_progress = blockhash_progress;
+        execution_deps.admin_vm = AdminVm::new(permanent_delegate);
 
         // Stage-private: nothing outside the executor takes from this budget.
         let results_budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
@@ -1494,6 +1498,27 @@ pub async fn execute_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delegate the test admin VM writes into mints.
+    const TEST_DELEGATE: Pubkey = crate::t22_fixtures::GOLDEN_DELEGATE;
+
+    /// `get_execution_deps` with the admin VM able to create mints.
+    async fn test_execution_deps(
+        accounts_db: AccountsDB,
+        settled_accounts: SettledInbox,
+        max_svm_workers: usize,
+        live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    ) -> ExecutionDeps {
+        let mut deps = get_execution_deps(
+            accounts_db,
+            settled_accounts,
+            max_svm_workers,
+            live_blockhashes,
+        )
+        .await;
+        deps.admin_vm = AdminVm::new(Some(TEST_DELEGATE));
+        deps
+    }
     use crate::{
         accounts::bob::BOB, stage_metrics::NoopMetrics, stages::retained_account_bytes,
         test_helpers::start_test_postgres,
@@ -1581,7 +1606,7 @@ mod tests {
         budget: usize,
     ) -> ExecutionDeps {
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.preload_budget_bytes = budget;
         deps
     }
@@ -1593,7 +1618,7 @@ mod tests {
         per_tx_limit: usize,
     ) -> ExecutionDeps {
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.max_tx_loaded_accounts_bytes = per_tx_limit;
         deps
     }
@@ -2146,7 +2171,7 @@ mod tests {
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
     fn data_account(lamports: u64) -> AccountSharedData {
-        AccountSharedData::new(lamports, 8, &spl_token::id())
+        AccountSharedData::new(lamports, 8, &spl_token_2022::id())
     }
 
     /// A dataless system-owned account with `lamports`.
@@ -2753,7 +2778,7 @@ mod tests {
     async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2777,7 +2802,7 @@ mod tests {
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2794,7 +2819,7 @@ mod tests {
     async fn two_step_setup_does_not_graduate_payer() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2828,7 +2853,7 @@ mod tests {
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2846,7 +2871,7 @@ mod tests {
     async fn fabricated_payer_cannot_fund_new_system_accounts() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         for n in [1, FLOAT] {
@@ -2874,22 +2899,32 @@ mod tests {
     async fn fabricated_payer_cannot_launder_the_float_through_an_ata() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
         let p = Keypair::new();
         let r = Pubkey::new_unique();
-        let ata = spl_associated_token_account::get_associated_token_address(&p.pubkey(), &mint);
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &p.pubkey(),
+            &mint,
+            &spl_token_2022::id(),
+        );
         let ixs = [
             spl_associated_token_account::instruction::create_associated_token_account(
                 &p.pubkey(),
                 &p.pubkey(),
                 &mint,
-                &spl_token::id(),
+                &spl_token_2022::id(),
             ),
-            spl_token::instruction::close_account(&spl_token::id(), &ata, &r, &p.pubkey(), &[])
-                .unwrap(),
+            spl_token_2022::instruction::close_account(
+                &spl_token_2022::id(),
+                &ata,
+                &r,
+                &p.pubkey(),
+                &[],
+            )
+            .unwrap(),
         ];
         let result = run_batch(&mut deps, &metrics, vec![admin_tx, payer_tx(&p, &ixs)]).await;
 
@@ -2907,7 +2942,7 @@ mod tests {
     async fn fabricated_payer_cannot_create_five_atas() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
@@ -2920,7 +2955,7 @@ mod tests {
                     &p.pubkey(),
                     w,
                     &mint,
-                    &spl_token::id(),
+                    &spl_token_2022::id(),
                 )
             })
             .collect();
@@ -2929,7 +2964,11 @@ mod tests {
         // The admin tx runs on the admin path, so the attack is regular index 0.
         assert_eq!(regular_status(&result, 0), unbalanced());
         for w in &wallets {
-            let ata = spl_associated_token_account::get_associated_token_address(w, &mint);
+            let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+                w,
+                &mint,
+                &spl_token_2022::id(),
+            );
             assert!(bob_balance(&deps.bob, &ata).is_none(), "{ata} persisted");
         }
     }
@@ -2940,13 +2979,17 @@ mod tests {
     async fn closing_a_persisted_ata_burns_its_lamport() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
         let p = Keypair::new();
         let w = Keypair::new();
-        let ata = spl_associated_token_account::get_associated_token_address(&w.pubkey(), &mint);
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &w.pubkey(),
+            &mint,
+            &spl_token_2022::id(),
+        );
         let setup = run_batch(
             &mut deps,
             &metrics,
@@ -2958,9 +3001,14 @@ mod tests {
 
         let q = Keypair::new();
         let d = Pubkey::new_unique();
-        let ix =
-            spl_token::instruction::close_account(&spl_token::id(), &ata, &d, &w.pubkey(), &[])
-                .unwrap();
+        let ix = spl_token_2022::instruction::close_account(
+            &spl_token_2022::id(),
+            &ata,
+            &d,
+            &w.pubkey(),
+            &[],
+        )
+        .unwrap();
         let msg = Message::new(&[ix], Some(&q.pubkey()));
         let raw = Transaction::new(&[&q, &w], msg, Hash::default());
         let close = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
@@ -2981,7 +3029,7 @@ mod tests {
     async fn gasless_sponsor_succeeds_and_is_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -3010,7 +3058,7 @@ mod tests {
     async fn real_transfer_debits_sender_and_burns_new_recipient() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -3031,13 +3079,17 @@ mod tests {
     async fn ata_creation_under_fabricated_payer_succeeds() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
         let payer = Keypair::new();
         let wallet = Pubkey::new_unique();
-        let ata = spl_associated_token_account::get_associated_token_address(&wallet, &mint);
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &wallet,
+            &mint,
+            &spl_token_2022::id(),
+        );
         let ata_tx = ata_create_tx(&payer, &wallet, &mint);
 
         let result = run_batch(&mut deps, &metrics, vec![admin_tx, ata_tx]).await;
@@ -3064,7 +3116,7 @@ mod tests {
             &payer.pubkey(),
             wallet,
             mint,
-            &spl_token::id(),
+            &spl_token_2022::id(),
         );
         payer_tx(payer, &[ix])
     }
@@ -3078,13 +3130,17 @@ mod tests {
 
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
-        let native = spl_token::native_mint::id();
+        let native = spl_token_2022::native_mint::id();
         let (admin_tx, _) = create_admin_initialize_mint_tx_for(native);
         let wallet = Pubkey::new_unique();
-        let ata = spl_associated_token_account::get_associated_token_address(&wallet, &native);
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &wallet,
+            &native,
+            &spl_token_2022::id(),
+        );
         let ata_tx = ata_create_tx(&Keypair::new(), &wallet, &native);
 
         let result = run_batch(&mut deps, &metrics, vec![admin_tx, ata_tx]).await;
@@ -3099,7 +3155,7 @@ mod tests {
         assert_eq!(
             admin_exec.execution_details.status,
             Err(TransactionError::InstructionError(
-                0,
+                1,
                 InstructionError::InvalidArgument
             )),
             "the native mint must be refused"
@@ -3128,7 +3184,7 @@ mod tests {
 
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -3188,7 +3244,7 @@ mod tests {
     async fn partial_failure_through_svm_is_executed_err_and_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -3243,7 +3299,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
+            test_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         // Above the parallel threshold so SnapshotCallback fabricates the payers.
@@ -3291,7 +3347,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
+            test_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so each worker gets 2× MIN_PARALLEL_BATCH_FACTOR
         // transactions — comfortably inside the parallel regime.
@@ -3324,7 +3380,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
+            test_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         let n = workers * MIN_PARALLEL_BATCH_FACTOR;
         let transactions: Vec<_> = (0..n)
@@ -3358,15 +3414,21 @@ mod tests {
         data[1] = 6; // decimals
         data[2..34].copy_from_slice(&authority.to_bytes());
         data[34] = 0; // no freeze authority
+        let delegate = spl_token_2022::instruction::initialize_permanent_delegate(
+            &spl_token_2022::id(),
+            &mint,
+            &TEST_DELEGATE,
+        )
+        .expect("delegate ix");
         let ix = Instruction {
-            program_id: spl_token::id(),
+            program_id: spl_token_2022::id(),
             accounts: vec![
                 AccountMeta::new(mint, false),
                 AccountMeta::new(payer.pubkey(), true),
             ],
             data,
         };
-        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let msg = Message::new(&[delegate, ix], Some(&payer.pubkey()));
         let tx = Transaction::new(&[&payer], msg, Hash::default());
         let sanitized = SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
             .expect("failed to create admin init-mint tx");
@@ -3387,7 +3449,7 @@ mod tests {
         data[1] = 6;
         data[2..34].copy_from_slice(&authority.to_bytes());
         let init_mint_ix = Instruction {
-            program_id: spl_token::id(),
+            program_id: spl_token_2022::id(),
             accounts: vec![
                 AccountMeta::new(mint, false),
                 AccountMeta::new(payer.pubkey(), true),
@@ -3407,7 +3469,7 @@ mod tests {
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let empty_batch = ConflictFreeBatch {
             transactions: vec![],
@@ -3425,7 +3487,7 @@ mod tests {
     async fn test_execute_batch_single_normal_transaction() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_test_transaction();
         let batch = ConflictFreeBatch {
@@ -3453,7 +3515,7 @@ mod tests {
     async fn test_execute_batch_multiple_normal_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx1 = create_test_transaction();
         let tx2 = create_test_transaction();
@@ -3488,7 +3550,7 @@ mod tests {
 
         let known = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([known])));
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
 
         // Two txs using the known (live) hash + one tx using an expired hash.
         let payer = Keypair::new();
@@ -3548,7 +3610,7 @@ mod tests {
 
         let bh = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([bh])));
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch_with = |payer: &Keypair| ConflictFreeBatch {
@@ -3609,6 +3671,7 @@ mod tests {
             max_svm_workers: 4,
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
+            permanent_delegate: None,
         })
         .await;
 
@@ -3639,7 +3702,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
+            test_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so the batch is comfortably in the
         // parallel regime and splits into multiple chunks.
@@ -3690,7 +3753,7 @@ mod tests {
         let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
+            test_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 17 is intentional: > threshold (16), not divisible by 4, last
         // chunk is much smaller than the others.
@@ -3743,7 +3806,7 @@ mod tests {
     async fn test_max_svm_workers_one_forces_sequential() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
 
         // Deliberately well above any reasonable parallel threshold — with
         // workers=2 this size would split; with workers=1 the gate keeps
@@ -3935,6 +3998,7 @@ mod tests {
             max_svm_workers: 4,
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
+            permanent_delegate: None,
         })
         .await;
 
@@ -3955,7 +4019,7 @@ mod tests {
         // A tx whose only instruction is an admin instruction routes to the Admin VM.
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (tx, _mint) = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
@@ -3981,7 +4045,7 @@ mod tests {
         // path stays strictly single-purpose.
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_mixed_admin_and_regular_tx();
         let batch = ConflictFreeBatch {
@@ -4008,7 +4072,7 @@ mod tests {
     async fn test_execute_batch_partitions_admin_and_regular_separately() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (admin_tx, _mint) = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();
@@ -4068,6 +4132,7 @@ mod tests {
             max_svm_workers: 1,
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::clone(&progress),
+            permanent_delegate: None,
         })
         .await;
 
@@ -4129,6 +4194,7 @@ mod tests {
             max_svm_workers: 1,
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
+            permanent_delegate: None,
         })
         .await;
 
@@ -4169,7 +4235,7 @@ mod tests {
 
         set_test_retry(2, 1);
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(
+        let mut deps = test_execution_deps(
             crate::test_helpers::dead_postgres_db(),
             inbox,
             1,
@@ -4256,7 +4322,7 @@ mod tests {
         insert_corrupt_pg(&accounts_db, corrupt).await;
 
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch = ConflictFreeBatch {
@@ -4282,7 +4348,7 @@ mod tests {
         insert_corrupt_pg(&accounts_db, unref).await;
 
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let result = run_batch(
@@ -4426,7 +4492,7 @@ mod tests {
         let big = seed_sized_accounts(&mut accounts_db, 7, BIG_ACCOUNT_BYTES).await;
 
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let oversized_payer = Keypair::new();
@@ -4568,7 +4634,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_batch_runs_a_warm_batch_without_the_store() {
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(
+        let mut deps = test_execution_deps(
             crate::test_helpers::dead_postgres_db(),
             inbox,
             1,
@@ -4633,7 +4699,7 @@ mod tests {
             data[1] = 6;
             data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
             let ix = Instruction {
-                program_id: spl_token::id(),
+                program_id: spl_token_2022::id(),
                 accounts: vec![
                     AccountMeta::new(Pubkey::new_unique(), false),
                     AccountMeta::new(payer.pubkey(), true),
@@ -4720,7 +4786,7 @@ mod tests {
         );
 
         // Admin and regular in one admission: only the later send is tagged.
-        let mut deps = get_execution_deps(
+        let mut deps = test_execution_deps(
             crate::accounts::AccountsDB::new(&url, true).await.unwrap(),
             SettledInbox::new(),
             1,
@@ -4796,7 +4862,7 @@ mod tests {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let tx = transfer_with_unused_readonly(&Keypair::new(), &[readonly]);
@@ -4846,7 +4912,7 @@ mod tests {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let readonly = seed_sized_accounts(&mut accounts_db, 2, 4096).await;
         let inbox = SettledInbox::new();
-        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let mut deps = test_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let tx = transfer_with_unused_readonly(&Keypair::new(), &readonly);
@@ -4962,7 +5028,7 @@ mod tests {
     async fn the_final_check_counts_an_admission_only_when_something_runs() {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let big = seed_sized_accounts(&mut accounts_db, 1, 2_000).await;
-        let mut deps = get_execution_deps(
+        let mut deps = test_execution_deps(
             accounts_db.clone(),
             SettledInbox::new(),
             1,
@@ -5100,7 +5166,7 @@ mod tests {
             let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
+            let mut deps = test_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 
             let (admin_tx, _mint) = create_admin_initialize_mint_tx();
@@ -5165,7 +5231,7 @@ mod tests {
             let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
+            let mut deps = test_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             deps.max_tx_loaded_accounts_bytes = 1_000;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 

@@ -94,7 +94,13 @@ pub struct NodeConfig {
     /// Expiry in seconds on cached block and transaction entries, bounding cache
     /// growth. Zero disables it.
     pub redis_block_ttl_secs: u64,
-    pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
+    pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass token program execution
+    /// Permanent delegate written into every channel mint and the only key the seize
+    /// rule polices. Required by write modes, which create mints.
+    pub permanent_delegate: Option<Pubkey>,
+    /// Owner of the compliance ATAs, the only place the delegate may move balances to.
+    /// None refuses every delegate move.
+    pub compliance_owner: Option<Pubkey>,
     /// How many blocks a blockhash stays valid for. A block count, not a
     /// duration: blocks come from traffic and from the idle heartbeat, so the
     /// wall-clock window moves with load exactly as it does on Solana. Read
@@ -160,6 +166,8 @@ impl Default for NodeConfig {
             redis_cache_url: None,
             redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
             admin_keys: vec![],         // No admin keys by default
+            permanent_delegate: None,
+            compliance_owner: None,
             max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
             allow_max_blockhashes_increase: false,
             blocktime_ms: DEFAULT_BLOCKTIME_MS,
@@ -300,6 +308,28 @@ pub const MAX_RPC_CONNECTIONS: usize = 10_000_000;
 /// Largest accepted `perf_sample_period_secs`: the settle stage stores it as a u16.
 pub const MAX_PERF_SAMPLE_PERIOD_SECS: u64 = u16::MAX as u64;
 
+/// Refuses seize keys that provably cannot work: a write node with no delegate could
+/// never create a mint, and a compliance owner equal to the delegate voids the seize
+/// rule because the delegate's own ATA is exempt from it.
+fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
+    if matches!(config.mode, NodeMode::Write | NodeMode::Aio) && config.permanent_delegate.is_none()
+    {
+        return Err(
+            "permanent_delegate (PRIVATE_CHANNEL_PERMANENT_DELEGATE) is required in write \
+             and aio modes: every channel mint is created with it"
+                .into(),
+        );
+    }
+    if config.compliance_owner.is_some() && config.compliance_owner == config.permanent_delegate {
+        return Err(
+            "compliance_owner (PRIVATE_CHANNEL_COMPLIANCE_OWNER) must differ from \
+             permanent_delegate (PRIVATE_CHANNEL_PERMANENT_DELEGATE)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
     if config.blocktime_ms == 0 {
@@ -379,6 +409,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             .into());
         }
     }
+    validate_seize_config(&config)?;
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
@@ -444,6 +475,15 @@ async fn start_services(
 
     // Set only for Aio with Redis; the read path waits on it below.
     let mut cache_aligned_rx = None;
+
+    // Sigverify and simulate admit transactions under the same keys.
+    let ingress_policy = crate::transactions::IngressPolicy {
+        admin_keys: config.admin_keys.clone(),
+        seize: crate::transactions::SeizePolicy {
+            delegate: config.permanent_delegate,
+            compliance_owner: config.compliance_owner,
+        },
+    };
 
     // Only create write pipeline for Write and Aio modes
     let write_deps = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
@@ -537,7 +577,7 @@ async fn start_services(
         // dedup so only verified transactions ever reach the dedup cache.
         let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
             num_workers: config.sigverify_workers,
-            admin_keys: config.admin_keys.clone(),
+            policy: ingress_policy.clone(),
             rx: ingress_rx,
             output_tx: dedup_tx,
             metrics: Arc::clone(&config.metrics),
@@ -585,6 +625,7 @@ async fn start_services(
             heartbeat: executor_hb,
             live_blockhashes: Arc::clone(&live_blockhashes),
             blockhash_progress: Arc::clone(&blockhash_progress),
+            permanent_delegate: config.permanent_delegate,
         })
         .await;
         workers.push(execution);
@@ -665,7 +706,7 @@ async fn start_services(
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
             Some(ReadDeps {
-                admin_keys: config.admin_keys,
+                ingress: ingress_policy,
                 accounts_db,
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
@@ -1225,5 +1266,58 @@ mod tests {
             result.err().unwrap().to_string(),
             "sequencer_queue_capacity (PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY) must be greater than 0"
         );
+    }
+
+    fn seize_config(
+        mode: NodeMode,
+        delegate: Option<Pubkey>,
+        compliance_owner: Option<Pubkey>,
+    ) -> NodeConfig {
+        NodeConfig {
+            mode,
+            permanent_delegate: delegate,
+            compliance_owner,
+            ..Default::default()
+        }
+    }
+
+    /// A write node with no delegate could never create a mint, so it refuses to start.
+    #[tokio::test]
+    async fn write_modes_without_a_delegate_refuse_to_start() {
+        for mode in [NodeMode::Write, NodeMode::Aio] {
+            let err = run_node(seize_config(mode.clone(), None, None))
+                .await
+                .err()
+                .expect("must refuse");
+            assert!(
+                err.to_string()
+                    .contains("PRIVATE_CHANNEL_PERMANENT_DELEGATE"),
+                "{mode:?}: {err}"
+            );
+        }
+        assert!(validate_seize_config(&seize_config(NodeMode::Read, None, None)).is_ok());
+    }
+
+    /// The delegate's own ATA is exempt from the seize rule, so the compliance owner
+    /// must be another key or one key could seize and move the funds anywhere.
+    #[tokio::test]
+    async fn compliance_owner_equal_to_the_delegate_refuses_to_start() {
+        let key = Pubkey::new_unique();
+        for mode in [NodeMode::Read, NodeMode::Write, NodeMode::Aio] {
+            let err = run_node(seize_config(mode.clone(), Some(key), Some(key)))
+                .await
+                .err()
+                .expect("must refuse");
+            assert!(
+                err.to_string().contains("PRIVATE_CHANNEL_COMPLIANCE_OWNER"),
+                "{mode:?}: {err}"
+            );
+        }
+        let other = Pubkey::new_unique();
+        for (delegate, compliance) in [(Some(key), Some(other)), (Some(key), None)] {
+            assert!(
+                validate_seize_config(&seize_config(NodeMode::Aio, delegate, compliance)).is_ok()
+            );
+        }
     }
 }
