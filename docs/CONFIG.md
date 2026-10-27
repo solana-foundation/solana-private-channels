@@ -55,6 +55,8 @@ The wall-clock duration of the window therefore moves with load, which is also h
 
 Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points to a PostgreSQL replica for read isolation.
 
+`simulateTransaction` is served here, so give the read node the same `PRIVATE_CHANNEL_ADMIN_KEYS`, `PRIVATE_CHANNEL_PERMANENT_DELEGATE` and `PRIVATE_CHANNEL_COMPLIANCE_OWNER` as the write node; otherwise a `sigVerify` simulation does not apply the admin and seize rules the write node enforces. The shipped compose files do this.
+
 `GATEWAY_READ_URL` must be exactly one read node on one replica. Load-balancing several read nodes or replicas behind it is not supported: clients decide when to re-sign by reading `getBlockHeight` and then `getSignatureStatuses`, and that is only safe when both reads see the same replica.
 
 ### Gateway

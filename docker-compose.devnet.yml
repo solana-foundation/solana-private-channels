@@ -220,6 +220,10 @@ services:
       - PRIVATE_CHANNEL_LOG_LEVEL=info
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=read
+      # simulateTransaction is served here, so it applies the same admin and seize rules.
+      - PRIVATE_CHANNEL_ADMIN_KEYS=${PRIVATE_CHANNEL_ADMIN_KEYS}
+      - PRIVATE_CHANNEL_PERMANENT_DELEGATE=${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_ADMIN_KEYS}}
+      - PRIVATE_CHANNEL_COMPLIANCE_OWNER
     ports:
       - "127.0.0.1:${PRIVATE_CHANNEL_READ_PORT}:${PRIVATE_CHANNEL_READ_PORT}"
     command: ["/usr/local/bin/private-channel-node"]

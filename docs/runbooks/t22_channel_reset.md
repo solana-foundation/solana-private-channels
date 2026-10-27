@@ -122,6 +122,10 @@ the `pg-backup-*` sidecars stay up.
    The replica follows the primary. If Redis is configured, clear it:
    `redis-cli -u <redis-url> FLUSHDB`.
 
+3. Check the wipe: `SELECT count(*) FROM accounts` must return 0. Do not skip this.
+   The solvency check reads a channel mint that Token-2022 does not own as supply 0,
+   so a leftover SPL mint would hide its old supply without any alert.
+
 ## 5. Configure
 
 Set, in the env file the stack starts from (or `permanent_delegate` and

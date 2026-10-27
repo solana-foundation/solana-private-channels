@@ -95,3 +95,5 @@ The permanent delegate is one value with two names: `PRIVATE_CHANNEL_PERMANENT_D
 for the node and `OPERATOR_PERMANENT_DELEGATE` for the operators. They must be equal.
 Compose fills a blank node value from `PRIVATE_CHANNEL_ADMIN_KEYS` and a blank operator
 value from the node's, and the Ansible deploy renders both from `permanent_delegate`.
+The read node gets the same admin keys, delegate and compliance owner as the write node,
+because it serves `simulateTransaction`.
