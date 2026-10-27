@@ -20,6 +20,10 @@ name = "ordered_shutdown_e2e"
 path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
 
 [[test]]
+name = "t22_golden"
+path = "tests/private-channel/test_t22_golden.rs"
+
+[[test]]
 name = "v1_transaction_e2e"
 path = "tests/private-channel/test_v1_transaction_e2e.rs"
 

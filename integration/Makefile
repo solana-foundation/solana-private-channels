@@ -36,6 +36,7 @@ integration-test:
 	@cargo test --test ingress_backpressure -- --nocapture
 	@cargo test --test ordered_shutdown_e2e -- --nocapture
 	@cargo test --test v1_transaction_e2e -- --nocapture
+	@cargo test --test t22_golden -- --nocapture
 	@cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== Building escrow with test-tree for test-tree-feature group ==="
 	@$(MAKE) -C ../private-channel-escrow-program build-test
@@ -204,6 +205,7 @@ integration-coverage-private-channel:
 	@cargo llvm-cov test --no-report --workspace --test ordered_shutdown_e2e -- --nocapture
 	@echo "Running v1 transaction end-to-end tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test v1_transaction_e2e -- --nocapture
+	@cargo llvm-cov test --no-report --workspace --test t22_golden -- --nocapture
 
 # Redis cache coverage.
 # Runs Postgres+Redis nodes to cover the settle worker's cache setup, the
