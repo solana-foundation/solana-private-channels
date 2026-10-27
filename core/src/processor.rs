@@ -64,6 +64,18 @@ pub struct BatchProcessor {
     pub environments: ProgramRuntimeEnvironments,
 }
 
+/// BPF programs loaded into the program cache; must match the precompiles loaded in BOB.
+fn cached_bpf_programs() -> [solana_sdk::pubkey::Pubkey; 6] {
+    [
+        spl_token::id(),
+        spl_token_2022::id(),
+        spl_associated_token_account::id(),
+        spl_memo::id(),
+        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        dvp_swap_program_client::DVP_SWAP_PROGRAM_ID,
+    ]
+}
+
 /// This function encapsulates some initial setup required to tweak the
 /// `TransactionBatchProcessor` for use within PrivateChannel.
 ///
@@ -90,18 +102,8 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
     {
         let mut cache = processor.global_program_cache.write().unwrap();
 
-        // List of BPF programs to load into the cache
-        // These should match the precompiles loaded in BOB
-        let bpf_programs = [
-            spl_token::id(),
-            spl_associated_token_account::id(),
-            spl_memo::id(),
-            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-            dvp_swap_program_client::DVP_SWAP_PROGRAM_ID,
-        ];
-
         // Loop over all BPF programs and add them to the cache
-        for program_id in bpf_programs {
+        for program_id in cached_bpf_programs() {
             // The slot beside the account is where it was last modified, which
             // this store does not track; the processor runs at slot zero.
             if let Some((program_account, _slot)) = accounts_db.get_account_shared_data(&program_id)
@@ -290,6 +292,19 @@ mod tests {
             &batch.processor.program_runtime_environment,
             "deployment environment must be the processor's own for the same reason"
         );
+    }
+
+    /// Every BPF precompile must be in the program cache, or calls to it fail.
+    #[test]
+    fn every_bpf_precompile_is_cached() {
+        use solana_sdk::account::ReadableAccount;
+        let cached = cached_bpf_programs();
+        for (id, account) in crate::accounts::precompiles::PRECOMPILES.iter() {
+            if *account.owner() == solana_sdk::bpf_loader::id() {
+                assert!(cached.contains(id), "{id} is a precompile but not cached");
+            }
+        }
+        assert!(cached.contains(&spl_token_2022::id()));
     }
 
     #[test]

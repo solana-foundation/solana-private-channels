@@ -55,6 +55,15 @@ fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
         bpf_loader_program_account(&spl_token::ID, spl_token_elf, &rent);
     precompiles.insert(spl_token_id, AccountSharedData::from(spl_token_account));
 
+    // Token-2022 v11.1.0, the build deployed on mainnet.
+    let spl_token_2022_elf = include_bytes!("../../precompiles/spl_token_2022-11.1.0.so");
+    let (spl_token_2022_id, spl_token_2022_account) =
+        bpf_loader_program_account(&spl_token_2022::ID, spl_token_2022_elf, &rent);
+    precompiles.insert(
+        spl_token_2022_id,
+        AccountSharedData::from(spl_token_2022_account),
+    );
+
     // Associated Token Account v1.1.1.
     let ata_elf = include_bytes!("../../precompiles/spl_associated_token_account-1.1.1.so");
     let (ata_id, ata_account) =
@@ -118,10 +127,16 @@ mod tests {
     const DVP_SWAP_PROGRAM_SHA256: &str =
         "3aec277fbd59f74afbc6d3807212a384a4bbd16ae845de7d048d9eff2fb3d1f8";
 
+    /// SHA-256 of `precompiles/spl_token_2022-11.1.0.so`, the mainnet Token-2022 program
+    /// (`program@v11.1.0`) dumped with `solana program dump -u m TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`.
+    const SPL_TOKEN_2022_SHA256: &str =
+        "15a2e615a42e20f31714bbaaee43002ae6f1cda2e8d7118243117ab3c1342e2d";
+
     #[test]
     fn precompiles_contains_expected_entries() {
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::system_program::ID));
         assert!(PRECOMPILES.contains_key(&spl_token::ID));
+        assert!(PRECOMPILES.contains_key(&spl_token_2022::ID));
         assert!(PRECOMPILES.contains_key(&spl_associated_token_account::ID));
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::sysvar::rent::ID));
         assert!(PRECOMPILES.contains_key(&spl_memo::id()));
@@ -129,13 +144,14 @@ mod tests {
             &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
         ));
         assert!(PRECOMPILES.contains_key(&dvp_swap_program_client::DVP_SWAP_PROGRAM_ID));
-        assert_eq!(PRECOMPILES.len(), 7);
+        assert_eq!(PRECOMPILES.len(), 8);
     }
 
     #[test]
     fn precompile_programs_are_executable_with_elf_data() {
         for program_id in [
             spl_token::ID,
+            spl_token_2022::ID,
             spl_associated_token_account::ID,
             spl_memo::id(),
             private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
@@ -158,6 +174,19 @@ mod tests {
             DVP_SWAP_PROGRAM_SHA256,
             "dvp_swap_program.so changed: update the pin and the provenance in \
              dvp-swap-program/README.md together"
+        );
+    }
+
+    /// A swapped Token-2022 binary must arrive with a visible change to this pin.
+    #[test]
+    fn token_2022_program_matches_the_pinned_mainnet_build() {
+        let account = PRECOMPILES
+            .get(&spl_token_2022::ID)
+            .expect("missing Token-2022 precompile");
+        assert_eq!(
+            hex::encode(Sha256::digest(account.data())),
+            SPL_TOKEN_2022_SHA256,
+            "spl_token_2022 .so changed: update the pin and its provenance together"
         );
     }
 
