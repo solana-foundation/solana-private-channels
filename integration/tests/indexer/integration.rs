@@ -125,13 +125,13 @@ async fn setup_test_environments(
         let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &user.pubkey(),
             &env.mint,
-            &spl_token::ID,
+            &spl_token_2022::ID,
         );
         let instance_ata =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &env.instance,
                 &env.mint,
-                &spl_token::ID,
+                &spl_token_2022::ID,
             );
 
         let deposit_ix = private_channel_escrow_program_client::instructions::DepositBuilder::new()
@@ -143,7 +143,7 @@ async fn setup_test_environments(
             .user_ata(user_ata)
             .instance_ata(instance_ata)
             .system_program(solana_system_interface::program::ID)
-            .token_program(spl_token::ID)
+            .token_program(spl_token_2022::ID)
             .associated_token_program(spl_associated_token_account::ID)
             .event_authority(event_authority_pda)
             .private_channel_escrow_program(

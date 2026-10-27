@@ -18,11 +18,9 @@ use {
     private_channel_indexer::storage::{common::amount::TokenAmount, TransactionType},
     solana_account_decoder_client_types::UiAccountData,
     solana_pubkey::Pubkey,
-    solana_sdk::{
-        program_pack::Pack, signature::Keypair, signer::Signer, transaction::Transaction,
-    },
+    solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
     spl_associated_token_account::get_associated_token_address_with_program_id,
-    spl_token::state::Account as TokenAccount,
+    spl_token_2022::{extension::StateWithExtensions, state::Account as TokenAccount},
     std::time::Duration,
     test_utils::mint_helper::{
         TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
@@ -551,18 +549,21 @@ async fn setup_private_channel_accounts(
     println!("\n=== Step 3: PrivateChannel Token Operations ===");
     println!("Using mint: {}", mint_pubkey);
 
-    // We only have SPL token on PrivateChannel
+    // Channel token accounts are Token-2022 ATAs
     let alice_token_account = get_associated_token_address_with_program_id(
         &alice.pubkey(),
         mint_pubkey,
-        &spl_token::id(),
+        &spl_token_2022::id(),
     );
-    let bob_token_account =
-        get_associated_token_address_with_program_id(&bob.pubkey(), mint_pubkey, &spl_token::id());
+    let bob_token_account = get_associated_token_address_with_program_id(
+        &bob.pubkey(),
+        mint_pubkey,
+        &spl_token_2022::id(),
+    );
     let charlie_token_account = get_associated_token_address_with_program_id(
         &charlie.pubkey(),
         mint_pubkey,
-        &spl_token::id(),
+        &spl_token_2022::id(),
     );
 
     // Wait for the operator to mint tokens based on Solana deposits
@@ -736,11 +737,11 @@ async fn private_channel_burn(
 ) {
     println!("\n=== Step 4: PrivateChannel Withdrawals ===");
 
-    // We only have SPL token on PrivateChannel
+    // Channel token accounts are Token-2022 ATAs
     let alice_token_account = get_associated_token_address_with_program_id(
         &alice.pubkey(),
         mint_pubkey,
-        &spl_token::id(),
+        &spl_token_2022::id(),
     );
 
     // Calculate expected balance before withdrawal
@@ -980,10 +981,16 @@ async fn test_simulate_transaction(
     amount: u64,
     tx_type: setup::TransactionType,
 ) -> Result<()> {
-    let from_ata =
-        get_associated_token_address_with_program_id(&from.pubkey(), mint_pubkey, &spl_token::id());
-    let to_ata =
-        get_associated_token_address_with_program_id(&to.pubkey(), mint_pubkey, &spl_token::id());
+    let from_ata = get_associated_token_address_with_program_id(
+        &from.pubkey(),
+        mint_pubkey,
+        &spl_token_2022::id(),
+    );
+    let to_ata = get_associated_token_address_with_program_id(
+        &to.pubkey(),
+        mint_pubkey,
+        &spl_token_2022::id(),
+    );
     let from_balance_before = private_channel_ctx
         .get_token_balance(&from_ata)
         .await
@@ -1048,9 +1055,11 @@ async fn test_simulate_transaction(
             let bytes = STANDARD.decode(data_str).unwrap_or_else(|e| {
                 panic!("Failed to decode {} account data: {}", label, e);
             });
-            TokenAccount::unpack(&bytes).unwrap_or_else(|e| {
-                panic!("Failed to unpack {} token account data: {}", label, e);
-            })
+            StateWithExtensions::<TokenAccount>::unpack(&bytes)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to unpack {} token account data: {}", label, e);
+                })
+                .base
         };
 
     let from_account = accounts

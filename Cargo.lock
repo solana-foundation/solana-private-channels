@@ -6391,6 +6391,7 @@ dependencies = [
  "borsh 1.8.1",
  "bs58",
  "chrono",
+ "devnet-scripts",
  "dvp-swap-program-client",
  "http-body-util",
  "hyper 1.11.1",

@@ -179,7 +179,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;

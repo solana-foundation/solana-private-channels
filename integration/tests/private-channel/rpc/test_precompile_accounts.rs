@@ -24,8 +24,8 @@ pub async fn run_precompile_accounts_test(private_channel_ctx: &PrivateChannelCo
             expect_empty_data: false,
         },
         TestPrecompile {
-            pubkey: spl_token::ID,
-            name: "SPL Token Program",
+            pubkey: spl_token_2022::ID,
+            name: "Token-2022 Program",
             executable: true,
             expect_empty_data: false,
         },
@@ -52,11 +52,16 @@ pub async fn run_precompile_accounts_test(private_channel_ctx: &PrivateChannelCo
     for precompile in precompiles {
         println!("  Testing {}: {}", precompile.name, precompile.pubkey);
 
-        // Get account info
-        let account = private_channel_ctx
-            .read_client
-            .get_account(&precompile.pubkey)
-            .await;
+        // The 1.4 MB Token-2022 ELF is over the account response budget, so it is
+        // read through a dataSlice like any oversized account.
+        let account = if precompile.pubkey == spl_token_2022::ID {
+            read_sliced(private_channel_ctx, &precompile.pubkey).await
+        } else {
+            private_channel_ctx
+                .read_client
+                .get_account(&precompile.pubkey)
+                .await
+        };
         println!("Account info: {:?}", account);
 
         let account = match account {
@@ -100,4 +105,24 @@ pub async fn run_precompile_accounts_test(private_channel_ctx: &PrivateChannelCo
     }
 
     println!("=== Precompile Account Info Test Passed ===\n");
+}
+
+async fn read_sliced(
+    private_channel_ctx: &PrivateChannelContext,
+    pubkey: &solana_sdk::pubkey::Pubkey,
+) -> solana_client::client_error::Result<solana_sdk::account::Account> {
+    let config = solana_client::rpc_config::RpcAccountInfoConfig {
+        encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+        data_slice: Some(solana_account_decoder_client_types::UiDataSliceConfig {
+            offset: 0,
+            length: 64,
+        }),
+        ..Default::default()
+    };
+    let response = private_channel_ctx
+        .read_client
+        .get_ui_account_with_config(pubkey, config)
+        .await?;
+    let account = response.value.expect("precompile account exists");
+    Ok(account.to_account().expect("base64 account decodes"))
 }

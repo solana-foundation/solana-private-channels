@@ -197,7 +197,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -367,7 +367,7 @@ async fn setup_gate_env(db_name: &str) -> Result<GateEnv, Box<dyn std::error::Er
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;

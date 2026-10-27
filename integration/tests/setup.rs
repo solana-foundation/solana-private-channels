@@ -7,18 +7,23 @@ use {
         hash::Hash,
         message::compiled_instruction::CompiledInstruction,
         message::{v0, v0::MessageAddressTableLookup, Message, MessageHeader, VersionedMessage},
-        program_pack::Pack,
         pubkey::Pubkey,
         signature::Keypair,
         signer::Signer,
         transaction::{Transaction, VersionedTransaction},
     },
     solana_system_interface::program as system_program,
-    spl_associated_token_account::{
-        get_associated_token_address, get_associated_token_address_with_program_id,
+    spl_associated_token_account::get_associated_token_address_with_program_id,
+    spl_token_2022::{
+        extension::StateWithExtensions,
+        state::{Account as TokenAccount, Mint},
     },
-    spl_token::state::{Account as TokenAccount, Mint},
 };
+
+/// Channel token accounts are Token-2022 ATAs.
+pub fn get_associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    get_associated_token_address_with_program_id(owner, mint, &spl_token_2022::ID)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionType {
@@ -27,7 +32,10 @@ pub enum TransactionType {
 }
 
 pub fn get_token_account_balance(data: &[u8]) -> u64 {
-    TokenAccount::unpack(data).unwrap().amount
+    StateWithExtensions::<TokenAccount>::unpack(data)
+        .unwrap()
+        .base
+        .amount
 }
 
 pub fn create_mint_account_transaction(
@@ -37,10 +45,16 @@ pub fn create_mint_account_transaction(
     decimals: u8,
     recent_blockhash: Hash,
 ) -> Transaction {
-    // PrivateChannel's admin VM creates the account automatically, so only initialize_mint
-    // is needed and the mint keypair does NOT sign.
-    let init_mint_ix = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
+    // PrivateChannel's admin VM creates the account automatically, so the mint keypair
+    // does NOT sign. The suites configure the node's permanent delegate as the paying admin.
+    let delegate_ix = spl_token_2022::instruction::initialize_permanent_delegate(
+        &spl_token_2022::id(),
+        &mint_keypair.pubkey(),
+        &payer.pubkey(),
+    )
+    .unwrap();
+    let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
+        &spl_token_2022::id(),
         &mint_keypair.pubkey(),
         mint_authority,
         None,
@@ -49,7 +63,7 @@ pub fn create_mint_account_transaction(
     .unwrap();
 
     Transaction::new_signed_with_payer(
-        &[init_mint_ix],
+        &[delegate_ix, init_mint_ix],
         Some(&payer.pubkey()),
         &[payer],
         recent_blockhash,
@@ -64,8 +78,8 @@ pub fn mint_to_transaction(
     amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
-    let mint_to_ix = spl_token::instruction::mint_to(
-        &spl_token::id(),
+    let mint_to_ix = spl_token_2022::instruction::mint_to(
+        &spl_token_2022::id(),
         mint,
         destination,
         mint_authority,
@@ -91,8 +105,9 @@ pub fn transfer_tokens_transaction(
 ) -> Transaction {
     let from_token_account = get_associated_token_address(&from.pubkey(), mint);
     let to_token_account = get_associated_token_address(to, mint);
-    let transfer_ix = spl_token::instruction::transfer(
-        &spl_token::id(),
+    #[allow(deprecated)]
+    let transfer_ix = spl_token_2022::instruction::transfer(
+        &spl_token_2022::id(),
         &from_token_account,
         &to_token_account,
         &from.pubkey(),
@@ -163,8 +178,9 @@ pub fn transfer_tokens_versioned_transaction(
 ) -> VersionedTransaction {
     let from_token_account = get_associated_token_address(&from.pubkey(), mint);
     let to_token_account = get_associated_token_address(to, mint);
-    let transfer_ix = spl_token::instruction::transfer(
-        &spl_token::id(),
+    #[allow(deprecated)]
+    let transfer_ix = spl_token_2022::instruction::transfer(
+        &spl_token_2022::id(),
         &from_token_account,
         &to_token_account,
         &from.pubkey(),
@@ -208,19 +224,19 @@ pub fn withdraw_funds_transaction(
     };
 
     let token_account =
-        get_associated_token_address_with_program_id(&from.pubkey(), mint, &spl_token::ID);
+        get_associated_token_address_with_program_id(&from.pubkey(), mint, &spl_token_2022::ID);
     let (withdraw_config, _) = Pubkey::find_program_address(
         &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     );
     let treasury_token_account =
-        get_associated_token_address_with_program_id(treasury, mint, &spl_token::ID);
+        get_associated_token_address_with_program_id(treasury, mint, &spl_token_2022::ID);
 
     let withdraw_ix = WithdrawFundsBuilder::new()
         .user(from.pubkey())
         .mint(*mint)
         .token_account(token_account)
-        .token_program(spl_token::id())
+        .token_program(spl_token_2022::id())
         .associated_token_program(spl_associated_token_account::id())
         .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
@@ -285,8 +301,8 @@ pub fn create_dvp_transaction(
         mint_b,
         nonce,
     );
-    let dvp_ata_a = get_associated_token_address_with_program_id(&swap_dvp, mint_a, &spl_token::ID);
-    let dvp_ata_b = get_associated_token_address_with_program_id(&swap_dvp, mint_b, &spl_token::ID);
+    let dvp_ata_a = get_associated_token_address(&swap_dvp, mint_a);
+    let dvp_ata_b = get_associated_token_address(&swap_dvp, mint_b);
     let (nonce_tombstone, _) =
         Pubkey::find_program_address(&[b"nonce", swap_dvp.as_ref()], &DVP_SWAP_PROGRAM_ID);
 
@@ -299,8 +315,8 @@ pub fn create_dvp_transaction(
         .mint_b(*mint_b)
         .dvp_ata_a(dvp_ata_a)
         .dvp_ata_b(dvp_ata_b)
-        .token_program_a(spl_token::ID)
-        .token_program_b(spl_token::ID)
+        .token_program_a(spl_token_2022::ID)
+        .token_program_b(spl_token_2022::ID)
         .user_a(user_a)
         .user_b(user_b)
         .settlement_authority(settlement_authority)
@@ -316,10 +332,10 @@ pub fn create_dvp_transaction(
     Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], recent_blockhash)
 }
 
-/// Fund a DvP leg by issuing a plain SPL transfer from the signer's ATA
-/// to the DvP's escrow ATA. The swap program no longer has a `FundDvp`
-/// instruction — funding is intentionally an out-of-band SPL transfer so
-/// custodian integrations need no custom program call.
+/// Fund a DvP leg by issuing a plain token transfer from the signer's ATA
+/// to the DvP's escrow ATA. The swap program has no `FundDvp` instruction:
+/// funding is intentionally an out-of-band transfer so custodian
+/// integrations need no custom program call.
 pub fn fund_dvp_transaction(
     signer: &Keypair,
     swap_dvp: Pubkey,
@@ -327,13 +343,12 @@ pub fn fund_dvp_transaction(
     amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
-    let signer_source_ata =
-        get_associated_token_address_with_program_id(&signer.pubkey(), leg_mint, &spl_token::ID);
-    let dvp_dest_ata =
-        get_associated_token_address_with_program_id(&swap_dvp, leg_mint, &spl_token::ID);
+    let signer_source_ata = get_associated_token_address(&signer.pubkey(), leg_mint);
+    let dvp_dest_ata = get_associated_token_address(&swap_dvp, leg_mint);
 
-    let ix = spl_token::instruction::transfer(
-        &spl_token::ID,
+    #[allow(deprecated)]
+    let ix = spl_token_2022::instruction::transfer(
+        &spl_token_2022::ID,
         &signer_source_ata,
         &dvp_dest_ata,
         &signer.pubkey(),
@@ -354,14 +369,20 @@ pub fn mixed_transaction(
     amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
-    let init_mint_ix =
-        spl_token::instruction::initialize_mint(&spl_token::id(), mint, mint_authority, None, 3)
-            .unwrap();
+    let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
+        &spl_token_2022::id(),
+        mint,
+        mint_authority,
+        None,
+        3,
+    )
+    .unwrap();
 
     let from_token_account = get_associated_token_address(&non_admin.pubkey(), mint);
     let to_token_account = get_associated_token_address(&admin.pubkey(), mint);
-    let transfer_ix = spl_token::instruction::transfer(
-        &spl_token::id(),
+    #[allow(deprecated)]
+    let transfer_ix = spl_token_2022::instruction::transfer(
+        &spl_token_2022::id(),
         &from_token_account,
         &to_token_account,
         &non_admin.pubkey(),
@@ -383,21 +404,16 @@ pub fn mint_account() -> AccountSharedData {
 }
 
 pub fn mint_account_with_authority(mint_authority: &Pubkey) -> AccountSharedData {
-    let mut data = [0; Mint::LEN];
-    Mint::pack(
-        Mint {
-            supply: 100_000_000,
-            decimals: 0,
-            is_initialized: true,
-            mint_authority: Some(*mint_authority).into(),
-            ..Default::default()
-        },
-        &mut data,
-    )
-    .unwrap();
-
+    let data = private_channel_core::t22_fixtures::t22_mint(
+        0,
+        mint_authority,
+        None,
+        Some(&Pubkey::new_unique()),
+        100_000_000,
+    );
     let rent_exempt_balance = 1_461_600;
-    let mut account = AccountSharedData::new(rent_exempt_balance, data.len(), &spl_token::id());
+    let mut account =
+        AccountSharedData::new(rent_exempt_balance, data.len(), &spl_token_2022::id());
     account.set_data_from_slice(&data);
     account
 }
@@ -407,21 +423,10 @@ pub fn system_account(lamports: u64) -> AccountSharedData {
 }
 
 pub fn token_account(owner: &Pubkey, mint: &Pubkey, amount: u64) -> AccountSharedData {
-    let mut data = [0; TokenAccount::LEN];
-    TokenAccount::pack(
-        TokenAccount {
-            mint: *mint,
-            owner: *owner,
-            amount,
-            state: spl_token::state::AccountState::Initialized,
-            ..Default::default()
-        },
-        &mut data,
-    )
-    .unwrap();
-
+    let data = private_channel_core::t22_fixtures::t22_ata(mint, owner, amount, false);
     let rent_exempt_balance = 2_039_280;
-    let mut account = AccountSharedData::new(rent_exempt_balance, data.len(), &spl_token::id());
+    let mut account =
+        AccountSharedData::new(rent_exempt_balance, data.len(), &spl_token_2022::id());
     account.set_data_from_slice(&data);
     account
 }

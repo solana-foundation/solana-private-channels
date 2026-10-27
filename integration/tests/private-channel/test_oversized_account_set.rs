@@ -50,6 +50,7 @@ fn load_config(db_url: String, port: u16) -> NodeConfig {
         mode: NodeMode::Aio,
         port,
         accountsdb_connection_url: db_url,
+        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_unique()),
         ..NodeConfig::default()
     }
 }

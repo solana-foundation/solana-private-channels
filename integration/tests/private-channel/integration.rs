@@ -290,6 +290,8 @@ async fn setup(
         redis_cache_url,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator_key.pubkey()],
+        permanent_delegate: Some(operator_key.pubkey()),
+        compliance_owner: Some(COMPLIANCE_OWNER),
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
@@ -439,6 +441,9 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
 
     // admin-vm InitializeMint persistence + account_keys mirror coverage.
     run_admin_vm_initialize_mint_persists_test(private_channel_ctx).await;
+
+    // Seize: permanent delegate moves only into the compliance ATA.
+    run_seize_test(private_channel_ctx).await;
 
     // parallel-SVM SnapshotCallback coverage (20-tx burst).
     run_parallel_svm_burst_test(private_channel_ctx).await;

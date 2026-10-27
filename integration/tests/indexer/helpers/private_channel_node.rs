@@ -200,6 +200,8 @@ async fn run_on(
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![admin_pubkey],
+        permanent_delegate: Some(admin_pubkey),
+        compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
         blocktime_ms: 100,

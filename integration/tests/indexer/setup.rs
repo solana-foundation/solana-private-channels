@@ -18,13 +18,15 @@ use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
-use spl_token::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
+// The validator plays the channel too, so the shared mint is a channel (Token-2022) mint.
+use spl_token_2022::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
 use test_utils::mint_helper::{
     TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
 };
 
 use super::helpers::{
-    generate_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions, setup_wallets,
+    generate_channel_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions,
+    setup_wallets,
 };
 
 const INSTANCE_SEED: &[u8] = b"instance";
@@ -90,7 +92,7 @@ impl TestEnvironment {
         setup_wallets(client, faucet_keypair, &all_wallets).await?;
 
         let mint_keypair = Keypair::new();
-        let mint = generate_mint(client, &admin, &admin, &mint_keypair).await?;
+        let mint = generate_channel_mint(client, &admin, &admin, &mint_keypair).await?;
 
         // This validator plays both chains, so write the withdraw config the
         // operator would on the first deposit. Withdrawals then work with or

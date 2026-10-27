@@ -94,6 +94,8 @@ fn node_config(pg_url: &str, port: u16, max_blockhashes: usize) -> NodeConfig {
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![Keypair::new().pubkey()],
+        permanent_delegate: Some(Keypair::new().pubkey()),
+        compliance_owner: None,
         max_blockhashes,
         allow_max_blockhashes_increase: false,
         blocktime_ms: BLOCKTIME_MS,

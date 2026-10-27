@@ -51,11 +51,8 @@ use {
         make_instruction, pack_mint_with_authority, send_transaction_echo_reply,
     },
     solana_keychain::SolanaSigner,
+    solana_sdk::program_option::COption,
     solana_sdk::{pubkey::Pubkey, signature::Signature},
-    spl_token::{
-        solana_program::{program_option::COption, program_pack::Pack},
-        state::Mint,
-    },
     std::sync::Arc,
     test_utils::mock_rpc::MockRpcServer,
 };
@@ -350,7 +347,7 @@ fn make_mint_builder_for_caller_arm(mint: Pubkey) -> MintToBuilder {
         .recipient_ata(Pubkey::new_unique())
         .payer(admin)
         .mint_authority(admin)
-        .token_program(spl_token::id())
+        .token_program(spl_token_2022::id())
         .amount(1_000)
         .idempotency_memo("private_channel:mint-idempotency:1".to_string());
     builder
@@ -493,7 +490,7 @@ async fn mint_not_initialized_jit_manual_review_corrupt_state() {
         build_state_for_jit_caller_arm(true).await;
 
     // Corrupt bytes (invalid COption discriminant) → CorruptData → ManualReview.
-    let mut data = vec![0u8; Mint::LEN];
+    let mut data = vec![0u8; 82];
     data[0] = 0xFF;
     mock.enqueue("getAccountInfo", account_info_reply_bytes(&data));
 
@@ -528,7 +525,7 @@ async fn mint_not_initialized_jit_transient_requeues_deposit() {
     // get_mint_decimals fails because there is no mint row.
     mock.enqueue(
         "getAccountInfo",
-        account_info_reply_bytes(&[0u8; Mint::LEN]),
+        account_info_reply_bytes(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
     );
 
     let txn_id: i64 = 5004;
@@ -573,7 +570,7 @@ async fn mint_not_initialized_jit_transient_at_cap_leaves_processing() {
 
     mock.enqueue(
         "getAccountInfo",
-        account_info_reply_bytes(&[0u8; Mint::LEN]),
+        account_info_reply_bytes(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
     );
 
     // The cap constant is crate-private to the indexer, so this mirrors its

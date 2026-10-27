@@ -291,17 +291,22 @@ async fn case_e_token_close_to_fresh_address_creates_nothing(ctx: &PrivateChanne
 
     let p = Keypair::new();
     let d = Pubkey::new_unique();
-    let ata =
-        spl_associated_token_account::get_associated_token_address(&p.pubkey(), &mint.pubkey());
+    let ata = crate::setup::get_associated_token_address(&p.pubkey(), &mint.pubkey());
     let ixs = [
         spl_associated_token_account::instruction::create_associated_token_account(
             &p.pubkey(),
             &p.pubkey(),
             &mint.pubkey(),
-            &spl_token::id(),
+            &spl_token_2022::id(),
         ),
-        spl_token::instruction::close_account(&spl_token::id(), &ata, &d, &p.pubkey(), &[])
-            .expect("close_account ix"),
+        spl_token_2022::instruction::close_account(
+            &spl_token_2022::id(),
+            &ata,
+            &d,
+            &p.pubkey(),
+            &[],
+        )
+        .expect("close_account ix"),
     ];
     let blockhash = ctx.get_blockhash().await.expect("blockhash for the close");
     let tx = Transaction::new_signed_with_payer(&ixs, Some(&p.pubkey()), &[&p], blockhash);

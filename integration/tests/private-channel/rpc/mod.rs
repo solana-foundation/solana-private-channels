@@ -46,6 +46,7 @@ mod test_admin_vm_initialize_mint_persists;
 
 // parallel-SVM SnapshotCallback coverage.
 mod test_parallel_svm_burst;
+mod test_seize;
 
 pub use test_address_index_slot::run_address_index_slot_test;
 pub use test_blockhash_validation::run_blockhash_validation_test;
@@ -88,3 +89,4 @@ pub use test_simulate_transaction_preflight::run_simulate_transaction_preflight_
 pub use test_admin_vm_initialize_mint_malformed::run_admin_vm_initialize_mint_malformed_test;
 pub use test_admin_vm_initialize_mint_persists::run_admin_vm_initialize_mint_persists_test;
 pub use test_parallel_svm_burst::run_parallel_svm_burst_test;
+pub use test_seize::{run_seize_test, COMPLIANCE_OWNER};

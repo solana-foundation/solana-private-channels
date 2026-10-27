@@ -15,7 +15,8 @@ use solana_sdk::{pubkey::Pubkey, signature::Signer};
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+// The shared test mint is a Token-2022 channel mint.
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 
 pub async fn execute_user_deposits(
     client: &RpcClient,

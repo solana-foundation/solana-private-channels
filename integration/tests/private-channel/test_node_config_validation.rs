@@ -37,6 +37,8 @@ fn base_config(mode: NodeMode) -> NodeConfig {
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![Keypair::new().pubkey()],
+        permanent_delegate: Some(Keypair::new().pubkey()),
+        compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
         blocktime_ms: 100,

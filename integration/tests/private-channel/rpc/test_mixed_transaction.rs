@@ -29,10 +29,8 @@ pub async fn run_mixed_transaction_test(ctx: &PrivateChannelContext) {
     ctx.check_transaction_exists(sig).await;
     println!("Created mint: {}", sig);
 
-    let non_admin_token_account = spl_associated_token_account::get_associated_token_address(
-        &non_admin.pubkey(),
-        &mint.pubkey(),
-    );
+    let non_admin_token_account =
+        setup::get_associated_token_address(&non_admin.pubkey(), &mint.pubkey());
 
     // Create token account for non-admin
     let blockhash = ctx.get_blockhash().await.unwrap();
@@ -40,7 +38,7 @@ pub async fn run_mixed_transaction_test(ctx: &PrivateChannelContext) {
         &non_admin.pubkey(),
         &non_admin.pubkey(),
         &mint.pubkey(),
-        &spl_token::id(),
+        &spl_token_2022::id(),
     );
     let sig = ctx
         .write_client

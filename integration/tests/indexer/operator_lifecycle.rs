@@ -409,7 +409,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -519,7 +519,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -627,7 +627,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -951,7 +951,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -1139,7 +1139,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     let mint_meta = DbMint::new(
         mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1336,7 +1336,7 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1456,7 +1456,7 @@ async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1476,7 +1476,7 @@ async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn
         user_pubkey,
         50_000,
         0,
-        spl_token::id(),
+        spl_token_2022::id(),
     )
     .await?;
     let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
@@ -1593,7 +1593,7 @@ async fn test_second_release_of_same_nonce_moves_no_tokens(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1749,7 +1749,7 @@ async fn test_withdrawal_one_generation_early_succeeds_after_rotation(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1851,7 +1851,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1871,7 +1871,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         user_pubkey,
         50_000,
         0,
-        spl_token::id(),
+        spl_token_2022::id(),
     )
     .await?;
     let balance_after_release = get_token_balance(&client, &user_pubkey, &env.mint).await?;
@@ -1956,11 +1956,12 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
             trace_id: trace_id.clone(),
             mint: env.mint,
             user: user_pubkey,
-            user_ata: spl_associated_token_account::get_associated_token_address(
+            user_ata: spl_associated_token_account::get_associated_token_address_with_program_id(
                 &user_pubkey,
                 &env.mint,
+                &spl_token_2022::id(),
             ),
-            token_program: spl_token::id(),
+            token_program: spl_token_2022::id(),
             amount: 50_000,
         },
         signatures: vec![PendingSig {

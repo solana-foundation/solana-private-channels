@@ -58,6 +58,51 @@ pub async fn generate_mint(
     Ok(mint.pubkey())
 }
 
+/// A mint usable on both sides of the single test validator: a Token-2022 mint whose
+/// permanent delegate is `authority`, the operator's default delegate.
+#[allow(dead_code)]
+pub async fn generate_channel_mint(
+    client: &RpcClient,
+    payer: &Keypair,
+    authority: &Keypair,
+    mint: &Keypair,
+) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+        ExtensionType::PermanentDelegate,
+    ])?;
+    let rent = client.get_minimum_balance_for_rent_exemption(space).await?;
+    let instructions = vec![
+        create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            space as u64,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
+        spl_token_2022::instruction::initialize_permanent_delegate(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &authority.pubkey(),
+        )?,
+        spl_token_2022::instruction::initialize_mint2(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &authority.pubkey(),
+            Some(&authority.pubkey()),
+            6,
+        )?,
+    ];
+    send_and_confirm_instructions(
+        client,
+        &instructions,
+        payer,
+        &[payer, mint],
+        "Generate Channel Mint",
+    )
+    .await?;
+    Ok(mint.pubkey())
+}
+
 #[allow(dead_code)]
 pub async fn mint_to_owner(
     client: &RpcClient,
@@ -67,17 +112,14 @@ pub async fn mint_to_owner(
     authority: &Keypair,
     amount: u64,
 ) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let ata = get_associated_token_address_with_program_id(&owner, &mint, &spl_token::id());
+    // Works for either token program: the mint's owner names it.
+    let token_program = client.get_account(&mint).await?.owner;
+    let ata = get_associated_token_address_with_program_id(&owner, &mint, &token_program);
 
     let instructions = vec![
-        create_associated_token_account_idempotent(
-            &payer.pubkey(),
-            &owner,
-            &mint,
-            &spl_token::id(),
-        ),
-        mint_to(
-            &spl_token::id(),
+        create_associated_token_account_idempotent(&payer.pubkey(), &owner, &mint, &token_program),
+        spl_token_2022::instruction::mint_to(
+            &token_program,
             &mint,
             &ata,
             &authority.pubkey(),
@@ -104,6 +146,13 @@ pub async fn get_token_balance(
     owner: &Pubkey,
     mint: &Pubkey,
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    // Channel ATAs derive under Token-2022 and Solana ones under the mint's own
+    // program, so read whichever exists on this client's chain.
+    let channel_ata =
+        get_associated_token_address_with_program_id(owner, mint, &TOKEN_2022_PROGRAM_ID);
+    if let Ok(balance) = client.get_token_account_balance(&channel_ata).await {
+        return Ok(balance.amount.parse::<u64>()?);
+    }
     let ata = get_associated_token_address_with_program_id(owner, mint, &spl_token::id());
 
     Ok(client
