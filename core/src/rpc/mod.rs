@@ -1492,7 +1492,7 @@ mod tests {
     async fn test_get_token_account_balance_wrong_owner() {
         let (mut db, _pg) = start_pg().await;
         let pk = Pubkey::new_unique();
-        // Store an account owned by system program, not spl_token
+        // Store an account owned by system program, not Token-2022
         db.set_account(pk, AccountSharedData::new(100, 0, &Pubkey::new_unique()))
             .await;
         let deps = make_read_deps(db);
@@ -1505,54 +1505,29 @@ mod tests {
         assert!(result.is_err()); // "not a token account"
     }
 
-    // ── get_token_account_balance with valid SPL token account ────────────
+    // ── get_token_account_balance with valid Token-2022 accounts ──────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_token_account_balance_valid() {
-        use spl_token::solana_program::program_pack::Pack;
+        use crate::t22_fixtures::{golden_mint, golden_t22_ata, GOLDEN_T22_MINT};
+        use solana_sdk::signature::Signer;
         let (mut db, _pg) = start_pg().await;
 
         // Store a block so get_latest_slot works
         seed_db(&mut db).await;
 
-        // Create a mint account
-        let mint_pk = Pubkey::new_unique();
-        let mint_authority = Pubkey::new_unique();
-        let mint = spl_token::state::Mint {
-            mint_authority: spl_token::solana_program::program_option::COption::Some(
-                mint_authority,
-            ),
-            supply: 1_000_000,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: spl_token::solana_program::program_option::COption::None,
-        };
-        let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
-        spl_token::state::Mint::pack(mint, &mut mint_data).unwrap();
+        // The golden mint (decimals 6, permanent delegate) and its ATA holding 1000.
+        let mint_pk = golden_mint().pubkey();
         let mut mint_account =
-            AccountSharedData::new(1, spl_token::state::Mint::LEN, &spl_token::id());
-        mint_account.set_data_from_slice(&mint_data);
+            AccountSharedData::new(1, GOLDEN_T22_MINT.len(), &spl_token_2022::id());
+        mint_account.set_data_from_slice(&GOLDEN_T22_MINT);
         db.set_account(mint_pk, mint_account).await;
 
-        // Create a token account
         let token_pk = Pubkey::new_unique();
-        let owner = Pubkey::new_unique();
-        let token_acct = spl_token::state::Account {
-            mint: mint_pk,
-            owner,
-            amount: 500_000,
-            delegate: spl_token::solana_program::program_option::COption::None,
-            state: spl_token::state::AccountState::Initialized,
-            is_native: spl_token::solana_program::program_option::COption::None,
-            delegated_amount: 0,
-            close_authority: spl_token::solana_program::program_option::COption::None,
-        };
-        let mut token_data = vec![0u8; spl_token::state::Account::LEN];
-        spl_token::state::Account::pack(token_acct, &mut token_data).unwrap();
-        let mut token_account =
-            AccountSharedData::new(1, spl_token::state::Account::LEN, &spl_token::id());
+        let token_data = golden_t22_ata();
+        let mut token_account = AccountSharedData::new(1, token_data.len(), &spl_token_2022::id());
         token_account.set_data_from_slice(&token_data);
-        db.set_account(token_pk, token_account).await;
+        db.set_account(token_pk, token_account.clone()).await;
 
         let deps = make_read_deps(db);
         let resp = get_token_account_balance_impl::get_token_account_balance_impl(
@@ -1562,9 +1537,35 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp.value.amount, "500000");
+        assert_eq!(resp.value.amount, "1000");
         assert_eq!(resp.value.decimals, 6);
-        assert_eq!(resp.value.ui_amount_string, "0.5");
+        assert_eq!(resp.value.ui_amount_string, "0.001");
+    }
+
+    /// Legacy SPL Token accounts no longer exist on the channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_token_account_balance_refuses_spl_token_owner() {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let token_pk = Pubkey::new_unique();
+        let data = crate::t22_fixtures::golden_t22_ata();
+        let mut account = AccountSharedData::new(1, data.len(), &spl_token::id());
+        account.set_data_from_slice(&data);
+        db.set_account(token_pk, account).await;
+
+        let deps = make_read_deps(db);
+        let err = get_token_account_balance_impl::get_token_account_balance_impl(
+            &deps,
+            token_pk.to_string(),
+            None,
+        )
+        .await
+        .expect_err("an SPL-owned account is not a channel token account");
+        assert!(
+            err.message().contains("not a token account"),
+            "{}",
+            err.message()
+        );
     }
 
     // ── get_signatures_for_address ────────────────────────────────────────
@@ -1858,7 +1859,7 @@ mod tests {
         };
         let precompile = get_account_info_impl::get_account_info_impl(
             &deps,
-            spl_token::ID.to_string(),
+            spl_token_2022::ID.to_string(),
             Some(zstd),
         )
         .await
@@ -1917,7 +1918,7 @@ mod tests {
         let (mut db, _pg) = start_pg().await;
         seed_db(&mut db).await;
         let deps = make_read_deps(db);
-        let precompile = spl_token::ID.to_string();
+        let precompile = spl_token_2022::ID.to_string();
 
         for encoding in [UiAccountEncoding::Base58, UiAccountEncoding::Binary] {
             let config = RpcAccountInfoConfig {

@@ -3543,10 +3543,12 @@ mod tests {
             Some(unreachable),
         );
 
-        let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-        let account_space = 165;
+        // A channel ATA: Token-2022, account type byte 2 at offset 165.
+        let token_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+        let account_space = 170;
         let mut account = vec![0u8; account_space];
         account[32..64].copy_from_slice(&[7u8; 32]);
+        account[165] = 2;
         let body = Bytes::from(
             json!({
                 "jsonrpc": "2.0",

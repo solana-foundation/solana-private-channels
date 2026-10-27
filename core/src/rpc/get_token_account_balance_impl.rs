@@ -7,8 +7,8 @@ use solana_account_decoder_client_types::token::{real_number_string_trimmed, UiT
 use solana_rpc_client_types::config::RpcContextConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
 use solana_sdk::{account::ReadableAccount, pubkey::Pubkey};
-use spl_token::solana_program::program_pack::Pack;
-use spl_token::state::{Account as TokenAccount, Mint};
+use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022::state::{Account as TokenAccount, Mint};
 use std::str::FromStr;
 
 pub async fn get_token_account_balance_impl(
@@ -28,7 +28,8 @@ pub async fn get_token_account_balance_impl(
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| custom_error(INVALID_PARAMS_CODE, "Account not found"))?;
 
-    if *account.owner() != spl_token::id() {
+    // Every channel token account is a Token-2022 account.
+    if *account.owner() != spl_token_2022::id() {
         return Err(custom_error(
             INVALID_PARAMS_CODE,
             "Account is not a token account",
@@ -36,15 +37,15 @@ pub async fn get_token_account_balance_impl(
     }
 
     let data = account.data();
-    let token_account = TokenAccount::unpack(data).map_err(|e| {
+    let token_account = StateWithExtensions::<TokenAccount>::unpack(data).map_err(|e| {
         custom_error(
             INVALID_PARAMS_CODE,
             format!("Invalid token account data: {}", e),
         )
     })?;
 
-    let amount = token_account.amount;
-    let mint_pubkey = token_account.mint;
+    let amount = token_account.base.amount;
+    let mint_pubkey = token_account.base.mint;
 
     // Fetch actual decimals from the mint account
     let mint_account = read_deps
@@ -54,13 +55,13 @@ pub async fn get_token_account_balance_impl(
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| custom_error(INVALID_PARAMS_CODE, "Mint account not found"))?;
 
-    let mint = Mint::unpack(mint_account.data()).map_err(|e| {
+    let mint = StateWithExtensions::<Mint>::unpack(mint_account.data()).map_err(|e| {
         custom_error(
             INVALID_PARAMS_CODE,
             format!("Invalid mint account data: {}", e),
         )
     })?;
-    let decimals = mint.decimals;
+    let decimals = mint.base.decimals;
 
     // Use f64 only for the optional numeric field (lossy for large amounts, matches Solana RPC)
     let ui_amount = amount as f64 / 10_f64.powi(decimals as i32);

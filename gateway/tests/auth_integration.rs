@@ -1929,8 +1929,8 @@ async fn test_operator_only_method_expired_token_returns_401() {
     assert_eq!(res.status(), 401);
 }
 
-/// A Token-2022 account with extensions (data > 165 bytes) must be treated the
-/// same as a standard SPL token account — owner/delegate check at fixed offsets.
+/// A Token-2022 channel ATA (170 bytes, account type 2 at byte 165) is treated
+/// the same as a standard token account: owner/delegate check at fixed offsets.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_account_info_token2022_extended_account_is_proxied() {
     let (pool, _url, _container) = start_postgres().await;
@@ -1942,10 +1942,11 @@ async fn test_get_account_info_token2022_extended_account_is_proxied() {
     insert_wallet(&pool, user_id, &wallet_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    // Build a Token-2022 account: standard 165-byte layout plus 50 bytes of
-    // extension data. Owner field at bytes 32-63 matches the user's wallet.
-    let mut data = vec![0u8; 215];
+    // Build a Token-2022 ATA: standard 165-byte layout, the account type byte and
+    // ImmutableOwner. Owner field at bytes 32-63 matches the user's wallet.
+    let mut data = vec![0u8; 170];
     data[32..64].copy_from_slice(&wallet_bytes);
+    data[165] = 2;
     let encoded = BASE64.encode(&data);
     let mock_body = json!({
         "jsonrpc": "2.0",
@@ -1986,6 +1987,66 @@ async fn test_get_account_info_token2022_extended_account_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// A Token-2022 channel mint (202 bytes, account type 1) is longer than a token
+/// account, so its bytes at the owner offset must not grant a user access.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_token2022_mint_is_forbidden() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let wallet_bytes = [23u8; 32];
+    let wallet_pubkey = bs58::encode(wallet_bytes).into_string();
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &wallet_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    // A mint whose freeze authority bytes (36..68) overlap the owner offset with
+    // the user's wallet; the account type byte says mint.
+    let mut data = vec![0u8; 202];
+    data[32..64].copy_from_slice(&wallet_bytes);
+    data[165] = 1;
+    let encoded = BASE64.encode(&data);
+    let mock_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": LEDGER_TIP},
+            "value": {
+                "lamports": 2_039_280,
+                "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+                "data": [encoded, "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string();
+
+    let ata_pubkey = bs58::encode([24u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(mock_body).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
 }
 
 /// `getBlock`, `getTransaction`, and `simulateTransaction` are operator-only.
