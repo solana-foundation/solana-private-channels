@@ -24,6 +24,9 @@ fn main() -> Result<()> {
         eprintln!("\nMoves <source-owner>'s channel balance into the compliance ATA in one tx.");
         eprintln!("All of it unless --amount is given. A frozen account is thawed, moved and");
         eprintln!("frozen again; the freeze authority defaults to the delegate keypair.");
+        eprintln!(
+            "Set PRIVATE_CHANNEL_READ_RPC_URL to the read node when the gateway enforces JWT."
+        );
         std::process::exit(1);
     }
     let rpc_url = &args[0];
@@ -49,12 +52,18 @@ fn main() -> Result<()> {
     }
 
     let client = RpcClient::new(rpc_url.to_string());
+    // With JWT on, the gateway refuses account reads and simulate without a token, so those
+    // can go to a read node; sending stays on the gateway.
+    let read_client = match env::var("PRIVATE_CHANNEL_READ_RPC_URL") {
+        Ok(url) if !url.trim().is_empty() => RpcClient::new(url),
+        _ => RpcClient::new(rpc_url.to_string()),
+    };
     let source =
         get_associated_token_address_with_program_id(&source_owner, &mint, &spl_token_2022::ID);
 
-    let mint_data = client.get_account_data(&mint)?;
+    let mint_data = read_client.get_account_data(&mint)?;
     let mint_state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
-    let source_data = client.get_account_data(&source)?;
+    let source_data = read_client.get_account_data(&source)?;
     let source_state = StateWithExtensions::<Account>::unpack(&source_data)?.base;
 
     let amount = amount.unwrap_or(source_state.amount);
@@ -108,7 +117,7 @@ fn main() -> Result<()> {
 
     // The node drops a refused delegate move silently at ingress, so simulate with
     // sigVerify first to surface the reason.
-    let simulation = client.simulate_transaction_with_config(
+    let simulation = read_client.simulate_transaction_with_config(
         &tx,
         RpcSimulateTransactionConfig {
             sig_verify: true,

@@ -105,6 +105,10 @@ balance (or `--amount`) with `TransferChecked`, and freezes the source again. Th
 authority defaults to the delegate key. It simulates with `sigVerify` first, because the node
 drops a refused delegate move without an RPC error.
 
+With JWT on (`JWT_SECRET` set) the public gateway refuses the account reads and the simulation
+without a token, so point them at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`.
+Sending still goes through the gateway URL.
+
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script
 prints the current gates before sending and warns when a flag re-opens one.
