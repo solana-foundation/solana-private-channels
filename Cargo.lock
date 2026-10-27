@@ -2741,6 +2741,7 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
 ]
 
 [[package]]
@@ -6156,6 +6157,7 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
  "tokio",
  "tokio-util 0.7.19",
  "tracing",

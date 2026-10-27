@@ -28,8 +28,9 @@ use {
         rpc::{poll_confirmations, send_parallel},
         setup_deposit::{ensure_escrow_instance, find_instance_pda},
         types::{
-            BenchState, WithdrawConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
-            BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
+            channel_ata, channel_permanent_delegate, BenchState, WithdrawConfig,
+            BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT, BENCH_WITHDRAW_FEE, MINT_DECIMALS,
+            SETUP_BATCH_SIZE,
         },
     },
     anyhow::{Context, Result},
@@ -383,6 +384,7 @@ pub async fn run_setup_withdraw_phase(
                         &mint,
                         &instance_ata,
                         seed_amount,
+                        &spl_token::id(),
                         blockhash,
                     );
                     match solana_rpc
@@ -473,7 +475,8 @@ pub async fn run_setup_withdraw_phase(
                         let owner = kp.pubkey();
                         let m = mint;
                         async move {
-                            let tx = create_ata_transaction(&admin, &owner, &m, bh);
+                            let tx =
+                                create_ata_transaction(&admin, &owner, &m, &spl_token::id(), bh);
                             RpcClient::new(url)
                                 .send_transaction_with_config(
                                     &tx,
@@ -527,8 +530,8 @@ pub async fn run_setup_withdraw_phase(
     // ------------------------------------------------------------------
     // Task 9: Initialize same mint on PrivateChannel
     //
-    // The PrivateChannel write-node creates accounts implicitly (gasless), so only
-    // `initialize_mint` is needed — no `create_account` like on Solana.
+    // The PrivateChannel write-node creates the mint account itself (gasless), so
+    // only the permanent delegate and `InitializeMint2` are sent, no `create_account`.
     // Using the same mint pubkey ensures ReleaseFunds on Solana looks up the
     // correct token_program (spl_token) via the existing Solana mint account.
     // ------------------------------------------------------------------
@@ -547,6 +550,7 @@ pub async fn run_setup_withdraw_phase(
                         &admin_keypair,
                         &mint,
                         MINT_DECIMALS,
+                        &channel_permanent_delegate(&admin_keypair.pubkey()),
                         blockhash,
                     );
                     match private_channel_rpc.send_transaction(&init_tx).await {
@@ -592,7 +596,7 @@ pub async fn run_setup_withdraw_phase(
         &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     );
-    let treasury_token_account = get_associated_token_address(&admin_keypair.pubkey(), &mint);
+    let treasury_token_account = channel_ata(&admin_keypair.pubkey(), &mint);
     let withdraw_config_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
@@ -608,7 +612,7 @@ pub async fn run_setup_withdraw_phase(
                             &admin_keypair.pubkey(),
                             &admin_keypair.pubkey(),
                             &mint,
-                            &spl_token::id(),
+                            &spl_token_2022::id(),
                         );
                     let set_withdraw_config_ix = SetWithdrawConfigBuilder::new()
                         .authority(admin_keypair.pubkey())
@@ -696,7 +700,13 @@ pub async fn run_setup_withdraw_phase(
                         let owner = kp.pubkey();
                         let m = mint;
                         async move {
-                            let tx = create_ata_transaction(&admin, &owner, &m, bh);
+                            let tx = create_ata_transaction(
+                                &admin,
+                                &owner,
+                                &m,
+                                &spl_token_2022::id(),
+                                bh,
+                            );
                             rpc.send_transaction(&tx).await
                         }
                     },
@@ -752,9 +762,16 @@ pub async fn run_setup_withdraw_phase(
                     "mint-to(withdraw)",
                     |kp, _url, bh| {
                         let admin = Arc::clone(&admin_keypair);
-                        let ata = get_associated_token_address(&kp.pubkey(), &mint);
+                        let ata = channel_ata(&kp.pubkey(), &mint);
                         async move {
-                            let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, bh);
+                            let tx = create_admin_mint_to(
+                                &admin,
+                                &mint,
+                                &ata,
+                                initial_balance,
+                                &spl_token_2022::id(),
+                                bh,
+                            );
                             RpcClient::new(_url)
                                 .send_transaction_with_config(
                                     &tx,

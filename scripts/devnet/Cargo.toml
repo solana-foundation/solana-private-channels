@@ -15,3 +15,4 @@ solana-sdk.workspace = true
 solana-system-interface.workspace = true
 spl-associated-token-account.workspace = true
 spl-token.workspace = true
+spl-token-2022.workspace = true

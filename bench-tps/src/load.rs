@@ -23,14 +23,13 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_TRANSFER},
-        types::{BenchConfig, BenchState, TRANSFER_AMOUNT},
+        types::{channel_ata, BenchConfig, BenchState, TRANSFER_AMOUNT},
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
         hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
         transaction::Transaction,
     },
-    spl_associated_token_account::get_associated_token_address,
     std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -61,11 +60,13 @@ fn build_transfer(
     nonce: u64,
 ) -> Transaction {
     let from_pubkey = from.pubkey();
-    let from_ata = get_associated_token_address(&from_pubkey, mint);
-    let to_ata = get_associated_token_address(to, mint);
+    let from_ata = channel_ata(&from_pubkey, mint);
+    let to_ata = channel_ata(to, mint);
 
-    let transfer_ix = spl_token::instruction::transfer(
-        &spl_token::id(),
+    // Unchecked Transfer keeps the measured tx shape; Token-2022 honours it for channel mints.
+    #[allow(deprecated)]
+    let transfer_ix = spl_token_2022::instruction::transfer(
+        &spl_token_2022::id(),
         &from_ata,
         &to_ata,
         &from_pubkey,

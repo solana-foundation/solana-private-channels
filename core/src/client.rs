@@ -1,7 +1,7 @@
 use {
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer, transaction::Transaction},
-    spl_associated_token_account::get_associated_token_address,
+    spl_associated_token_account::get_associated_token_address_with_program_id,
     std::{fs, path::Path},
 };
 
@@ -19,7 +19,13 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// Create an SPL token transfer transaction
+/// A user's channel token account: channel ATAs derive under Token-2022.
+fn channel_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    get_associated_token_address_with_program_id(owner, mint, &spl_token_2022::id())
+}
+
+/// Create a channel token transfer transaction (unchecked Transfer, which
+/// Token-2022 honours for channel mints: they carry no fee or hook extension)
 pub fn create_spl_transfer(
     from: &Keypair,
     to: &Pubkey,
@@ -28,33 +34,30 @@ pub fn create_spl_transfer(
     blockhash: Hash,
 ) -> Transaction {
     let from_pubkey = from.pubkey();
-    let from_token_account = get_associated_token_address(&from_pubkey, mint);
-    let to_token_account = get_associated_token_address(to, mint);
+    let from_token_account = channel_ata(&from_pubkey, mint);
+    let to_token_account = channel_ata(to, mint);
 
-    Transaction::new_signed_with_payer(
-        &[spl_token::instruction::transfer(
-            &spl_token::id(),
-            &from_token_account,
-            &to_token_account,
-            &from_pubkey,
-            &[],
-            amount,
-        )
-        .unwrap()],
-        Some(&from_pubkey),
-        &[from],
-        blockhash,
+    #[allow(deprecated)]
+    let transfer = spl_token_2022::instruction::transfer(
+        &spl_token_2022::id(),
+        &from_token_account,
+        &to_token_account,
+        &from_pubkey,
+        &[],
+        amount,
     )
+    .unwrap();
+    Transaction::new_signed_with_payer(&[transfer], Some(&from_pubkey), &[from], blockhash)
 }
 
-/// Create an SPL token burn transaction
+/// Create a channel token burn transaction
 pub fn create_spl_burn(from: &Keypair, mint: &Pubkey, amount: u64, blockhash: Hash) -> Transaction {
     let from_pubkey = from.pubkey();
-    let from_token_account = get_associated_token_address(&from_pubkey, mint);
+    let from_token_account = channel_ata(&from_pubkey, mint);
 
     Transaction::new_signed_with_payer(
-        &[spl_token::instruction::burn(
-            &spl_token::id(),
+        &[spl_token_2022::instruction::burn(
+            &spl_token_2022::id(),
             &from_token_account,
             mint,
             &from_pubkey,
@@ -81,7 +84,7 @@ pub fn create_withdraw_funds(
     use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 
     let from_pubkey = from.pubkey();
-    let token_account = get_associated_token_address(&from_pubkey, mint);
+    let token_account = channel_ata(&from_pubkey, mint);
     let (withdraw_config, _) = Pubkey::find_program_address(
         &[
             private_channel_withdraw_program_client::WITHDRAW_CONFIG_SEED,
@@ -94,7 +97,7 @@ pub fn create_withdraw_funds(
         .user(from_pubkey)
         .mint(*mint)
         .token_account(token_account)
-        .token_program(spl_token::id())
+        .token_program(spl_token_2022::id())
         .associated_token_program(spl_associated_token_account::id())
         .withdraw_config(withdraw_config)
         .treasury_token_account(*treasury_token_account)
@@ -104,39 +107,48 @@ pub fn create_withdraw_funds(
     Transaction::new_signed_with_payer(&[withdraw_ix], Some(&from_pubkey), &[from], blockhash)
 }
 
-/// Create an admin transaction to initialize a mint
+/// Create an admin transaction that creates a channel mint. The node only creates
+/// mints that carry its configured permanent delegate, so `delegate` must match it.
 pub fn create_admin_initialize_mint(
     admin: &Keypair,
     mint: &Pubkey,
     decimals: u8,
+    delegate: &Pubkey,
     blockhash: Hash,
 ) -> Transaction {
+    let program = spl_token_2022::id();
     Transaction::new_signed_with_payer(
-        &[spl_token::instruction::initialize_mint(
-            &spl_token::id(),
-            mint,
-            &admin.pubkey(), // mint authority
-            None,            // freeze authority
-            decimals,
-        )
-        .unwrap()],
+        &[
+            spl_token_2022::instruction::initialize_permanent_delegate(&program, mint, delegate)
+                .unwrap(),
+            spl_token_2022::instruction::initialize_mint2(
+                &program,
+                mint,
+                &admin.pubkey(), // mint authority
+                None,            // freeze authority
+                decimals,
+            )
+            .unwrap(),
+        ],
         Some(&admin.pubkey()),
         &[admin],
         blockhash,
     )
 }
 
-/// Create an admin transaction to mint tokens
+/// Create an admin transaction to mint tokens. `token_program` is Token-2022 on the
+/// channel and the mint's own program on Solana.
 pub fn create_admin_mint_to(
     admin: &Keypair,
     mint: &Pubkey,
     destination: &Pubkey,
     amount: u64,
+    token_program: &Pubkey,
     blockhash: Hash,
 ) -> Transaction {
     Transaction::new_signed_with_payer(
-        &[spl_token::instruction::mint_to(
-            &spl_token::id(),
+        &[spl_token_2022::instruction::mint_to(
+            token_program,
             mint,
             destination,
             &admin.pubkey(),
@@ -150,11 +162,12 @@ pub fn create_admin_mint_to(
     )
 }
 
-/// Create a transaction to create an associated token account
+/// Create a transaction to create an associated token account under `token_program`
 pub fn create_ata_transaction(
     payer: &Keypair,
     owner: &Pubkey,
     mint: &Pubkey,
+    token_program: &Pubkey,
     blockhash: Hash,
 ) -> Transaction {
     Transaction::new_signed_with_payer(
@@ -163,7 +176,7 @@ pub fn create_ata_transaction(
                 &payer.pubkey(),
                 owner,
                 mint,
-                &spl_token::id(),
+                token_program,
             ),
         ],
         Some(&payer.pubkey()),
@@ -196,8 +209,7 @@ pub fn load_keypair(path: &Path) -> Result<Keypair, Box<dyn std::error::Error + 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spl_token::instruction::TokenInstruction;
-    use spl_token::solana_program::program_option::COption;
+    use spl_token_2022::instruction::TokenInstruction;
 
     /// Helper: resolve the program ID from a compiled instruction
     fn resolve_program_id(tx: &Transaction, ix_index: usize) -> Pubkey {
@@ -206,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_create_spl_transfer() {
         let from = Keypair::new();
         let to = Pubkey::new_unique();
@@ -219,8 +232,8 @@ mod tests {
         assert_eq!(tx.message.instructions.len(), 1);
         assert_eq!(tx.message.account_keys[0], from.pubkey());
 
-        // Program must be SPL Token
-        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+        // Program must be Token-2022
+        assert_eq!(resolve_program_id(&tx, 0), spl_token_2022::id());
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack Transfer instruction") {
@@ -233,8 +246,8 @@ mod tests {
         }
 
         // Account keys must contain the correct ATAs
-        let expected_from_ata = get_associated_token_address(&from.pubkey(), &mint);
-        let expected_to_ata = get_associated_token_address(&to, &mint);
+        let expected_from_ata = channel_ata(&from.pubkey(), &mint);
+        let expected_to_ata = channel_ata(&to, &mint);
         assert!(
             tx.message.account_keys.contains(&expected_from_ata),
             "source ATA missing from account keys"
@@ -257,7 +270,7 @@ mod tests {
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
         assert_eq!(tx.message.account_keys[0], from.pubkey());
-        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+        assert_eq!(resolve_program_id(&tx, 0), spl_token_2022::id());
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack Burn instruction") {
@@ -269,7 +282,7 @@ mod tests {
             other => panic!("expected Burn, got {other:?}"),
         }
 
-        let expected_ata = get_associated_token_address(&from.pubkey(), &mint);
+        let expected_ata = channel_ata(&from.pubkey(), &mint);
         assert!(
             tx.message.account_keys.contains(&expected_ata),
             "source ATA missing from account keys"
@@ -280,34 +293,41 @@ mod tests {
         );
     }
 
+    /// The channel mint is created with the delegate first, as the node requires.
     #[test]
     fn test_create_admin_initialize_mint() {
         let admin = Keypair::new();
         let mint = Pubkey::new_unique();
+        let delegate = Pubkey::new_unique();
         let decimals: u8 = 6;
         let blockhash = Hash::new_unique();
 
-        let tx = create_admin_initialize_mint(&admin, &mint, decimals, blockhash);
+        let tx = create_admin_initialize_mint(&admin, &mint, decimals, &delegate, blockhash);
 
         assert_eq!(tx.message.recent_blockhash, blockhash);
-        assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.instructions.len(), 2);
         assert_eq!(tx.message.account_keys[0], admin.pubkey());
-        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+        for index in 0..2 {
+            assert_eq!(resolve_program_id(&tx, index), spl_token_2022::id());
+        }
 
-        let ix = &tx.message.instructions[0];
-        match TokenInstruction::unpack(&ix.data)
-            .expect("failed to unpack InitializeMint instruction")
-        {
-            TokenInstruction::InitializeMint {
+        match TokenInstruction::unpack(&tx.message.instructions[0].data).unwrap() {
+            TokenInstruction::InitializePermanentDelegate { delegate: decoded } => {
+                assert_eq!(decoded, delegate);
+            }
+            other => panic!("expected InitializePermanentDelegate, got {other:?}"),
+        }
+        match TokenInstruction::unpack(&tx.message.instructions[1].data).unwrap() {
+            TokenInstruction::InitializeMint2 {
                 decimals: decoded_decimals,
                 mint_authority,
                 freeze_authority,
             } => {
                 assert_eq!(decoded_decimals, decimals);
                 assert_eq!(mint_authority, admin.pubkey());
-                assert_eq!(freeze_authority, COption::None);
+                assert_eq!(freeze_authority, None.into());
             }
-            other => panic!("expected InitializeMint, got {other:?}"),
+            other => panic!("expected InitializeMint2, got {other:?}"),
         }
 
         assert!(
@@ -324,12 +344,19 @@ mod tests {
         let amount: u64 = 1_000;
         let blockhash = Hash::new_unique();
 
-        let tx = create_admin_mint_to(&admin, &mint, &dest, amount, blockhash);
+        let tx = create_admin_mint_to(
+            &admin,
+            &mint,
+            &dest,
+            amount,
+            &spl_token_2022::id(),
+            blockhash,
+        );
 
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
         assert_eq!(tx.message.account_keys[0], admin.pubkey());
-        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+        assert_eq!(resolve_program_id(&tx, 0), spl_token_2022::id());
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack MintTo instruction") {
@@ -358,7 +385,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let blockhash = Hash::new_unique();
 
-        let tx = create_ata_transaction(&payer, &owner, &mint, blockhash);
+        let tx = create_ata_transaction(&payer, &owner, &mint, &spl_token_2022::id(), blockhash);
 
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
@@ -371,7 +398,7 @@ mod tests {
         );
 
         // The derived ATA address must appear in account keys
-        let expected_ata = get_associated_token_address(&owner, &mint);
+        let expected_ata = channel_ata(&owner, &mint);
         assert!(
             tx.message.account_keys.contains(&expected_ata),
             "derived ATA missing from account keys"
@@ -407,7 +434,7 @@ mod tests {
         );
 
         // Account keys must include the derived ATA, mint, and token programs
-        let expected_ata = get_associated_token_address(&from.pubkey(), &mint);
+        let expected_ata = channel_ata(&from.pubkey(), &mint);
         assert!(
             tx.message.account_keys.contains(&expected_ata),
             "token account ATA missing from account keys"
@@ -432,8 +459,8 @@ mod tests {
             "treasury token account missing from account keys"
         );
         assert!(
-            tx.message.account_keys.contains(&spl_token::id()),
-            "SPL Token program missing from account keys"
+            tx.message.account_keys.contains(&spl_token_2022::id()),
+            "Token-2022 program missing from account keys"
         );
         assert!(
             tx.message

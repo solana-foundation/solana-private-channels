@@ -19,7 +19,9 @@
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
-        types::{BenchState, MINT_DECIMALS, SETUP_BATCH_SIZE},
+        types::{
+            channel_ata, channel_permanent_delegate, BenchState, MINT_DECIMALS, SETUP_BATCH_SIZE,
+        },
     },
     anyhow::{Context, Result},
     private_channel_core::client::{
@@ -28,7 +30,6 @@ use {
     rayon::prelude::*,
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{signature::Keypair, signer::Signer},
-    spl_associated_token_account::get_associated_token_address,
     std::{sync::Arc, time::Instant},
     tokio::{sync::RwLock, time::Duration},
     tracing::{info, warn},
@@ -118,6 +119,7 @@ pub async fn run_setup_phase(
                         &admin_keypair,
                         &mint,
                         MINT_DECIMALS,
+                        &channel_permanent_delegate(&admin_keypair.pubkey()),
                         blockhash,
                     );
                     match rpc.send_transaction(&init_tx).await {
@@ -181,7 +183,13 @@ pub async fn run_setup_phase(
                     let admin = Arc::clone(&admin_keypair);
                     let owner = kp.pubkey();
                     async move {
-                        let tx = create_ata_transaction(&admin, &owner, &mint, bh);
+                        let tx = create_ata_transaction(
+                            &admin,
+                            &owner,
+                            &mint,
+                            &spl_token_2022::id(),
+                            bh,
+                        );
                         RpcClient::new(url).send_transaction(&tx).await
                     }
                 })
@@ -251,9 +259,16 @@ pub async fn run_setup_phase(
 
                 let sigs = send_parallel(rpc_url, batch, blockhash, "mint-to", |kp, url, bh| {
                     let admin = Arc::clone(&admin_keypair);
-                    let ata = get_associated_token_address(&kp.pubkey(), &mint);
+                    let ata = channel_ata(&kp.pubkey(), &mint);
                     async move {
-                        let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, bh);
+                        let tx = create_admin_mint_to(
+                            &admin,
+                            &mint,
+                            &ata,
+                            initial_balance,
+                            &spl_token_2022::id(),
+                            bh,
+                        );
                         RpcClient::new(url).send_transaction(&tx).await
                     }
                 })

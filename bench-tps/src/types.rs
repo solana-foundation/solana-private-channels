@@ -19,6 +19,29 @@ use {
 /// Number of decimal places for the SPL mint created during setup.
 pub const MINT_DECIMALS: u8 = 6;
 
+/// The node only creates channel mints carrying its configured permanent delegate,
+/// which defaults to the admin key; PRIVATE_CHANNEL_PERMANENT_DELEGATE overrides it.
+pub fn channel_permanent_delegate(
+    admin: &solana_sdk::pubkey::Pubkey,
+) -> solana_sdk::pubkey::Pubkey {
+    std::env::var("PRIVATE_CHANNEL_PERMANENT_DELEGATE")
+        .ok()
+        .and_then(|key| key.trim().parse().ok())
+        .unwrap_or(*admin)
+}
+
+/// A channel token account: channel ATAs derive under Token-2022.
+pub fn channel_ata(
+    owner: &solana_sdk::pubkey::Pubkey,
+    mint: &solana_sdk::pubkey::Pubkey,
+) -> solana_sdk::pubkey::Pubkey {
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        &spl_token_2022::id(),
+    )
+}
+
 /// Withdraw fee every bench AllowMint sets, and the withdraw setup writes to
 /// the channel. Charged on top of each withdrawal, so a withdraw of 1 raw unit
 /// spends 2 of a withdrawer's `initial_balance`.
