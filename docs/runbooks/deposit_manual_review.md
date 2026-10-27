@@ -194,7 +194,7 @@ update, escalate before retrying.
 ##### `NOT_LANDED` — inspect mint authority on the private channel
 
 ```bash
-spl-token display <mint> --url <private-channel-rpc>
+spl-token display <mint> --program-2022 --url <private-channel-rpc>
 ```
 
 Compare the displayed `Mint authority` to the operator's current
@@ -205,7 +205,7 @@ admin pubkey.
   since the node requires a configured admin signer,
 
   ```bash
-  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --url <private-channel-rpc>
+  spl-token authorize <mint> mint-authority <new-authority> --fee-payer <current-admin-keypair> --program-2022 --url <private-channel-rpc>
   ```
 
   to point the mint at the current operator admin. Then re-arm to

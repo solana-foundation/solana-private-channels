@@ -33,8 +33,9 @@ pnpm add private-channel-escrow-program @solana/kit
 6. [RemoveOperator](#removeoperator) - Remove an operator
 7. [SetNewAdmin](#setnewadmin) - Transfer admin control
 8. [Whitelist](#whitelist) - Restrict who can deposit and who can withdraw (AddOrUpdateAllowedWallet, RemoveAllowedWallet, SetWhitelistEnabled)
-9. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
-10. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
+9. [Channel Seize Authority](#channel-seize-authority) - The permanent delegate on channel mints, the compliance wallet, and rotating the delegate
+10. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
+11. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
 ## CreateInstance
 
@@ -259,7 +260,7 @@ const setAdminIx = getSetNewAdminInstruction({
 - Change is immediate and irreversible
 - Old admin loses its `Instance.admin` privileges once confirmed. It does **not** lose anything else: this instruction rewrites one field and nothing more
 - Operator PDAs survive the handover. Any wallet added via `AddOperator` can still sign `ReleaseFunds` and `RotateBitmap` until the new admin calls `RemoveOperator` for it, including the old admin itself if it was ever registered
-- If the old admin was also used as the channel admin, it keeps SPL mint and freeze authority over every already-initialized receipt mint. Remove it from `PRIVATE_CHANNEL_ADMIN_KEYS` first: that ends its ability to mint, freeze, thaw, rewrite a withdraw config or change a mint's authorities alone. Then migrate every receipt mint with SPL `SetAuthority`, co-signed by the new admin, before treating the rotation as complete. Keeping the two keys separate from the start avoids this entirely
+- If the old admin was also used as the channel admin, it keeps Token-2022 mint and freeze authority over every already-initialized receipt mint, and, if it is also the permanent delegate, the seize authority (see [Rotating the delegate](#rotating-the-delegate)). Remove it from `PRIVATE_CHANNEL_ADMIN_KEYS` first: that ends its ability to mint, freeze, thaw, rewrite a withdraw config or change a mint's authorities alone. Then migrate every receipt mint with Token-2022 `SetAuthority`, co-signed by the new admin, before treating the rotation as complete. Keeping the two keys separate from the start avoids this entirely
 - The channel admin is also each mint's withdraw-fee treasury, exempt from the fee and minimum, and only a deposit of that mint rewrites it. Sweep the old key's collected fees before rotating. Once the operator runs with the new key, make a small deposit per allowed mint, of at least its `minDepositAmount`, and treat the rotation as complete only when every mint's [`WithdrawConfig.treasury`](WITHDRAW_PROGRAM.md#withdrawconfig) names the new key. If the old key was compromised, block withdrawals per mint until then
 - Verify new admin address carefully (typos = permanent loss of control)
 
@@ -318,6 +319,35 @@ const enableIx = getSetWhitelistEnabledInstruction({
 - While withdrawals are whitelisted, give every mint a nonzero withdraw fee. On a zero-fee mint nothing limits how often a refused wallet triggers remints and alerts
 
 To derive an allowed wallet PDA, refer to the [PDA Reference](#pda-reference) section.
+
+## Channel Seize Authority
+
+This is channel-side and involves no escrow instruction. Every channel mint is a Token-2022 mint whose only extension is `PermanentDelegate`, set to the node's `PRIVATE_CHANNEL_PERMANENT_DELEGATE`. The Mainnet mint is unchanged and may be SPL Token or Token-2022.
+
+The delegate can move any holder's channel balance, but the node admits only a `TransferChecked` into the compliance ATA, `ATA(PRIVATE_CHANNEL_COMPLIANCE_OWNER, mint, Token-2022)`. Burns and transfers anywhere else are refused, and with no compliance owner configured every delegate move is refused. Each admitted move logs `permanent delegate move admitted` at warn level. The `seize` command in `scripts/devnet` builds the transaction, thawing and re-freezing a frozen source in the same transaction.
+
+**Keys:**
+- The default deployment uses the operator admin key as the delegate. Use a dedicated delegate key in production, so the hot admin key cannot seize and the delegate key cannot mint or freeze.
+- The compliance owner must differ from the delegate; the node refuses to start otherwise.
+- The compliance wallet withdraws to Mainnet like any holder, through `WithdrawFunds` and `ReleaseFunds`. While withdrawals are [whitelisted](#whitelist), the compliance owner and its Mainnet destination must be allowed to withdraw, so the escrow's destination whitelisting governs where seized funds can leave to.
+
+### Rotating the delegate
+
+The node polices only the configured delegate. A mint still naming the old key after the restart leaves that key unpoliced on it: it can move those balances anywhere. This is an accepted risk, kept short by rotating every mint right after the restart:
+
+1. Pause deposits: stop `operator-solana` and keep it stopped until step 4.
+2. Set the new key in `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node) and `OPERATOR_PERMANENT_DELEGATE` (operator), and restart the write node and `operator-private-channel`.
+3. Immediately, for every channel mint, send a Token-2022 `SetAuthority(PermanentDelegate)` naming the new key. The old delegate signs as the current authority, and a channel admin co-signs, since the node requires an admin signer on every mint-side `SetAuthority`:
+
+   ```bash
+   spl-token authorize <mint> permanent-delegate <new-delegate> \
+     --authority <old-delegate-keypair> --fee-payer <channel-admin-keypair> \
+     --program-2022 --url <private-channel-rpc>
+   ```
+
+4. Confirm each mint shows the new `Permanent delegate` (`spl-token display <mint> --program-2022 --url <private-channel-rpc>`), then start `operator-solana` again.
+
+The node refuses a rotation to any key other than the configured one, and refuses removing the delegate (`None`), even when admin-signed. A mint whose delegate is lost can never be rotated.
 
 ## Deposit
 

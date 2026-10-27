@@ -30,9 +30,8 @@ pub fn block_list_slots(pool_size: u32) -> usize {
 }
 
 /// Encoded-byte budget for the account in a `getAccountInfo` reply.
-/// Sized off what the endpoint actually serves: the largest account is the
-/// 134 KB SPL Token precompile, encoding to ~175 KB. The reply holds nothing
-/// else, so there is no logs allowance to leave room for.
+/// The reply holds nothing but the account, so there is no logs allowance. The
+/// 1.4 MB Token-2022 precompile is over it and is read through a dataSlice.
 pub const MAX_ACCOUNT_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Allowance per account for its metadata fields and the JSON punctuation.

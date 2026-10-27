@@ -98,12 +98,15 @@ EOF
 The derivation is pinned by `source_event_id_matches_documented_vector` in
 `indexer/src/operator/utils/instruction_util.rs`.
 
-Derive the recipient ATA:
+Derive the recipient ATA. Channel mints are Token-2022, and the token program is
+an ATA seed, so `--program-2022` is required; without it `spl-token` derives the
+legacy SPL Token address, which never exists on the channel:
 
 ```bash
 spl-token address \
   --token <mint> \
   --owner <recipient> \
+  --program-2022 \
   --url <private-channel-rpc-url> \
   --verbose
 ```

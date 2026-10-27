@@ -24,9 +24,11 @@ This document defines the safety and correctness invariants that Solana Private 
 | C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
 | C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
 | C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
-| C17 | A transaction that lists the spl-token native mint MUST be rejected at ingress, and the admin VM MUST NOT create it, so fabricated lamports never become wSOL. Revisit if a second ingress path or a lamport-valued exit is added | MUST | Done | - |
+| C17 | A transaction that lists the spl-token native mint MUST be rejected at ingress, and the admin VM MUST NOT create either native mint (spl-token or Token-2022), so fabricated lamports never become wSOL. The Token-2022 native mint is held off by that admin VM refusal, since Token-2022 accounts need an existing mint and `CreateNativeMint` is refused at ingress. Revisit if a second ingress path or a lamport-valued exit is added | MUST | Done | - |
 | C18 | `sendTransaction` MUST refuse every top-level System instruction. A regular transaction MUST NOT create a System-owned account; lamports that would create one are burned. A transaction that leaves any synthesized float unrepaid MUST NOT create more than 4 accounts. Storage per anonymous caller is otherwise bounded only by the gateway rate limit | MUST | Done | - |
 | C19 | A transaction MUST commit in a block whose height is at most `lastValidBlockHeight + 1` of its blockhash or never, and `isBlockhashValid` MUST NOT return `false` for that hash before that block is durable | MUST | Done | - |
+| C20 | A top-level Token-2022 move whose authority is the configured permanent delegate, from a source other than the delegate's own ATA, MUST be a `TransferChecked` into the compliance ATA; any other delegate move, burns included, MUST be refused, and all are refused when no compliance owner is configured | MUST | Done | - |
+| C21 | Every channel mint MUST carry the configured permanent delegate, never `None`: the admin VM MUST NOT create a mint without it, and a `SetAuthority(PermanentDelegate)` to anything but the configured delegate MUST be refused | MUST | Done | - |
 
 ## On-chain Programs
 

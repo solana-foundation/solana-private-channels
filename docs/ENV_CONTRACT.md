@@ -86,3 +86,12 @@ repository, so an equal value lets them authenticate there as superuser.
 Keys with compose-side defaults (e.g. `PRIVATE_CHANNEL_VERSION`, `STREAMER_PORT`)
 are still documented in `.env.example` so the contract is complete, even though
 omitting them from an env file is harmless.
+
+`PRIVATE_CHANNEL_COMPLIANCE_OWNER` is optional; the node reads a blank value as unset.
+`.env.example` documents it as a commented line, which the check does not count. Compose passes it through only when it is set, and
+`templates/env.j2` renders it only when `compliance_owner` is set.
+
+The permanent delegate is one value with two names: `PRIVATE_CHANNEL_PERMANENT_DELEGATE`
+for the node and `OPERATOR_PERMANENT_DELEGATE` for the operators. They must be equal.
+Compose fills a blank node value from `PRIVATE_CHANNEL_ADMIN_KEYS` and a blank operator
+value from the node's, and the Ansible deploy renders both from `permanent_delegate`.

@@ -115,14 +115,14 @@ struct Args {
     admin_keys: Vec<String>,
 
     /// Permanent delegate written into every channel mint (base58). Required in write
-    /// and aio modes. A bad value stops startup, unlike an admin key.
-    #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE", value_parser = parse_optional_pubkey)]
-    permanent_delegate: Option<Pubkey>,
+    /// and aio modes. Blank means unset; a bad value stops startup, unlike an admin key.
+    #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
+    permanent_delegate: Option<String>,
 
     /// Owner of the compliance ATAs, the only place the delegate may move balances to
-    /// (base58). Unset refuses every delegate move.
-    #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER", value_parser = parse_optional_pubkey)]
-    compliance_owner: Option<Pubkey>,
+    /// (base58). Unset or blank refuses every delegate move.
+    #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER")]
+    compliance_owner: Option<String>,
 
     /// Expiry in seconds on cached Redis block and transaction entries; 0 disables it
     #[arg(
@@ -164,11 +164,25 @@ struct Args {
     metrics: bool,
 }
 
-fn parse_optional_pubkey(value: &str) -> Result<Pubkey, String> {
-    Pubkey::from_str(value.trim()).map_err(|e| format!("invalid pubkey '{value}': {e}"))
+/// A blank value is unset, so compose can pass an empty default; anything else must be a pubkey.
+fn optional_pubkey(value: Option<&str>, name: &str) -> Result<Option<Pubkey>, String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => Pubkey::from_str(v)
+            .map(Some)
+            .map_err(|e| format!("{name}: invalid pubkey '{v}': {e}")),
+    }
 }
 
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let permanent_delegate = optional_pubkey(
+        args.permanent_delegate.as_deref(),
+        "PRIVATE_CHANNEL_PERMANENT_DELEGATE",
+    )?;
+    let compliance_owner = optional_pubkey(
+        args.compliance_owner.as_deref(),
+        "PRIVATE_CHANNEL_COMPLIANCE_OWNER",
+    )?;
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
         .admin_keys
@@ -192,7 +206,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
     }
     info!(
         "Permanent delegate: {:?}, compliance owner: {:?}",
-        args.permanent_delegate, args.compliance_owner
+        permanent_delegate, compliance_owner
     );
 
     let metrics: Arc<dyn private_channel_core::stage_metrics::StageMetrics> = if args.metrics {
@@ -236,8 +250,8 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         redis_cache_url: args.redis_cache_url.filter(|url| !url.trim().is_empty()),
         redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
-        permanent_delegate: args.permanent_delegate,
-        compliance_owner: args.compliance_owner,
+        permanent_delegate,
+        compliance_owner,
         max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
             args.max_blockhashes,
             args.transaction_expiration_ms,
@@ -374,16 +388,18 @@ mod tests {
         Args::try_parse_from(argv)
     }
 
-    /// Unlike an admin key, a bad delegate or compliance key stops startup.
+    /// Unlike an admin key, a bad delegate or compliance key stops startup; blank is unset.
     #[test]
     fn seize_keys_must_be_valid_pubkeys() {
-        let key = Pubkey::new_unique().to_string();
-        let args = parse(&["--permanent-delegate", &key, "--compliance-owner", &key]).unwrap();
-        assert_eq!(args.permanent_delegate.map(|k| k.to_string()), Some(key));
-        for flag in ["--permanent-delegate", "--compliance-owner"] {
-            assert!(parse(&[flag, "not-a-key"]).is_err(), "{flag}");
+        let key = Pubkey::new_unique();
+        let args = parse(&["--permanent-delegate", &key.to_string()]).unwrap();
+        assert_eq!(
+            optional_pubkey(args.permanent_delegate.as_deref(), "delegate"),
+            Ok(Some(key))
+        );
+        assert!(optional_pubkey(Some("not-a-key"), "delegate").is_err());
+        for blank in [None, Some(""), Some("  ")] {
+            assert_eq!(optional_pubkey(blank, "compliance"), Ok(None));
         }
-        let args = parse(&[]).unwrap();
-        assert!(args.permanent_delegate.is_none() && args.compliance_owner.is_none());
     }
 }

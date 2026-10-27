@@ -344,7 +344,7 @@ impl AdminVm {
             debug!("[admin-vm] InitializePermanentDelegate: malformed");
             return Err(InstructionError::InvalidInstructionData);
         };
-        if !self.delegate.is_some_and(|d| d.as_ref() == delegate) {
+        if self.delegate.is_none_or(|d| d.as_ref() != delegate) {
             warn!("[admin-vm] InitializePermanentDelegate: delegate is not the configured key");
             return Err(InstructionError::InvalidArgument);
         }

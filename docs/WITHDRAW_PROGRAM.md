@@ -6,6 +6,8 @@
 J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 ```
 
+The program runs on the channel, where Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`) is the only token program. It burns and transfers with Token-2022's unchecked `Burn` and `Transfer`, which channel mints allow because their only extension is `PermanentDelegate`. Token accounts, the treasury's included, are ATAs derived under Token-2022. The generated clients default `token_program` to Token-2022.
+
 - [Instruction Details](#instruction-details)
 - [Accounts](#accounts)
 - [Treasury](#treasury)
@@ -48,7 +50,7 @@ The instruction emits a `WithdrawFundsEvent` via program log:
 | 0 | `user` | ✓ | | User initiating the withdrawal |
 | 1 | `mint` | | ✓ | Token mint |
 | 2 | `token_account` | | ✓ | Source token account |
-| 3 | `token_program` | | | Token program |
+| 3 | `token_program` | | | Token program; must be the Token-2022 program id |
 | 4 | `associated_token_program` | | | Associated token program |
 | 5 | `withdraw_config` | | | Withdraw config PDA for the mint |
 | 6 | `treasury_token_account` | | ✓ | Treasury token account the fee is paid to |
@@ -65,7 +67,7 @@ Discriminator: `1`
 |-----------|------|-------------|
 | `fee` | u64 | Fee in base units charged on top of each withdrawal. `0` is allowed and means no fee; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint) |
 | `allow_mint_slot` | u64 | Slot of the `AllowMint` these values came from. A value older than the stored one leaves the config unchanged |
-| `treasury` | Pubkey | Owner of the token account fees are paid to. Its ATA is derived and stored; the account itself may not exist yet |
+| `treasury` | Pubkey | Owner of the token account fees are paid to. Its Token-2022 ATA is derived and stored; the account itself may not exist yet |
 | `min_withdraw_amount` | u64 | Smallest `amount` a withdrawal may burn. `0` means no minimum |
 
 **Accounts:**
