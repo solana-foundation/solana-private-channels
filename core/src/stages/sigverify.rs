@@ -5,8 +5,8 @@ use {
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
         transactions::{
-            is_admin_instruction, is_foreign_delegate_rotation, requires_admin_signer,
-            IngressPolicy,
+            delegate_move, is_admin_instruction, is_foreign_delegate_rotation,
+            requires_admin_signer, DelegateMove, IngressPolicy, SeizePolicy,
         },
     },
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
@@ -25,6 +25,8 @@ pub enum SigverifyResult {
     NotSignedByAdmin,
     /// A `SetAuthority(PermanentDelegate)` naming anything but the configured delegate.
     ForeignDelegateRotation,
+    /// A permanent delegate move that is not a TransferChecked into the compliance ATA.
+    SeizeTargetRefused,
     SigverifyFailed(String),
 }
 
@@ -38,6 +40,9 @@ impl Display for SigverifyResult {
             SigverifyResult::NotSignedByAdmin => write!(f, "Not signed by admin"),
             SigverifyResult::ForeignDelegateRotation => {
                 write!(f, "Permanent delegate rotated to an unconfigured key")
+            }
+            SigverifyResult::SeizeTargetRefused => {
+                write!(f, "Permanent delegate move outside the compliance account")
             }
             SigverifyResult::SigverifyFailed(e) => write!(f, "Sigverify failed: {}", e),
         }
@@ -99,6 +104,26 @@ fn rotates_delegate_away(transaction: &SanitizedTransaction, policy: &IngressPol
                 policy.seize.delegate.as_ref(),
             )
         })
+}
+
+/// Every top-level delegate move in the transaction, with its resolved accounts.
+fn delegate_moves(transaction: &SanitizedTransaction, seize: &SeizePolicy) -> Vec<DelegateMove> {
+    if seize.delegate.is_none() {
+        return Vec::new();
+    }
+    let keys = transaction.message().account_keys();
+    transaction
+        .message()
+        .program_instructions_iter()
+        .filter_map(|(program_id, instruction)| {
+            let accounts: Vec<Pubkey> = instruction
+                .accounts
+                .iter()
+                .filter_map(|&index| keys.get(usize::from(index)).copied())
+                .collect();
+            delegate_move(program_id, &accounts, &instruction.data, seize)
+        })
+        .collect()
 }
 
 /// Classifies a transaction into one TransactionType enum
@@ -167,9 +192,15 @@ pub async fn sigverify_transaction(
         }
     }
 
-    // Applies even to admin signers: an admin key is not the policed delegate.
+    // Both apply to every signer, admins included: an admin key is not the policed delegate.
     if rotates_delegate_away(transaction, policy) {
         return SigverifyResult::ForeignDelegateRotation;
+    }
+    if delegate_moves(transaction, &policy.seize)
+        .iter()
+        .any(|delegate_move| delegate_move.is_refused(&policy.seize))
+    {
+        return SigverifyResult::SeizeTargetRefused;
     }
 
     // Verify signature
@@ -216,6 +247,17 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                         match result {
                             SigverifyResult::Valid(_) => {
                                 metrics.sigverify_forwarded();
+                                // A delegate key signed a move: alert even if it later fails on chain.
+                                for delegate_move in delegate_moves(&transaction, &policy.seize) {
+                                    metrics.delegate_moves_admitted();
+                                    warn!(
+                                        signature = %transaction.signature(),
+                                        mint = %delegate_move.mint,
+                                        source = %delegate_move.source,
+                                        amount = ?delegate_move.amount,
+                                        "permanent delegate move admitted"
+                                    );
+                                }
                                 // A verified transaction in hand is finished, never
                                 // abandoned: dedup drains until this stage drops its
                                 // sender, so waiting here cannot wedge the exit.
@@ -257,6 +299,21 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                     worker_id,
                                     transaction.signature()
                                 );
+                            }
+                            SigverifyResult::SeizeTargetRefused => {
+                                metrics.sigverify_rejected("seize_target");
+                                for delegate_move in delegate_moves(&transaction, &policy.seize)
+                                    .into_iter()
+                                    .filter(|m| m.is_refused(&policy.seize))
+                                {
+                                    warn!(
+                                        signature = %transaction.signature(),
+                                        mint = %delegate_move.mint,
+                                        source = %delegate_move.source,
+                                        destination = ?delegate_move.destination,
+                                        "permanent delegate move refused"
+                                    );
+                                }
                             }
                             SigverifyResult::SigverifyFailed(e) => {
                                 metrics.sigverify_rejected("sig_failed");
@@ -697,6 +754,202 @@ mod tests {
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "{result}"
         );
+    }
+
+    fn t22_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            mint,
+            &spl_token_2022::id(),
+        )
+    }
+
+    /// Delegate keypair, its seize policy, a mint and a victim's ATA.
+    fn seize_setup() -> (Keypair, IngressPolicy, Pubkey, Pubkey, Pubkey) {
+        let delegate = Keypair::new();
+        let compliance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let policy = IngressPolicy {
+            admin_keys: vec![],
+            seize: crate::transactions::SeizePolicy {
+                delegate: Some(delegate.pubkey()),
+                compliance_owner: Some(compliance),
+            },
+        };
+        let victim_ata = t22_ata(&Pubkey::new_unique(), &mint);
+        (delegate, policy, compliance, mint, victim_ata)
+    }
+
+    fn seize_ix(source: &Pubkey, mint: &Pubkey, dest: &Pubkey, delegate: &Pubkey) -> Instruction {
+        spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
+            source,
+            mint,
+            dest,
+            delegate,
+            &[],
+            500,
+            6,
+        )
+        .unwrap()
+    }
+
+    /// The seize rule runs on the full transaction: one bad move refuses it all.
+    #[tokio::test]
+    async fn delegate_moves_are_refused_unless_into_the_compliance_ata() {
+        let (delegate, policy, compliance, mint, victim) = seize_setup();
+        let to_compliance = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&compliance, &mint),
+            &delegate.pubkey(),
+        );
+        let elsewhere = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let burn = spl_token_2022::instruction::burn(
+            &spl_token_2022::id(),
+            &victim,
+            &mint,
+            &delegate.pubkey(),
+            &[],
+            5,
+        )
+        .unwrap();
+
+        let tx = sanitize(
+            std::slice::from_ref(&to_compliance),
+            &delegate,
+            &[&delegate],
+        );
+        let result = sigverify_transaction(&tx, &policy).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "seize into compliance must pass, got {result}"
+        );
+
+        let cases = [
+            ("to another ATA", vec![elsewhere]),
+            ("burn", vec![burn]),
+            (
+                "good move then a bad one",
+                vec![to_compliance.clone(), {
+                    seize_ix(
+                        &victim,
+                        &mint,
+                        &t22_ata(&delegate.pubkey(), &mint),
+                        &delegate.pubkey(),
+                    )
+                }],
+            ),
+        ];
+        for (label, ixs) in cases {
+            let tx = sanitize(&ixs, &delegate, &[&delegate]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SeizeTargetRefused),
+                "{label}: expected SeizeTargetRefused, got {result}"
+            );
+        }
+
+        // An admin signer does not lift the rule.
+        let mut admin_policy = policy.clone();
+        admin_policy.admin_keys = vec![delegate.pubkey()];
+        let bad = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let tx = sanitize(&[bad], &delegate, &[&delegate]);
+        let result = sigverify_transaction(&tx, &admin_policy).await;
+        assert!(
+            matches!(result, SigverifyResult::SeizeTargetRefused),
+            "{result}"
+        );
+    }
+
+    /// Admitted delegate moves count once and refused ones count as rejections;
+    /// ordinary transfers bump neither. One test, so the global counters see no
+    /// other writer.
+    #[tokio::test]
+    async fn worker_counts_delegate_moves() {
+        use crate::stage_metrics::PrometheusMetrics;
+        fn counter(name: &str, label: Option<&str>) -> f64 {
+            private_channel_metrics::prometheus::gather()
+                .into_iter()
+                .filter(|mf| mf.name() == name)
+                .flat_map(|mf| mf.get_metric().to_vec())
+                .filter(|m| label.is_none_or(|l| m.get_label().iter().any(|p| p.value() == l)))
+                .map(|m| m.get_counter().value())
+                .sum()
+        }
+        let admitted = || counter("private_channel_delegate_moves_admitted_total", None);
+        let refused = || {
+            counter(
+                "private_channel_sigverify_rejected_total",
+                Some("seize_target"),
+            )
+        };
+
+        let (delegate, policy, compliance, mint, victim) = seize_setup();
+        let good = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&compliance, &mint),
+            &delegate.pubkey(),
+        );
+        let bad = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let user = Keypair::new();
+        let ordinary = spl_transfer_ix(&t22_ata(&user.pubkey(), &mint), &victim, &user.pubkey());
+
+        let (in_tx, in_rx) = async_channel::bounded::<SanitizedTransaction>(10);
+        let (out_tx, mut out_rx) = mpsc::channel(SEQ_CAP);
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            policy,
+            rx: in_rx,
+            output_tx: out_tx,
+            metrics: Arc::new(PrometheusMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        let (admitted_before, refused_before) = (admitted(), refused());
+        // The ordinary tx goes last so its arrival proves the others were handled.
+        in_tx
+            .send(sanitize(&[good], &delegate, &[&delegate]))
+            .await
+            .unwrap();
+        in_tx
+            .send(sanitize(&[bad], &delegate, &[&delegate]))
+            .await
+            .unwrap();
+        in_tx
+            .send(sanitize(&[ordinary], &user, &[&user]))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(admitted() - admitted_before, 1.0);
+        assert_eq!(refused() - refused_before, 1.0);
+
+        drop(in_tx);
+        for handle in handles {
+            handle.handle.await.unwrap();
+        }
     }
 
     #[tokio::test]

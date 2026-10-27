@@ -104,6 +104,86 @@ pub fn is_foreign_delegate_rotation(
     !names_delegate
 }
 
+/// A Token-2022 balance move whose authority is the configured permanent delegate acting
+/// on a source account it does not own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegateMove {
+    pub instruction_type: u8,
+    pub source: Pubkey,
+    pub mint: Pubkey,
+    /// Set for TransferChecked only.
+    pub destination: Option<Pubkey>,
+    pub amount: Option<u64>,
+}
+
+const T22_BURN: u8 = 8;
+const T22_TRANSFER_CHECKED: u8 = 12;
+const T22_BURN_CHECKED: u8 = 15;
+
+/// The delegate move in one top-level instruction, if any. Token-2022 honours a
+/// permanent delegate only on TransferChecked and the two burns (the others never read
+/// it), and Batch and the fee/permissioned variants are refused at ingress, so these
+/// three are the only seize paths. A source that is the delegate's own ATA is its own
+/// balance, not a seize. `accounts` are the instruction's resolved account keys.
+pub fn delegate_move(
+    program_id: &Pubkey,
+    accounts: &[Pubkey],
+    data: &[u8],
+    seize: &SeizePolicy,
+) -> Option<DelegateMove> {
+    let delegate = seize.delegate.as_ref()?;
+    if *program_id != spl_token_2022::id() {
+        return None;
+    }
+    let instruction_type = *data.first()?;
+    // Layouts: TransferChecked [source, mint, destination, authority], burns [source, mint, authority].
+    let authority_index = match instruction_type {
+        T22_TRANSFER_CHECKED => 3,
+        T22_BURN | T22_BURN_CHECKED => 2,
+        _ => return None,
+    };
+    // Checked first so a normal transaction pays one key compare and no derivation.
+    if accounts.get(authority_index) != Some(delegate) {
+        return None;
+    }
+    let (source, mint) = (*accounts.first()?, *accounts.get(1)?);
+    if source == token_2022_ata(delegate, &mint) {
+        return None;
+    }
+    Some(DelegateMove {
+        instruction_type,
+        source,
+        mint,
+        destination: (instruction_type == T22_TRANSFER_CHECKED)
+            .then(|| accounts.get(2).copied())
+            .flatten(),
+        amount: data
+            .get(1..9)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes),
+    })
+}
+
+impl DelegateMove {
+    /// Only a TransferChecked into the mint's compliance ATA may pass. The mint is the
+    /// instruction's own, which Token-2022 checks against the source, so the derived
+    /// compliance ATA is the real one. No compliance owner refuses every move.
+    pub fn is_refused(&self, seize: &SeizePolicy) -> bool {
+        let to_compliance = seize
+            .compliance_owner
+            .is_some_and(|owner| self.destination == Some(token_2022_ata(&owner, &self.mint)));
+        !(self.instruction_type == T22_TRANSFER_CHECKED && to_compliance)
+    }
+}
+
+fn token_2022_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        &spl_token_2022::id(),
+    )
+}
+
 /// Token-2022 instructions a channel mint can use: the classic token set (0..=24) and
 /// the permanent delegate init (35, admin only). Everything else is extension machinery
 /// our mints do not carry, plus Batch (255) which would hide inner instructions from
@@ -422,6 +502,231 @@ mod tests {
             &[12, 8],
             Some(&delegate)
         ));
+    }
+
+    // ── Seize rule (`delegate_move`) ─────────────────────────────────────
+
+    fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            mint,
+            &t22(),
+        )
+    }
+
+    struct Seize {
+        policy: SeizePolicy,
+        delegate: Pubkey,
+        compliance: Pubkey,
+        mint: Pubkey,
+        alice_ata: Pubkey,
+    }
+
+    fn seize() -> Seize {
+        let (delegate, compliance, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        Seize {
+            policy: SeizePolicy {
+                delegate: Some(delegate),
+                compliance_owner: Some(compliance),
+            },
+            delegate,
+            compliance,
+            mint,
+            alice_ata: ata(&Pubkey::new_unique(), &mint),
+        }
+    }
+
+    fn transfer_checked(
+        source: &Pubkey,
+        mint: &Pubkey,
+        dest: &Pubkey,
+        authority: &Pubkey,
+    ) -> (Vec<Pubkey>, Vec<u8>) {
+        let ix = spl_token_2022::instruction::transfer_checked(
+            &t22(),
+            source,
+            mint,
+            dest,
+            authority,
+            &[],
+            500,
+            6,
+        )
+        .unwrap();
+        (ix.accounts.iter().map(|m| m.pubkey).collect(), ix.data)
+    }
+
+    fn burn(
+        checked: bool,
+        source: &Pubkey,
+        mint: &Pubkey,
+        authority: &Pubkey,
+    ) -> (Vec<Pubkey>, Vec<u8>) {
+        let ix = if checked {
+            spl_token_2022::instruction::burn_checked(&t22(), source, mint, authority, &[], 500, 6)
+        } else {
+            spl_token_2022::instruction::burn(&t22(), source, mint, authority, &[], 500)
+        }
+        .unwrap();
+        (ix.accounts.iter().map(|m| m.pubkey).collect(), ix.data)
+    }
+
+    fn refused(s: &Seize, (accounts, data): &(Vec<Pubkey>, Vec<u8>)) -> Option<bool> {
+        delegate_move(&t22(), accounts, data, &s.policy).map(|m| m.is_refused(&s.policy))
+    }
+
+    /// Acting as delegate, only a TransferChecked into the mint's compliance ATA passes.
+    #[test]
+    fn delegate_moves_only_into_the_compliance_ata() {
+        let s = seize();
+        let compliance_ata = ata(&s.compliance, &s.mint);
+        let other_mint = Pubkey::new_unique();
+        let cases = [
+            (
+                "to compliance",
+                transfer_checked(&s.alice_ata, &s.mint, &compliance_ata, &s.delegate),
+                Some(false),
+            ),
+            (
+                "to another ATA",
+                transfer_checked(
+                    &s.alice_ata,
+                    &s.mint,
+                    &ata(&Pubkey::new_unique(), &s.mint),
+                    &s.delegate,
+                ),
+                Some(true),
+            ),
+            (
+                "to the delegate",
+                transfer_checked(
+                    &s.alice_ata,
+                    &s.mint,
+                    &ata(&s.delegate, &s.mint),
+                    &s.delegate,
+                ),
+                Some(true),
+            ),
+            (
+                "to compliance of another mint",
+                transfer_checked(
+                    &s.alice_ata,
+                    &s.mint,
+                    &ata(&s.compliance, &other_mint),
+                    &s.delegate,
+                ),
+                Some(true),
+            ),
+            (
+                "Burn",
+                burn(false, &s.alice_ata, &s.mint, &s.delegate),
+                Some(true),
+            ),
+            (
+                "BurnChecked",
+                burn(true, &s.alice_ata, &s.mint, &s.delegate),
+                Some(true),
+            ),
+        ];
+        for (label, ix, expected) in cases {
+            assert_eq!(refused(&s, &ix), expected, "{label}");
+        }
+    }
+
+    /// The delegate's own ATA is its own balance (operator payouts), and other
+    /// authorities are not the delegate: neither is a delegate move.
+    #[test]
+    fn own_balance_and_other_authorities_are_not_delegate_moves() {
+        let s = seize();
+        let own = ata(&s.delegate, &s.mint);
+        let anywhere = ata(&Pubkey::new_unique(), &s.mint);
+        let alice = Pubkey::new_unique();
+        let cases = [
+            (
+                "own ATA TransferChecked",
+                transfer_checked(&own, &s.mint, &anywhere, &s.delegate),
+            ),
+            ("own ATA Burn", burn(false, &own, &s.mint, &s.delegate)),
+            (
+                "owner TransferChecked",
+                transfer_checked(&s.alice_ata, &s.mint, &anywhere, &alice),
+            ),
+            ("owner Burn", burn(true, &s.alice_ata, &s.mint, &alice)),
+        ];
+        for (label, ix) in cases {
+            assert_eq!(refused(&s, &ix), None, "{label}");
+        }
+    }
+
+    /// Token-2022 reads the permanent delegate only on TransferChecked and the burns,
+    /// so the delegate signing Transfer or Approve is not a seize.
+    #[test]
+    fn delegate_as_transfer_or_approve_authority_is_not_a_delegate_move() {
+        let s = seize();
+        let dest = ata(&Pubkey::new_unique(), &s.mint);
+        #[allow(deprecated)]
+        let transfer =
+            spl_token_2022::instruction::transfer(&t22(), &s.alice_ata, &dest, &s.delegate, &[], 5)
+                .unwrap();
+        let approve =
+            spl_token_2022::instruction::approve(&t22(), &s.alice_ata, &dest, &s.delegate, &[], 5)
+                .unwrap();
+        for ix in [transfer, approve] {
+            let accounts: Vec<Pubkey> = ix.accounts.iter().map(|m| m.pubkey).collect();
+            assert_eq!(delegate_move(&t22(), &accounts, &ix.data, &s.policy), None);
+        }
+    }
+
+    /// With no compliance owner configured every delegate move is refused.
+    #[test]
+    fn no_compliance_owner_refuses_every_delegate_move() {
+        let mut s = seize();
+        let compliance_ata = ata(&s.compliance, &s.mint);
+        s.policy.compliance_owner = None;
+        let ix = transfer_checked(&s.alice_ata, &s.mint, &compliance_ata, &s.delegate);
+        assert_eq!(refused(&s, &ix), Some(true));
+    }
+
+    /// A truncated account list or another program is not a delegate move: the
+    /// program itself refuses the former.
+    #[test]
+    fn truncated_or_foreign_instructions_are_not_delegate_moves() {
+        let s = seize();
+        let compliance_ata = ata(&s.compliance, &s.mint);
+        let (accounts, data) =
+            transfer_checked(&s.alice_ata, &s.mint, &compliance_ata, &s.delegate);
+        assert_eq!(
+            delegate_move(&t22(), &accounts[..3], &data, &s.policy),
+            None
+        );
+        assert_eq!(
+            delegate_move(&spl_token::id(), &accounts, &data, &s.policy),
+            None
+        );
+        let no_delegate = SeizePolicy::default();
+        assert_eq!(delegate_move(&t22(), &accounts, &data, &no_delegate), None);
+    }
+
+    /// The move carries what the alert logs.
+    #[test]
+    fn delegate_move_reports_mint_source_destination_and_amount() {
+        let s = seize();
+        let dest = ata(&s.compliance, &s.mint);
+        let (accounts, data) = transfer_checked(&s.alice_ata, &s.mint, &dest, &s.delegate);
+        assert_eq!(
+            delegate_move(&t22(), &accounts, &data, &s.policy),
+            Some(DelegateMove {
+                instruction_type: 12,
+                source: s.alice_ata,
+                mint: s.mint,
+                destination: Some(dest),
+                amount: Some(500),
+            })
+        );
     }
 
     // ── Admission policy (`is_allowed_program_instruction`) ──────────────────

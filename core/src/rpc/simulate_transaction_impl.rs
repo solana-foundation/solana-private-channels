@@ -202,6 +202,14 @@ pub async fn simulate_transaction(
                     "Transaction not signed by admin".to_string(),
                 ));
             }
+            SigverifyResult::SeizeTargetRefused => {
+                return Err(custom_error(
+                    INVALID_PARAMS_CODE,
+                    "A permanent delegate may only move balances with TransferChecked into the \
+                     compliance account"
+                        .to_string(),
+                ));
+            }
             SigverifyResult::ForeignDelegateRotation => {
                 return Err(custom_error(
                     INVALID_PARAMS_CODE,
@@ -722,6 +730,59 @@ mod tests {
             deps.simulation_permits.available_permits(),
             1,
             "a failed call must release its permit"
+        );
+    }
+
+    /// With sigVerify a simulation applies the seize rule exactly as the write path does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sig_verify_simulation_refuses_a_delegate_move_elsewhere() {
+        use solana_sdk::{
+            hash::Hash,
+            message::Message,
+            signature::{Keypair, Signer},
+            transaction::{Transaction, VersionedTransaction},
+        };
+        let delegate = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ata = |owner: &Pubkey| {
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                owner,
+                &mint,
+                &spl_token_2022::id(),
+            )
+        };
+        let mut deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        deps.ingress.seize = crate::transactions::SeizePolicy {
+            delegate: Some(delegate.pubkey()),
+            compliance_owner: Some(Pubkey::new_unique()),
+        };
+        let ix = spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
+            &ata(&Pubkey::new_unique()),
+            &mint,
+            &ata(&Pubkey::new_unique()),
+            &delegate.pubkey(),
+            &[],
+            5,
+            6,
+        )
+        .unwrap();
+        let msg = Message::new(&[ix], Some(&delegate.pubkey()));
+        let tx = VersionedTransaction::from(Transaction::new(&[&delegate], msg, Hash::default()));
+        let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: true,
+            ..Default::default()
+        };
+
+        let err = simulate_transaction(&deps, encoded, Some(config))
+            .await
+            .expect_err("a delegate move elsewhere must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert!(
+            err.message().contains("compliance account"),
+            "{}",
+            err.message()
         );
     }
 

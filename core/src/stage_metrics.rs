@@ -15,6 +15,8 @@ pub trait StageMetrics: Send + Sync {
     // Sigverify
     fn sigverify_forwarded(&self);
     fn sigverify_rejected(&self, reason: &'static str);
+    /// An admitted transaction in which the permanent delegate moved another owner's balance.
+    fn delegate_moves_admitted(&self);
 
     // Sequencer
     fn sequencer_collected(&self, tx_count: usize);
@@ -119,6 +121,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn sigverify_rejected(&self, reason: &'static str) {
         debug!("sigverify: rejected reason={}", reason);
+    }
+    fn delegate_moves_admitted(&self) {
+        debug!("sigverify: delegate move admitted");
     }
     fn sequencer_collected(&self, n: usize) {
         debug!("sequencer: collected {}", n);
@@ -317,6 +322,12 @@ counter_vec!(
     "private_channel_sigverify_rejected_total",
     "Transactions rejected by sigverify",
     &["reason"]
+);
+counter_vec!(
+    DELEGATE_MOVES_ADMITTED,
+    "private_channel_delegate_moves_admitted_total",
+    "Admitted permanent delegate moves of another owner's balance",
+    &[]
 );
 counter_vec!(
     SEQUENCER_COLLECTED,
@@ -573,6 +584,11 @@ impl StageMetrics for PrometheusMetrics {
     fn sigverify_rejected(&self, reason: &'static str) {
         SIGVERIFY_REJECTED.with_label_values(&[reason]).inc();
     }
+    fn delegate_moves_admitted(&self) {
+        DELEGATE_MOVES_ADMITTED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn sequencer_collected(&self, n: usize) {
         SEQUENCER_COLLECTED
             .with_label_values(&[] as &[&str])
@@ -778,6 +794,7 @@ pub fn init_prometheus_metrics() {
         DEDUP_DROPPED_UNK_BH,
         SIGVERIFY_FORWARDED,
         SIGVERIFY_REJECTED,
+        DELEGATE_MOVES_ADMITTED,
         SEQUENCER_COLLECTED,
         SEQUENCER_TXS_EMITTED,
         EXECUTOR_RESULTS_SENT,
