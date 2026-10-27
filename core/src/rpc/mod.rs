@@ -1857,9 +1857,10 @@ mod tests {
             encoding: Some(UiAccountEncoding::Base64Zstd),
             ..Default::default()
         };
+        // The ATA program fits the budget; the 1.4 MB Token-2022 ELF needs a dataSlice.
         let precompile = get_account_info_impl::get_account_info_impl(
             &deps,
-            spl_token_2022::ID.to_string(),
+            spl_associated_token_account::ID.to_string(),
             Some(zstd),
         )
         .await
@@ -1918,7 +1919,7 @@ mod tests {
         let (mut db, _pg) = start_pg().await;
         seed_db(&mut db).await;
         let deps = make_read_deps(db);
-        let precompile = spl_token_2022::ID.to_string();
+        let precompile = spl_associated_token_account::ID.to_string();
 
         for encoding in [UiAccountEncoding::Base58, UiAccountEncoding::Binary] {
             let config = RpcAccountInfoConfig {

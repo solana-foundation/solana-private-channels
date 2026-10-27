@@ -49,13 +49,8 @@ fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
         AccountSharedData::from(system_account),
     );
 
-    // SPL Token v8.
-    let spl_token_elf = include_bytes!("../../precompiles/spl_token-8.0.0.so");
-    let (spl_token_id, spl_token_account) =
-        bpf_loader_program_account(&spl_token::ID, spl_token_elf, &rent);
-    precompiles.insert(spl_token_id, AccountSharedData::from(spl_token_account));
-
-    // Token-2022 v11.1.0, the build deployed on mainnet.
+    // Token-2022 v11.1.0, the build deployed on mainnet. It is the only token
+    // program: every channel mint and token account lives under it.
     let spl_token_2022_elf = include_bytes!("../../precompiles/spl_token_2022-11.1.0.so");
     let (spl_token_2022_id, spl_token_2022_account) =
         bpf_loader_program_account(&spl_token_2022::ID, spl_token_2022_elf, &rent);
@@ -135,7 +130,7 @@ mod tests {
     #[test]
     fn precompiles_contains_expected_entries() {
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::system_program::ID));
-        assert!(PRECOMPILES.contains_key(&spl_token::ID));
+        assert!(!PRECOMPILES.contains_key(&spl_token::ID));
         assert!(PRECOMPILES.contains_key(&spl_token_2022::ID));
         assert!(PRECOMPILES.contains_key(&spl_associated_token_account::ID));
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::sysvar::rent::ID));
@@ -144,13 +139,12 @@ mod tests {
             &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
         ));
         assert!(PRECOMPILES.contains_key(&dvp_swap_program_client::DVP_SWAP_PROGRAM_ID));
-        assert_eq!(PRECOMPILES.len(), 8);
+        assert_eq!(PRECOMPILES.len(), 7);
     }
 
     #[test]
     fn precompile_programs_are_executable_with_elf_data() {
         for program_id in [
-            spl_token::ID,
             spl_token_2022::ID,
             spl_associated_token_account::ID,
             spl_memo::id(),
@@ -212,7 +206,7 @@ mod tests {
 
     #[test]
     fn get_returns_cloned_precompile() {
-        let account = get(&spl_token::ID).expect("spl_token missing");
+        let account = get(&spl_token_2022::ID).expect("spl_token_2022 missing");
         assert!(account.executable());
     }
 }

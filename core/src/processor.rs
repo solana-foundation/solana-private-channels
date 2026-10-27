@@ -65,9 +65,8 @@ pub struct BatchProcessor {
 }
 
 /// BPF programs loaded into the program cache; must match the precompiles loaded in BOB.
-fn cached_bpf_programs() -> [solana_sdk::pubkey::Pubkey; 6] {
+fn cached_bpf_programs() -> [solana_sdk::pubkey::Pubkey; 5] {
     [
-        spl_token::id(),
         spl_token_2022::id(),
         spl_associated_token_account::id(),
         spl_memo::id(),
@@ -304,7 +303,8 @@ mod tests {
                 assert!(cached.contains(id), "{id} is a precompile but not cached");
             }
         }
-        assert!(cached.contains(&spl_token_2022::id()));
+        assert_eq!(cached[0], spl_token_2022::id());
+        assert!(!cached.contains(&spl_token::id()));
     }
 
     #[test]
@@ -319,14 +319,14 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error when BPF programs are missing"),
         };
-        // The first BPF program looked up is spl_token
+        // The first BPF program looked up is Token-2022
         assert!(
             err.contains("BPF program") && err.contains("not found"),
             "expected 'BPF program ... not found' error, got: {err}"
         );
         assert!(
-            err.contains(&spl_token::id().to_string()),
-            "error should mention the first missing program (spl_token), got: {err}"
+            err.contains(&spl_token_2022::id().to_string()),
+            "error should mention the first missing program (Token-2022), got: {err}"
         );
     }
 }
