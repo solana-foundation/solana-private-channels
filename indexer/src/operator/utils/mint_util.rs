@@ -571,9 +571,9 @@ impl MintCache {
         Ok(account.data[DECIMALS_OFFSET])
     }
 
-    // The private channel only supports SPL for now.
+    /// Every channel mint and token account lives under Token-2022.
     pub fn get_private_channel_token_program(&self) -> Pubkey {
-        TOKEN_PROGRAM_ID
+        TOKEN_2022_PROGRAM_ID
     }
 
     /// Operator gate: refuses deposits whose mint was not allowed coming into
@@ -622,6 +622,16 @@ mod tests {
     };
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
     use std::time::Duration;
+
+    /// Every channel mint and token account lives under Token-2022.
+    #[test]
+    fn private_channel_token_program_is_token_2022() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        assert_eq!(
+            MintCache::new(storage).get_private_channel_token_program(),
+            TOKEN_2022_PROGRAM_ID
+        );
+    }
 
     impl RpcClientWithRetry {
         pub fn new_mocked(mocks: solana_client::rpc_client::Mocks) -> Self {

@@ -2942,20 +2942,16 @@ mod tests {
         mock_channel_supply_at(server, supply, CHANNEL_TIP).await;
     }
 
-    /// Answer every channel `getAccountInfo` with an SPL mint at `supply`, read at `slot`.
+    /// Answer every channel `getAccountInfo` with a channel mint at `supply`, read at `slot`.
     async fn mock_channel_supply_at(server: &mut mockito::Server, supply: u64, slot: u64) {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        let mint = spl_token::state::Mint {
-            mint_authority: COption::None,
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
             supply,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
-        };
-        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
-        mint.pack_into_slice(&mut buf);
+        );
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         server
             .mock("POST", "/")
@@ -2965,7 +2961,7 @@ mod tests {
             .with_status(200)
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{slot}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-                prog = spl_token::id(),
+                prog = spl_token_2022::id(),
             ))
             .create_async()
             .await;
@@ -3228,17 +3224,13 @@ mod tests {
         seen: Arc<std::sync::Mutex<Vec<usize>>>,
     ) {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        let mint = spl_token::state::Mint {
-            mint_authority: COption::None,
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
             supply,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
-        };
-        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
-        mint.pack_into_slice(&mut buf);
+        );
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         server
             .mock("POST", "/")
@@ -3256,7 +3248,7 @@ mod tests {
                     "result": {
                         "context": {"slot": CHANNEL_TIP},
                         "value": {
-                            "owner": spl_token::id().to_string(),
+                            "owner": spl_token_2022::id().to_string(),
                             "lamports": 1_000_000u64,
                             "data": [b64, "base64"],
                             "executable": false,
@@ -4122,21 +4114,17 @@ mod tests {
         on_read: impl Fn() + Send + Sync + 'static,
     ) {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        let mint = spl_token::state::Mint {
-            mint_authority: COption::None,
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
             supply,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
-        };
-        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
-        mint.pack_into_slice(&mut buf);
+        );
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{CHANNEL_TIP}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-            prog = spl_token::id(),
+            prog = spl_token_2022::id(),
         );
         server
             .mock("POST", "/")

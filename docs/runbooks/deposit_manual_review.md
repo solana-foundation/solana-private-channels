@@ -62,7 +62,8 @@ to the right Path below.
 | `error_message` contains | Cause |
 |---|---|
 | `Mint instruction failed after JIT: mint_authority mismatch` | The on-chain mint's `mint_authority` is not the operator's admin pubkey. Two known triggers: (a) an existing mint on the private channel is owned by a different authority and `mint_to` produced one of the three classified `InstructionError` variants (rare — the most common rotated-admin case produces `OwnerMismatch` → `Custom(3)`, which routes to `Failed` instead of here); (b) post-`InitializeMint` race where another party initialized the same mint with a different authority during our send window. |
-| `Mint instruction failed after JIT: corrupt mint state` | The mint's account data does not decode as a valid SPL Mint (`COption` discriminant invalid, length mismatched). Defensive — should not occur in normal operation; investigate before any recovery. |
+| `Mint instruction failed after JIT: corrupt mint state` | The mint's account data does not decode as a valid Token-2022 mint (`COption` discriminant invalid, length mismatched). Defensive, should not occur in normal operation; investigate before any recovery. |
+| `Mint instruction failed after JIT: permanent delegate mismatch` | The mint's authority is the operator's admin, but its `PermanentDelegate` extension is missing, revoked, or names a key other than `OPERATOR_PERMANENT_DELEGATE`. The operator never mints into such a mint because the channel could not seize from it. Usual cause: the operator and the node (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`) disagree after a delegate rotation, or the mint was rotated on chain before the operator was restarted. |
 
 ### Processor-side allowlist surface (`processor.rs::process_deposit_funds`)
 
@@ -221,6 +222,14 @@ admin pubkey.
 - **`error_message` contains `corrupt mint state`.** Escalate (Tier
   2). Corrupt mint data on a deployed chain is a structural anomaly
   engineering must investigate before any recovery. Do not re-arm.
+- **`error_message` contains `permanent delegate mismatch`.** Compare
+  the mint's `Permanent delegate` (`spl-token display <mint>
+  --program-2022 --url <private-channel-rpc>`) with the operator's
+  `OPERATOR_PERMANENT_DELEGATE` and the node's
+  `PRIVATE_CHANNEL_PERMANENT_DELEGATE`. If the config is stale, fix it,
+  restart, and re-arm to `pending` (SQL below). If the mint itself carries
+  a wrong or no delegate, escalate (Tier 1): the delegate can only be
+  moved by its current holder, and a mint with none can never get one.
 
 ##### `AMBIGUOUS`
 

@@ -1981,7 +1981,7 @@ mod tests {
         );
     }
 
-    /// getAccountInfo mock returning an SPL Mint blob with `supply`.
+    /// getAccountInfo mock returning a channel mint blob with `supply`.
     async fn mock_channel_supply(server: &mut mockito::Server, supply: u64) {
         mock_channel_supply_times(server, supply, None).await;
     }
@@ -1994,19 +1994,13 @@ mod tests {
         times: Option<usize>,
     ) {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        use spl_token::state::Mint;
-
-        let mint_state = Mint {
-            mint_authority: COption::Some(Pubkey::new_unique()),
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
             supply,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
-        };
-        let mut buf = vec![0u8; Mint::LEN];
-        mint_state.pack_into_slice(&mut buf);
+        );
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         let mock = server
             .mock("POST", "/")
@@ -2014,7 +2008,7 @@ mod tests {
             .with_status(200)
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":100}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-                prog = spl_token::id(),
+                prog = spl_token_2022::id(),
             ));
         match times {
             Some(n) => mock.expect(n).create_async().await,
@@ -2084,19 +2078,13 @@ mod tests {
         times: Option<usize>,
     ) -> mockito::Mock {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        use spl_token::state::Mint;
-
-        let mint_state = Mint {
-            mint_authority: COption::Some(Pubkey::new_unique()),
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
             supply,
-            decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
-        };
-        let mut buf = vec![0u8; Mint::LEN];
-        mint_state.pack_into_slice(&mut buf);
+        );
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         let mock = server
             .mock("POST", "/")
@@ -2107,7 +2095,7 @@ mod tests {
             .with_status(200)
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":100}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-                prog = spl_token::id(),
+                prog = spl_token_2022::id(),
             ));
         match times {
             Some(n) => mock.expect(n).create_async().await,
@@ -2727,9 +2715,6 @@ mod tests {
         script: impl Fn(usize) -> (u64, u64) + Send + Sync + 'static,
     ) -> Arc<AtomicUsize> {
         use base64::Engine as _;
-        use spl_token::solana_program::program_option::COption;
-        use spl_token::solana_program::program_pack::Pack;
-        use spl_token::state::Mint;
 
         let reads = Arc::new(AtomicUsize::new(0));
         let counter = reads.clone();
@@ -2742,19 +2727,17 @@ mod tests {
             .with_status(200)
             .with_body_from_request(move |_| {
                 let (supply, slot) = script(counter.fetch_add(1, Ordering::SeqCst));
-                let mint_state = Mint {
-                    mint_authority: COption::Some(Pubkey::default()),
+                let buf = private_channel_core::t22_fixtures::t22_mint(
+                    6,
+                    &Pubkey::default(),
+                    None,
+                    Some(&Pubkey::new_unique()),
                     supply,
-                    decimals: 6,
-                    is_initialized: true,
-                    freeze_authority: COption::None,
-                };
-                let mut buf = vec![0u8; Mint::LEN];
-                mint_state.pack_into_slice(&mut buf);
+                );
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
                 format!(
                     r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{slot}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-                    prog = spl_token::id(),
+                    prog = spl_token_2022::id(),
                 )
                 .into_bytes()
             })

@@ -1,6 +1,7 @@
 use solana_keychain::{Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
 use std::env;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -9,6 +10,8 @@ const ADMIN_SIGNER: &str = "ADMIN_SIGNER";
 
 /// Environment variables for operator signer
 const OPERATOR_SIGNER: &str = "OPERATOR_SIGNER";
+/// Permanent delegate written into channel mints; defaults to the admin signer's key.
+const OPERATOR_PERMANENT_DELEGATE: &str = "OPERATOR_PERMANENT_DELEGATE";
 
 // In memory env vars (per-signer)
 const ADMIN_PRIVATE_KEY: &str = "ADMIN_PRIVATE_KEY";
@@ -330,6 +333,30 @@ async fn build(spec: SignerSpec) -> Result<Signer, LoadError> {
 struct Signers {
     admin: Signer,
     operator: Option<Signer>,
+    /// Must match the node's PRIVATE_CHANNEL_PERMANENT_DELEGATE or mint creation is refused.
+    permanent_delegate: Pubkey,
+}
+
+/// The configured permanent delegate, or None when unset or blank. A bad value is an error.
+fn read_permanent_delegate(env: Env) -> Result<Option<Pubkey>, String> {
+    match env(OPERATOR_PERMANENT_DELEGATE) {
+        Some(value) if !value.trim().is_empty() => Pubkey::from_str(value.trim())
+            .map(Some)
+            .map_err(|e| format!("{OPERATOR_PERMANENT_DELEGATE} is not a pubkey: {e}")),
+        _ => Ok(None),
+    }
+}
+
+fn log_permanent_delegate(delegate: &Pubkey, configured: bool) {
+    let source = if configured {
+        OPERATOR_PERMANENT_DELEGATE
+    } else {
+        "admin signer default"
+    };
+    info!(
+        "Permanent delegate for new mints ({}): {}",
+        source, delegate
+    );
 }
 
 /// Both specs are read before anything is built, so a bad operator config fails before
@@ -358,6 +385,7 @@ fn log_operator_role(operator: &Option<Signer>) {
 
 async fn load_signers(env: Env<'_>) -> Result<Signers, String> {
     let (admin_spec, operator_spec) = read_specs(env)?;
+    let configured_delegate = read_permanent_delegate(env)?;
     let label = admin_spec.label();
     let admin = build(admin_spec)
         .await
@@ -375,11 +403,18 @@ async fn load_signers(env: Env<'_>) -> Result<Signers, String> {
         None => None,
     };
     log_operator_role(&operator);
-    Ok(Signers { admin, operator })
+    let permanent_delegate = configured_delegate.unwrap_or_else(|| admin.pubkey());
+    log_permanent_delegate(&permanent_delegate, configured_delegate.is_some());
+    Ok(Signers {
+        admin,
+        operator,
+        permanent_delegate,
+    })
 }
 
 fn load_signers_sync(env: Env) -> Result<Signers, String> {
     let (admin_spec, operator_spec) = read_specs(env)?;
+    let configured_delegate = read_permanent_delegate(env)?;
     let label = admin_spec.label();
     let admin = build_sync(admin_spec).map_err(|e| format!("admin signer: {e}"))?;
     log_loaded("admin", label, &admin);
@@ -393,7 +428,13 @@ fn load_signers_sync(env: Env) -> Result<Signers, String> {
         None => None,
     };
     log_operator_role(&operator);
-    Ok(Signers { admin, operator })
+    let permanent_delegate = configured_delegate.unwrap_or_else(|| admin.pubkey());
+    log_permanent_delegate(&permanent_delegate, configured_delegate.is_some());
+    Ok(Signers {
+        admin,
+        operator,
+        permanent_delegate,
+    })
 }
 
 static SIGNERS: OnceLock<Signers> = OnceLock::new();
@@ -433,6 +474,11 @@ impl SignerUtil {
 
     pub fn get_operator_pubkey() -> Pubkey {
         Self::operator_signer().pubkey()
+    }
+
+    /// Permanent delegate the operator writes into new channel mints and expects on them.
+    pub fn permanent_delegate() -> Pubkey {
+        signers().permanent_delegate
     }
 
     pub fn admin_signer() -> &'static Signer {
@@ -529,6 +575,22 @@ mod tests {
     fn unknown_backend_is_refused() {
         let msg = spec_err(SignerRole::Admin, &[(ADMIN_SIGNER, "hsm")]);
         assert!(msg.contains("Unsupported signer type"), "got: {msg}");
+    }
+
+    /// The permanent delegate defaults to the admin key; a set value must be a pubkey.
+    #[test]
+    fn permanent_delegate_is_optional_and_validated() {
+        for pairs in [&[][..], &[(OPERATOR_PERMANENT_DELEGATE, " ")][..]] {
+            assert_eq!(read_permanent_delegate(&env_of(pairs)), Ok(None));
+        }
+        let key = Pubkey::new_unique();
+        assert_eq!(
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, &key.to_string())])),
+            Ok(Some(key))
+        );
+        let err =
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, "nope")])).unwrap_err();
+        assert!(err.contains(OPERATOR_PERMANENT_DELEGATE), "got: {err}");
     }
 
     #[test]
