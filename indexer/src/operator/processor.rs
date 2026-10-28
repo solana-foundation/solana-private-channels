@@ -983,8 +983,8 @@ async fn check_withdrawal_preflights_inner(
 /// The program's cap on extras (`MAX_HOOK_REMAINING_ACCOUNTS` in its `token_utils`,
 /// which codama does not export), checked before the list is resolved.
 ///
-/// The legacy packet binds first, at 12 new accounts, or 15 when the admin key is also
-/// the operator, so `attach_hook_extras` also measures the built release. The message
+/// The legacy packet binds first, at 12 new accounts, or 15 when the operator key is
+/// the fee payer's, so `attach_hook_extras` also measures the built release. The message
 /// lists a key once, so a withdrawal to the withdrawer's own wallet, whose two whitelist
 /// entries are one account, fits one more. Versioned transactions with a lookup table,
 /// or v1 transactions, would make room for all 32.
@@ -4094,16 +4094,24 @@ mod tests {
         assert!(accounts.iter().all(|meta| meta.pubkey != validation_pda));
     }
 
-    /// The packet decides, not the number of hook accounts. With separate admin and
+    /// The packet decides, not the number of hook accounts. With separate fee-payer and
     /// operator keys, 12 hook accounts fit a withdrawal to another wallet and 13 park.
     /// A withdrawal to the withdrawer's own wallet carries one whitelist entry for both
-    /// wallets, so it fits 13.
+    /// wallets, so it fits 13. When the operator key is the fee payer's, 15 fit (16 to the
+    /// withdrawer's own wallet) and 16 to another wallet park.
     #[tokio::test]
     async fn a_hook_release_parks_only_past_the_packet() {
-        // (hook accounts, to the withdrawer's own wallet, released)
-        let cases = [(12, false, true), (13, false, false), (13, true, true)];
+        // (hook accounts, to the withdrawer's own wallet, operator key is the fee payer's, released)
+        let cases = [
+            (12, false, false, true),
+            (13, false, false, false),
+            (13, true, false, true),
+            (15, false, true, true),
+            (16, false, true, false),
+            (16, true, true, true),
+        ];
 
-        for (hook_accounts, to_own_wallet, released) in cases {
+        for (hook_accounts, to_own_wallet, shared_key, released) in cases {
             // The entries plus the hook program and the validation account.
             let entry_count = hook_accounts - 2;
             let mint = Pubkey::new_unique();
@@ -4119,6 +4127,14 @@ mod tests {
                 &spl_token_2022::id(),
                 transfer_hook_mint_bytes(&hook_program),
             );
+
+            if shared_key {
+                ps.admin_pubkey = ps
+                    .release_funds_state
+                    .as_ref()
+                    .expect("the release state is set")
+                    .operator_pubkey;
+            }
 
             let entry_addresses: Vec<Pubkey> =
                 (0..entry_count).map(|_| Pubkey::new_unique()).collect();
@@ -4168,7 +4184,9 @@ mod tests {
 
             let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
 
-            let case = format!("hook_accounts={hook_accounts} to_own_wallet={to_own_wallet}");
+            let case = format!(
+                "hook_accounts={hook_accounts} to_own_wallet={to_own_wallet} shared_key={shared_key}"
+            );
             assert!(outcome.is_ok(), "{case}: {outcome:?}");
             if released {
                 assert!(update.is_none(), "{case}: {update:?}");
