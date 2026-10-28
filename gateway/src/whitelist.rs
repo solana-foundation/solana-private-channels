@@ -301,8 +301,10 @@ pub fn wallet_not_allowed_body(wallet: &Pubkey) -> Bytes {
 /// refuses on its own: larger than a v1 transaction, or not decodable. No program the
 /// channel admits calls WithdrawFunds by CPI; one that did would skip this check.
 fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
+    // The write node takes the transaction positionally or as the named `transaction` param.
     let Some(bytes) = params
         .get(0)
+        .or_else(|| params.get("transaction"))
         .and_then(Value::as_str)
         .and_then(|encoded| BASE64.decode(encoded).ok())
     else {
@@ -492,6 +494,19 @@ mod tests {
         );
 
         assert_eq!(withdraw_wallets(&params), vec![withdrawer.pubkey()]);
+    }
+
+    // The write node also takes the transaction as the named `transaction` param.
+    #[test]
+    fn a_withdrawal_in_named_params_is_checked() {
+        let withdrawer = Keypair::new();
+        let positional = send_params(
+            &[withdraw_funds(&withdrawer.pubkey(), None)],
+            &[&withdrawer],
+        );
+        let named = json!({ "transaction": positional[0], "config": { "encoding": "base64" } });
+
+        assert_eq!(withdraw_wallets(&named), vec![withdrawer.pubkey()]);
     }
 
     #[test]
