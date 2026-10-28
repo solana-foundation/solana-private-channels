@@ -321,6 +321,8 @@ fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> 
         12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
         13 => Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
         14 => Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+        20 => Some(PrivateChannelEscrowProgramError::WalletNotAllowed),
+        21 => Some(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda),
         _ => None,
     }
 }
@@ -441,6 +443,11 @@ mod tests {
             (
                 14,
                 Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+            ),
+            (20, Some(PrivateChannelEscrowProgramError::WalletNotAllowed)),
+            (
+                21,
+                Some(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda),
             ),
             (99, None),
         ];
