@@ -327,7 +327,7 @@ This is channel-side and involves no escrow instruction. Every channel mint is a
 The delegate can move any holder's channel balance, but the node admits only a `TransferChecked` into the compliance ATA, `ATA(PRIVATE_CHANNEL_COMPLIANCE_OWNER, mint, Token-2022)`. Burns and transfers anywhere else are refused, and with no compliance owner configured every delegate move is refused. Each admitted move logs `permanent delegate move admitted` at warn level. The `seize` command in `scripts/devnet` builds the transaction, thawing and re-freezing a frozen source in the same transaction.
 
 **Keys:**
-- The default deployment uses the operator admin key as the delegate. Use a dedicated delegate key in production, so the hot admin key cannot seize and the delegate key cannot mint or freeze.
+- With `PRIVATE_CHANNEL_PERMANENT_DELEGATE` blank, the node uses the first key in `PRIVATE_CHANNEL_ADMIN_KEYS` as the delegate, and the operator uses its admin signer, which is the same key in the default deployment. Use a dedicated delegate key in production, so the hot admin key cannot seize and the delegate key cannot mint or freeze.
 - The compliance owner must differ from the delegate; the node refuses to start otherwise.
 - The compliance wallet withdraws to Mainnet like any holder, through `WithdrawFunds` and `ReleaseFunds`. While withdrawals are [whitelisted](#whitelist), the compliance owner and its Mainnet destination must be allowed to withdraw, so the escrow's destination whitelisting governs where seized funds can leave to.
 

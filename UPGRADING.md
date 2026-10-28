@@ -84,8 +84,8 @@ image swap:
   mint is recreated on its first deposit. Follow
   [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md); its supply
   sign-off is the only gate.
-- **New env vars.** `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (write and aio nodes refuse to
-  start without it), `OPERATOR_PERMANENT_DELEGATE` (must equal it) and the optional
+- **New env vars.** `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (blank means the first key in
+  `PRIVATE_CHANNEL_ADMIN_KEYS`; write and aio nodes refuse to start with neither), `OPERATOR_PERMANENT_DELEGATE` (must equal it) and the optional
   `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (leave it unset, not blank, if unused). See
   [docs/CONFIG.md](docs/CONFIG.md).
 - **Channel ATAs change.** Clients must derive channel ATAs with the Token-2022 program

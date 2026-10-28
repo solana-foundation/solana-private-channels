@@ -14,7 +14,10 @@ use {
         transaction::Transaction,
     },
     spl_token_2022::{
-        extension::StateWithExtensions,
+        extension::{
+            permanent_delegate::PermanentDelegate, BaseStateWithExtensions, StateWithExtensions,
+        },
+        instruction::AuthorityType,
         state::{Account, AccountState, Mint},
     },
     std::time::Duration,
@@ -31,6 +34,8 @@ pub async fn run_seize_test(ctx: &PrivateChannelContext) {
     case_seize_frozen_account_into_compliance(ctx).await;
     case_delegate_cannot_move_elsewhere(ctx).await;
     case_seize_out_of_a_dvp_escrow(ctx).await;
+    case_delegate_rotation(ctx).await;
+    case_delegate_burn_refused(ctx).await;
     println!("✓ Seize tests passed");
 }
 
@@ -84,6 +89,21 @@ async fn supply(ctx: &PrivateChannelContext, mint: &Pubkey) -> u64 {
         .unwrap()
         .base
         .supply
+}
+
+/// The mint's on-chain permanent delegate, None when cleared.
+async fn mint_delegate(ctx: &PrivateChannelContext, mint: &Pubkey) -> Option<Pubkey> {
+    let account = ctx
+        .read_client
+        .get_account(mint)
+        .await
+        .expect("mint exists");
+    let state = StateWithExtensions::<Mint>::unpack(&account.data).unwrap();
+    state
+        .get_extension::<PermanentDelegate>()
+        .unwrap()
+        .delegate
+        .into()
 }
 
 /// A channel mint with the operator as authority, freeze authority and delegate, and
@@ -388,6 +408,99 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
     );
     assert_eq!(token_account(ctx, &user_a_ata).await.amount, BALANCE - 100);
     println!("  ✓ DvP escrow seized only into compliance; Cancel refunds the rest");
+}
+
+/// Admin-signed SetAuthority(PermanentDelegate) lands only when it names the configured
+/// delegate. The harness can only create mints with that delegate, so it rotates to itself.
+async fn case_delegate_rotation(ctx: &PrivateChannelContext) {
+    let operator = &ctx.operator_key;
+    let (mint, _) = mint_with_balance(ctx, &Keypair::new().pubkey()).await;
+    let rotate = |new: Option<&Pubkey>| {
+        spl_token_2022::instruction::set_authority(
+            &spl_token_2022::id(),
+            &mint,
+            new,
+            AuthorityType::PermanentDelegate,
+            &operator.pubkey(),
+            &[],
+        )
+        .unwrap()
+    };
+
+    let sig = land(ctx, &[rotate(Some(&operator.pubkey()))], &[operator])
+        .await
+        .expect("rotation to the configured delegate lands");
+    assert!(meta_err(ctx, &sig).await.is_null(), "rotation must succeed");
+    assert_eq!(mint_delegate(ctx, &mint).await, Some(operator.pubkey()));
+
+    let other = Keypair::new().pubkey();
+    for (label, new) in [("another key", Some(&other)), ("None", None)] {
+        let ix = rotate(new);
+        let blockhash = ctx.get_blockhash().await.unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            std::slice::from_ref(&ix),
+            Some(&operator.pubkey()),
+            &[operator],
+            blockhash,
+        );
+        let simulation = ctx
+            .read_client
+            .simulate_transaction_with_config(
+                &tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let message = format!("{simulation:?}");
+        assert!(
+            message.contains("configured delegate"),
+            "{label}: simulate must name the rule: {message}"
+        );
+        assert_eq!(
+            land(ctx, &[ix], &[operator]).await,
+            None,
+            "rotation to {label} must never land"
+        );
+        assert_eq!(mint_delegate(ctx, &mint).await, Some(operator.pubkey()));
+    }
+    println!("  ✓ delegate rotation lands only to the configured key");
+}
+
+/// The delegate burning a user's balance, Burn or BurnChecked, never lands.
+async fn case_delegate_burn_refused(ctx: &PrivateChannelContext) {
+    let operator = &ctx.operator_key;
+    let alice = Keypair::new().pubkey();
+    let (mint, alice_ata) = mint_with_balance(ctx, &alice).await;
+    let program = spl_token_2022::id();
+    let burn =
+        spl_token_2022::instruction::burn(&program, &alice_ata, &mint, &operator.pubkey(), &[], 10)
+            .unwrap();
+    let burn_checked = spl_token_2022::instruction::burn_checked(
+        &program,
+        &alice_ata,
+        &mint,
+        &operator.pubkey(),
+        &[],
+        10,
+        DECIMALS,
+    )
+    .unwrap();
+    for (label, ix) in [("Burn", burn), ("BurnChecked", burn_checked)] {
+        assert_eq!(
+            land(ctx, &[ix], &[operator]).await,
+            None,
+            "delegate {label} must never land"
+        );
+        assert_eq!(
+            token_account(ctx, &alice_ata).await.amount,
+            BALANCE,
+            "{label}"
+        );
+        assert_eq!(supply(ctx, &mint).await, BALANCE, "{label}");
+    }
+    println!("  ✓ delegate Burn and BurnChecked refused, balance and supply unchanged");
 }
 
 fn chrono_now() -> i64 {

@@ -131,9 +131,8 @@ the `pg-backup-*` sidecars stay up.
 Set, in the env file the stack starts from (or `permanent_delegate` and
 `compliance_owner` in the Ansible vars):
 
-- `PRIVATE_CHANNEL_PERMANENT_DELEGATE`: the delegate pubkey. Required; the write node
-  refuses to start without it. The shipped compose files fall back to
-  `PRIVATE_CHANNEL_ADMIN_KEYS` when it is blank.
+- `PRIVATE_CHANNEL_PERMANENT_DELEGATE`: the delegate pubkey. Blank, the node uses the
+  first key in `PRIVATE_CHANNEL_ADMIN_KEYS`; with neither, the write node refuses to start.
 - `OPERATOR_PERMANENT_DELEGATE`: the same pubkey. The shipped compose files fill a
   blank value from `PRIVATE_CHANNEL_PERMANENT_DELEGATE`; blank there too means the
   operator admin pubkey.

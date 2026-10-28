@@ -114,8 +114,8 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
-    /// Permanent delegate written into every channel mint (base58). Required in write
-    /// and aio modes. Blank means unset; a bad value stops startup, unlike an admin key.
+    /// Permanent delegate written into every channel mint (base58). Unset or blank, it is
+    /// the first admin key. A bad value stops startup, unlike an admin key.
     #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
     permanent_delegate: Option<String>,
 
@@ -174,15 +174,28 @@ fn optional_pubkey(value: Option<&str>, name: &str) -> Result<Option<Pubkey>, St
     }
 }
 
-async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+/// Parses the seize keys. A blank delegate defaults to the first admin key, so a node
+/// with several admin keys (as during an admin rotation) still boots.
+fn seize_keys(
+    args: &Args,
+    admin_keys: &[Pubkey],
+) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
     let permanent_delegate = optional_pubkey(
         args.permanent_delegate.as_deref(),
         "PRIVATE_CHANNEL_PERMANENT_DELEGATE",
-    )?;
+    )?
+    .or_else(|| admin_keys.first().copied());
     let compliance_owner = optional_pubkey(
         args.compliance_owner.as_deref(),
         "PRIVATE_CHANNEL_COMPLIANCE_OWNER",
     )?;
+    if compliance_owner.is_none() {
+        info!("seize disabled: no compliance owner configured");
+    }
+    Ok((permanent_delegate, compliance_owner))
+}
+
+async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
         .admin_keys
@@ -200,6 +213,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             }
         })
         .collect();
+    let (permanent_delegate, compliance_owner) = seize_keys(&args, &admin_keys)?;
 
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
@@ -359,7 +373,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, private_channel_core::nodes::node::validate_seize_config};
 
     /// Guards the removal of `--mode`'s `aio` default: restoring it would let a
     /// read deployment start as a writer whenever the variable is dropped.
@@ -401,5 +415,75 @@ mod tests {
         for blank in [None, Some(""), Some("  ")] {
             assert_eq!(optional_pubkey(blank, "compliance"), Ok(None));
         }
+    }
+
+    /// Two admin keys and no delegate: the first admin key is the delegate and boot passes.
+    #[test]
+    fn blank_delegate_defaults_to_the_first_admin_key() {
+        let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let admin = format!("{k1},{k2}");
+        for delegate in [None, Some(""), Some("  ")] {
+            let mut extra = vec!["--admin-keys", admin.as_str()];
+            if let Some(d) = delegate {
+                extra.extend(["--permanent-delegate", d]);
+            }
+            let args = parse(&extra).unwrap();
+            let (permanent_delegate, compliance_owner) = seize_keys(&args, &[k1, k2]).unwrap();
+            assert_eq!(permanent_delegate, Some(k1), "{delegate:?}");
+            let config = NodeConfig {
+                mode: NodeMode::Aio,
+                admin_keys: vec![k1, k2],
+                permanent_delegate,
+                compliance_owner,
+                ..NodeConfig::default()
+            };
+            assert_eq!(validate_seize_config(&config), Ok(()));
+        }
+
+        // An explicit delegate wins, and no admin key leaves it unset.
+        let explicit = Pubkey::new_unique();
+        let args = parse(&["--permanent-delegate", &explicit.to_string()]).unwrap();
+        assert_eq!(seize_keys(&args, &[k1]).unwrap().0, Some(explicit));
+        assert_eq!(seize_keys(&parse(&[]).unwrap(), &[]).unwrap().0, None);
+    }
+
+    /// Runs `seize_keys` under a subscriber and returns what it logged.
+    fn seize_keys_log(extra: &[&str]) -> String {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || CapturedLog(writer.clone()))
+            .finish();
+        let args = parse(extra).unwrap();
+        tracing::subscriber::with_default(subscriber, || seize_keys(&args, &[]).unwrap());
+        let out = buf.lock().unwrap().clone();
+        String::from_utf8(out).unwrap()
+    }
+
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_compliance_owner_logs_seize_disabled_at_info() {
+        let log = seize_keys_log(&[]);
+        let line = log
+            .lines()
+            .find(|l| l.contains("seize disabled: no compliance owner configured"))
+            .unwrap_or_else(|| panic!("no seize-off line in {log:?}"));
+        assert!(line.contains("INFO"), "{line}");
+
+        let owner = Pubkey::new_unique().to_string();
+        let log = seize_keys_log(&["--compliance-owner", &owner]);
+        assert!(!log.contains("seize disabled"), "{log}");
     }
 }

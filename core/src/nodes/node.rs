@@ -311,7 +311,7 @@ pub const MAX_PERF_SAMPLE_PERIOD_SECS: u64 = u16::MAX as u64;
 /// Refuses seize keys that provably cannot work: a write node with no delegate could
 /// never create a mint, and a compliance owner equal to the delegate voids the seize
 /// rule because the delegate's own ATA is exempt from it.
-fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
+pub fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
     if matches!(config.mode, NodeMode::Write | NodeMode::Aio) && config.permanent_delegate.is_none()
     {
         return Err(
