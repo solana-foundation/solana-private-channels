@@ -29,7 +29,7 @@ by `remint_signature`. Check the row's status, then:
 
 While withdrawals are whitelisted, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw, with `custom program error: 0x14` (`WalletNotAllowed`). `Some(WalletNotAllowed)` proves it: the operator traced it to the escrow. A bare `0x14` or `recovered from persistent storage` does not, since Token-2022 and hooks can return `0x14` too. For those, confirm that withdrawals are whitelisted, that the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set, and that the admin's history (`getSignaturesForAddress`) shows neither changed since the row's `created_at`. If so, reconcile as usual; repeats need no ticket. Otherwise ticket it. With the gateway check on, a whitelist refusal that still reaches a remint means the check could not run (look for `Withdraw whitelist not checked` in the gateway log), or the wallet was removed after it sent.
 
-`custom program error: 0x15` is never an expected refusal. With withdrawals whitelisted it most likely means `InvalidAllowedWalletPda`, an operator bug that passed the wrong account: [escalate](_escalation.md) (Tier 3).
+`custom program error: 0x15` or `Some(InvalidAllowedWalletPda)` is never an expected refusal. It most likely means an operator bug that passed the wrong account: [escalate](_escalation.md) (Tier 3).
 
 ## Reconciliation steps
 
