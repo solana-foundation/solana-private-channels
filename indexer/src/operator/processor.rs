@@ -983,11 +983,11 @@ async fn check_withdrawal_preflights_inner(
 /// The program's cap on extras (`MAX_HOOK_REMAINING_ACCOUNTS` in its `token_utils`,
 /// which codama does not export), checked before the list is resolved.
 ///
-/// The legacy packet binds first, at about 12 new accounts, so `attach_hook_extras`
-/// also measures the built release. The message lists a key once, so a withdrawal to
-/// the withdrawer's own wallet, whose two whitelist entries are one account, fits one
-/// more. Versioned transactions with a lookup table, or v1 transactions, would make
-/// room for all 32.
+/// The legacy packet binds first, at 12 new accounts, or 15 when the admin key is also
+/// the operator, so `attach_hook_extras` also measures the built release. The message
+/// lists a key once, so a withdrawal to the withdrawer's own wallet, whose two whitelist
+/// entries are one account, fits one more. Versioned transactions with a lookup table,
+/// or v1 transactions, would make room for all 32.
 const MAX_HOOK_EXTRAS: usize = 32;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
