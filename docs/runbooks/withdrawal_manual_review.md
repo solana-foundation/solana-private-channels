@@ -318,15 +318,13 @@ would reopen the free retry loop it exists to close.
      Re-arm the row once. If it parks here again, or other rows of the mint do
      too, treat it as the first case. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook accounts exceed the per-transfer cap` - the mint's
-     `ExtraAccountMetaList` resolves to more accounts than a release transaction
-     can carry. The message gives the count and the program's cap, or the
-     release's size and the packet's. The escrow still holds the funds and the
-     row is intact, but its release cannot be sent while the list is this long. Only the hook authority can shorten it, so contact the mint
-     issuer. Expect every withdrawal of that mint to park here, except perhaps
-     those to the withdrawer's own wallet, which carry one account fewer, and
-     deposits to fail client-side for the same reason. The cap is the legacy
-     transaction's, not the program's: moving the sender to a versioned
-     transaction with a lookup table would raise it toward the program's 32.
+     `ExtraAccountMetaList` resolves to more accounts than a release can carry.
+     The message gives the count and the program's cap, or the release's size
+     and the packet's. The escrow still holds the funds and the row is intact,
+     but the release cannot be sent until the hook authority shortens the list,
+     so contact the mint issuer. Its deposits fail client-side too, and most of
+     its withdrawals park here (one to the withdrawer's own wallet may fit). A
+     versioned transaction with a lookup table would raise the limit toward 32.
      [Escalate](_escalation.md) (Tier 2).
    - `no longer matches its reviewed profile:` - the mint is missing an extension
      the `AllowedMint` account pinned at allow time, which is what a close and
