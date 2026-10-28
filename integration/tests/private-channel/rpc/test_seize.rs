@@ -277,6 +277,8 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
     let (mint_a, user_a_ata) = mint_with_balance(ctx, &user_a.pubkey()).await;
     let (mint_b, user_b_ata) = mint_with_balance(ctx, &user_b.pubkey()).await;
     let program = spl_token_2022::id();
+    // Fresh per run so the swap PDA never collides with an earlier run.
+    let nonce = u64::from_le_bytes(settlement.pubkey().to_bytes()[..8].try_into().unwrap());
 
     let (swap_dvp, _) = setup::swap_dvp_pda(
         &settlement.pubkey(),
@@ -284,7 +286,7 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
         &user_b.pubkey(),
         &mint_a,
         &mint_b,
-        7,
+        nonce,
     );
     let blockhash = ctx.get_blockhash().await.unwrap();
     let create = setup::create_dvp_transaction(
@@ -298,7 +300,7 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
         BALANCE,
         chrono_now() + 3600,
         None,
-        7,
+        nonce,
         blockhash,
     );
     let sig = ctx

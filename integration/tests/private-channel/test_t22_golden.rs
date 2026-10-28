@@ -70,7 +70,7 @@ async fn golden_fixtures_match_the_token_2022_program() {
     assert_eq!(
         mint_data,
         GOLDEN_T22_MINT.to_vec(),
-        "golden mint drifted, real bytes: {mint_data:?}"
+        "golden mint drifted from the real program"
     );
 
     let ata = get_associated_token_address_with_program_id(&GOLDEN_OWNER, &mint.pubkey(), &t22);
@@ -101,6 +101,6 @@ async fn golden_fixtures_match_the_token_2022_program() {
     assert_eq!(
         ata_data,
         GOLDEN_T22_ATA.to_vec(),
-        "golden token account drifted, real bytes: {ata_data:?}"
+        "golden token account drifted from the real program"
     );
 }
