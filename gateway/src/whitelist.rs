@@ -155,7 +155,8 @@ impl WithdrawWhitelist {
         (read_at.elapsed() < CACHE_TTL).then(|| account.clone())
     }
 
-    /// Caches `accounts`, read at `read_at` from `keys`.
+    /// Caches `accounts`, read at `read_at` from `keys`. A key already holding a later
+    /// read keeps it.
     fn remember(&self, read_at: Instant, keys: &[Pubkey], accounts: &[Option<FetchedAccount>]) {
         let mut cache = self.cache.lock().unwrap();
         // Drop expired reads, so the map holds only the last CACHE_TTL of them.
@@ -165,6 +166,13 @@ impl WithdrawWhitelist {
             return;
         }
         for (key, account) in keys.iter().zip(accounts) {
+            // Reads can finish out of order, so one that started later wins.
+            if cache
+                .get(key)
+                .is_some_and(|(cached_at, _)| *cached_at > read_at)
+            {
+                continue;
+            }
             cache.insert(*key, (read_at, account.clone()));
         }
     }
@@ -728,6 +736,32 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert!(cache.contains_key(&fresh));
         assert!(cache.contains_key(&read));
+    }
+
+    // Reads can finish out of order. One that started earlier must not replace a
+    // later one, or the cache could go back to a whitelist the admin has since turned on.
+    #[test]
+    fn an_older_read_does_not_replace_a_newer_one() {
+        let whitelist = enabled_whitelist();
+        let instance = Pubkey::new_unique();
+        let newer_read_at = Instant::now();
+        let older_read_at = newer_read_at - Duration::from_secs(1);
+
+        whitelist.remember(
+            newer_read_at,
+            &[instance],
+            &[escrow_account(instance_data(true))],
+        );
+        whitelist.remember(
+            older_read_at,
+            &[instance],
+            &[escrow_account(instance_data(false))],
+        );
+
+        let cache = whitelist.cache.lock().unwrap();
+        let (cached_at, account) = cache.get(&instance).expect("the instance is cached");
+        assert_eq!(*cached_at, newer_read_at);
+        assert_eq!(whitelists_withdrawals(account), Some(true));
     }
 
     #[test]
