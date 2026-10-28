@@ -4094,17 +4094,18 @@ mod tests {
         assert!(accounts.iter().all(|meta| meta.pubkey != validation_pda));
     }
 
-    /// The packet decides, not the number of hook accounts. A withdrawal to the
-    /// withdrawer's own wallet carries one whitelist entry for both wallets, so it
-    /// fits 13 hook accounts. The same 13 on a withdrawal to another wallet do not
-    /// fit and park.
+    /// The packet decides, not the number of hook accounts. With separate admin and
+    /// operator keys, 12 hook accounts fit a withdrawal to another wallet and 13 park.
+    /// A withdrawal to the withdrawer's own wallet carries one whitelist entry for both
+    /// wallets, so it fits 13.
     #[tokio::test]
     async fn a_hook_release_parks_only_past_the_packet() {
-        // The entries plus the hook program and the validation account.
-        let hook_accounts = 13;
-        let entry_count = hook_accounts - 2;
+        // (hook accounts, to the withdrawer's own wallet, released)
+        let cases = [(12, false, true), (13, false, false), (13, true, true)];
 
-        for to_own_wallet in [false, true] {
+        for (hook_accounts, to_own_wallet, released) in cases {
+            // The entries plus the hook program and the validation account.
+            let entry_count = hook_accounts - 2;
             let mint = Pubkey::new_unique();
             let hook_program = Pubkey::new_unique();
             let storage = Arc::new(Storage::Mock(MockStorage::new()));
@@ -4167,27 +4168,25 @@ mod tests {
 
             let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
 
-            assert!(
-                outcome.is_ok(),
-                "to_own_wallet={to_own_wallet}: {outcome:?}"
-            );
-            if to_own_wallet {
-                assert!(update.is_none(), "{update:?}");
+            let case = format!("hook_accounts={hook_accounts} to_own_wallet={to_own_wallet}");
+            assert!(outcome.is_ok(), "{case}: {outcome:?}");
+            if released {
+                assert!(update.is_none(), "{case}: {update:?}");
                 assert!(
                     matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
-                    "the withdrawal to the withdrawer's own wallet must be dispatched"
+                    "{case}: the withdrawal must be dispatched"
                 );
             } else {
                 let update = update.expect("a release past the packet parks");
-                assert_eq!(update.status, TransactionStatus::ManualReview);
+                assert_eq!(update.status, TransactionStatus::ManualReview, "{case}");
                 assert!(
                     update
                         .error_message
                         .as_deref()
                         .is_some_and(|m| m.contains("exceed the per-transfer cap")),
-                    "{update:?}"
+                    "{case}: {update:?}"
                 );
-                assert!(builder.is_none(), "nothing reaches the sender");
+                assert!(builder.is_none(), "{case}: nothing reaches the sender");
             }
         }
     }
