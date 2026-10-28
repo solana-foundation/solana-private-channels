@@ -313,6 +313,7 @@ const enableIx = getSetWhitelistEnabledInstruction({
 - The operator names the withdrawer, as it already names the destination and amount
 - While withdrawals are whitelisted, the operator admin (treasury) and its sweep destination must be allowed to withdraw. While deposits are whitelisted, the reprice or rotation deposit must come from an allowed wallet
 - Not gated: transfers inside the channel. A wallet that cannot withdraw can still move its balance to one that can
+- Not gated either: the tokens after a release. The escrow pays the destination's canonical ATA, so an allowed wallet can move them on, or on SPL Token have already handed that ATA to another owner
 - Whitelisting withdrawals on a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the mint's withdraw fee, if it has one
 - Whitelisting withdrawals but not deposits lets unlisted wallets deposit but not withdraw; each release they try is reminted, costs them the mint's withdraw fee, if it has one, and raises an alert
 - While withdrawals are whitelisted, give every mint a nonzero withdraw fee. On a zero-fee mint nothing limits how often a refused wallet triggers remints and alerts
