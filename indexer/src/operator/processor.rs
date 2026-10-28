@@ -4032,7 +4032,7 @@ mod tests {
                     update
                         .error_message
                         .as_deref()
-                        .is_some_and(|m| m.contains("freshness")),
+                        .is_some_and(|message| message.contains("freshness")),
                     "{update:?}"
                 );
             }
@@ -4183,7 +4183,7 @@ mod tests {
                     update
                         .error_message
                         .as_deref()
-                        .is_some_and(|m| m.contains("exceed the per-transfer cap")),
+                        .is_some_and(|message| message.contains("exceed the per-transfer cap")),
                     "{case}: {update:?}"
                 );
                 assert!(builder.is_none(), "{case}: nothing reaches the sender");
