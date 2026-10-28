@@ -336,16 +336,18 @@ The delegate can move any holder's channel balance, but the node admits only a `
 The node polices only the configured delegate. A mint still naming the old key after the restart leaves that key unpoliced on it: it can move those balances anywhere. This is an accepted risk, kept short by rotating every mint right after the restart:
 
 1. Pause deposits: stop `operator-solana` and keep it stopped until step 4.
-2. Set the new key in `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node) and `OPERATOR_PERMANENT_DELEGATE` (operator), and restart the write node and `operator-private-channel`.
-3. Immediately, for every channel mint, send a Token-2022 `SetAuthority(PermanentDelegate)` naming the new key. The old delegate signs as the current authority, and a channel admin co-signs, since the node requires an admin signer on every mint-side `SetAuthority`:
+2. Set the new key in `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node) and `OPERATOR_PERMANENT_DELEGATE` (operator). Recreate the containers that read it, since `docker compose restart` keeps the old env:
+   - the write node, the read node and `operator-private-channel`: `docker compose up -d --no-deps write-node read-node operator-private-channel`. The read node serves the seize dry run, so it needs the new key too.
+   - `operator-solana`, which creates new mints with the delegate, without starting it: `docker compose up --no-start --no-deps operator-solana`.
+3. Immediately, for every channel mint, send a Token-2022 `SetAuthority(PermanentDelegate)` naming the new key. The old delegate signs as the current authority, and a channel admin co-signs, since the node requires an admin signer on every mint-side `SetAuthority`. Send it through the gateway's internal port: it reads from the read node and sends to the write node with no JWT. That port is not published to the host, so use the gateway container's address (`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' private-channel-gateway`, then `http://<ip>:8904`). The read node alone refuses the send, the write node alone serves no account reads, and the public port needs a JWT `spl-token` cannot send:
 
    ```bash
    spl-token authorize <mint> permanent-delegate <new-delegate> \
      --authority <old-delegate-keypair> --fee-payer <channel-admin-keypair> \
-     --program-2022 --url <private-channel-rpc>
+     --program-2022 --url http://<gateway-ip>:8904
    ```
 
-4. Confirm each mint shows the new `Permanent delegate` (`spl-token display <mint> --program-2022 --url <private-channel-rpc>`), then start `operator-solana` again.
+4. Confirm each mint shows the new `Permanent delegate` (`spl-token display <mint> --program-2022 --url <private-channel-rpc>`), then start `operator-solana` again (`docker compose start operator-solana`).
 
 The node refuses a rotation to any key other than the configured one, and refuses removing the delegate (`None`), even when admin-signed. A mint whose delegate is lost can never be rotated.
 

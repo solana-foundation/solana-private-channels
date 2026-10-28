@@ -63,7 +63,7 @@ to the right Path below.
 |---|---|
 | `Mint instruction failed after JIT: mint_authority mismatch` | The on-chain mint's `mint_authority` is not the operator's admin pubkey. Two known triggers: (a) an existing mint on the private channel is owned by a different authority and `mint_to` produced one of the three classified `InstructionError` variants (rare — the most common rotated-admin case produces `OwnerMismatch` → `Custom(3)`, which routes to `Failed` instead of here); (b) post-`InitializeMint` race where another party initialized the same mint with a different authority during our send window. |
 | `Mint instruction failed after JIT: corrupt mint state` | The mint's account data does not decode as a valid Token-2022 mint (`COption` discriminant invalid, length mismatched). Defensive, should not occur in normal operation; investigate before any recovery. |
-| `Mint instruction failed after JIT: permanent delegate mismatch` | The mint's authority is the operator's admin, but its `PermanentDelegate` extension is missing, revoked, or names a key other than `OPERATOR_PERMANENT_DELEGATE`. The operator never mints into such a mint because the channel could not seize from it. Usual cause: the operator and the node (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`) disagree after a delegate rotation, or the mint was rotated on chain before the operator was restarted. |
+| `Mint instruction failed after JIT: permanent delegate mismatch` | The mint's authority is the operator's admin, but its `PermanentDelegate` extension is missing, revoked, or names a key other than `OPERATOR_PERMANENT_DELEGATE`. The operator never mints into such a mint because the channel could not seize from it. This check runs only on a mint the operator creates or finds uninitialized; a config mismatch on a new mint usually ends in `recovery requeues without progress` instead (see **Path G**). Usual cause: the operator and the node (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`) disagree after a delegate rotation, or the mint was rotated on chain before the operator was restarted. |
 
 ### Processor-side allowlist surface (`processor.rs::process_deposit_funds`)
 
@@ -470,6 +470,11 @@ operator logs for this `transaction_id`:
   channel RPC health and that the mint account exists on the private channel
   with the operator's admin as `mint_authority`. This is environmental, not row
   data.
+  If the write node logs `InitializePermanentDelegate: delegate is not the
+  configured key` for this mint, the operator's `OPERATOR_PERMANENT_DELEGATE`
+  differs from the node's `PRIVATE_CHANNEL_PERMANENT_DELEGATE`, so the node refuses
+  every mint creation. Nothing was minted. Fix the operator's config, recreate
+  `operator-solana`, and re-arm to `pending`.
 - **Mint rejected.** No JIT lines in the logs. The deposit mint is
   fire-and-forget (`spawn_fire_and_store`), so a repeating failure points at a
   deterministic mint rejection (paused/frozen mint, `mint_authority` mismatch,

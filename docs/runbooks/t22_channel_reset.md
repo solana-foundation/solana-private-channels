@@ -45,6 +45,11 @@ needs an Operator JWT.
 3. Sweep the treasury fees: the operator admin's channel ATA holds the collected
    withdraw fees. Withdraw them with the running release's tooling
    (`scripts/devnet` `withdraw`), which charges the treasury no fee and no minimum.
+   Create the operator admin's Mainnet token account for each mint first
+   (`spl-token create-account <mint> --owner <admin> --url <solana-rpc>`, with
+   `--program-2022` for a Token-2022 mint): fees accrue only on the channel, so it
+   usually has none, and without it the escrow refuses the release and the fees are
+   reminted.
 4. Let both operators finish their queues.
 
 ## 2. Sign-off: every supply is 0, nothing pending
