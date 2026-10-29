@@ -361,6 +361,20 @@ pub fn set_mint_with_authority(
     mint: &Pubkey,
     mint_authority: COption<Pubkey>,
 ) {
+    set_mint_with(context, mint, mint_authority, TEST_PERMANENT_DELEGATE);
+}
+
+/// A channel mint whose permanent delegate is `delegate`, for tests that sign as it.
+pub fn set_mint_with_delegate(context: &mut TestContext, mint: &Pubkey, delegate: &Pubkey) {
+    set_mint_with(context, mint, COption::None, *delegate);
+}
+
+fn set_mint_with(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    mint_authority: COption<Pubkey>,
+    delegate: Pubkey,
+) {
     // Channel mints carry exactly one extension, the permanent delegate.
     let len = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::PermanentDelegate])
         .unwrap();
@@ -369,7 +383,7 @@ pub fn set_mint_with_authority(
     state
         .init_extension::<PermanentDelegate>(true)
         .unwrap()
-        .delegate = Some(TEST_PERMANENT_DELEGATE).try_into().unwrap();
+        .delegate = Some(delegate).try_into().unwrap();
     state.base = Mint {
         decimals: 6,
         is_initialized: true,

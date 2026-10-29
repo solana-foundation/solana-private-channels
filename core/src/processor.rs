@@ -201,7 +201,10 @@ const MAX_LOADED_ACCOUNTS_DATA_SIZE: u32 = 64 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
+    use solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        pubkey::Pubkey,
+    };
     use solana_svm::transaction_processing_callback::TransactionProcessingCallback;
     use solana_svm_callback::InvokeContextCallback;
 
@@ -296,7 +299,6 @@ mod tests {
     /// Every BPF precompile must be in the program cache, or calls to it fail.
     #[test]
     fn every_bpf_precompile_is_cached() {
-        use solana_sdk::account::ReadableAccount;
         let cached = cached_bpf_programs();
         for (id, account) in crate::accounts::precompiles::PRECOMPILES.iter() {
             if *account.owner() == solana_sdk::bpf_loader::id() {

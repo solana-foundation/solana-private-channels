@@ -10,10 +10,10 @@ use crate::{
     state_utils::assert_get_or_withdraw_funds,
     utils::{
         assert_program_error, channel_ata, find_withdraw_config_pda, get_mint_supply,
-        get_permanent_delegate, get_token_balance, set_mint, set_token_balance,
-        set_withdraw_config, set_withdraw_config_with_minimum, setup_test_balances, TestContext,
-        AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR,
-        INVALID_INSTRUCTION_DATA_ERROR, INVALID_TREASURY_ACCOUNT_ERROR,
+        get_permanent_delegate, get_token_balance, set_mint, set_mint_with_delegate,
+        set_token_balance, set_withdraw_config, set_withdraw_config_with_minimum,
+        setup_test_balances, TestContext, AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID,
+        INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR, INVALID_TREASURY_ACCOUNT_ERROR,
         INVALID_WITHDRAW_CONFIG_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         TEST_PERMANENT_DELEGATE, TEST_WITHDRAW_FEE, TOKEN_INSUFFICIENT_FUNDS_ERROR,
         WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR, ZERO_AMOUNT_ERROR,
@@ -632,19 +632,23 @@ fn test_withdraw_funds_refuses_the_spl_token_program() {
     assert_program_error(result, INCORRECT_PROGRAM_ID_ERROR);
 }
 
-/// The permanent delegate can move a user's balance on the token program, but it
-/// cannot withdraw it: the source must be the signer's own ATA.
+/// The permanent delegate can burn a user's balance but cannot withdraw it: the source must
+/// be the signer's own ATA. It is also the treasury, as in the default deployment, so no
+/// fee Transfer runs and only the Burn, which honours the delegate, is left.
 #[test]
 fn test_permanent_delegate_cannot_withdraw_a_users_balance() {
     let mut context = TestContext::new();
     let user = Keypair::new();
     let delegate = Keypair::new();
     let mint = Keypair::new();
-    let admin = Pubkey::new_unique();
 
-    set_mint(&mut context, &mint.pubkey());
-    let (withdraw_config, treasury_token_account) =
-        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    set_mint_with_delegate(&mut context, &mint.pubkey(), &delegate.pubkey());
+    let (withdraw_config, treasury_token_account) = set_withdraw_config(
+        &mut context,
+        &mint.pubkey(),
+        TEST_WITHDRAW_FEE,
+        &delegate.pubkey(),
+    );
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
     context
         .airdrop_if_required(&delegate.pubkey(), 1_000_000_000)
@@ -665,6 +669,25 @@ fn test_permanent_delegate_cannot_withdraw_a_users_balance() {
     let result = context.send_transaction_with_signers(instruction, &[&delegate]);
     assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
     assert_eq!(get_token_balance(&mut context, &user_ata), INITIAL_BALANCE);
+
+    // The same key burning directly succeeds, so the refusal above is the withdraw program's.
+    let burn = spl_token_2022::instruction::burn_checked(
+        &TOKEN_PROGRAM_ID,
+        &user_ata,
+        &mint.pubkey(),
+        &delegate.pubkey(),
+        &[],
+        WITHDRAW_AMOUNT,
+        6,
+    )
+    .unwrap();
+    context
+        .send_transaction_with_signers(burn, &[&delegate])
+        .expect("the permanent delegate burns directly");
+    assert_eq!(
+        get_token_balance(&mut context, &user_ata),
+        INITIAL_BALANCE - WITHDRAW_AMOUNT
+    );
 }
 
 /// The indexer and the gateway read WithdrawFunds accounts by position, and clients

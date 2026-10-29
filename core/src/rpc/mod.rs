@@ -43,6 +43,7 @@ pub use {
 mod tests {
     use super::*;
     use crate::accounts::{traits::BlockInfo, write_batch::write_batch_redis, AccountsDB};
+    use crate::t22_fixtures::{golden_mint, golden_t22_ata, GOLDEN_T22_MINT};
     use crate::test_helpers::{
         create_test_sanitized_transaction, flush_address_signatures_sync, start_stamped_redis,
         start_test_postgres_raw,
@@ -1509,8 +1510,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_token_account_balance_valid() {
-        use crate::t22_fixtures::{golden_mint, golden_t22_ata, GOLDEN_T22_MINT};
-        use solana_sdk::signature::Signer;
         let (mut db, _pg) = start_pg().await;
 
         // Store a block so get_latest_slot works

@@ -39,6 +39,10 @@ pub(crate) fn ensure_test_signer() {
             "ADMIN_PRIVATE_KEY",
             bs58::encode(keypair.to_bytes()).into_string(),
         );
+        std::env::set_var(
+            "OPERATOR_PERMANENT_DELEGATE",
+            solana_sdk::signer::Signer::pubkey(&keypair).to_string(),
+        );
     });
 }
 

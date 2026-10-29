@@ -2002,8 +2002,9 @@ async fn test_get_account_info_token2022_mint_is_forbidden() {
     insert_wallet(&pool, user_id, &wallet_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    // A mint whose freeze authority bytes (36..68) overlap the owner offset with
-    // the user's wallet; the account type byte says mint.
+    // A mint holding the user's wallet at bytes 32..64, where a token account keeps its
+    // owner (in a mint: the mint authority's tail, the supply and the decimals); the
+    // account type byte says mint.
     let mut data = vec![0u8; 202];
     data[32..64].copy_from_slice(&wallet_bytes);
     data[165] = 1;

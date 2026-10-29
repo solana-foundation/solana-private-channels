@@ -426,7 +426,7 @@ mod tests {
         hash::Hash,
         message::{compiled_instruction::CompiledInstruction, Message, MessageHeader},
         signature::{Keypair, Signer},
-        transaction::Transaction,
+        transaction::{Transaction, VersionedTransaction},
     };
     use solana_svm_callback::InvokeContextCallback;
     use std::{
@@ -736,12 +736,6 @@ mod tests {
     /// With sigVerify a simulation applies the seize rule exactly as the write path does.
     #[tokio::test(flavor = "multi_thread")]
     async fn sig_verify_simulation_refuses_a_delegate_move_elsewhere() {
-        use solana_sdk::{
-            hash::Hash,
-            message::Message,
-            signature::{Keypair, Signer},
-            transaction::{Transaction, VersionedTransaction},
-        };
         let delegate = Keypair::new();
         let mint = Pubkey::new_unique();
         let ata = |owner: &Pubkey| {

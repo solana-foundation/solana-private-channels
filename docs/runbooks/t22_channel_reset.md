@@ -23,8 +23,8 @@ mints and custody stay as they are.
 ## Prerequisites
 
 - The new release's images, and the keys it needs:
-  - the permanent delegate pubkey (default: the operator admin pubkey; use a
-    dedicated key in production),
+  - the permanent delegate pubkey (required, no default; use a dedicated key in
+    production),
   - optionally the compliance owner pubkey, which must differ from the delegate.
 - The escrow instance admin keypair, to block and reopen deposits per mint.
 - A quiet window. Every holder must withdraw their whole channel balance before the
@@ -136,11 +136,11 @@ the `pg-backup-*` sidecars stay up.
 Set, in the env file the stack starts from (or `permanent_delegate` and
 `compliance_owner` in the Ansible vars):
 
-- `PRIVATE_CHANNEL_PERMANENT_DELEGATE`: the delegate pubkey. Blank, the node uses the
-  first key in `PRIVATE_CHANNEL_ADMIN_KEYS`; with neither, the write node refuses to start.
+- `PRIVATE_CHANNEL_PERMANENT_DELEGATE`: the delegate pubkey. Required: blank, the
+  write node refuses to start.
 - `OPERATOR_PERMANENT_DELEGATE`: the same pubkey. The shipped compose files fill a
-  blank value from `PRIVATE_CHANNEL_PERMANENT_DELEGATE`; blank there too means the
-  operator admin pubkey.
+  blank value from `PRIVATE_CHANNEL_PERMANENT_DELEGATE`; blank there too, the
+  operators refuse to start.
 - `PRIVATE_CHANNEL_COMPLIANCE_OWNER`: the compliance owner, or leave it unset or
   blank to refuse every delegate move.
 

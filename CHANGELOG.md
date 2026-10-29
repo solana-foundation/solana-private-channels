@@ -8,11 +8,11 @@
 - Channel ATA addresses change, since the token program is an ATA seed. Clients and wallets must derive channel ATAs with the Token-2022 program id
 - Ownership handoffs (`SetAuthority(AccountOwner)`) of channel token accounts now fail on chain (`ImmutableOwner`)
 - The upgrade is a channel reset, not a migration: every channel mint's supply must be 0 and nothing pending. See [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md)
-- Write and aio nodes refuse to start without a permanent delegate: `PRIVATE_CHANNEL_PERMANENT_DELEGATE`, else the first key in `PRIVATE_CHANNEL_ADMIN_KEYS`
+- Write and aio nodes and both operators refuse to start without a permanent delegate (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`, `OPERATOR_PERMANENT_DELEGATE`); it is never derived from the admin keys
 
 ### Core node and RPC
 - The permanent delegate (by default the first channel admin key) can seize a holder's balance, but only with a `TransferChecked` into the compliance ATA of `PRIVATE_CHANNEL_COMPLIANCE_OWNER`. Delegate burns and moves anywhere else are refused (`seize_target`), and all of them are refused when no compliance owner is set (the node logs `seize disabled: no compliance owner configured` at startup)
-- Every admitted delegate move logs `permanent delegate move admitted` and bumps `private_channel_delegate_moves_admitted_total` (with stage metrics on); a refused one logs `permanent delegate move refused`
+- Every admitted delegate move logs `permanent delegate move admitted` and bumps `private_channel_delegate_moves_admitted_total` (with stage metrics on), counted at ingress, so resends and moves that later fail count too; a refused one logs `permanent delegate move refused`
 - Ingress allowlist narrowed to classic Token-2022 instructions: first byte `0..=24`, or `35` (`InitializePermanentDelegate`, admin only). `Batch`, the other extension instructions, the token-metadata and group interfaces and empty data are refused, and the rejection reads "Only Token-2022 (classic token instructions), ATA, Memo, Withdraw, and Swap program transactions are accepted"
 - Admin signer required for Token-2022 `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount` and every `SetAuthority` except `AccountOwner` and `CloseAccount`. A `SetAuthority(PermanentDelegate)` to anything but the configured delegate, `None` included, is refused even when admin-signed (`delegate_rotation`)
 - The AdminVM creates a mint only from `InitializePermanentDelegate` with the configured delegate immediately followed by `InitializeMint` or `InitializeMint2` on the same mint, and refuses both native mints
@@ -32,9 +32,9 @@
 - Solvency reconciliation reads channel supply from Token-2022 mints
 
 ### Deploy, compose and scripts
-- New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node; blank means the first key in `PRIVATE_CHANNEL_ADMIN_KEYS`), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, defaults to the admin signer). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`
+- New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node, required), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, required). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`
 - New `seize` command in `scripts/devnet`: moves a holder's channel balance into the compliance ATA in one transaction, thawing and re-freezing a frozen source
-- bench-tps creates its channel mints with `PRIVATE_CHANNEL_PERMANENT_DELEGATE`, falling back to its admin key
+- bench-tps creates its channel mints with `PRIVATE_CHANNEL_PERMANENT_DELEGATE`, which `run.sh` sets to its admin key
 
 ### Docs and CI
 - ctutils bumped past RUSTSEC-2026-0385; it ships in core, indexer and auth (#406)

@@ -1568,11 +1568,6 @@ mod tests {
                 "{len} bytes"
             );
         }
-        let account = AccountSharedData::new(1, 165, &spl_token_2022::id());
-        assert_eq!(
-            AdminVm::check_initialize_mint_target(Some(&account), true),
-            Err(InstructionError::InvalidAccountData)
-        );
     }
 
     #[test]

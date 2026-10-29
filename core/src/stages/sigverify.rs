@@ -345,7 +345,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
 mod tests {
     use super::*;
     use crate::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY as SEQ_CAP;
-    use crate::stage_metrics::NoopMetrics;
+    use crate::stage_metrics::{NoopMetrics, PrometheusMetrics};
     use private_channel_withdraw_program_client::instructions::{
         SetWithdrawConfigBuilder, WithdrawFundsBuilder,
     };
@@ -920,7 +920,6 @@ mod tests {
     /// other writer.
     #[tokio::test]
     async fn worker_counts_delegate_moves() {
-        use crate::stage_metrics::PrometheusMetrics;
         fn counter(name: &str, label: Option<&str>) -> f64 {
             private_channel_metrics::prometheus::gather()
                 .into_iter()

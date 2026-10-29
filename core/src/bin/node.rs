@@ -114,8 +114,8 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
-    /// Permanent delegate written into every channel mint (base58). Unset or blank, it is
-    /// the first admin key. A bad value stops startup, unlike an admin key.
+    /// Permanent delegate written into every channel mint (base58). Required on write and
+    /// aio nodes, with no fallback. A bad value stops startup, unlike an admin key.
     #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
     permanent_delegate: Option<String>,
 
@@ -174,17 +174,13 @@ fn optional_pubkey(value: Option<&str>, name: &str) -> Result<Option<Pubkey>, St
     }
 }
 
-/// Parses the seize keys. A blank delegate defaults to the first admin key, so a node
-/// with several admin keys (as during an admin rotation) still boots.
-fn seize_keys(
-    args: &Args,
-    admin_keys: &[Pubkey],
-) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
+/// Parses the seize keys. The delegate has no fallback: deriving it from the admin keys
+/// would silently change the policed key whenever that list is edited.
+fn seize_keys(args: &Args) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
     let permanent_delegate = optional_pubkey(
         args.permanent_delegate.as_deref(),
         "PRIVATE_CHANNEL_PERMANENT_DELEGATE",
-    )?
-    .or_else(|| admin_keys.first().copied());
+    )?;
     let compliance_owner = optional_pubkey(
         args.compliance_owner.as_deref(),
         "PRIVATE_CHANNEL_COMPLIANCE_OWNER",
@@ -213,7 +209,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             }
         })
         .collect();
-    let (permanent_delegate, compliance_owner) = seize_keys(&args, &admin_keys)?;
+    let (permanent_delegate, compliance_owner) = seize_keys(&args)?;
 
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
@@ -417,9 +413,9 @@ mod tests {
         }
     }
 
-    /// Two admin keys and no delegate: the first admin key is the delegate and boot passes.
+    /// Admin keys never stand in for a blank delegate, so a write or aio node refuses to boot.
     #[test]
-    fn blank_delegate_defaults_to_the_first_admin_key() {
+    fn blank_delegate_is_not_taken_from_the_admin_keys() {
         let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
         let admin = format!("{k1},{k2}");
         for delegate in [None, Some(""), Some("  ")] {
@@ -427,9 +423,9 @@ mod tests {
             if let Some(d) = delegate {
                 extra.extend(["--permanent-delegate", d]);
             }
-            let args = parse(&extra).unwrap();
-            let (permanent_delegate, compliance_owner) = seize_keys(&args, &[k1, k2]).unwrap();
-            assert_eq!(permanent_delegate, Some(k1), "{delegate:?}");
+            let (permanent_delegate, compliance_owner) =
+                seize_keys(&parse(&extra).unwrap()).unwrap();
+            assert_eq!(permanent_delegate, None, "{delegate:?}");
             let config = NodeConfig {
                 mode: NodeMode::Aio,
                 admin_keys: vec![k1, k2],
@@ -437,14 +433,12 @@ mod tests {
                 compliance_owner,
                 ..NodeConfig::default()
             };
-            assert_eq!(validate_seize_config(&config), Ok(()));
+            assert!(validate_seize_config(&config).is_err(), "{delegate:?}");
         }
 
-        // An explicit delegate wins, and no admin key leaves it unset.
         let explicit = Pubkey::new_unique();
         let args = parse(&["--permanent-delegate", &explicit.to_string()]).unwrap();
-        assert_eq!(seize_keys(&args, &[k1]).unwrap().0, Some(explicit));
-        assert_eq!(seize_keys(&parse(&[]).unwrap(), &[]).unwrap().0, None);
+        assert_eq!(seize_keys(&args).unwrap().0, Some(explicit));
     }
 
     /// Runs `seize_keys` under a subscriber and returns what it logged.
@@ -456,7 +450,7 @@ mod tests {
             .with_writer(move || CapturedLog(writer.clone()))
             .finish();
         let args = parse(extra).unwrap();
-        tracing::subscriber::with_default(subscriber, || seize_keys(&args, &[]).unwrap());
+        tracing::subscriber::with_default(subscriber, || seize_keys(&args).unwrap());
         let out = buf.lock().unwrap().clone();
         String::from_utf8(out).unwrap()
     }

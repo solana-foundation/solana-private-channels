@@ -326,7 +326,7 @@ counter_vec!(
 counter_vec!(
     DELEGATE_MOVES_ADMITTED,
     "private_channel_delegate_moves_admitted_total",
-    "Admitted permanent delegate moves of another owner's balance",
+    "Permanent delegate moves of another owner's balance admitted at ingress, counting resends and moves that later fail",
     &[]
 );
 counter_vec!(

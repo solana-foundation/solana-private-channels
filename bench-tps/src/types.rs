@@ -19,8 +19,8 @@ use {
 /// Number of decimal places for the SPL mint created during setup.
 pub const MINT_DECIMALS: u8 = 6;
 
-/// The node only creates channel mints carrying its configured permanent delegate,
-/// which defaults to the admin key; PRIVATE_CHANNEL_PERMANENT_DELEGATE overrides it.
+/// The node only creates channel mints carrying its PRIVATE_CHANNEL_PERMANENT_DELEGATE.
+/// run.sh sets it to the admin key, which is also the fallback when the bench runs alone.
 pub fn channel_permanent_delegate(
     admin: &solana_sdk::pubkey::Pubkey,
 ) -> solana_sdk::pubkey::Pubkey {

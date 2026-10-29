@@ -93,8 +93,9 @@ omitting them from an env file is harmless.
 
 The permanent delegate is one value with two names: `PRIVATE_CHANNEL_PERMANENT_DELEGATE`
 for the node and `OPERATOR_PERMANENT_DELEGATE` for the operators. They must be equal.
-A blank node value means the first key in `PRIVATE_CHANNEL_ADMIN_KEYS` (the node picks it,
-not compose). Compose fills a blank operator value from the node's, blank there too means
-the operator's admin signer, and the Ansible deploy renders both from `permanent_delegate`.
+Neither has a fallback to an admin key: write and aio nodes and both operators refuse to
+start without it. Compose fills a blank operator value from the node's, `make build-*` fills
+a blank node value with the admin pubkey once, and the Ansible deploy renders both from the
+required `permanent_delegate`.
 The read node gets the same admin keys, delegate and compliance owner as the write node,
 because it serves `simulateTransaction`.

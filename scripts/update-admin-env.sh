@@ -26,6 +26,17 @@ admin_private_key="$(tr -d '\n' < "$admin_keypair")"
 # Public key -> tracked template (safe to commit).
 "$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$admin_pubkey"
 
+# The node needs an explicit delegate. A blank one gets the admin pubkey once; a set one
+# is kept, so replacing the admin key later never silently changes the policed delegate.
+delegate=""
+if [[ -f "$env_file" ]]; then
+  delegate="$(awk -F= '/^PRIVATE_CHANNEL_PERMANENT_DELEGATE=/ { v = $2 } END { sub(/[ \t#].*/, "", v); print v }' "$env_file")"
+fi
+if [[ -z "$delegate" ]]; then
+  "$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_PERMANENT_DELEGATE" "$admin_pubkey"
+  echo "Set PRIVATE_CHANNEL_PERMANENT_DELEGATE=$admin_pubkey in $env_file"
+fi
+
 # Private key -> gitignored runtime file only, on stdin via the printf builtin
 # so it never sits in a child argv.
 printf '%s' "$admin_private_key" | "$script_dir/upsert-env.sh" "$runtime_env_file" "ADMIN_PRIVATE_KEY"

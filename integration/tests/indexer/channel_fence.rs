@@ -228,9 +228,14 @@ async fn escrow_operator_refuses_on_fence_mismatch() {
     };
     let config = test_utils::operator_helper::default_operator_config();
     // Without the fence the operator would go on to sign mints, so give it a signer.
-    let key = bs58::encode(solana_sdk::signature::Keypair::new().to_bytes()).into_string();
+    let keypair = solana_sdk::signature::Keypair::new();
+    let key = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &key);
+    std::env::set_var(
+        "OPERATOR_PERMANENT_DELEGATE",
+        solana_sdk::signer::Signer::pubkey(&keypair).to_string(),
+    );
     let err = tokio::time::timeout(
         Duration::from_secs(30),
         private_channel_indexer::operator::run(storage, common, config, None),
