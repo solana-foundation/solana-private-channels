@@ -12,7 +12,7 @@ mod helpers;
 #[allow(dead_code)]
 mod setup;
 
-use helpers::{generate_mint, mint_to_owner, setup_wallets};
+use helpers::{generate_channel_mint, mint_to_owner, setup_wallets};
 use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::IndexerError,
@@ -115,14 +115,22 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
     let authority = Keypair::new();
     setup_wallets(client.as_ref(), &faucet_keypair, &[&authority]).await?;
 
-    // Create mint
+    // A Token-2022 mint: this validator is also the channel, whose supply is read for it.
     let mint_keypair = Keypair::new();
-    let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
+    let mint_pubkey =
+        generate_channel_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
     // A real instance with the mint allowed; startup ignores custody of unapproved mints.
     let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
+    allow_mint_for_program(
+        client.as_ref(),
+        &admin,
+        pda,
+        mint_pubkey,
+        spl_token_2022::id(),
+    )
+    .await?;
 
     const AMOUNT: u64 = 500_000;
 
@@ -147,7 +155,7 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &pda,
             &mint_pubkey,
-            &spl_token::id(),
+            &spl_token_2022::id(),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {

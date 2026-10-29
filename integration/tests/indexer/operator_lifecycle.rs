@@ -34,7 +34,7 @@ use helpers::private_channel_node::{
     start_private_channel_node, start_private_channel_node_with_delegate,
 };
 use helpers::test_types::WAIT_TIMEOUT_SECS;
-use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
+use helpers::{db, generate_channel_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
 use private_channel_indexer::config::{
     OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
@@ -833,14 +833,13 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     )
     .await?;
 
-    // Create a valid SPL mint with a *different* mint authority than the operator's
-    // admin key. When the operator calls mint_to using the admin key, the SPL token
-    // program rejects it (wrong authority), so the mint fails at preflight after the
-    // write-ahead signature is persisted.
+    // A Token-2022 channel mint with a *different* mint authority than the operator's
+    // admin key, so mint_to fails at preflight after the write-ahead signature is
+    // persisted. Token-2022 because this validator is also the channel.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let bad_authority = Keypair::new(); // NOT the operator admin — intentionally wrong
     let bad_mint = Keypair::new();
-    generate_mint(&client, &admin, &bad_authority, &bad_mint).await?;
+    generate_channel_mint(&client, &admin, &bad_authority, &bad_mint).await?;
 
     // Register the bad mint in the mints table so the operator's pending-deposit
     // query (which joins with mints) can find and attempt to process this deposit.
@@ -848,7 +847,7 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     let bad_mint_meta = DbMint::new(
         bad_mint.pubkey().to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[bad_mint_meta]).await?;
@@ -917,11 +916,12 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
-    let bad_mint_pubkey = generate_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
+    let bad_mint_pubkey =
+        generate_channel_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
     let mint_meta = DbMint::new(
         bad_mint_pubkey.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
