@@ -35,18 +35,16 @@ use {
     },
     serde_json::json,
     solana_keychain::SolanaSigner,
+    solana_sdk::program_option::COption,
     solana_sdk::pubkey::Pubkey,
-    spl_token::{
-        solana_program::{program_option::COption, program_pack::Pack},
-        state::Mint,
-    },
+    spl_token_2022::{extension::StateWithExtensionsMut, state::Mint},
     std::sync::Arc,
     test_utils::mock_rpc::{MockRpcServer, Reply},
 };
 
-/// Pack an SPL `Mint` into its on-chain bytes so the byte layout the
-/// production helper decodes in `decode_and_check_authority` matches what
-/// a real Solana validator would return for `getAccountInfo`.
+/// Build a channel mint (Token-2022, permanent delegate = the operator's
+/// configured delegate) so the bytes the production helper decodes in
+/// `decode_and_check_authority` match what the channel returns for `getAccountInfo`.
 ///
 /// `authority`:
 /// - `COption::Some(admin_pubkey)` → simulates an initialized mint where
@@ -56,15 +54,20 @@ use {
 /// - `COption::None` → simulates a mint whose authority was cleared (also
 ///   Mismatch in the helper).
 fn pack_mint_bytes(is_initialized: bool, authority: COption<Pubkey>) -> Vec<u8> {
-    let mint = Mint {
-        mint_authority: authority,
-        supply: 0,
-        decimals: 6,
-        is_initialized,
-        freeze_authority: COption::None,
-    };
-    let mut data = vec![0u8; Mint::LEN];
-    Mint::pack(mint, &mut data).expect("pack mint");
+    if !is_initialized {
+        return vec![0u8; private_channel_core::t22_fixtures::T22_MINT_LEN];
+    }
+    let delegate = SignerUtil::permanent_delegate();
+    let mut data = private_channel_core::t22_fixtures::t22_mint(
+        6,
+        &Pubkey::new_unique(),
+        None,
+        Some(&delegate),
+        0,
+    );
+    let mut state = StateWithExtensionsMut::<Mint>::unpack(&mut data).expect("channel mint");
+    state.base.mint_authority = authority;
+    state.pack_base();
     data
 }
 
@@ -80,12 +83,18 @@ fn foreign_authority_initialized_mint_bytes() -> Vec<u8> {
     pack_mint_bytes(true, COption::Some(Pubkey::new_unique()))
 }
 
-/// Build `Mint::LEN` bytes that fail to decode. Setting the
+/// Initialized admin-owned mint whose delegate is the admin key, not the configured
+/// delegate: what a mint created under an admin-key fallback looks like.
+fn admin_delegate_initialized_mint_bytes() -> Vec<u8> {
+    let admin = SignerUtil::admin_signer().pubkey();
+    private_channel_core::t22_fixtures::t22_mint(6, &admin, None, Some(&admin), 0)
+}
+
+/// Build base-mint-sized bytes that fail to decode. Setting the
 /// `mint_authority` `COption` discriminant (offset 0..4) to an invalid
-/// value makes `Mint::unpack_unchecked` reject the buffer with
-/// `InvalidAccountData`.
+/// value makes the unpack reject the buffer with `InvalidAccountData`.
 fn corrupt_mint_bytes() -> Vec<u8> {
-    let mut data = vec![0u8; Mint::LEN];
+    let mut data = vec![0u8; 82];
     // COption discriminants only allow {0, 1}; 0xFF is invalid.
     data[0] = 0xFF;
     data
@@ -100,7 +109,7 @@ fn account_info_reply(data: &[u8]) -> Reply {
             "data": [STANDARD.encode(data), "base64"],
             "executable": false,
             "lamports": 1_461_600u64,
-            "owner": spl_token::id().to_string(),
+            "owner": spl_token_2022::id().to_string(),
             "rentEpoch": 0u64,
             "space": data.len(),
         }
@@ -120,7 +129,7 @@ fn make_mint_builder(mint: Pubkey) -> MintToBuilder {
         .recipient_ata(Pubkey::new_unique())
         .payer(admin)
         .mint_authority(admin)
-        .token_program(spl_token::id())
+        .token_program(spl_token_2022::id())
         .amount(1_000)
         .idempotency_memo("private_channel:mint-idempotency:1".to_string());
     builder
@@ -277,6 +286,39 @@ async fn jit_returns_manual_review_when_mint_authority_mismatch() {
     mock.shutdown().await;
 }
 
+// Pre-check: the authority matches but the permanent delegate is not the
+// configured one. Pins the `AuthorityCheck::DelegateMismatch` branch.
+#[tokio::test]
+async fn jit_returns_manual_review_when_mint_delegate_mismatch() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_delegate_initialized_mint_bytes()),
+    );
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    match outcome {
+        JitOutcome::ManualReview(reason) => assert!(
+            reason.contains("permanent delegate mismatch"),
+            "ManualReview reason must carry the runbook-dispatch substring; got {reason:?}"
+        ),
+        other => panic!("expected ManualReview, got {:?}", debug_outcome(&other)),
+    }
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "delegate mismatch must abort before sending InitializeMint"
+    );
+    mock.shutdown().await;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Pre-check: mint initialized with `mint_authority = COption::None`
 // (authority cleared via SetAuthority) — also ManualReview.
@@ -358,7 +400,10 @@ async fn jit_completes_full_initialize_then_returns_retry() {
     } = build_fixture(true).await;
 
     // Pre-check: account exists with right size but is_initialized=false.
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     mock.enqueue("getSignatureStatuses", confirmed_status_reply());
@@ -402,7 +447,10 @@ async fn jit_returns_manual_review_when_post_init_authority_mismatch() {
         instruction,
     } = build_fixture(true).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     mock.enqueue("getSignatureStatuses", confirmed_status_reply());
@@ -449,7 +497,10 @@ async fn jit_returns_transient_when_mint_decimals_unavailable() {
         instruction,
     } = build_fixture_inner(true, false).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
 
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
@@ -525,7 +576,10 @@ async fn jit_returns_transient_when_send_transaction_fails() {
         instruction,
     } = build_fixture(true).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue(
         "sendTransaction",
@@ -571,7 +625,10 @@ async fn jit_returns_retry_when_backoff_recovers_with_admin_authority() {
         instruction,
     } = build_fixture(true).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     for _ in 0..5 {
@@ -617,7 +674,10 @@ async fn jit_returns_manual_review_when_backoff_recovers_with_authority_mismatch
         instruction,
     } = build_fixture(true).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     for _ in 0..5 {
@@ -660,14 +720,20 @@ async fn jit_returns_transient_when_backoff_exhausts_with_uninit() {
         instruction,
     } = build_fixture(true).await;
 
-    mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+    );
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     for _ in 0..5 {
         mock.enqueue("getSignatureStatuses", null_status_reply());
     }
     for _ in 0..4 {
-        mock.enqueue("getAccountInfo", account_info_reply(&[0u8; Mint::LEN]));
+        mock.enqueue(
+            "getAccountInfo",
+            account_info_reply(&[0u8; private_channel_core::t22_fixtures::T22_MINT_LEN]),
+        );
     }
 
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;

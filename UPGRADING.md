@@ -74,6 +74,25 @@ to a target at least 60 s earlier plus a replica wipe, and the withdraw operator
 to boot on an indexer database rolled back past a release. A release that changes schema
 says so in its notes and cannot be rolled back by image swap.
 
+## Token-2022 channel
+
+Breaking. The channel's only token program becomes Token-2022, so this release is not an
+image swap:
+
+- **Reset required.** Existing channel mints and token accounts cannot move under the new
+  release. Every channel mint is emptied, the channel account state is wiped, and each
+  mint is recreated on its first deposit. Follow
+  [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md); its supply
+  sign-off is the only gate.
+- **New env vars.** `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (required on write and aio
+  nodes, no fallback), `OPERATOR_PERMANENT_DELEGATE` (required, must equal it) and the
+  optional `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (blank or unset means seize is off). See
+  [docs/CONFIG.md](docs/CONFIG.md).
+- **Channel ATAs change.** Clients must derive channel ATAs with the Token-2022 program
+  id, and channel ownership handoffs stop working.
+- **Rollback.** Before the reset, redeploy the previous `image_tag`. After it, restore
+  the pre-reset base backups as the runbook describes.
+
 ## Rehearsal
 
 Before the first upgrade on a shared environment, rehearse on devnet: deploy N, run a

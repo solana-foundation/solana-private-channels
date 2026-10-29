@@ -183,6 +183,10 @@ The runbooks call this out at every relevant site.
   database records a completed or failed withdrawal or an observed release.
   Log-discovered, not paged; fails closed before deleting anything, so the
   database is intact. The supported path is a fresh instance, not a resync.
+- [`t22_channel_reset.md`](t22_channel_reset.md) - the one-time cutover to the
+  Token-2022 channel: drain, sign off that every channel mint's supply is 0 and
+  nothing is pending, wipe the channel account state, and start the new release.
+  Planned work, not paged.
 
 ## Drills
 

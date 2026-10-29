@@ -65,6 +65,8 @@ fn minimal_node_config(accountsdb_connection_url: String, port: u16) -> NodeConf
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![dummy_admin],
+        permanent_delegate: Some(dummy_admin),
+        compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
         blocktime_ms: 100,

@@ -4,7 +4,6 @@ use private_channel_withdraw_program_client::{
 };
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey;
-use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
     instruction::Instruction,
@@ -13,14 +12,20 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
-use spl_token::{
+use spl_token_2022::{
+    extension::{
+        immutable_owner::ImmutableOwner, permanent_delegate::PermanentDelegate,
+        BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
+        StateWithExtensionsMut,
+    },
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
 };
 
 use solana_program::clock::Clock;
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
 };
 
 const MIN_LAMPORTS: u64 = 500_000_000;
@@ -62,6 +67,9 @@ pub const INCORRECT_PROGRAM_ID_ERROR: u32 = 4; // ProgramError::IncorrectProgram
 pub const INVALID_SEEDS_ERROR: u32 = 14; // ProgramError::InvalidSeeds
 pub const MISSING_REQUIRED_SIGNATURE_ERROR: u32 = 0; // ProgramError::MissingRequiredSignature
 
+/// Permanent delegate every channel test mint carries.
+pub const TEST_PERMANENT_DELEGATE: Pubkey = pubkey!("De1egate11111111111111111111111111111111111");
+
 // SPL Token Program Error Codes
 pub const TOKEN_INSUFFICIENT_FUNDS_ERROR: u32 = 1; // TokenError::InsufficientFunds
 
@@ -91,6 +99,10 @@ impl TestContext {
         let program_data =
             include_bytes!("../../../../target/deploy/private_channel_withdraw_program.so");
         let _ = svm.add_program(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, program_data);
+
+        // The channel runs the mainnet Token-2022 build, so test against the same binary.
+        let token_2022 = include_bytes!("../../../../core/precompiles/spl_token_2022-11.1.0.so");
+        let _ = svm.add_program(TOKEN_PROGRAM_ID, token_2022);
 
         let payer = Keypair::new();
 
@@ -244,9 +256,10 @@ pub fn get_token_balance(context: &mut TestContext, ata: &Pubkey) -> u64 {
     let account = context.get_account(ata);
     match account {
         Some(account) if account.owner == TOKEN_PROGRAM_ID => {
-            let token_account =
-                TokenAccount::unpack(&account.data).expect("Should deserialize token account");
-            token_account.amount
+            StateWithExtensions::<TokenAccount>::unpack(&account.data)
+                .expect("Should deserialize token account")
+                .base
+                .amount
         }
         Some(_) => 0,
         None => 0,
@@ -269,7 +282,31 @@ pub fn get_or_create_associated_token_account(
         .send_transaction(ata_ix)
         .expect("Failed to create associated token account");
 
-    get_associated_token_address(wallet, mint)
+    channel_ata(wallet, mint)
+}
+
+/// The channel ATA of `wallet` for `mint`, derived under Token-2022.
+pub fn channel_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    get_associated_token_address_with_program_id(wallet, mint, &TOKEN_PROGRAM_ID)
+}
+
+/// Current supply of a Token-2022 mint.
+pub fn get_mint_supply(context: &mut TestContext, mint: &Pubkey) -> u64 {
+    let data = context.get_account_data(mint).expect("mint should exist");
+    StateWithExtensions::<Mint>::unpack(&data)
+        .expect("Should deserialize mint")
+        .base
+        .supply
+}
+
+/// Delegate written into a Token-2022 mint's PermanentDelegate extension.
+pub fn get_permanent_delegate(context: &mut TestContext, mint: &Pubkey) -> Option<Pubkey> {
+    let data = context.get_account_data(mint).expect("mint should exist");
+    let state = StateWithExtensions::<Mint>::unpack(&data).expect("Should deserialize mint");
+    state
+        .get_extension::<PermanentDelegate>()
+        .ok()
+        .and_then(|e| Option::<Pubkey>::from(e.delegate))
 }
 
 pub fn set_token_balance(
@@ -279,26 +316,34 @@ pub fn set_token_balance(
     owner: &Pubkey,
     amount: u64,
 ) {
-    let token_account = TokenAccount {
+    // Same layout the ATA program writes on Token-2022: base account plus ImmutableOwner.
+    let len =
+        ExtensionType::try_calculate_account_len::<TokenAccount>(&[ExtensionType::ImmutableOwner])
+            .unwrap();
+    let mut data = vec![0u8; len];
+    let mut state =
+        StateWithExtensionsMut::<TokenAccount>::unpack_uninitialized(&mut data).unwrap();
+    state.init_extension::<ImmutableOwner>(true).unwrap();
+    state.base = TokenAccount {
         mint: *mint,
         owner: *owner,
         amount,
         delegate: COption::None,
-        state: spl_token::state::AccountState::Initialized,
+        state: spl_token_2022::state::AccountState::Initialized,
         is_native: COption::None,
         delegated_amount: 0,
         close_authority: COption::None,
     };
+    state.pack_base();
+    state.init_account_type().unwrap();
 
-    let mut data = vec![0u8; TokenAccount::LEN];
-    TokenAccount::pack(token_account, &mut data).expect("Failed to pack token account");
-
+    let lamports = context.svm.minimum_balance_for_rent_exemption(data.len());
     context
         .svm
         .set_account(
             *ata,
             Account {
-                lamports: 2039280, // Rent-exempt minimum for token account
+                lamports,
                 data,
                 owner: TOKEN_PROGRAM_ID,
                 executable: false,
@@ -317,16 +362,38 @@ pub fn set_mint_with_authority(
     mint: &Pubkey,
     mint_authority: COption<Pubkey>,
 ) {
-    let mint_account = Mint {
+    set_mint_with(context, mint, mint_authority, TEST_PERMANENT_DELEGATE);
+}
+
+/// A channel mint whose permanent delegate is `delegate`, for tests that sign as it.
+pub fn set_mint_with_delegate(context: &mut TestContext, mint: &Pubkey, delegate: &Pubkey) {
+    set_mint_with(context, mint, COption::None, *delegate);
+}
+
+fn set_mint_with(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    mint_authority: COption<Pubkey>,
+    delegate: Pubkey,
+) {
+    // Channel mints carry exactly one extension, the permanent delegate.
+    let len = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::PermanentDelegate])
+        .unwrap();
+    let mut data = vec![0u8; len];
+    let mut state = StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut data).unwrap();
+    state
+        .init_extension::<PermanentDelegate>(true)
+        .unwrap()
+        .delegate = Some(delegate).try_into().unwrap();
+    state.base = Mint {
         decimals: 6,
         is_initialized: true,
         freeze_authority: COption::None,
         mint_authority,
         supply: 1_000_000,
     };
-
-    let mut data = vec![0u8; Mint::LEN];
-    Mint::pack(mint_account, &mut data).expect("Failed to pack mint account");
+    state.pack_base();
+    state.init_account_type().unwrap();
 
     context
         .svm
@@ -370,7 +437,7 @@ pub fn set_withdraw_config_with_minimum(
     min_withdraw_amount: u64,
 ) -> (Pubkey, Pubkey) {
     let (withdraw_config, bump) = find_withdraw_config_pda(mint);
-    let treasury_token_account = get_associated_token_address(treasury, mint);
+    let treasury_token_account = channel_ata(treasury, mint);
 
     let mut data = vec![bump];
     data.extend_from_slice(&fee.to_le_bytes());
@@ -462,13 +529,13 @@ pub fn setup_test_balances(
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .expect("Failed to airdrop to user");
 
-    let user_ata = get_associated_token_address(&user.pubkey(), mint);
+    let user_ata = channel_ata(&user.pubkey(), mint);
 
     let create_ata_ix = create_associated_token_account_idempotent(
         &context.payer.pubkey(),
         &user.pubkey(),
         mint,
-        &TOKEN_PROGRAM_ID, // Use TOKEN_PROGRAM_ID for now
+        &TOKEN_PROGRAM_ID,
     );
 
     context

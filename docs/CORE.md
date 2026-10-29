@@ -11,7 +11,15 @@ Transaction → [1:SigVerify] → [2:Dedup] → [3:Sequencer] → [4:Executor] �
 
 Parallelizes Ed25519 signature verification across configurable workers. Each worker independently validates transaction signatures before forwarding to dedup. Invalid signatures are dropped with error logging. Verification runs first so that only fully-verified transactions ever reach the dedup cache.
 
-**Location**: [`core/src/stages/sigverify.rs`](../core/src/stages/sigverify.rs)
+Each worker checks the admin rule before the signature and the seize rules after it, so a seize alert always names a real signature. Their refusals are dropped like an invalid signature: logged, counted in `private_channel_sigverify_rejected_total`, and never returned to the `sendTransaction` caller. `simulateTransaction` with `sigVerify` runs the same rules and reports the result.
+
+- **Admin signer.** A Token-2022 `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount`, or a `SetAuthority` of any authority type other than `AccountOwner` and `CloseAccount` (unknown types included), needs a signature from a `PRIVATE_CHANNEL_ADMIN_KEYS` key. So does the withdraw program's `SetWithdrawConfig`. Refusal reason `not_admin`.
+- **Delegate rotation.** A `SetAuthority(PermanentDelegate)` whose new authority is not the configured delegate is refused, even when admin-signed. `None` is refused too, since it would remove seize from the mint for good. Reason `delegate_rotation`.
+- **Seize rule.** Token-2022 honours a mint's permanent delegate only on `TransferChecked`, `Burn` and `BurnChecked`. When one of those is top level, its authority is the configured delegate, and its source is not the delegate's own ATA for that mint, it must be a `TransferChecked` into the compliance ATA, `ATA(PRIVATE_CHANNEL_COMPLIANCE_OWNER, mint, Token-2022)`. Anything else, burns included, is refused (result `SeizeTargetRefused`, reason `seize_target`). With no compliance owner configured, every such move is refused. A plain `Transfer` or `Approve` signed by the delegate is not a seize: Token-2022 treats it as an ordinary owner or delegate action. The rule keys on the authority, so a balance a user `Approve`d to the delegate can also only go to compliance.
+
+Every admitted delegate move logs `permanent delegate move admitted` at warn level with the signature, mint, source and amount, and bumps `private_channel_delegate_moves_admitted_total` (only when stage metrics are on, `PRIVATE_CHANNEL_METRICS`). Both fire at ingress, before duplicate filtering and execution: they count admissions, so a resent seize counts again and a move that fails on chain still counts. They alarm that the delegate signed a move; the ledger is the record of seizures. A refused one logs `permanent delegate move refused`. The warn logs are the always-on alert.
+
+**Location**: [`core/src/stages/sigverify.rs`](../core/src/stages/sigverify.rs), [`core/src/transactions.rs`](../core/src/transactions.rs) (predicates)
 
 ### Stage 2: Dedup
 
@@ -160,7 +168,7 @@ one dropped on arrival does.
 
 #### AdminVM
 
-Privileged execution for token mint operations (bypasses BPF execution). This enables consistent mint addresses across Mainnet and the Solana Private Channels payment channel. This is achieved by intercepting `InitializeMint` instructions and synthesizing mint accounts without executing BPF code.
+Privileged execution for token mint operations (bypasses BPF execution). This enables consistent mint addresses across Mainnet and the Solana Private Channels payment channel. This is achieved by intercepting Token-2022 `InitializePermanentDelegate` + `InitializeMint`/`InitializeMint2` pairs and synthesizing 202-byte Token-2022 mint accounts without executing BPF code. Each mint carries exactly one extension, `PermanentDelegate`, set to `PRIVATE_CHANNEL_PERMANENT_DELEGATE`.
 
 **Location**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 **Security**: Transactions are gated by admin key validation in the SigVerify stage (`PRIVATE_CHANNEL_ADMIN_KEYS`). Only transactions signed by an admin key are routed to AdminVM for execution.
@@ -229,18 +237,20 @@ Finally, the settler notifies the executor's in-memory cache (BOB) of settled ac
 
 ## Supported Programs
 
-Solana Private Channels restricts which programs can execute in the payment channel. Transactions referencing unsupported programs are rejected at the RPC layer.
+Solana Private Channels restricts which programs can execute in the payment channel. Transactions referencing unsupported programs are rejected at the RPC layer with `-32602`, "Only Token-2022 (classic token instructions), ATA, Memo, Withdraw, and Swap program transactions are accepted".
 
 | Program | Status | Notes |
 |---------|--------|-------|
-| **SPL Token** | Supported | Token-2022 is **not** admitted at ingress; the escrow program on Mainnet accepts it, the channel does not |
+| **Token-2022** (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`) | Supported, classic instructions only | The only token program on the channel: the Mainnet build `program@v11.1.0`, embedded and hash-pinned. First instruction byte `0..=24` or `35` (`InitializePermanentDelegate`, admin only); everything else is refused, including `Batch` (255), every other extension instruction (`25..=46`), the token-metadata and group interfaces, and empty data. The legacy SPL Token program is not loaded. Mainnet mints may be SPL Token or Token-2022; their channel mints are always Token-2022 |
 | **SPL Associated Token Account** | Supported | ATA creation and lookup |
 | **SPL Memo** | Supported | Memo attachments |
 | **System Program** | Not supported at top level | Every System instruction is refused at ingress, `Transfer` included; still reachable as a CPI target of the allowlisted programs |
 | **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
 | **DvP Swap Program** | Supported | Delivery-versus-payment swaps |
 
-A transaction that lists the spl-token native mint (`So11111111111111111111111111111111111111112`) in its account keys is also rejected. spl-token builds a native (wSOL) account without loading the mint, so refusing the key is what keeps fabricated gasless lamports from becoming wSOL.
+A transaction that lists the spl-token native mint (`So11111111111111111111111111111111111111112`) in its account keys is also rejected. spl-token builds a native (wSOL) account without loading the mint, so refusing the key is what keeps fabricated gasless lamports from becoming wSOL. The Token-2022 native mint (`9pan9bMn5HatX4EJdBwg9VgCa7Uz5HL8N1m5D3NdXejP`) is held off differently: Token-2022 `InitializeAccount` needs the mint to exist, `CreateNativeMint` (31) is refused at ingress, and the AdminVM refuses to create either native mint.
+
+Channel token accounts are 170-byte Token-2022 ATAs with the `ImmutableOwner` extension, so their addresses derive with the Token-2022 program id, and an ownership handoff (`SetAuthority(AccountOwner)`) fails on chain.
 
 A writable account other than the fee payer that no instruction is given, or only a Memo (which never writes), is rejected too (`-32602`, "Every writable account other than the fee payer must be passed to an instruction other than Memo"): the scheduler write-locks every writable key, so an unused one would serialize unrelated transactions on that account. A writable program, sysvar or other reserved key is rejected even when an instruction is given it (`-32602`, "Program, sysvar and other reserved accounts must not be writable"), since honest transactions read-lock those keys and would all serialize behind it.
 
@@ -248,9 +258,11 @@ A writable account other than the fee payer that no instruction is given, or onl
 
 ### AdminVM Program Support
 
-The AdminVM (used for operator mint operations) only supports SPL Token `InitializeMint`. All other instruction types are rejected.
+Admin-only Token-2022 instructions are `InitializeMint` (0), `InitializeMint2` (20) and `InitializePermanentDelegate` (35). A transaction that contains one needs an admin signature and runs in the AdminVM, which accepts nothing else.
 
-An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, a second guard behind the ingress check that refuses any transaction listing the native mint.
+The AdminVM creates a mint only from `InitializePermanentDelegate` immediately followed by `InitializeMint` or `InitializeMint2` on the same mint, with the delegate equal to `PRIVATE_CHANNEL_PERMANENT_DELEGATE`. Any other shape (a mint init without the delegate before it, a delegate without its mint init, another delegate key) fails with `InvalidArgument`. With no delegate configured it creates no mint.
+
+An init that targets either native mint (`So11111111111111111111111111111111111111112` or `9pan9bMn5HatX4EJdBwg9VgCa7Uz5HL8N1m5D3NdXejP`) is rejected with `InvalidArgument`.
 
 **Source**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 
@@ -258,7 +270,7 @@ An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint 
 
 ### No Custom Program Deployment
 
-Solana Private Channels does not support deploying arbitrary BPF programs. The supported program set is fixed at compile time. The instruction allowlist is currently hardcoded to SPL Token instructions.
+Solana Private Channels does not support deploying arbitrary BPF programs. The supported program set is fixed at compile time. The token instruction allowlist is hardcoded to the classic Token-2022 instructions listed above.
 
 ### No Address Lookup Tables
 
@@ -289,6 +301,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max addresses per `simulateTransaction` | the transaction's own account count (matches Agave) | [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) |
 | Max encoded bytes for `simulateTransaction` accounts | 5 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max concurrent `simulateTransaction` calls | 8, the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max encoded bytes for the account in a `getAccountInfo` reply | 1 MiB; a larger account needs a `dataSlice`, which the 1.38 MB Token-2022 program account always does | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max RPC response size | 10 MB, **declared but not enforced** (see below) | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Gateway max request body | 64 KB | [`gateway/src/lib.rs`](../gateway/src/lib.rs) |
 

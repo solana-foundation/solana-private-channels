@@ -60,7 +60,7 @@ use {
             RpcSimulateTransactionResult, RpcSupply, RpcVoteAccountStatus,
         },
     },
-    solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::SanitizedTransaction},
+    solana_sdk::{hash::Hash, transaction::SanitizedTransaction},
     solana_transaction_status_client_types::TransactionStatus,
     std::{
         collections::LinkedList,
@@ -71,8 +71,8 @@ use {
 
 pub struct ReadDeps {
     pub accounts_db: AccountsDB,
-    // Used for simulating sigverify
-    pub admin_keys: Vec<Pubkey>,
+    /// Admin and seize keys, for simulating sigverify and the admin path.
+    pub ingress: crate::transactions::IngressPolicy,
     /// One permit per running `simulateTransaction`; a call finding none is refused.
     pub simulation_permits: tokio::sync::Semaphore,
     /// One permit per running block listing wider than `MAX_UNCAPPED_BLOCK_SPAN`.

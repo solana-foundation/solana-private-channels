@@ -79,7 +79,7 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
 
     let _sigverify_workers = start_sigverify_workerpool(SigverifyArgs {
         num_workers: 2,
-        admin_keys: vec![],
+        policy: Default::default(),
         rx: ingress_rx,
         output_tx: dedup_tx,
         metrics: Arc::new(NoopMetrics),

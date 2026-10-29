@@ -114,6 +114,16 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
+    /// Permanent delegate written into every channel mint (base58). Required on write and
+    /// aio nodes, with no fallback. A bad value stops startup, unlike an admin key.
+    #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
+    permanent_delegate: Option<String>,
+
+    /// Owner of the compliance ATAs, the only place the delegate may move balances to
+    /// (base58). Unset or blank refuses every delegate move.
+    #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER")]
+    compliance_owner: Option<String>,
+
     /// Expiry in seconds on cached Redis block and transaction entries; 0 disables it
     #[arg(
         long,
@@ -154,6 +164,33 @@ struct Args {
     metrics: bool,
 }
 
+/// A blank value is unset, so compose can pass an empty default; anything else must be a pubkey.
+fn optional_pubkey(value: Option<&str>, name: &str) -> Result<Option<Pubkey>, String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => Pubkey::from_str(v)
+            .map(Some)
+            .map_err(|e| format!("{name}: invalid pubkey '{v}': {e}")),
+    }
+}
+
+/// Parses the seize keys. The delegate has no fallback: deriving it from the admin keys
+/// would silently change the policed key whenever that list is edited.
+fn seize_keys(args: &Args) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
+    let permanent_delegate = optional_pubkey(
+        args.permanent_delegate.as_deref(),
+        "PRIVATE_CHANNEL_PERMANENT_DELEGATE",
+    )?;
+    let compliance_owner = optional_pubkey(
+        args.compliance_owner.as_deref(),
+        "PRIVATE_CHANNEL_COMPLIANCE_OWNER",
+    )?;
+    if compliance_owner.is_none() {
+        info!("seize disabled: no compliance owner configured");
+    }
+    Ok((permanent_delegate, compliance_owner))
+}
+
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
@@ -172,10 +209,15 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             }
         })
         .collect();
+    let (permanent_delegate, compliance_owner) = seize_keys(&args)?;
 
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
     }
+    info!(
+        "Permanent delegate: {:?}, compliance owner: {:?}",
+        permanent_delegate, compliance_owner
+    );
 
     let metrics: Arc<dyn private_channel_core::stage_metrics::StageMetrics> = if args.metrics {
         let metrics_port = match std::env::var("PRIVATE_CHANNEL_METRICS_PORT") {
@@ -218,6 +260,8 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         redis_cache_url: args.redis_cache_url.filter(|url| !url.trim().is_empty()),
         redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
+        permanent_delegate,
+        compliance_owner,
         max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
             args.max_blockhashes,
             args.transaction_expiration_ms,
@@ -325,7 +369,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, private_channel_core::nodes::node::validate_seize_config};
 
     /// Guards the removal of `--mode`'s `aio` default: restoring it would let a
     /// read deployment start as a writer whenever the variable is dropped.
@@ -340,5 +384,118 @@ mod tests {
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         assert!(err.to_string().contains("--mode"));
+    }
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec![
+            "private-channel-node",
+            "--mode",
+            "aio",
+            "--accountsdb-connection-url",
+            "postgres://localhost/private_channel",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    /// Unlike an admin key, a bad delegate or compliance key stops startup; blank is unset.
+    #[test]
+    fn seize_keys_must_be_valid_pubkeys() {
+        let key = Pubkey::new_unique();
+        let args = parse(&["--permanent-delegate", &key.to_string()]).unwrap();
+        assert_eq!(
+            optional_pubkey(args.permanent_delegate.as_deref(), "delegate"),
+            Ok(Some(key))
+        );
+        assert!(optional_pubkey(Some("not-a-key"), "delegate").is_err());
+        for blank in [None, Some(""), Some("  ")] {
+            assert_eq!(optional_pubkey(blank, "compliance"), Ok(None));
+        }
+    }
+
+    /// Admin keys never stand in for a blank delegate, so a write or aio node refuses to boot.
+    #[test]
+    fn blank_delegate_is_not_taken_from_the_admin_keys() {
+        let (k1, k2) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let admin = format!("{k1},{k2}");
+        for delegate in [None, Some(""), Some("  ")] {
+            let mut extra = vec!["--admin-keys", admin.as_str()];
+            if let Some(d) = delegate {
+                extra.extend(["--permanent-delegate", d]);
+            }
+            let (permanent_delegate, compliance_owner) =
+                seize_keys(&parse(&extra).unwrap()).unwrap();
+            assert_eq!(permanent_delegate, None, "{delegate:?}");
+            let config = NodeConfig {
+                mode: NodeMode::Aio,
+                admin_keys: vec![k1, k2],
+                permanent_delegate,
+                compliance_owner,
+                ..NodeConfig::default()
+            };
+            assert!(validate_seize_config(&config).is_err(), "{delegate:?}");
+        }
+
+        let explicit = Pubkey::new_unique();
+        let args = parse(&["--permanent-delegate", &explicit.to_string()]).unwrap();
+        assert_eq!(seize_keys(&args).unwrap().0, Some(explicit));
+    }
+
+    /// Runs `seize_keys` under a subscriber and returns what it logged.
+    fn seize_keys_log(extra: &[&str]) -> String {
+        let args = parse(extra).unwrap();
+        captured_log(|| {
+            seize_keys(&args).unwrap();
+        })
+    }
+
+    /// Runs `f` under a subscriber and returns what it logged.
+    fn captured_log(f: impl FnOnce()) -> String {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || CapturedLog(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let out = buf.lock().unwrap().clone();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A read node may run without a delegate, but it says so: simulate polices nothing.
+    #[test]
+    fn read_node_without_a_delegate_warns() {
+        let config = NodeConfig {
+            mode: NodeMode::Read,
+            ..NodeConfig::default()
+        };
+        let log = captured_log(|| validate_seize_config(&config).unwrap());
+        assert!(log.contains("no permanent delegate configured"), "{log}");
+    }
+
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_compliance_owner_logs_seize_disabled_at_info() {
+        let log = seize_keys_log(&[]);
+        let line = log
+            .lines()
+            .find(|l| l.contains("seize disabled: no compliance owner configured"))
+            .unwrap_or_else(|| panic!("no seize-off line in {log:?}"));
+        assert!(line.contains("INFO"), "{line}");
+
+        let owner = Pubkey::new_unique().to_string();
+        let log = seize_keys_log(&["--compliance-owner", &owner]);
+        assert!(!log.contains("seize disabled"), "{log}");
     }
 }

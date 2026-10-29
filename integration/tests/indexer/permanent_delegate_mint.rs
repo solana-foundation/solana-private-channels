@@ -306,6 +306,10 @@ fn set_operator_env_vars() {
     let private_key_base58 = bs58::encode(admin.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &private_key_base58);
+    std::env::set_var(
+        "OPERATOR_PERMANENT_DELEGATE",
+        solana_sdk::signer::Signer::pubkey(&admin).to_string(),
+    );
     std::env::set_var("OPERATOR_SIGNER", "memory");
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }

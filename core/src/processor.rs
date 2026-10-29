@@ -64,6 +64,17 @@ pub struct BatchProcessor {
     pub environments: ProgramRuntimeEnvironments,
 }
 
+/// BPF programs loaded into the program cache; must match the precompiles loaded in BOB.
+fn cached_bpf_programs() -> [solana_sdk::pubkey::Pubkey; 5] {
+    [
+        spl_token_2022::id(),
+        spl_associated_token_account::id(),
+        spl_memo::id(),
+        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        dvp_swap_program_client::DVP_SWAP_PROGRAM_ID,
+    ]
+}
+
 /// This function encapsulates some initial setup required to tweak the
 /// `TransactionBatchProcessor` for use within PrivateChannel.
 ///
@@ -90,18 +101,8 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
     {
         let mut cache = processor.global_program_cache.write().unwrap();
 
-        // List of BPF programs to load into the cache
-        // These should match the precompiles loaded in BOB
-        let bpf_programs = [
-            spl_token::id(),
-            spl_associated_token_account::id(),
-            spl_memo::id(),
-            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-            dvp_swap_program_client::DVP_SWAP_PROGRAM_ID,
-        ];
-
         // Loop over all BPF programs and add them to the cache
-        for program_id in bpf_programs {
+        for program_id in cached_bpf_programs() {
             // The slot beside the account is where it was last modified, which
             // this store does not track; the processor runs at slot zero.
             if let Some((program_account, _slot)) = accounts_db.get_account_shared_data(&program_id)
@@ -200,7 +201,10 @@ const MAX_LOADED_ACCOUNTS_DATA_SIZE: u32 = 64 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
+    use solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        pubkey::Pubkey,
+    };
     use solana_svm::transaction_processing_callback::TransactionProcessingCallback;
     use solana_svm_callback::InvokeContextCallback;
 
@@ -292,6 +296,19 @@ mod tests {
         );
     }
 
+    /// Every BPF precompile must be in the program cache, or calls to it fail.
+    #[test]
+    fn every_bpf_precompile_is_cached() {
+        let cached = cached_bpf_programs();
+        for (id, account) in crate::accounts::precompiles::PRECOMPILES.iter() {
+            if *account.owner() == solana_sdk::bpf_loader::id() {
+                assert!(cached.contains(id), "{id} is a precompile but not cached");
+            }
+        }
+        assert_eq!(cached[0], spl_token_2022::id());
+        assert!(!cached.contains(&spl_token::id()));
+    }
+
     #[test]
     fn test_create_processor_fails_when_bpf_program_missing() {
         let db = EmptyAccountsDB;
@@ -304,14 +321,14 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected error when BPF programs are missing"),
         };
-        // The first BPF program looked up is spl_token
+        // The first BPF program looked up is Token-2022
         assert!(
             err.contains("BPF program") && err.contains("not found"),
             "expected 'BPF program ... not found' error, got: {err}"
         );
         assert!(
-            err.contains(&spl_token::id().to_string()),
-            "error should mention the first missing program (spl_token), got: {err}"
+            err.contains(&spl_token_2022::id().to_string()),
+            "error should mention the first missing program (Token-2022), got: {err}"
         );
     }
 }

@@ -351,6 +351,10 @@ fn drill_1_error_message_contracts_present_in_source() {
             "Mint instruction failed after JIT: corrupt mint state",
             "indexer/src/operator/sender/mint.rs",
         ),
+        (
+            "Mint instruction failed after JIT: permanent delegate mismatch",
+            "indexer/src/operator/sender/mint.rs",
+        ),
         // Deposit — idempotency memo prefix. Anchors `_verify_onchain_mint.md`
         // step 3.
         (
@@ -1215,6 +1219,7 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
     for substr in [
         "Mint instruction failed after JIT: mint_authority mismatch",
         "Mint instruction failed after JIT: corrupt mint state",
+        "Mint instruction failed after JIT: permanent delegate mismatch",
     ] {
         let path = workspace_root.join("indexer/src/operator/sender/mint.rs");
         let content =

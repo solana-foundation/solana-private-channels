@@ -67,7 +67,7 @@ use solana_sdk::{
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 use sqlx::{PgPool, Row};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
@@ -353,7 +353,7 @@ fn channel_transaction(
             mint_to.recipient_ata.to_string(),
             TOKEN_PROGRAM_ID.to_string(),
         ]);
-        let data = spl_token::instruction::mint_to(
+        let data = spl_token_2022::instruction::mint_to(
             &TOKEN_PROGRAM_ID,
             &mint_to.mint,
             &mint_to.recipient_ata,
@@ -938,7 +938,8 @@ async fn top_up_custody_to_supply(
     keep: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let amount = token_balance(client, user.pubkey(), mint).await - keep;
-    let ix = spl_token::instruction::transfer(
+    #[allow(deprecated)]
+    let ix = spl_token_2022::instruction::transfer(
         &TOKEN_PROGRAM_ID,
         &get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID),
         &get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID),
@@ -3591,7 +3592,7 @@ async fn send_memo_mint(
                 )],
                 data: memo.as_bytes().to_vec(),
             },
-            spl_token::instruction::mint_to(
+            spl_token_2022::instruction::mint_to(
                 &TOKEN_PROGRAM_ID,
                 &mint,
                 &ata,
@@ -4608,11 +4609,11 @@ async fn e2e_resync_after_real_admin_rotation_does_not_reopen_deposit(
 
     // 3. The documented rotation: A hands the mint authority to B.
     let new_admin = Keypair::new();
-    let rotate = spl_token::instruction::set_authority(
+    let rotate = spl_token_2022::instruction::set_authority(
         &TOKEN_PROGRAM_ID,
         &env.mint,
         Some(&new_admin.pubkey()),
-        spl_token::instruction::AuthorityType::MintTokens,
+        spl_token_2022::instruction::AuthorityType::MintTokens,
         &admin().pubkey(),
         &[],
     )?;

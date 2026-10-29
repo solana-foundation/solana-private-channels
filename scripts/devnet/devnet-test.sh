@@ -350,7 +350,9 @@ USER_SOLANA_FINAL=$(get_token_balance "$USER" "$MINT")
 INSTANCE_SOLANA_FINAL=$(get_token_balance "$INSTANCE_ID" "$MINT")
 
 # Get Solana Private Channels balance via RPC - need to derive ATA first (raw amount)
-USER_ATA=$(spl-token address --verbose --owner "$USER" --token "$MINT" 2>/dev/null | grep "Associated token address" | awk '{print $4}')
+# Channel token accounts are Token-2022 ATAs; derived offline since the mint is not on devnet's Token-2022.
+USER_ATA=$(solana find-program-derived-address ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL \
+  "pubkey:$USER" pubkey:TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb "pubkey:$MINT")
 USER_PRIVATE_CHANNEL_FINAL=$(curl -s -X POST "$PRIVATE_CHANNEL_READ_RPC_URL" \
   -H "Content-Type: application/json" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountBalance\",\"params\":[\"$USER_ATA\"]}" \

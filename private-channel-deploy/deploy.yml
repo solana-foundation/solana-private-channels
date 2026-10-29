@@ -178,6 +178,17 @@
           one. Set fallback_rpc_url in vars/{{ network }}.yml to a provider
           independent from rpc_url ({{ rpc_url | default('unset') }}).
 
+    # The node and the operator both need the delegate, with no fallback to the admin key:
+    # deriving it on each deploy would change the policed key whenever the admin key does.
+    - name: Assert the permanent delegate is set
+      ansible.builtin.assert:
+        that: permanent_delegate | default('') | length > 0
+        fail_msg: |
+          permanent_delegate is not set for network={{ network }}.
+          Set it in vars/{{ network }}.yml to the base58 pubkey written into every
+          channel mint as its permanent delegate: a dedicated key in production, or
+          the channel admin pubkey for a dev stack.
+
     - name: Derive admin pubkey via solana-keygen
       ansible.builtin.command: "solana-keygen pubkey {{ admin_keypair_path }}"
       changed_when: false

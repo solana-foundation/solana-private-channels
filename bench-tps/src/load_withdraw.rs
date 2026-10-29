@@ -10,7 +10,7 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_WITHDRAW},
-        types::{BatchQueue, BenchState, WithdrawConfig, MAX_QUEUE_DEPTH},
+        types::{channel_ata, BatchQueue, BenchState, WithdrawConfig, MAX_QUEUE_DEPTH},
     },
     private_channel_withdraw_program_client::instructions::{
         WithdrawFunds, WithdrawFundsInstructionArgs,
@@ -19,7 +19,6 @@ use {
         hash::Hash, instruction::Instruction, pubkey, pubkey::Pubkey, signature::Keypair,
         signer::Signer, transaction::Transaction,
     },
-    spl_associated_token_account::get_associated_token_address,
     std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -48,13 +47,13 @@ fn build_withdraw_tx(
     nonce: u64,
 ) -> Transaction {
     let withdrawer_pubkey = withdrawer.pubkey();
-    let token_account = get_associated_token_address(&withdrawer_pubkey, &config.mint);
+    let token_account = channel_ata(&withdrawer_pubkey, &config.mint);
 
     let accounts = WithdrawFunds {
         user: withdrawer_pubkey,
         mint: config.mint,
         token_account,
-        token_program: spl_token::id(),
+        token_program: spl_token_2022::id(),
         associated_token_program: spl_associated_token_account::id(),
         withdraw_config: config.withdraw_config,
         treasury_token_account: config.treasury_token_account,

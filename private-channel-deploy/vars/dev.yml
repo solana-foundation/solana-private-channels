@@ -108,6 +108,15 @@ gateway_enforce_jwt: true
 # drain escrow custody after the handover.
 admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
 
+# === Seize keys =============================================================
+# permanent_delegate: base58 pubkey written into every channel mint as its
+# Token-2022 permanent delegate, rendered for both the write node and the
+# operator. Required, with no fallback to the admin key; use a dedicated key in production.
+# compliance_owner: owner of the compliance ATAs, the only place the delegate may
+# move balances to. Unset refuses every delegate move. Must differ from the delegate.
+# permanent_delegate: "<delegate_pubkey>"
+# compliance_owner: "<compliance_owner_pubkey>"
+
 # === Public surface ========================================================
 
 # domain — hostname the gateway is reachable at. Used by the report phase + any

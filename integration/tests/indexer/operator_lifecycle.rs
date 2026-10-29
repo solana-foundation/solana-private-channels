@@ -20,6 +20,8 @@
 //!    recorded must be reconciled in place and let the operator start.
 //! 10. Double release: the same nonce submitted under two different rows must move
 //!     tokens exactly once, and the loser must not be reminted.
+//! 11. Delegate rotation: after a restart with a new delegate configured, the old key
+//!     rotates a mint to it.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -28,9 +30,11 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use helpers::private_channel_node::start_private_channel_node;
+use helpers::private_channel_node::{
+    start_private_channel_node, start_private_channel_node_with_delegate,
+};
 use helpers::test_types::WAIT_TIMEOUT_SECS;
-use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
+use helpers::{db, generate_channel_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
 use private_channel_indexer::config::{
     OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
@@ -51,6 +55,11 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
+use solana_sdk::transaction::Transaction;
+use spl_token_2022::extension::{
+    permanent_delegate::PermanentDelegate, BaseStateWithExtensions, StateWithExtensions,
+};
+use spl_token_2022::instruction::AuthorityType;
 use std::sync::Arc;
 use std::time::Duration;
 use test_utils::mint_helper::TEST_WITHDRAW_FEE;
@@ -120,6 +129,10 @@ fn set_operator_env_vars(keypair: &Keypair) {
     let private_key_base58 = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &private_key_base58);
+    std::env::set_var(
+        "OPERATOR_PERMANENT_DELEGATE",
+        solana_sdk::signer::Signer::pubkey(&keypair).to_string(),
+    );
     std::env::set_var("OPERATOR_SIGNER", "memory");
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }
@@ -409,7 +422,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -467,10 +480,77 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     assert_eq!(db_tx.status, "completed");
     assert!(db_tx.counterpart_signature.is_some());
 
+    // The operator JIT-created the channel mint, a Token-2022 mint with the delegate.
+    assert_eq!(
+        channel_mint_delegate(&pc_node.url, &env.mint).await?,
+        Some(admin.pubkey())
+    );
+
     operator_handle.shutdown().await;
     pc_node.shutdown().await;
 
     Ok(())
+}
+
+/// The channel mint's permanent delegate, after checking Token-2022 owns it.
+async fn channel_mint_delegate(
+    url: &str,
+    mint: &Pubkey,
+) -> Result<Option<Pubkey>, Box<dyn std::error::Error>> {
+    let account = RpcClient::new(url.to_string()).get_account(mint).await?;
+    assert_eq!(account.owner, spl_token_2022::id());
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&account.data)?;
+    Ok(state.get_extension::<PermanentDelegate>()?.delegate.into())
+}
+
+/// Delegate rotation: the node restarts with the new key configured, then the old key
+/// hands the mint over with an admin signing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (admin, old, new) = (Keypair::new(), Keypair::new(), Pubkey::new_unique());
+    let mut node = start_private_channel_node_with_delegate(admin.pubkey(), old.pubkey()).await?;
+    let program = spl_token_2022::id();
+    let mint = Pubkey::new_unique();
+    let create = [
+        spl_token_2022::instruction::initialize_permanent_delegate(&program, &mint, &old.pubkey())?,
+        spl_token_2022::instruction::initialize_mint2(&program, &mint, &admin.pubkey(), None, 6)?,
+    ];
+    send_on_channel(&node.url, &create, &[&admin]).await?;
+    assert_eq!(
+        channel_mint_delegate(&node.url, &mint).await?,
+        Some(old.pubkey())
+    );
+
+    node.restart_with_delegate(new).await?;
+    let rotate = spl_token_2022::instruction::set_authority(
+        &program,
+        &mint,
+        Some(&new),
+        AuthorityType::PermanentDelegate,
+        &old.pubkey(),
+        &[],
+    )?;
+    send_on_channel(&node.url, &[rotate], &[&admin, &old]).await?;
+    assert_eq!(channel_mint_delegate(&node.url, &mint).await?, Some(new));
+
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn send_on_channel(
+    url: &str,
+    ixs: &[solana_sdk::instruction::Instruction],
+    signers: &[&Keypair],
+) -> Result<Signature, Box<dyn std::error::Error>> {
+    let client = RpcClient::new(url.to_string());
+    let tx = Transaction::new_signed_with_payer(
+        ixs,
+        Some(&signers[0].pubkey()),
+        signers,
+        client.get_latest_blockhash().await?,
+    );
+    Ok(client.send_and_confirm_transaction(&tx).await?)
 }
 
 /// Inserts the same deposit row twice (same signature), starts the operator,
@@ -519,7 +599,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -627,7 +707,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -753,14 +833,13 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     )
     .await?;
 
-    // Create a valid SPL mint with a *different* mint authority than the operator's
-    // admin key. When the operator calls mint_to using the admin key, the SPL token
-    // program rejects it (wrong authority), so the mint fails at preflight after the
-    // write-ahead signature is persisted.
+    // A Token-2022 channel mint with a *different* mint authority than the operator's
+    // admin key, so mint_to fails at preflight after the write-ahead signature is
+    // persisted. Token-2022 because this validator is also the channel.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let bad_authority = Keypair::new(); // NOT the operator admin — intentionally wrong
     let bad_mint = Keypair::new();
-    generate_mint(&client, &admin, &bad_authority, &bad_mint).await?;
+    generate_channel_mint(&client, &admin, &bad_authority, &bad_mint).await?;
 
     // Register the bad mint in the mints table so the operator's pending-deposit
     // query (which joins with mints) can find and attempt to process this deposit.
@@ -768,7 +847,7 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     let bad_mint_meta = DbMint::new(
         bad_mint.pubkey().to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[bad_mint_meta]).await?;
@@ -837,11 +916,12 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
-    let bad_mint_pubkey = generate_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
+    let bad_mint_pubkey =
+        generate_channel_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
     let mint_meta = DbMint::new(
         bad_mint_pubkey.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -951,7 +1031,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         .upsert_mints_batch(&[DbMint::new(
             env.mint.to_string(),
             6,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(TEST_WITHDRAW_FEE),
         )])
         .await?;
@@ -1139,7 +1219,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     let mint_meta = DbMint::new(
         mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1336,7 +1416,7 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1456,7 +1536,7 @@ async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1476,7 +1556,7 @@ async fn test_operator_refuses_when_chain_is_ahead_of_db() -> Result<(), Box<dyn
         user_pubkey,
         50_000,
         0,
-        spl_token::id(),
+        spl_token_2022::id(),
     )
     .await?;
     let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
@@ -1593,7 +1673,7 @@ async fn test_second_release_of_same_nonce_moves_no_tokens(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1749,7 +1829,7 @@ async fn test_withdrawal_one_generation_early_succeeds_after_rotation(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1851,7 +1931,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     let mint_meta = DbMint::new(
         env.mint.to_string(),
         6,
-        spl_token::id().to_string(),
+        spl_token_2022::id().to_string(),
         TokenAmount(TEST_WITHDRAW_FEE),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
@@ -1871,7 +1951,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         user_pubkey,
         50_000,
         0,
-        spl_token::id(),
+        spl_token_2022::id(),
     )
     .await?;
     let balance_after_release = get_token_balance(&client, &user_pubkey, &env.mint).await?;
@@ -1956,11 +2036,12 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
             trace_id: trace_id.clone(),
             mint: env.mint,
             user: user_pubkey,
-            user_ata: spl_associated_token_account::get_associated_token_address(
+            user_ata: spl_associated_token_account::get_associated_token_address_with_program_id(
                 &user_pubkey,
                 &env.mint,
+                &spl_token_2022::id(),
             ),
-            token_program: spl_token::id(),
+            token_program: spl_token_2022::id(),
             amount: 50_000,
         },
         signatures: vec![PendingSig {

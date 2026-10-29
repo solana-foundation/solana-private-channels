@@ -188,7 +188,7 @@ pub async fn simulate_transaction(
     }
 
     if config.sig_verify {
-        let sigverify_result = sigverify_transaction(&sanitized_tx, &read_deps.admin_keys).await;
+        let sigverify_result = sigverify_transaction(&sanitized_tx, &read_deps.ingress).await;
         match sigverify_result {
             SigverifyResult::InvalidTransaction(transaction_type) => {
                 return Err(custom_error(
@@ -200,6 +200,20 @@ pub async fn simulate_transaction(
                 return Err(custom_error(
                     INVALID_PARAMS_CODE,
                     "Transaction not signed by admin".to_string(),
+                ));
+            }
+            SigverifyResult::SeizeTargetRefused => {
+                return Err(custom_error(
+                    INVALID_PARAMS_CODE,
+                    "A permanent delegate may only move balances with TransferChecked into the \
+                     compliance account"
+                        .to_string(),
+                ));
+            }
+            SigverifyResult::ForeignDelegateRotation => {
+                return Err(custom_error(
+                    INVALID_PARAMS_CODE,
+                    "The permanent delegate may only be set to the configured delegate".to_string(),
                 ));
             }
             SigverifyResult::SigverifyFailed(e) => {
@@ -250,6 +264,8 @@ pub async fn simulate_transaction(
         sim_live_blockhashes,
     )
     .await;
+    // Admin transactions simulate against the same delegate the write node enforces.
+    execution_deps.admin_vm = crate::vm::admin::AdminVm::new(read_deps.ingress.seize.delegate);
     // One transaction is never deferred, so the budget only sets the fetch limit.
     // At the per-transaction cap, each permit holds at most that much account data.
     execution_deps.preload_budget_bytes = execution_deps.max_tx_loaded_accounts_bytes;
@@ -410,7 +426,7 @@ mod tests {
         hash::Hash,
         message::{compiled_instruction::CompiledInstruction, Message, MessageHeader},
         signature::{Keypair, Signer},
-        transaction::Transaction,
+        transaction::{Transaction, VersionedTransaction},
     };
     use solana_svm_callback::InvokeContextCallback;
     use std::{
@@ -681,7 +697,7 @@ mod tests {
     fn read_deps(accounts_db: crate::accounts::AccountsDB, permits: usize) -> ReadDeps {
         ReadDeps {
             accounts_db,
-            admin_keys: vec![],
+            ingress: Default::default(),
             simulation_permits: tokio::sync::Semaphore::new(permits),
             block_list_permits: tokio::sync::Semaphore::new(
                 crate::rpc::constants::block_list_slots(
@@ -714,6 +730,53 @@ mod tests {
             deps.simulation_permits.available_permits(),
             1,
             "a failed call must release its permit"
+        );
+    }
+
+    /// With sigVerify a simulation applies the seize rule exactly as the write path does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sig_verify_simulation_refuses_a_delegate_move_elsewhere() {
+        let delegate = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ata = |owner: &Pubkey| {
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                owner,
+                &mint,
+                &spl_token_2022::id(),
+            )
+        };
+        let mut deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+        deps.ingress.seize = crate::transactions::SeizePolicy {
+            delegate: Some(delegate.pubkey()),
+            compliance_owner: Some(Pubkey::new_unique()),
+        };
+        let ix = spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
+            &ata(&Pubkey::new_unique()),
+            &mint,
+            &ata(&Pubkey::new_unique()),
+            &delegate.pubkey(),
+            &[],
+            5,
+            6,
+        )
+        .unwrap();
+        let msg = Message::new(&[ix], Some(&delegate.pubkey()));
+        let tx = VersionedTransaction::from(Transaction::new(&[&delegate], msg, Hash::default()));
+        let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let config = RpcSimulateTransactionConfig {
+            sig_verify: true,
+            ..Default::default()
+        };
+
+        let err = simulate_transaction(&deps, encoded, Some(config))
+            .await
+            .expect_err("a delegate move elsewhere must be refused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert!(
+            err.message().contains("compliance account"),
+            "{}",
+            err.message()
         );
     }
 
@@ -768,8 +831,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn writable_program_or_reserved_account_rejected() {
         let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
-        // spl_token is a loaded program, the clock sysvar a reserved key.
-        for protected_key in [spl_token::ID, solana_sdk_ids::sysvar::clock::ID] {
+        // Token-2022 is a loaded program, the clock sysvar a reserved key.
+        for protected_key in [spl_token_2022::ID, solana_sdk_ids::sysvar::clock::ID] {
             let payer = Keypair::new();
             // Key 1 is writable and given to an ATA instruction, so it is not unused.
             let message = Message {

@@ -4,7 +4,10 @@ use {
     crate::{
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
-        transactions::{is_admin_instruction, requires_admin_signer},
+        transactions::{
+            delegate_move, is_admin_instruction, is_foreign_delegate_rotation,
+            requires_admin_signer, DelegateMove, IngressPolicy, SeizePolicy,
+        },
     },
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
     std::{
@@ -20,6 +23,10 @@ pub enum SigverifyResult {
     Valid(TransactionType),
     InvalidTransaction(TransactionType),
     NotSignedByAdmin,
+    /// A `SetAuthority(PermanentDelegate)` naming anything but the configured delegate.
+    ForeignDelegateRotation,
+    /// A permanent delegate move that is not a TransferChecked into the compliance ATA.
+    SeizeTargetRefused,
     SigverifyFailed(String),
 }
 
@@ -31,6 +38,12 @@ impl Display for SigverifyResult {
                 write!(f, "Invalid transaction: {:?}", transaction_type)
             }
             SigverifyResult::NotSignedByAdmin => write!(f, "Not signed by admin"),
+            SigverifyResult::ForeignDelegateRotation => {
+                write!(f, "Permanent delegate rotated to an unconfigured key")
+            }
+            SigverifyResult::SeizeTargetRefused => {
+                write!(f, "Permanent delegate move outside the compliance account")
+            }
             SigverifyResult::SigverifyFailed(e) => write!(f, "Sigverify failed: {}", e),
         }
     }
@@ -79,6 +92,40 @@ fn needs_admin_signer(transaction: &SanitizedTransaction) -> bool {
         .any(|(program_id, instruction)| requires_admin_signer(program_id, &instruction.data))
 }
 
+/// True when any instruction moves a mint's permanent delegate off the configured key.
+fn rotates_delegate_away(transaction: &SanitizedTransaction, policy: &IngressPolicy) -> bool {
+    transaction
+        .message()
+        .program_instructions_iter()
+        .any(|(program_id, instruction)| {
+            is_foreign_delegate_rotation(
+                program_id,
+                &instruction.data,
+                policy.seize.delegate.as_ref(),
+            )
+        })
+}
+
+/// Every top-level delegate move in the transaction, with its resolved accounts.
+fn delegate_moves(transaction: &SanitizedTransaction, seize: &SeizePolicy) -> Vec<DelegateMove> {
+    if seize.delegate.is_none() {
+        return Vec::new();
+    }
+    let keys = transaction.message().account_keys();
+    transaction
+        .message()
+        .program_instructions_iter()
+        .filter_map(|(program_id, instruction)| {
+            let accounts: Vec<Pubkey> = instruction
+                .accounts
+                .iter()
+                .filter_map(|&index| keys.get(usize::from(index)).copied())
+                .collect();
+            delegate_move(program_id, &accounts, &instruction.data, seize)
+        })
+        .collect()
+}
+
 /// Classifies a transaction into one TransactionType enum
 fn classify_transaction(transaction: &SanitizedTransaction) -> TransactionType {
     let mut num_admin_ix = 0;
@@ -111,7 +158,7 @@ fn classify_transaction(transaction: &SanitizedTransaction) -> TransactionType {
 
 pub struct SigverifyArgs {
     pub num_workers: usize,
-    pub admin_keys: Vec<Pubkey>,
+    pub policy: IngressPolicy,
     pub rx: async_channel::Receiver<SanitizedTransaction>,
     /// Verified transactions are forwarded here to the single dedup consumer.
     /// Sigverify runs before dedup so only verified transactions are ever cached.
@@ -122,8 +169,9 @@ pub struct SigverifyArgs {
 
 pub async fn sigverify_transaction(
     transaction: &SanitizedTransaction,
-    admin_keys: &[Pubkey],
+    policy: &IngressPolicy,
 ) -> SigverifyResult {
+    let admin_keys = &policy.admin_keys;
     let transaction_type = classify_transaction(transaction);
 
     // Check transaction type
@@ -145,29 +193,42 @@ pub async fn sigverify_transaction(
     }
 
     // Verify signature
-    match transaction.verify() {
-        Ok(_) => SigverifyResult::Valid(transaction_type),
-        Err(e) => SigverifyResult::SigverifyFailed(e.to_string()),
+    if let Err(e) = transaction.verify() {
+        return SigverifyResult::SigverifyFailed(e.to_string());
     }
+
+    // After verify so the refusal alerts only fire on a real signature.
+    // Both apply to every signer, admins included: an admin key is not the policed delegate.
+    if rotates_delegate_away(transaction, policy) {
+        return SigverifyResult::ForeignDelegateRotation;
+    }
+    if delegate_moves(transaction, &policy.seize)
+        .iter()
+        .any(|delegate_move| delegate_move.is_refused(&policy.seize))
+    {
+        return SigverifyResult::SeizeTargetRefused;
+    }
+
+    SigverifyResult::Valid(transaction_type)
 }
 
 /// Start the signature verification worker pool
 pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle> {
     let SigverifyArgs {
         num_workers,
-        admin_keys,
+        policy,
         rx,
         output_tx,
         metrics,
         heartbeat,
     } = args;
     let mut handles = Vec::with_capacity(num_workers);
-    let admin_keys = Arc::new(admin_keys);
+    let policy = Arc::new(policy);
     // metrics is already an Arc; clone it for each worker
     for worker_id in 0..num_workers {
         let rx = rx.clone();
         let tx = output_tx.clone();
-        let admin_keys = admin_keys.clone();
+        let policy = Arc::clone(&policy);
         let metrics = Arc::clone(&metrics);
         let heartbeat = Arc::clone(&heartbeat);
 
@@ -182,12 +243,23 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                 match rx.recv().await {
                     Ok(transaction) => {
                         heartbeat.record_input();
-                        let result = sigverify_transaction(&transaction, &admin_keys).await;
+                        let result = sigverify_transaction(&transaction, &policy).await;
                         // Each verify (forward or reject) counts as progress — the stage isn't wedged.
                         heartbeat.record_progress();
                         match result {
                             SigverifyResult::Valid(_) => {
                                 metrics.sigverify_forwarded();
+                                // A delegate key signed a move: alert even if it later fails on chain.
+                                for delegate_move in delegate_moves(&transaction, &policy.seize) {
+                                    metrics.delegate_moves_admitted();
+                                    warn!(
+                                        signature = %transaction.signature(),
+                                        mint = %delegate_move.mint,
+                                        source = %delegate_move.source,
+                                        amount = ?delegate_move.amount,
+                                        "permanent delegate move admitted"
+                                    );
+                                }
                                 // A verified transaction in hand is finished, never
                                 // abandoned: dedup drains until this stage drops its
                                 // sender, so waiting here cannot wedge the exit.
@@ -221,6 +293,30 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                     transaction.signature()
                                 );
                             }
+                            SigverifyResult::ForeignDelegateRotation => {
+                                metrics.sigverify_rejected("delegate_rotation");
+                                warn!(
+                                    "Worker {} rejected transaction rotating the permanent delegate \
+                                     to an unconfigured key: {}",
+                                    worker_id,
+                                    transaction.signature()
+                                );
+                            }
+                            SigverifyResult::SeizeTargetRefused => {
+                                metrics.sigverify_rejected("seize_target");
+                                for delegate_move in delegate_moves(&transaction, &policy.seize)
+                                    .into_iter()
+                                    .filter(|m| m.is_refused(&policy.seize))
+                                {
+                                    warn!(
+                                        signature = %transaction.signature(),
+                                        mint = %delegate_move.mint,
+                                        source = %delegate_move.source,
+                                        destination = ?delegate_move.destination,
+                                        "permanent delegate move refused"
+                                    );
+                                }
+                            }
                             SigverifyResult::SigverifyFailed(e) => {
                                 metrics.sigverify_rejected("sig_failed");
                                 warn!("Worker {} sigverify failed: {}", worker_id, e);
@@ -249,7 +345,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
 mod tests {
     use super::*;
     use crate::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY as SEQ_CAP;
-    use crate::stage_metrics::NoopMetrics;
+    use crate::stage_metrics::{NoopMetrics, PrometheusMetrics};
     use private_channel_withdraw_program_client::instructions::{
         SetWithdrawConfigBuilder, WithdrawFundsBuilder,
     };
@@ -259,8 +355,16 @@ mod tests {
         signature::{Keypair, Signature, Signer},
         transaction::{SanitizedTransaction, Transaction},
     };
-    use spl_token::instruction::AuthorityType;
+    use spl_token_2022::instruction::AuthorityType;
     use std::collections::HashSet;
+
+    /// Ingress policy with the given admin keys and no seize keys.
+    fn policy(admin_keys: &[Pubkey]) -> IngressPolicy {
+        IngressPolicy {
+            admin_keys: admin_keys.to_vec(),
+            ..IngressPolicy::default()
+        }
+    }
 
     /// Build a signed `SanitizedTransaction` from instructions + signers.
     fn sanitize(
@@ -278,19 +382,35 @@ mod tests {
     }
 
     fn spl_transfer_ix(from_ata: &Pubkey, to_ata: &Pubkey, authority: &Pubkey) -> Instruction {
-        spl_token::instruction::transfer(&spl_token::id(), from_ata, to_ata, authority, &[], 1_000)
-            .unwrap()
+        spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
+            from_ata,
+            &Pubkey::new_unique(),
+            to_ata,
+            authority,
+            &[],
+            1_000,
+            6,
+        )
+        .unwrap()
     }
 
     fn initialize_mint_ix(mint: &Pubkey, authority: &Pubkey) -> Instruction {
-        spl_token::instruction::initialize_mint(&spl_token::id(), mint, authority, None, 6).unwrap()
+        spl_token_2022::instruction::initialize_mint(
+            &spl_token_2022::id(),
+            mint,
+            authority,
+            None,
+            6,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn empty_transaction_rejected() {
         let payer = Keypair::new();
         let tx = sanitize(&[], &payer, &[&payer]);
-        let result = sigverify_transaction(&tx, &[]).await;
+        let result = sigverify_transaction(&tx, &policy(&[])).await;
         assert!(
             matches!(
                 result,
@@ -312,7 +432,7 @@ mod tests {
         let normal_ix = spl_transfer_ix(&from_ata, &to_ata, &user.pubkey());
 
         let tx = sanitize(&[admin_ix, normal_ix], &admin, &[&admin, &user]);
-        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(
                 result,
@@ -330,7 +450,7 @@ mod tests {
 
         let ix = initialize_mint_ix(&mint, &non_admin.pubkey());
         let tx = sanitize(&[ix], &non_admin, &[&non_admin]);
-        let result = sigverify_transaction(&tx, &[real_admin]).await;
+        let result = sigverify_transaction(&tx, &policy(&[real_admin])).await;
         assert!(
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "expected NotSignedByAdmin, got {result}"
@@ -344,7 +464,7 @@ mod tests {
 
         let ix = initialize_mint_ix(&mint, &admin.pubkey());
         let tx = sanitize(&[ix], &admin, &[&admin]);
-        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
             "expected Valid(Admin), got {result}"
@@ -370,8 +490,8 @@ mod tests {
             let instructions = [
                 (
                     "MintTo",
-                    spl_token::instruction::mint_to(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::mint_to(
+                        &spl_token_2022::id(),
                         &mint,
                         &token_account,
                         &authority,
@@ -382,8 +502,8 @@ mod tests {
                 ),
                 (
                     "MintToChecked",
-                    spl_token::instruction::mint_to_checked(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::mint_to_checked(
+                        &spl_token_2022::id(),
                         &mint,
                         &token_account,
                         &authority,
@@ -395,8 +515,8 @@ mod tests {
                 ),
                 (
                     "FreezeAccount",
-                    spl_token::instruction::freeze_account(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::freeze_account(
+                        &spl_token_2022::id(),
                         &token_account,
                         &mint,
                         &authority,
@@ -406,8 +526,8 @@ mod tests {
                 ),
                 (
                     "ThawAccount",
-                    spl_token::instruction::thaw_account(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::thaw_account(
+                        &spl_token_2022::id(),
                         &token_account,
                         &mint,
                         &authority,
@@ -417,8 +537,8 @@ mod tests {
                 ),
                 (
                     "SetAuthority MintTokens",
-                    spl_token::instruction::set_authority(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::set_authority(
+                        &spl_token_2022::id(),
                         &mint,
                         None,
                         AuthorityType::MintTokens,
@@ -429,8 +549,8 @@ mod tests {
                 ),
                 (
                     "SetAuthority FreezeAccount",
-                    spl_token::instruction::set_authority(
-                        &spl_token::id(),
+                    spl_token_2022::instruction::set_authority(
+                        &spl_token_2022::id(),
                         &mint,
                         None,
                         AuthorityType::FreezeAccount,
@@ -455,7 +575,7 @@ mod tests {
 
             for (label, instruction) in instructions {
                 let tx = sanitize(&[instruction], signer, &[signer]);
-                let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+                let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
                 if signed_by_admin {
                     assert!(
                         matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
@@ -489,8 +609,8 @@ mod tests {
             .treasury_token_account(Pubkey::new_unique())
             .amount(amount)
             .instruction();
-        let mint_to = spl_token::instruction::mint_to(
-            &spl_token::id(),
+        let mint_to = spl_token_2022::instruction::mint_to(
+            &spl_token_2022::id(),
             &mint,
             &token_account,
             &retired_admin.pubkey(),
@@ -500,7 +620,7 @@ mod tests {
         .unwrap();
 
         let tx = sanitize(&[withdraw, mint_to], &retired_admin, &[&retired_admin]);
-        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "MintTo after WithdrawFunds signed by a retired admin must be rejected, got {result}"
@@ -514,8 +634,8 @@ mod tests {
         let admin = Keypair::new();
         let retired_admin = Keypair::new();
         let mint = Pubkey::new_unique();
-        let migrate = spl_token::instruction::set_authority(
-            &spl_token::id(),
+        let migrate = spl_token_2022::instruction::set_authority(
+            &spl_token_2022::id(),
             &mint,
             Some(&admin.pubkey()),
             AuthorityType::MintTokens,
@@ -529,7 +649,7 @@ mod tests {
             &admin,
             &[&admin, &retired_admin],
         );
-        let result = sigverify_transaction(&co_signed, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&co_signed, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
             "migration co-signed by the admin must pass, got {result}"
@@ -540,7 +660,7 @@ mod tests {
             .accounts
             .push(AccountMeta::new_readonly(admin.pubkey(), false));
         let unsigned = sanitize(&[admin_listed_unsigned], &retired_admin, &[&retired_admin]);
-        let result = sigverify_transaction(&unsigned, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&unsigned, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "migration listing the admin without its signature must be rejected, got {result}"
@@ -558,8 +678,8 @@ mod tests {
 
         for authority_type in [AuthorityType::AccountOwner, AuthorityType::CloseAccount] {
             let label = format!("{authority_type:?}");
-            let instruction = spl_token::instruction::set_authority(
-                &spl_token::id(),
+            let instruction = spl_token_2022::instruction::set_authority(
+                &spl_token_2022::id(),
                 &token_account,
                 Some(&new_authority),
                 authority_type,
@@ -568,11 +688,309 @@ mod tests {
             )
             .unwrap();
             let tx = sanitize(&[instruction], &user, &[&user]);
-            let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+            let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
             assert!(
                 matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
                 "SetAuthority {label} signed by its owner must pass, got {result}"
             );
+        }
+    }
+
+    /// The on-chain delegate can only be rotated to the configured key, even by an
+    /// admin: a key the node does not know would move balances with no rule.
+    #[tokio::test]
+    async fn delegate_rotation_must_name_the_configured_delegate() {
+        let admin = Keypair::new();
+        let delegate = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let policy = IngressPolicy {
+            admin_keys: vec![admin.pubkey()],
+            seize: crate::transactions::SeizePolicy {
+                delegate: Some(delegate),
+                compliance_owner: None,
+            },
+        };
+        let rotate = |new: Option<&Pubkey>| {
+            spl_token_2022::instruction::set_authority(
+                &spl_token_2022::id(),
+                &mint,
+                new,
+                AuthorityType::PermanentDelegate,
+                &admin.pubkey(),
+                &[],
+            )
+            .unwrap()
+        };
+
+        let tx = sanitize(&[rotate(Some(&delegate))], &admin, &[&admin]);
+        let result = sigverify_transaction(&tx, &policy).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "rotation to the configured delegate must pass, got {result}"
+        );
+
+        let other = Pubkey::new_unique();
+        for (label, new) in [("other key", Some(&other)), ("None", None)] {
+            let tx = sanitize(&[rotate(new)], &admin, &[&admin]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::ForeignDelegateRotation),
+                "rotation to {label} must be refused, got {result}"
+            );
+        }
+
+        // Still an admin-signer instruction first.
+        let outsider = Keypair::new();
+        let ix = spl_token_2022::instruction::set_authority(
+            &spl_token_2022::id(),
+            &mint,
+            Some(&delegate),
+            AuthorityType::PermanentDelegate,
+            &outsider.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let tx = sanitize(&[ix], &outsider, &[&outsider]);
+        let result = sigverify_transaction(&tx, &policy).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "{result}"
+        );
+    }
+
+    fn t22_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner,
+            mint,
+            &spl_token_2022::id(),
+        )
+    }
+
+    /// Delegate keypair, its seize policy, a mint and a victim's ATA.
+    fn seize_setup() -> (Keypair, IngressPolicy, Pubkey, Pubkey, Pubkey) {
+        let delegate = Keypair::new();
+        let compliance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let policy = IngressPolicy {
+            admin_keys: vec![],
+            seize: crate::transactions::SeizePolicy {
+                delegate: Some(delegate.pubkey()),
+                compliance_owner: Some(compliance),
+            },
+        };
+        let victim_ata = t22_ata(&Pubkey::new_unique(), &mint);
+        (delegate, policy, compliance, mint, victim_ata)
+    }
+
+    fn seize_ix(source: &Pubkey, mint: &Pubkey, dest: &Pubkey, delegate: &Pubkey) -> Instruction {
+        spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
+            source,
+            mint,
+            dest,
+            delegate,
+            &[],
+            500,
+            6,
+        )
+        .unwrap()
+    }
+
+    /// The seize rule runs on the full transaction: one bad move refuses it all.
+    #[tokio::test]
+    async fn delegate_moves_are_refused_unless_into_the_compliance_ata() {
+        let (delegate, policy, compliance, mint, victim) = seize_setup();
+        let to_compliance = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&compliance, &mint),
+            &delegate.pubkey(),
+        );
+        let elsewhere = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let burn = spl_token_2022::instruction::burn(
+            &spl_token_2022::id(),
+            &victim,
+            &mint,
+            &delegate.pubkey(),
+            &[],
+            5,
+        )
+        .unwrap();
+
+        let tx = sanitize(
+            std::slice::from_ref(&to_compliance),
+            &delegate,
+            &[&delegate],
+        );
+        let result = sigverify_transaction(&tx, &policy).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "seize into compliance must pass, got {result}"
+        );
+
+        let cases = [
+            ("to another ATA", vec![elsewhere]),
+            ("burn", vec![burn]),
+            (
+                "good move then a bad one",
+                vec![to_compliance.clone(), {
+                    seize_ix(
+                        &victim,
+                        &mint,
+                        &t22_ata(&delegate.pubkey(), &mint),
+                        &delegate.pubkey(),
+                    )
+                }],
+            ),
+        ];
+        for (label, ixs) in cases {
+            let tx = sanitize(&ixs, &delegate, &[&delegate]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SeizeTargetRefused),
+                "{label}: expected SeizeTargetRefused, got {result}"
+            );
+        }
+
+        // An admin signer does not lift the rule.
+        let mut admin_policy = policy.clone();
+        admin_policy.admin_keys = vec![delegate.pubkey()];
+        let bad = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let tx = sanitize(&[bad], &delegate, &[&delegate]);
+        let result = sigverify_transaction(&tx, &admin_policy).await;
+        assert!(
+            matches!(result, SigverifyResult::SeizeTargetRefused),
+            "{result}"
+        );
+    }
+
+    /// Refusals raise alerts, so they must only fire once the signatures are proven.
+    #[tokio::test]
+    async fn delegate_refusals_need_a_valid_signature() {
+        let (delegate, mut policy, _, mint, victim) = seize_setup();
+        policy.admin_keys = vec![delegate.pubkey()];
+        let bad_move = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let bad_rotation = spl_token_2022::instruction::set_authority(
+            &spl_token_2022::id(),
+            &mint,
+            None,
+            AuthorityType::PermanentDelegate,
+            &delegate.pubkey(),
+            &[],
+        )
+        .unwrap();
+
+        for (label, ix) in [("seize", bad_move), ("rotation", bad_rotation)] {
+            let mut tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&delegate.pubkey()),
+                &[&delegate],
+                Hash::default(),
+            );
+            let mut sig_bytes = <[u8; 64]>::from(tx.signatures[0]);
+            sig_bytes[0] ^= 0xff;
+            tx.signatures[0] = Signature::from(sig_bytes);
+            let tx =
+                SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SigverifyFailed(_)),
+                "{label}: expected SigverifyFailed, got {result}"
+            );
+        }
+    }
+
+    /// Admitted delegate moves count once and refused ones count as rejections;
+    /// ordinary transfers bump neither. One test, so the global counters see no
+    /// other writer.
+    #[tokio::test]
+    async fn worker_counts_delegate_moves() {
+        fn counter(name: &str, label: Option<&str>) -> f64 {
+            private_channel_metrics::prometheus::gather()
+                .into_iter()
+                .filter(|mf| mf.name() == name)
+                .flat_map(|mf| mf.get_metric().to_vec())
+                .filter(|m| label.is_none_or(|l| m.get_label().iter().any(|p| p.value() == l)))
+                .map(|m| m.get_counter().value())
+                .sum()
+        }
+        let admitted = || counter("private_channel_delegate_moves_admitted_total", None);
+        let refused = || {
+            counter(
+                "private_channel_sigverify_rejected_total",
+                Some("seize_target"),
+            )
+        };
+
+        let (delegate, policy, compliance, mint, victim) = seize_setup();
+        let good = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&compliance, &mint),
+            &delegate.pubkey(),
+        );
+        let bad = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &delegate.pubkey(),
+        );
+        let user = Keypair::new();
+        let ordinary = spl_transfer_ix(&t22_ata(&user.pubkey(), &mint), &victim, &user.pubkey());
+
+        let (in_tx, in_rx) = async_channel::bounded::<SanitizedTransaction>(10);
+        let (out_tx, mut out_rx) = mpsc::channel(SEQ_CAP);
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            policy,
+            rx: in_rx,
+            output_tx: out_tx,
+            metrics: Arc::new(PrometheusMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        let (admitted_before, refused_before) = (admitted(), refused());
+        // The ordinary tx goes last so its arrival proves the others were handled.
+        in_tx
+            .send(sanitize(&[good], &delegate, &[&delegate]))
+            .await
+            .unwrap();
+        in_tx
+            .send(sanitize(&[bad], &delegate, &[&delegate]))
+            .await
+            .unwrap();
+        in_tx
+            .send(sanitize(&[ordinary], &user, &[&user]))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(admitted() - admitted_before, 1.0);
+        assert_eq!(refused() - refused_before, 1.0);
+
+        drop(in_tx);
+        for handle in handles {
+            handle.handle.await.unwrap();
         }
     }
 
@@ -592,7 +1010,7 @@ mod tests {
 
         let sanitized =
             SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
-        let result = sigverify_transaction(&sanitized, &[]).await;
+        let result = sigverify_transaction(&sanitized, &policy(&[])).await;
         assert!(
             matches!(result, SigverifyResult::SigverifyFailed(_)),
             "expected SigverifyFailed for wrong signer, got {result}"
@@ -620,7 +1038,7 @@ mod tests {
 
         let sanitized =
             SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
-        let result = sigverify_transaction(&sanitized, &[]).await;
+        let result = sigverify_transaction(&sanitized, &policy(&[])).await;
         assert!(
             matches!(result, SigverifyResult::SigverifyFailed(_)),
             "expected SigverifyFailed, got {result}"
@@ -635,7 +1053,7 @@ mod tests {
         let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
 
         let tx = sanitize(&[ix], &payer, &[&payer]);
-        let result = sigverify_transaction(&tx, &[]).await;
+        let result = sigverify_transaction(&tx, &policy(&[])).await;
         assert!(
             matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
             "expected Valid(Normal), got {result}"
@@ -656,7 +1074,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -702,7 +1120,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 2,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -744,7 +1162,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -772,7 +1190,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -789,15 +1207,7 @@ mod tests {
         let sentinel_tx = {
             let payer = &sentinel_from;
             let to = &sentinel_to;
-            let ix = spl_token::instruction::transfer(
-                &spl_token::id(),
-                to,
-                to,
-                &payer.pubkey(),
-                &[],
-                1_000,
-            )
-            .unwrap();
+            let ix = spl_transfer_ix(to, to, &payer.pubkey());
             let message = solana_sdk::message::Message::new(&[ix], Some(&payer.pubkey()));
             let tx = solana_sdk::transaction::Transaction::new(
                 &[payer],
@@ -832,7 +1242,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 2,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -855,7 +1265,7 @@ mod tests {
         let ix = initialize_mint_ix(&mint, &admin.pubkey());
         let tx = sanitize(&[ix], &admin, &[&admin]);
         // Empty admin_keys means no one is an admin
-        let result = sigverify_transaction(&tx, &[]).await;
+        let result = sigverify_transaction(&tx, &policy(&[])).await;
         assert!(
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "expected NotSignedByAdmin when admin_keys is empty, got {result}"
@@ -874,7 +1284,7 @@ mod tests {
             data: vec![], // empty data
         };
         let tx = sanitize(&[ix], &payer, &[&payer]);
-        let result = sigverify_transaction(&tx, &[]).await;
+        let result = sigverify_transaction(&tx, &policy(&[])).await;
         assert!(
             matches!(
                 result,
@@ -904,7 +1314,7 @@ mod tests {
 
         let sanitized =
             SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
-        let result = sigverify_transaction(&sanitized, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&sanitized, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::SigverifyFailed(_)),
             "expected SigverifyFailed for corrupted admin tx, got {result}"
@@ -918,7 +1328,7 @@ mod tests {
         let signer = Keypair::new();
         let mint = Pubkey::new_unique();
         let ix = Instruction {
-            program_id: spl_token::id(),
+            program_id: spl_token_2022::id(),
             accounts: vec![
                 AccountMeta::new(mint, false),
                 AccountMeta::new_readonly(admin.pubkey(), false), // admin as read-only
@@ -926,7 +1336,7 @@ mod tests {
             data: vec![0], // initialize_mint opcode
         };
         let tx = sanitize(&[ix], &signer, &[&signer]);
-        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &policy(&[admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::NotSignedByAdmin),
             "expected NotSignedByAdmin when admin is non-signer, got {result}"
@@ -942,7 +1352,7 @@ mod tests {
 
         let ix = initialize_mint_ix(&mint, &real_admin.pubkey());
         let tx = sanitize(&[ix], &real_admin, &[&real_admin]);
-        let result = sigverify_transaction(&tx, &[other_admin, real_admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &policy(&[other_admin, real_admin.pubkey()])).await;
         assert!(
             matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
             "expected Valid(Admin) when one of multiple admin keys signs, got {result}"
@@ -956,7 +1366,7 @@ mod tests {
 
         let mut handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -993,7 +1403,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
@@ -1051,7 +1461,7 @@ mod tests {
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
-            admin_keys: vec![],
+            policy: IngressPolicy::default(),
             rx: sigverify_rx,
             output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),

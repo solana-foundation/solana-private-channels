@@ -2741,6 +2741,7 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
 ]
 
 [[package]]
@@ -6156,6 +6157,7 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
  "tokio",
  "tokio-util 0.7.19",
  "tracing",
@@ -6227,6 +6229,7 @@ dependencies = [
  "spl-associated-token-account",
  "spl-memo 7.0.0",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
  "sqlx",
  "tempfile",
  "testcontainers",
@@ -6388,6 +6391,7 @@ dependencies = [
  "borsh 1.8.1",
  "bs58",
  "chrono",
+ "devnet-scripts",
  "dvp-swap-program-client",
  "http-body-util",
  "hyper 1.11.1",
@@ -6455,7 +6459,7 @@ dependencies = [
  "pinocchio-associated-token-account",
  "pinocchio-log",
  "pinocchio-system",
- "pinocchio-token",
+ "pinocchio-token-2022",
  "serde_json",
  "solana-address 2.6.1",
  "thiserror 2.0.20",
@@ -14185,6 +14189,7 @@ dependencies = [
  "solana-sdk",
  "spl-associated-token-account",
  "spl-token 9.0.0",
+ "spl-token-2022 11.0.0",
 ]
 
 [[package]]

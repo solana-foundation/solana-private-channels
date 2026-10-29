@@ -59,7 +59,10 @@ async fn build_module(admin_keys: Vec<Pubkey>) -> (RpcModule<()>, ContainerAsync
     let (db, pg) = start_pg().await;
     let read_deps = ReadDeps {
         accounts_db: db,
-        admin_keys,
+        ingress: private_channel_core::transactions::IngressPolicy {
+            admin_keys,
+            ..Default::default()
+        },
         simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
         block_list_permits: tokio::sync::Semaphore::new(block_list_slots(32)),
     };
@@ -163,14 +166,14 @@ async fn simulate_rejects_more_addresses_than_tx_accounts() {
 
 // ── (e) repeated large account over the encoded-byte budget ─────────────────
 // 34 addresses against 34 keys clears the count cap, isolating the byte budget.
-// The SPL Token precompile is always resident, so this needs no setup.
+// The Token-2022 precompile is always resident, so this needs no setup.
 #[tokio::test(flavor = "multi_thread")]
 async fn simulate_rejects_repeated_precompile_over_budget() {
     let (module, _pg) = build_module(vec![]).await;
 
     let tx = tx_with_account_keys(34);
     let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
-    let addresses: Vec<String> = std::iter::repeat_n(spl_token::ID.to_string(), 34).collect();
+    let addresses: Vec<String> = std::iter::repeat_n(spl_token_2022::ID.to_string(), 34).collect();
 
     let resp = call(
         &module,

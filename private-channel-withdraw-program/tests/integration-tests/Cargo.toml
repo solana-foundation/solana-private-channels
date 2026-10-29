@@ -11,6 +11,7 @@ private-channel-withdraw-program-client = { workspace = true, features = ["fetch
 solana-sdk = { workspace = true }
 solana-program = { workspace = true }
 spl-token = { workspace = true }
+spl-token-2022 = { workspace = true }
 spl-associated-token-account = { workspace = true }
 solana-program-pack = { workspace = true }
 solana-compute-budget-interface = { workspace = true }

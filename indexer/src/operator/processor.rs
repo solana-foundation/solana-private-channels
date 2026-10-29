@@ -3412,7 +3412,7 @@ mod tests {
             get_associated_token_address_with_program_id(
                 &initiator,
                 &mint_pubkey,
-                &spl_token::id()
+                &spl_token_2022::id()
             ),
             "remint must mint into the initiator's private channel ATA"
         );

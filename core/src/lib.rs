@@ -12,4 +12,5 @@ pub mod transactions;
 mod vm;
 pub mod webhook;
 
+pub mod t22_fixtures;
 pub mod test_helpers;

@@ -339,7 +339,7 @@ async fn mock_escrow_rpc(
             "context": {"slot": slot},
             "value": {
                 "lamports": 1_000_000u64,
-                "owner": spl_token::id().to_string(),
+                "owner": spl_token_2022::id().to_string(),
                 "executable": false,
                 "rentEpoch": 0,
                 "data": [STANDARD.encode(&mint_data), "base64"]

@@ -1,6 +1,7 @@
 use solana_keychain::{Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
 use std::env;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -9,6 +10,8 @@ const ADMIN_SIGNER: &str = "ADMIN_SIGNER";
 
 /// Environment variables for operator signer
 const OPERATOR_SIGNER: &str = "OPERATOR_SIGNER";
+/// Permanent delegate written into channel mints; required, with no fallback to the admin signer.
+const OPERATOR_PERMANENT_DELEGATE: &str = "OPERATOR_PERMANENT_DELEGATE";
 
 // In memory env vars (per-signer)
 const ADMIN_PRIVATE_KEY: &str = "ADMIN_PRIVATE_KEY";
@@ -330,6 +333,32 @@ async fn build(spec: SignerSpec) -> Result<Signer, LoadError> {
 struct Signers {
     admin: Signer,
     operator: Option<Signer>,
+    /// Must match the node's PRIVATE_CHANNEL_PERMANENT_DELEGATE or mint creation is refused.
+    permanent_delegate: Pubkey,
+}
+
+/// Required, with no fallback to the admin signer, so the operator can never pick a
+/// different delegate from the node's.
+fn read_permanent_delegate(env: Env) -> Result<Pubkey, String> {
+    match env(OPERATOR_PERMANENT_DELEGATE) {
+        Some(value) if !value.trim().is_empty() => match Pubkey::from_str(value.trim()) {
+            Ok(key) if key == Pubkey::default() => Err(format!(
+                "{OPERATOR_PERMANENT_DELEGATE} must not be the zero key"
+            )),
+            Ok(key) => Ok(key),
+            Err(e) => Err(format!(
+                "{OPERATOR_PERMANENT_DELEGATE} is not a pubkey: {e}"
+            )),
+        },
+        _ => Err(format!("{OPERATOR_PERMANENT_DELEGATE} not set")),
+    }
+}
+
+fn log_permanent_delegate(delegate: &Pubkey) {
+    info!(
+        "Permanent delegate for new mints ({}): {}",
+        OPERATOR_PERMANENT_DELEGATE, delegate
+    );
 }
 
 /// Both specs are read before anything is built, so a bad operator config fails before
@@ -358,6 +387,7 @@ fn log_operator_role(operator: &Option<Signer>) {
 
 async fn load_signers(env: Env<'_>) -> Result<Signers, String> {
     let (admin_spec, operator_spec) = read_specs(env)?;
+    let permanent_delegate = read_permanent_delegate(env)?;
     let label = admin_spec.label();
     let admin = build(admin_spec)
         .await
@@ -375,11 +405,17 @@ async fn load_signers(env: Env<'_>) -> Result<Signers, String> {
         None => None,
     };
     log_operator_role(&operator);
-    Ok(Signers { admin, operator })
+    log_permanent_delegate(&permanent_delegate);
+    Ok(Signers {
+        admin,
+        operator,
+        permanent_delegate,
+    })
 }
 
 fn load_signers_sync(env: Env) -> Result<Signers, String> {
     let (admin_spec, operator_spec) = read_specs(env)?;
+    let permanent_delegate = read_permanent_delegate(env)?;
     let label = admin_spec.label();
     let admin = build_sync(admin_spec).map_err(|e| format!("admin signer: {e}"))?;
     log_loaded("admin", label, &admin);
@@ -393,7 +429,12 @@ fn load_signers_sync(env: Env) -> Result<Signers, String> {
         None => None,
     };
     log_operator_role(&operator);
-    Ok(Signers { admin, operator })
+    log_permanent_delegate(&permanent_delegate);
+    Ok(Signers {
+        admin,
+        operator,
+        permanent_delegate,
+    })
 }
 
 static SIGNERS: OnceLock<Signers> = OnceLock::new();
@@ -435,6 +476,11 @@ impl SignerUtil {
         Self::operator_signer().pubkey()
     }
 
+    /// Permanent delegate the operator writes into new channel mints and expects on them.
+    pub fn permanent_delegate() -> Pubkey {
+        signers().permanent_delegate
+    }
+
     pub fn admin_signer() -> &'static Signer {
         &signers().admin
     }
@@ -457,6 +503,16 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name| map.get(name).cloned()
+    }
+
+    /// `env_of` plus the required delegate, for tests that load the signers.
+    fn signer_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let mut all = pairs.to_vec();
+        all.push((
+            OPERATOR_PERMANENT_DELEGATE,
+            "De1egate11111111111111111111111111111111111",
+        ));
+        env_of(&all)
     }
 
     fn b58(kp: &Keypair) -> String {
@@ -531,6 +587,27 @@ mod tests {
         assert!(msg.contains("Unsupported signer type"), "got: {msg}");
     }
 
+    /// The permanent delegate is required and must be a pubkey; unset or blank is refused.
+    #[test]
+    fn permanent_delegate_is_required_and_validated() {
+        for pairs in [&[][..], &[(OPERATOR_PERMANENT_DELEGATE, " ")][..]] {
+            let err = read_permanent_delegate(&env_of(pairs)).unwrap_err();
+            assert!(err.contains("not set"), "got: {err}");
+        }
+        let key = Pubkey::new_unique();
+        assert_eq!(
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, &key.to_string())])),
+            Ok(key)
+        );
+        let err =
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, "nope")])).unwrap_err();
+        assert!(err.contains(OPERATOR_PERMANENT_DELEGATE), "got: {err}");
+        let zero = Pubkey::default().to_string();
+        let err =
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, &zero)])).unwrap_err();
+        assert!(err.contains("zero key"), "got: {err}");
+    }
+
     #[test]
     fn operator_spec_unset_is_none() {
         for pairs in [&[][..], &[(OPERATOR_SIGNER, "")][..]] {
@@ -548,7 +625,7 @@ mod tests {
         assert!(msg.contains("OPERATOR_PRIVATE_KEY not set"), "got: {msg}");
 
         let admin = b58(&Keypair::new());
-        let env = env_of(&[
+        let env = signer_env(&[
             (ADMIN_SIGNER, "memory"),
             (ADMIN_PRIVATE_KEY, &admin),
             (OPERATOR_SIGNER, "memory"),
@@ -576,7 +653,7 @@ mod tests {
         let admin = Keypair::new();
         let operator = Keypair::new();
         let admin_b58 = b58(&admin);
-        let only_admin = env_of(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &admin_b58)]);
+        let only_admin = signer_env(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &admin_b58)]);
         let signers = load_signers_sync(&only_admin).unwrap();
         assert_eq!(
             signers.admin.pubkey(),
@@ -585,7 +662,7 @@ mod tests {
         assert!(signers.operator.is_none());
 
         let operator_b58 = b58(&operator);
-        let both = env_of(&[
+        let both = signer_env(&[
             (ADMIN_SIGNER, "memory"),
             (ADMIN_PRIVATE_KEY, &admin_b58),
             (OPERATOR_SIGNER, "memory"),
@@ -602,7 +679,7 @@ mod tests {
     /// `block_on` inside the runtime. Its only caller, `signers()`, panics with that error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn privy_on_the_sync_path_errors_instead_of_panicking() {
-        let env = env_of(&[
+        let env = signer_env(&[
             (ADMIN_SIGNER, "privy"),
             (ADMIN_PRIVY_APP_ID, "app"),
             (ADMIN_PRIVY_APP_SECRET, "secret"),
@@ -614,7 +691,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn privy_init_returns_a_config_error_inside_a_runtime() {
-        let env = env_of(&[(ADMIN_SIGNER, "privy")]);
+        let env = signer_env(&[(ADMIN_SIGNER, "privy")]);
         let err = load_signers(&env).await.err().expect("missing privy var");
         assert!(err.contains("ADMIN_PRIVY_APP_ID not set"), "got: {err}");
     }
@@ -623,7 +700,7 @@ mod tests {
     /// The fake credentials go to the real Privy API, so an error or the timeout both pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn privy_init_awaits_the_constructor_inside_a_runtime() {
-        let env = env_of(&[
+        let env = signer_env(&[
             (ADMIN_SIGNER, "privy"),
             (ADMIN_PRIVY_APP_ID, "app"),
             (ADMIN_PRIVY_APP_SECRET, "secret"),
@@ -641,11 +718,11 @@ mod tests {
         let cell = OnceLock::new();
         let first = Keypair::new();
         let first_b58 = b58(&first);
-        let env = env_of(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &first_b58)]);
+        let env = signer_env(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &first_b58)]);
         install(&cell, &env).await.unwrap();
 
         let second_b58 = b58(&Keypair::new());
-        let env = env_of(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &second_b58)]);
+        let env = signer_env(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &second_b58)]);
         install(&cell, &env).await.unwrap();
         assert_eq!(
             cell.get().unwrap().admin.pubkey(),
@@ -656,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn install_reports_a_bad_config_and_installs_nothing() {
         let cell = OnceLock::new();
-        let env = env_of(&[(ADMIN_SIGNER, "memory")]);
+        let env = signer_env(&[(ADMIN_SIGNER, "memory")]);
         let err = install(&cell, &env).await.unwrap_err();
         assert!(err.contains("ADMIN_PRIVATE_KEY not set"), "got: {err}");
         assert!(cell.get().is_none());

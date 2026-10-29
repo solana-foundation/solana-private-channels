@@ -163,25 +163,31 @@ pub fn redacts_transaction_errors_for(claims: Option<&Claims>, method: &str) -> 
 /// SPL Token program — owns both regular token accounts and mints.
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-/// Token-2022 program — same account layout for the base 165 bytes; extensions
-/// are appended after that. We support it now so future programs using Token-2022
-/// work without changes.
+/// Token-2022 program, which owns channel mints and accounts. Same layout as SPL
+/// Token for the base 165 bytes; extensions are appended after that.
 const SPL_TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 // ---------------------------------------------------------------------------
 // SPL token account layout constants (shared by Token and Token-2022)
 //
-// Both programs use identical byte offsets for the base fields.
-// Token-2022 accounts may be larger (extensions after byte 165), so we check
-// `len >= TOKEN_ACCOUNT_SIZE` rather than `len == TOKEN_ACCOUNT_SIZE`.
-//
-// Mints (82 bytes) are also owned by the same token programs, so we still
-// need the size check to distinguish mint from token account.
+// Both programs use identical byte offsets for the base fields. Token-2022
+// accounts and mints with extensions are longer than 165 bytes and carry an
+// account type byte at offset 165, so size alone cannot tell them apart: a
+// channel mint (202 bytes) is longer than a token account (170 bytes).
 // ---------------------------------------------------------------------------
 
-/// Minimum size of a valid token account. Anything smaller (e.g. mint = 82 bytes)
-/// is not a token account and is denied for User-role callers.
+/// Size of a token account without extensions. A legacy mint is 82 bytes.
 const TOKEN_ACCOUNT_SIZE: usize = 165;
+
+/// Offset of the Token-2022 account type byte in an extended account.
+const ACCOUNT_TYPE_OFFSET: usize = TOKEN_ACCOUNT_SIZE;
+/// Account type value of a token account (1 is a mint).
+const ACCOUNT_TYPE_ACCOUNT: u8 = 2;
+
+/// Whether the bytes are a token account rather than a mint.
+fn is_token_account(data: &[u8]) -> bool {
+    data.len() == TOKEN_ACCOUNT_SIZE || data.get(ACCOUNT_TYPE_OFFSET) == Some(&ACCOUNT_TYPE_ACCOUNT)
+}
 
 /// Byte range of the `mint` field, the first thing in a token account.
 const MINT_OFFSET: usize = 0;
@@ -353,7 +359,7 @@ pub fn authority_is_in_account_data(program_owner: &str) -> bool {
 /// account.
 pub fn token_account_amount(data: &[u8], program_owner: &str) -> Option<u64> {
     if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
-        || data.len() < TOKEN_ACCOUNT_SIZE
+        || !is_token_account(data)
     {
         return None;
     }
@@ -471,7 +477,7 @@ pub async fn resolve_owned_slot_ranges(
     auth_db: &PgPool,
 ) -> Result<Option<Vec<(i64, i64)>>, sqlx::Error> {
     if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
-        || data.len() < TOKEN_ACCOUNT_SIZE
+        || !is_token_account(data)
     {
         record_scope_outcome("not_a_token_account");
         return Ok(None);
@@ -651,15 +657,15 @@ fn slot_ranges_for_owner(
 /// nonzero allowance on an initialized account. The delegate grants read access
 /// for a current-state method, but is skipped for an `OWNER_ONLY_METHODS` one.
 ///
-/// Mints are owned by the same programs but are only 82 bytes, below
-/// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
+/// Mints are owned by the same programs but are not token accounts (82 bytes, or
+/// account type 1 for a Token-2022 mint); they are not user accounts and are denied.
 async fn check_token_account_ownership(
     data: &[u8],
     method: &str,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
-    if data.len() < TOKEN_ACCOUNT_SIZE {
+    if !is_token_account(data) {
         return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
 
@@ -1416,6 +1422,99 @@ mod tests {
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+    }
+
+    /// A Token-2022 mint with the permanent delegate: 202 bytes, account type 1 at byte 165.
+    fn t22_mint_bytes() -> Vec<u8> {
+        let mut data = vec![0u8; 202];
+        data[165] = 1;
+        data
+    }
+
+    /// A Token-2022 ATA with ImmutableOwner: 170 bytes, account type 2 at byte 165.
+    fn t22_account_bytes(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
+        let mut data = token_account_bytes(mint, owner);
+        data[AMOUNT_OFFSET..AMOUNT_END].copy_from_slice(&amount.to_le_bytes());
+        data.resize(170, 0);
+        data[165] = 2;
+        data
+    }
+
+    /// The account type byte, not the size, tells a channel mint from a token account.
+    #[test]
+    fn token_account_is_told_from_a_mint_by_its_type_byte() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        assert!(is_token_account(&token_account_bytes(&mint, &owner)));
+        assert!(is_token_account(&t22_account_bytes(&mint, &owner, 5)));
+        assert!(!is_token_account(&t22_mint_bytes()));
+        assert!(!is_token_account(&[0u8; 82]));
+        // An extended account whose type byte is not "account" is not one.
+        let mut unknown = t22_account_bytes(&mint, &owner, 5);
+        unknown[165] = 0;
+        assert!(!is_token_account(&unknown));
+    }
+
+    #[test]
+    fn token_2022_mint_has_no_token_amount() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        assert_eq!(
+            token_account_amount(&t22_mint_bytes(), SPL_TOKEN_2022_PROGRAM),
+            None
+        );
+        assert_eq!(
+            token_account_amount(&t22_account_bytes(&mint, &owner, 5), SPL_TOKEN_2022_PROGRAM),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_2022_channel_mint_rejected_by_type() {
+        let pool = lazy_pool();
+        let decision = check_account_data_ownership(
+            &t22_mint_bytes(),
+            SPL_TOKEN_2022_PROGRAM,
+            "SomePubkey",
+            "getAccountInfo",
+            Uuid::new_v4(),
+            &pool,
+        )
+        .await;
+        assert!(matches!(
+            decision,
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_2022_channel_mint_has_no_history_ranges() {
+        let pool = lazy_pool();
+        let ranges = resolve_owned_slot_ranges(
+            &t22_mint_bytes(),
+            SPL_TOKEN_2022_PROGRAM,
+            &Pubkey::new_unique().to_string(),
+            1,
+            Uuid::new_v4(),
+            &pool,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ranges, None);
+    }
+
+    /// A channel ATA derives under Token-2022 from its own owner.
+    #[test]
+    fn a_token_2022_ata_derives_from_its_owner() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(SPL_TOKEN_2022_PROGRAM).unwrap();
+        let address = get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+        assert!(derives_as_own_ata(
+            &t22_account_bytes(&mint, &owner, 0),
+            SPL_TOKEN_2022_PROGRAM,
+            &address.to_string(),
         ));
     }
 

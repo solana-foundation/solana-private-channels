@@ -1,5 +1,5 @@
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
-use pinocchio_token::instructions::{Burn, Transfer};
+use pinocchio_token_2022::instructions::{Burn, Transfer};
 
 use crate::{
     error::PrivateChannelWithdrawProgramError,
@@ -102,6 +102,7 @@ pub fn process_withdraw_funds(
             to: treasury_token_account_info,
             authority: user_info,
             amount: withdraw_config.fee,
+            token_program: token_program_info.address(),
         }
         .invoke()?;
     }
@@ -111,6 +112,7 @@ pub fn process_withdraw_funds(
         mint: mint_info,
         authority: user_info,
         amount: args.amount,
+        token_program: token_program_info.address(),
     }
     .invoke()?;
 

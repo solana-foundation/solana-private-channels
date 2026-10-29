@@ -99,4 +99,14 @@ if grep -qF "$admin_key_bytes" "$argv_log"; then
   fail "admin private key appeared in a child process argv"
 fi
 
+# 8. A blank delegate gets the admin pubkey once; a set one survives a new admin key.
+admin_pubkey="$(solana-keygen pubkey "$admin_keypair")"
+grep -qx "PRIVATE_CHANNEL_PERMANENT_DELEGATE=$admin_pubkey" "$tracked_env" \
+  || fail "blank delegate was not filled with the admin pubkey"
+other_keypair="$workdir/other.json"
+solana-keygen new -o "$other_keypair" -s --no-bip39-passphrase >/dev/null
+run_script "$tracked_env" "$other_keypair" "$runtime_env"
+grep -qx "PRIVATE_CHANNEL_PERMANENT_DELEGATE=$admin_pubkey" "$tracked_env" \
+  || fail "a set delegate was overwritten by a new admin key"
+
 echo "PASS: the admin private key stays out of the tracked template and off every PATH command line, in a private runtime file"

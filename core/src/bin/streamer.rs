@@ -55,7 +55,8 @@ const DISC_ROTATE_BITMAP: u8 = 8;
 
 /// Known program IDs
 const ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
-const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Channel token accounts are Token-2022; it shares the classic instruction layouts parsed here.
+const TOKEN_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 // ---------------------------------------------------------------------------
 // Streamed transaction — JSON matches frontend `ActivityTransaction` type
@@ -231,7 +232,7 @@ fn parse_escrow_instruction(
     }
 }
 
-/// Parse an SPL Token program instruction.
+/// Parse a Token-2022 instruction from the classic token set.
 ///
 /// Supported: Transfer(3), MintTo(7), Burn(8), TransferChecked(12), MintToChecked(14), BurnChecked(15)
 fn parse_spl_token_instruction(
@@ -350,7 +351,7 @@ fn parse_stored_transaction(
     };
 
     let escrow_program_id: Pubkey = ESCROW_PROGRAM_ID.parse().unwrap();
-    let spl_token_program_id: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
+    let token_program_id: Pubkey = TOKEN_PROGRAM_ID.parse().unwrap();
 
     let failed = stored_tx.meta.err.is_some();
 
@@ -365,7 +366,7 @@ fn parse_stored_transaction(
         mint: None,
     };
 
-    // Extract pre_token_balances for SPL Token parsing
+    // Extract pre_token_balances for token instruction parsing
     let pre_token_balances = stored_tx.meta.pre_token_balances.clone();
 
     for ix in instructions {
@@ -376,7 +377,7 @@ fn parse_stored_transaction(
             break;
         }
 
-        if prog_id == Some(&spl_token_program_id) {
+        if prog_id == Some(&token_program_id) {
             if let Some(parsed) = parse_spl_token_instruction(
                 &ix.data,
                 account_keys,
@@ -831,4 +832,99 @@ async fn main() {
         .expect("Server error");
 
     info!("Streamer shut down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_program_is_token_2022() {
+        assert_eq!(
+            TOKEN_PROGRAM_ID.parse::<Pubkey>().unwrap(),
+            spl_token_2022::id()
+        );
+    }
+
+    /// The Token-2022 builders emit the layouts the parser reads.
+    #[test]
+    fn parses_token_2022_moves() {
+        let keys: Vec<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
+        let (source, mint, dest, authority) = (keys[0], keys[1], keys[2], keys[3]);
+        let program = spl_token_2022::id();
+        let index = |key: &Pubkey| keys.iter().position(|k| k == key).unwrap() as u8;
+        #[allow(deprecated)]
+        let cases = [
+            (
+                spl_token_2022::instruction::transfer(&program, &source, &dest, &authority, &[], 7)
+                    .unwrap(),
+                "transfer",
+                dest,
+            ),
+            (
+                spl_token_2022::instruction::mint_to(&program, &mint, &dest, &authority, &[], 7)
+                    .unwrap(),
+                "mint_to",
+                dest,
+            ),
+            (
+                spl_token_2022::instruction::burn(&program, &source, &mint, &authority, &[], 7)
+                    .unwrap(),
+                "burn",
+                source,
+            ),
+            (
+                spl_token_2022::instruction::transfer_checked(
+                    &program,
+                    &source,
+                    &mint,
+                    &dest,
+                    &authority,
+                    &[],
+                    7,
+                    6,
+                )
+                .unwrap(),
+                "transfer",
+                dest,
+            ),
+            (
+                spl_token_2022::instruction::mint_to_checked(
+                    &program,
+                    &mint,
+                    &dest,
+                    &authority,
+                    &[],
+                    7,
+                    6,
+                )
+                .unwrap(),
+                "mint_to",
+                dest,
+            ),
+            (
+                spl_token_2022::instruction::burn_checked(
+                    &program,
+                    &source,
+                    &mint,
+                    &authority,
+                    &[],
+                    7,
+                    6,
+                )
+                .unwrap(),
+                "burn",
+                source,
+            ),
+        ];
+        for (ix, tx_type, to) in cases {
+            let accounts: Vec<u8> = ix.accounts.iter().map(|m| index(&m.pubkey)).collect();
+            let parsed = parse_spl_token_instruction(&ix.data, &keys, &accounts, &None)
+                .unwrap_or_else(|| panic!("byte {} must parse", ix.data[0]));
+            assert_eq!(parsed.tx_type, tx_type);
+            assert_eq!(parsed.from, authority.to_string());
+            assert_eq!(parsed.to, to.to_string());
+            assert_eq!(parsed.amount.as_deref(), Some("7"));
+        }
+    }
 }

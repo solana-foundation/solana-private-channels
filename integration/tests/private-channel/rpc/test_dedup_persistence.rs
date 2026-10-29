@@ -1,10 +1,10 @@
 use {
+    crate::setup::get_associated_token_address,
     private_channel_core::nodes::node::{NodeConfig, NodeMode},
     private_channel_core::stage_metrics::NoopMetrics,
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_commitment_config::CommitmentConfig,
     solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
-    spl_associated_token_account::get_associated_token_address,
     std::{sync::Arc, time::Duration},
     tokio::time::sleep,
 };
@@ -55,6 +55,8 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator.pubkey()],
+        permanent_delegate: Some(operator.pubkey()),
+        compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
         blocktime_ms: 100,
@@ -88,7 +90,7 @@ pub async fn run_dedup_persistence_test(db_url: String) {
                 &keypair.pubkey(),
                 &keypair.pubkey(),
                 &mint.pubkey(),
-                &spl_token::id(),
+                &spl_token_2022::id(),
             );
         let tx = Transaction::new_signed_with_payer(
             &[create_ata_ix],

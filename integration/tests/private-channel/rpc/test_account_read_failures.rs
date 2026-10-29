@@ -60,7 +60,7 @@ async fn start_read_only_rpc() -> (
         max_connections: 8,
         read_deps: Some(ReadDeps {
             accounts_db: db.clone(),
-            admin_keys: vec![],
+            ingress: Default::default(),
             simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
             block_list_permits: tokio::sync::Semaphore::new(block_list_slots(32)),
         }),

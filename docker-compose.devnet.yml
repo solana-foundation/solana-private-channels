@@ -129,6 +129,10 @@ services:
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=write
       - PRIVATE_CHANNEL_ADMIN_KEYS=${PRIVATE_CHANNEL_ADMIN_KEYS}
+      # Delegate written into every channel mint; required, with no fallback.
+      # Compliance owner passes through only when set; blank reads as unset.
+      - PRIVATE_CHANNEL_PERMANENT_DELEGATE
+      - PRIVATE_CHANNEL_COMPLIANCE_OWNER
       - PRIVATE_CHANNEL_METRICS=${PRIVATE_CHANNEL_METRICS:-false}
       - PRIVATE_CHANNEL_METRICS_PORT=${PRIVATE_CHANNEL_METRICS_PORT:-9090}
     ports:
@@ -216,6 +220,10 @@ services:
       - PRIVATE_CHANNEL_LOG_LEVEL=info
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=read
+      # simulateTransaction is served here, so it applies the same admin and seize rules.
+      - PRIVATE_CHANNEL_ADMIN_KEYS=${PRIVATE_CHANNEL_ADMIN_KEYS}
+      - PRIVATE_CHANNEL_PERMANENT_DELEGATE
+      - PRIVATE_CHANNEL_COMPLIANCE_OWNER
     ports:
       - "127.0.0.1:${PRIVATE_CHANNEL_READ_PORT}:${PRIVATE_CHANNEL_READ_PORT}"
     command: ["/usr/local/bin/private-channel-node"]
@@ -498,6 +506,8 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      # Delegate for new channel mints; required. Must match the node's.
+      - OPERATOR_PERMANENT_DELEGATE=${OPERATOR_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-}}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
       # Required for the escrow operator: it refuses to start without a
@@ -558,6 +568,8 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      # Delegate for new channel mints; required. Must match the node's.
+      - OPERATOR_PERMANENT_DELEGATE=${OPERATOR_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-}}
       - METRICS_PORT=9103
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:

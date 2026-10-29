@@ -4,12 +4,12 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_associated_token_account::get_associated_token_address;
 
 use crate::utils::{
-    assert_program_error, find_withdraw_config_pda, get_withdraw_config, set_mint_with_authority,
-    TestContext, INVALID_MINT_AUTHORITY_ERROR, INVALID_SYSTEM_PROGRAM_ERROR,
-    INVALID_WITHDRAW_CONFIG_ERROR, SYSTEM_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+    assert_program_error, channel_ata, find_withdraw_config_pda, get_withdraw_config,
+    set_mint_with_authority, TestContext, INVALID_MINT_AUTHORITY_ERROR,
+    INVALID_SYSTEM_PROGRAM_ERROR, INVALID_WITHDRAW_CONFIG_ERROR, SYSTEM_PROGRAM_ID,
+    TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
 };
 
 // `admin` is the mint authority, the signer and the treasury, as the operator
@@ -50,7 +50,7 @@ fn test_set_withdraw_config_creates_config() {
     assert_eq!(config.treasury, admin.pubkey());
     assert_eq!(
         config.treasury_token_account,
-        get_associated_token_address(&admin.pubkey(), &mint.pubkey())
+        channel_ata(&admin.pubkey(), &mint.pubkey())
     );
 }
 
@@ -106,7 +106,7 @@ fn test_set_withdraw_config_overwrites() {
     assert_eq!(config.treasury, new_treasury);
     assert_eq!(
         config.treasury_token_account,
-        get_associated_token_address(&new_treasury, &mint.pubkey())
+        channel_ata(&new_treasury, &mint.pubkey())
     );
 }
 
@@ -166,7 +166,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
     assert_eq!(config.treasury, admin.pubkey());
     assert_eq!(
         config.treasury_token_account,
-        get_associated_token_address(&admin.pubkey(), &mint.pubkey())
+        channel_ata(&admin.pubkey(), &mint.pubkey())
     );
 
     let instruction = SetWithdrawConfigBuilder::new()

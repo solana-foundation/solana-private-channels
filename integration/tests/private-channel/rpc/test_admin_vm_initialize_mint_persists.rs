@@ -21,11 +21,10 @@ use {
     crate::setup,
     solana_sdk::{
         account::ReadableAccount,
-        program_pack::Pack,
         signature::{Keypair, Signer},
         transaction::Transaction,
     },
-    spl_token::state::Mint,
+    spl_token_2022::{extension::StateWithExtensions, state::Mint},
     std::time::Duration,
 };
 
@@ -34,6 +33,7 @@ pub async fn run_admin_vm_initialize_mint_persists_test(ctx: &PrivateChannelCont
 
     case_single_mint_persists(ctx).await;
     case_two_mints_persist(ctx).await;
+    case_mint_bytes_match_the_real_program(ctx).await;
 
     println!("✓ AdminVm mint-persistence tests passed");
 }
@@ -79,8 +79,11 @@ async fn assert_mint_decimals(
         .get_account(pubkey)
         .await
         .unwrap_or_else(|e| panic!("{label}: mint {pubkey} must exist after settle: {e:?}"));
-    let mint = Mint::unpack(account.data())
-        .unwrap_or_else(|e| panic!("{label}: mint {pubkey} must unpack as SPL Mint: {e:?}"));
+    let mint = StateWithExtensions::<Mint>::unpack(account.data())
+        .unwrap_or_else(|e| {
+            panic!("{label}: mint {pubkey} must unpack as a Token-2022 mint: {e:?}")
+        })
+        .base;
     assert!(mint.is_initialized, "{label}: mint must be initialized");
     assert_eq!(
         mint.decimals, MINT_DECIMALS,
@@ -91,13 +94,13 @@ async fn assert_mint_decimals(
 // ── Cases ───────────────────────────────────────────────────────────────────
 
 /// A well-formed single InitializeMint lands, has length-aligned balance meta,
-/// persists the mint, and leaves the spl_token program account untouched.
+/// persists the mint, and leaves the Token-2022 program account untouched.
 async fn case_single_mint_persists(ctx: &PrivateChannelContext) {
     let mint = Keypair::new();
 
-    // Baseline of the spl_token program account so we can prove it is not
+    // Baseline of the Token-2022 program account so we can prove it is not
     // clobbered by the mint write (best-effort: skipped if the RPC lacks it).
-    let program_before = ctx.read_client.get_account(&spl_token::id()).await.ok();
+    let program_before = program_head(ctx).await;
 
     let blockhash = ctx.get_blockhash().await.unwrap();
     let init_tx = setup::create_mint_account_transaction(
@@ -134,15 +137,12 @@ async fn case_single_mint_persists(ctx: &PrivateChannelContext) {
     assert_mint_decimals(ctx, &mint.pubkey(), "case 1").await;
 
     if let Some(before) = program_before {
-        let after = ctx
-            .read_client
-            .get_account(&spl_token::id())
+        let after = program_head(ctx)
             .await
-            .expect("spl_token program must still exist after mint write");
+            .expect("Token-2022 program must still exist after mint write");
         assert_eq!(
-            before.data(),
-            after.data(),
-            "case 1: spl_token program account must not be clobbered"
+            before, after,
+            "case 1: Token-2022 program account must not be clobbered"
         );
     }
     println!("  ✓ case 1: single InitializeMint persists mint, balances aligned");
@@ -155,30 +155,30 @@ async fn case_two_mints_persist(ctx: &PrivateChannelContext) {
     let mint_b = Keypair::new();
     let operator = ctx.operator_key.pubkey();
 
-    let ix_a = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
-        &mint_a.pubkey(),
-        &operator,
-        None,
-        MINT_DECIMALS,
-    )
-    .unwrap();
-    let ix_b = spl_token::instruction::initialize_mint(
-        &spl_token::id(),
-        &mint_b.pubkey(),
-        &operator,
-        None,
-        MINT_DECIMALS,
-    )
-    .unwrap();
+    // The suite's node delegate is the operator key.
+    let pair = |mint: &Keypair| {
+        [
+            spl_token_2022::instruction::initialize_permanent_delegate(
+                &spl_token_2022::id(),
+                &mint.pubkey(),
+                &operator,
+            )
+            .unwrap(),
+            spl_token_2022::instruction::initialize_mint(
+                &spl_token_2022::id(),
+                &mint.pubkey(),
+                &operator,
+                None,
+                MINT_DECIMALS,
+            )
+            .unwrap(),
+        ]
+    };
+    let ixs: Vec<_> = pair(&mint_a).into_iter().chain(pair(&mint_b)).collect();
 
     let blockhash = ctx.get_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(
-        &[ix_a, ix_b],
-        Some(&operator),
-        &[&ctx.operator_key],
-        blockhash,
-    );
+    let tx =
+        Transaction::new_signed_with_payer(&ixs, Some(&operator), &[&ctx.operator_key], blockhash);
 
     let sig = ctx
         .send_and_check(&tx, Duration::from_secs(SEND_AND_CHECK_DURATION_SECONDS))
@@ -203,4 +203,72 @@ async fn case_two_mints_persist(ctx: &PrivateChannelContext) {
     assert_mint_decimals(ctx, &mint_a.pubkey(), "case 2 mint_a").await;
     assert_mint_decimals(ctx, &mint_b.pubkey(), "case 2 mint_b").await;
     println!("  ✓ case 2: two InitializeMint instructions both persist");
+}
+
+/// First bytes and flags of the Token-2022 program account; the full 1.4 MB ELF
+/// is over the account response budget, so it is read through a dataSlice.
+async fn program_head(ctx: &PrivateChannelContext) -> Option<(Vec<u8>, bool, u64)> {
+    let config = solana_client::rpc_config::RpcAccountInfoConfig {
+        encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+        data_slice: Some(solana_account_decoder_client_types::UiDataSliceConfig {
+            offset: 0,
+            length: 256,
+        }),
+        ..Default::default()
+    };
+    let account = ctx
+        .read_client
+        .get_ui_account_with_config(&spl_token_2022::id(), config)
+        .await
+        .ok()?
+        .value?
+        .to_account()?;
+    Some((account.data, account.executable, account.lamports))
+}
+
+/// The admin VM writes exactly what the real Token-2022 program writes for
+/// `[InitializePermanentDelegate, InitializeMint2]`. `t22_mint` reproduces the
+/// validator-captured golden bytes, so it stands in for the program here.
+async fn case_mint_bytes_match_the_real_program(ctx: &PrivateChannelContext) {
+    let mint = Keypair::new();
+    let operator = ctx.operator_key.pubkey();
+    let ixs = [
+        spl_token_2022::instruction::initialize_permanent_delegate(
+            &spl_token_2022::id(),
+            &mint.pubkey(),
+            &operator,
+        )
+        .unwrap(),
+        spl_token_2022::instruction::initialize_mint2(
+            &spl_token_2022::id(),
+            &mint.pubkey(),
+            &operator,
+            Some(&operator),
+            MINT_DECIMALS,
+        )
+        .unwrap(),
+    ];
+    let blockhash = ctx.get_blockhash().await.unwrap();
+    let tx =
+        Transaction::new_signed_with_payer(&ixs, Some(&operator), &[&ctx.operator_key], blockhash);
+    ctx.send_and_check(&tx, Duration::from_secs(SEND_AND_CHECK_DURATION_SECONDS))
+        .await
+        .expect("send_and_check should not error")
+        .expect("mint creation should land");
+
+    let account = ctx
+        .read_client
+        .get_account(&mint.pubkey())
+        .await
+        .expect("mint must exist");
+    assert_eq!(account.owner, spl_token_2022::id());
+    let expected = private_channel_core::t22_fixtures::t22_mint(
+        MINT_DECIMALS,
+        &operator,
+        Some(&operator),
+        Some(&operator),
+        0,
+    );
+    assert_eq!(account.data(), &expected[..], "case 3: mint bytes");
+    println!("  ✓ case 3: channel mint bytes match the real Token-2022 layout");
 }

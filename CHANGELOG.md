@@ -2,17 +2,46 @@
 
 ## [Unreleased]
 
+### Breaking
+- The channel's only token program is Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`), the Mainnet `program@v11.1.0` build, embedded and hash-pinned. The legacy SPL Token program is removed from the channel. Mainnet is unchanged: the escrow still takes SPL Token and Token-2022 mints
+- Channel mints are 202-byte Token-2022 mints whose only extension is `PermanentDelegate`, and channel token accounts are 170-byte Token-2022 ATAs with `ImmutableOwner`
+- Channel ATA addresses change, since the token program is an ATA seed. Clients and wallets must derive channel ATAs with the Token-2022 program id
+- Ownership handoffs (`SetAuthority(AccountOwner)`) of channel token accounts now fail on chain (`ImmutableOwner`)
+- The upgrade is a channel reset, not a migration: every channel mint's supply must be 0 and nothing pending. See [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md)
+- Write and aio nodes and both operators refuse to start without a permanent delegate (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`, `OPERATOR_PERMANENT_DELEGATE`) or with the zero key; it is never derived from the admin keys
+
+### Core node and RPC
+- The permanent delegate can seize a holder's balance, but only with a `TransferChecked` into the compliance ATA of `PRIVATE_CHANNEL_COMPLIANCE_OWNER`. Delegate burns and moves anywhere else are refused (`seize_target`), and all of them are refused when no compliance owner is set (the node logs `seize disabled: no compliance owner configured` at startup)
+- Every admitted delegate move logs `permanent delegate move admitted` and bumps `private_channel_delegate_moves_admitted_total` (with stage metrics on), counted at ingress, so resends and moves that later fail count too; a refused one logs `permanent delegate move refused`
+- Ingress allowlist narrowed to classic Token-2022 instructions: first byte `0..=24`, or `35` (`InitializePermanentDelegate`, admin only). `Batch`, the other extension instructions, the token-metadata and group interfaces and empty data are refused, and the rejection reads "Only Token-2022 (classic token instructions), ATA, Memo, Withdraw, and Swap program transactions are accepted"
+- Admin signer required for Token-2022 `MintTo`, `MintToChecked`, `FreezeAccount`, `ThawAccount` and every `SetAuthority` except `AccountOwner` and `CloseAccount`. A `SetAuthority(PermanentDelegate)` to anything but the configured delegate, `None` included, is refused even when admin-signed (`delegate_rotation`)
+- The AdminVM creates a mint only from `InitializePermanentDelegate` with the configured delegate immediately followed by `InitializeMint` or `InitializeMint2` on the same mint, and refuses both native mints
+- `getTokenAccountBalance` reads Token-2022 accounts only
+- `getAccountInfo` of the Token-2022 program account (1.38 MB) is above the 1 MiB account reply budget and needs a `dataSlice`
+
 ### Gateway and auth
+- Tells a channel mint from a token account by the account type byte at offset 165 (`2` for an account), not by size
 - Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second; past that, withdrawals are forwarded unchecked
 
 ### Programs
+- The withdraw program runs on Token-2022: `token_program` must be the Token-2022 id, with the same account order, and the treasury ATA derives under Token-2022. The generated clients default `token_program` to Token-2022
 - Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
+
+### Indexer and operators
+- The escrow operator creates channel mints with `InitializePermanentDelegate(OPERATOR_PERMANENT_DELEGATE)` and `InitializeMint2`, and never mints into a channel mint whose delegate is missing or another key (manual review, `permanent delegate mismatch`)
+- Solvency reconciliation reads channel supply from Token-2022 mints
+
+### Deploy, compose and scripts
+- New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node, required), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, required). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`
+- New `seize` command in `scripts/devnet`: moves a holder's channel balance into the compliance ATA in one transaction, thawing and re-freezing a frozen source
+- bench-tps creates its channel mints with `PRIVATE_CHANNEL_PERMANENT_DELEGATE`, which `run.sh` sets to its admin key
 
 ### Docs and CI
 - ctutils bumped past RUSTSEC-2026-0385; it ships in core, indexer and auth (#406)
 - `cargo audit` also covers the trident fuzz lockfile, and `pnpm audit` fails both program lockfiles on high and critical advisories; testcontainers, handlebars, brace-expansion and trident's rustls bumped past their advisories (#406)
 
 ### Upgrade notes
+- Token-2022 channel: follow [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md) and the matching section of [UPGRADING.md](UPGRADING.md). Set `PRIVATE_CHANNEL_PERMANENT_DELEGATE` and `OPERATOR_PERMANENT_DELEGATE` to the same key before starting. Rollback after the reset is a restore, not an image swap
 - Escrow clients: `Deposit` takes `user_allowed_wallet_pda` and `recipient_allowed_wallet_pda`, and `ReleaseFunds` takes `user_allowed_wallet_pda` and `withdrawer_allowed_wallet_pda`, after the existing accounts. `ReleaseFunds` also takes a trailing `withdrawer` argument, and `SetWhitelistEnabled` takes `system_program`.
 - `Instance` is now 133 bytes, version 2: the whitelist flags plus 64 reserved bytes. A 0.1.0 instance (67 bytes) keeps working with the whitelist off; `SetWhitelistEnabled` grows it, with the payer topping up its rent. After the program upgrade, call `SetWhitelistEnabled` once on each 0.1.0 instance with both flags off, so every client can decode it. Rust callers decode either layout with `decode_instance`; the generated decoders, TypeScript's included, read only the new one.
 - A 0.1.0 client's `Deposit` fails. Without hook extras it gets `NotEnoughAccountKeys`. With them, its first two extras fill the whitelist slots, so it gets `InvalidAllowedWalletPda` (`0x15`) while deposits are whitelisted, and a Token-2022 error otherwise.

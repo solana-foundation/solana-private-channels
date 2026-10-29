@@ -48,7 +48,7 @@ mod multi_instruction_pipeline;
 #[path = "liability_reconciliation.rs"]
 mod liability_reconciliation;
 
-use helpers::{generate_mint, mint_to_owner, setup_wallets};
+use helpers::{generate_channel_mint, mint_to_owner, setup_wallets};
 use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
@@ -273,14 +273,22 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     let authority = Keypair::new();
     setup_wallets(client.as_ref(), &faucet_keypair, &[&authority]).await?;
 
-    // Create an SPL mint with `authority` as the mint authority.
+    // A Token-2022 mint: this validator is also the channel, whose supply is read for it.
     let mint_keypair = Keypair::new();
-    let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
+    let mint_pubkey =
+        generate_channel_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
     // A real instance with the mint allowed; startup ignores custody of unapproved mints.
     let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
+    allow_mint_for_program(
+        client.as_ref(),
+        &admin,
+        pda,
+        mint_pubkey,
+        spl_token_2022::id(),
+    )
+    .await?;
 
     // Mint tokens directly to the instance ATA.
     const AMOUNT: u64 = 1_000_000;
@@ -307,7 +315,7 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &pda,
             &mint_pubkey,
-            &spl_token::id(),
+            &spl_token_2022::id(),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
@@ -364,14 +372,22 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
     let authority = Keypair::new();
     setup_wallets(client.as_ref(), &faucet_keypair, &[&authority]).await?;
 
-    // Create an SPL mint with `authority` as the mint authority.
+    // A Token-2022 mint: this validator is also the channel, whose supply is read for it.
     let mint_keypair = Keypair::new();
-    let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
+    let mint_pubkey =
+        generate_channel_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
     // A real instance with the mint allowed; startup ignores custody of unapproved mints.
     let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
+    allow_mint_for_program(
+        client.as_ref(),
+        &admin,
+        pda,
+        mint_pubkey,
+        spl_token_2022::id(),
+    )
+    .await?;
 
     // Mint the balanced amount to the instance ATA.
     const AMOUNT: u64 = 1_000_000;
@@ -406,7 +422,7 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &pda,
             &mint_pubkey,
-            &spl_token::id(),
+            &spl_token_2022::id(),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
@@ -466,7 +482,7 @@ async fn test_reconciliation_ignores_an_unapproved_mint() -> Result<(), Box<dyn 
     // The attacker's mint: never allowed, with supply held in the attacker's own wallet.
     const UNAPPROVED_SUPPLY: u64 = 250_000;
     let unapproved_mint =
-        generate_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
+        generate_channel_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
     mint_to_owner(
         client.as_ref(),
         &authority,
@@ -491,9 +507,16 @@ async fn test_reconciliation_ignores_an_unapproved_mint() -> Result<(), Box<dyn 
     // attacker's accounts are too.
     const AMOUNT: u64 = 1_000_000;
     let allowed_mint =
-        generate_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
+        generate_channel_mint(client.as_ref(), &authority, &authority, &Keypair::new()).await?;
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    allow_mint_for_program(client.as_ref(), &admin, pda, allowed_mint, spl_token::id()).await?;
+    allow_mint_for_program(
+        client.as_ref(),
+        &admin,
+        pda,
+        allowed_mint,
+        spl_token_2022::id(),
+    )
+    .await?;
     mint_to_owner(
         client.as_ref(),
         &authority,
@@ -511,7 +534,7 @@ async fn test_reconciliation_ignores_an_unapproved_mint() -> Result<(), Box<dyn 
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &pda,
             &allowed_mint,
-            &spl_token::id(),
+            &spl_token_2022::id(),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {

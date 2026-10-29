@@ -15,7 +15,7 @@ use solana_keychain::Signer;
 use solana_sdk::hash::hashv;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
-use spl_token::instruction::mint_to;
+use spl_token_2022::instruction::mint_to;
 use std::fmt::Display;
 
 pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
@@ -178,7 +178,7 @@ impl TransactionBuilder {
             Self::ReleaseFunds(builder_with_nonce) => {
                 Ok(vec![builder_with_nonce.builder.instruction()])
             }
-            Self::InitializeMint(builder) => Ok(vec![builder.instruction()?]),
+            Self::InitializeMint(builder) => builder.instructions(),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
             Self::RotateBitmap(builder) => Ok(vec![builder.instruction()]),
         }
@@ -310,7 +310,7 @@ pub struct WithdrawConfigSetup {
     pub min_withdraw_amount: u64,
 }
 
-/// Builder for simple SPL token mint instructions (deposit flow)
+/// Builder for channel Token-2022 mint instructions (deposit flow)
 /// Creates ATA idempotently, then mints tokens
 #[derive(Clone, Debug, Default)]
 pub struct MintToBuilder {
@@ -524,7 +524,7 @@ pub struct MintToBuilderWithTxnId {
     pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Builder for initialize_mint instruction (sent before first mint)
+/// Builder for the channel mint creation (sent before first mint)
 #[derive(Clone, Debug)]
 pub struct InitializeMintBuilder {
     pub mint: Pubkey,
@@ -532,6 +532,8 @@ pub struct InitializeMintBuilder {
     pub mint_authority: Pubkey,
     pub token_program: Pubkey,
     pub payer: Pubkey,
+    /// Seize authority written into the mint; the node refuses any other key.
+    pub permanent_delegate: Pubkey,
 }
 
 impl InitializeMintBuilder {
@@ -541,6 +543,7 @@ impl InitializeMintBuilder {
         mint_authority: Pubkey,
         token_program: Pubkey,
         payer: Pubkey,
+        permanent_delegate: Pubkey,
     ) -> Self {
         Self {
             mint,
@@ -548,20 +551,32 @@ impl InitializeMintBuilder {
             mint_authority,
             token_program,
             payer,
+            permanent_delegate,
         }
     }
 
-    pub fn instruction(&self) -> Result<Instruction, crate::error::ProgramError> {
-        spl_token::instruction::initialize_mint(
-            &self.token_program,
-            &self.mint,
-            &self.mint_authority,
-            Some(&self.mint_authority),
-            self.decimals,
-        )
-        .map_err(|e| ProgramError::InvalidBuilder {
-            reason: format!("failed to build initialize_mint: {}", e),
-        })
+    /// `[InitializePermanentDelegate, InitializeMint2]`: the delegate can only be set
+    /// before the mint is initialized, and the node creates no mint without it.
+    pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
+        let build_error = |e| ProgramError::InvalidBuilder {
+            reason: format!("failed to build mint creation: {}", e),
+        };
+        Ok(vec![
+            spl_token_2022::instruction::initialize_permanent_delegate(
+                &self.token_program,
+                &self.mint,
+                &self.permanent_delegate,
+            )
+            .map_err(build_error)?,
+            spl_token_2022::instruction::initialize_mint2(
+                &self.token_program,
+                &self.mint,
+                &self.mint_authority,
+                Some(&self.mint_authority),
+                self.decimals,
+            )
+            .map_err(build_error)?,
+        ])
     }
 }
 
@@ -588,7 +603,7 @@ mod tests {
             .recipient_ata(pk(3))
             .payer(pk(4))
             .mint_authority(pk(5))
-            .token_program(spl_token::id())
+            .token_program(spl_token_2022::id())
             .amount(500);
         b
     }
@@ -634,7 +649,7 @@ mod tests {
                 PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
                 spl_associated_token_account::id(),
                 spl_memo::id(),
-                spl_token::id(),
+                spl_token_2022::id(),
             ]
         );
 
@@ -644,7 +659,7 @@ mod tests {
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &treasury,
                 &mint,
-                &spl_token::id(),
+                &spl_token_2022::id(),
             );
         assert_eq!(ixs[0].accounts[1].pubkey, treasury_ata);
 
@@ -680,7 +695,7 @@ mod tests {
         let mut b = MintToBuilder::new();
         b.recipient_ata(pk(3))
             .mint_authority(pk(5))
-            .token_program(spl_token::id())
+            .token_program(spl_token_2022::id())
             .amount(500);
         let result = b.instruction();
         assert!(result.is_err());
@@ -690,11 +705,38 @@ mod tests {
     // InitializeMintBuilder
     // ========================================================================
 
+    /// The mint is created with the permanent delegate first, then InitializeMint2
+    /// with freeze authority = mint authority, all on Token-2022.
     #[test]
-    fn initialize_mint_builder_instruction_ok() {
-        let builder = InitializeMintBuilder::new(pk(1), 6, pk(2), spl_token::id(), pk(3));
-        let ix = builder.instruction();
-        assert!(ix.is_ok());
+    fn initialize_mint_builder_emits_delegate_then_mint() {
+        let builder =
+            InitializeMintBuilder::new(pk(1), 6, pk(2), spl_token_2022::id(), pk(3), pk(9));
+        let ixs = builder.instructions().unwrap();
+        let expected = [
+            spl_token_2022::instruction::initialize_permanent_delegate(
+                &spl_token_2022::id(),
+                &pk(1),
+                &pk(9),
+            )
+            .unwrap(),
+            spl_token_2022::instruction::initialize_mint2(
+                &spl_token_2022::id(),
+                &pk(1),
+                &pk(2),
+                Some(&pk(2)),
+                6,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(ixs, expected);
+    }
+
+    /// MintTo is built for Token-2022 channel mints.
+    #[test]
+    fn mint_to_targets_token_2022() {
+        let ix = fully_configured_builder().instruction().unwrap();
+        assert_eq!(ix.program_id, spl_token_2022::id());
+        assert_eq!(ix.data[0], 7);
     }
 
     // ========================================================================
@@ -747,8 +789,9 @@ mod tests {
             pk(1),
             6,
             pk(2),
-            spl_token::id(),
+            spl_token_2022::id(),
             pk(3),
+            pk(9),
         )))
     }
 

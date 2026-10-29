@@ -149,7 +149,7 @@ async fn case_future_expiry_funds_ok(
         mint_b,
         nonce,
     );
-    let dvp_ata_a = get_associated_token_address_with_program_id(&swap_dvp, mint_a, &spl_token::ID);
+    let dvp_ata_a = setup::get_associated_token_address(&swap_dvp, mint_a);
 
     let bh = private_channel_ctx.get_blockhash().await.unwrap();
     let create_tx = setup::create_dvp_transaction(
@@ -311,10 +311,9 @@ async fn bootstrap_user_a(
     deposit_to_escrow(solana_ctx, user_a, &mint_a, DEPOSIT_A).await?;
     deposit_to_escrow(solana_ctx, user_a, &mint_b, DEPOSIT_B).await?;
 
-    let user_a_contra_ata_a =
-        get_associated_token_address_with_program_id(&user_a.pubkey(), &mint_a, &spl_token::ID);
-    let user_a_contra_ata_b =
-        get_associated_token_address_with_program_id(&user_a.pubkey(), &mint_b, &spl_token::ID);
+    // Channel ATAs derive under Token-2022 whatever program the Solana mint uses.
+    let user_a_contra_ata_a = setup::get_associated_token_address(&user_a.pubkey(), &mint_a);
+    let user_a_contra_ata_b = setup::get_associated_token_address(&user_a.pubkey(), &mint_b);
     wait_for_private_channel_balance(private_channel_ctx, &user_a_contra_ata_a, DEPOSIT_A).await;
     wait_for_private_channel_balance(private_channel_ctx, &user_a_contra_ata_b, DEPOSIT_B).await;
 

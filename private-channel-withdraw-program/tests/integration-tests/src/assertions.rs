@@ -1,6 +1,5 @@
-use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
-use spl_token::state::Account as TokenAccount;
+use spl_token_2022::{extension::StateWithExtensions, state::Account as TokenAccount};
 
 use crate::utils::TestContext;
 
@@ -13,8 +12,10 @@ pub fn assert_balance_changed(
     let account = context
         .get_account(token_account)
         .expect("Token account should exist");
-    let token_account = TokenAccount::unpack(&account.data).unwrap();
-    let current_balance = token_account.amount;
+    let current_balance = StateWithExtensions::<TokenAccount>::unpack(&account.data)
+        .unwrap()
+        .base
+        .amount;
     let expected_balance = (initial_balance as i64 + expected_change) as u64;
     assert_eq!(
         current_balance, expected_balance,

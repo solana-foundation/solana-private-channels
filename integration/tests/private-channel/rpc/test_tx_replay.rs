@@ -1,6 +1,6 @@
 use {
+    crate::setup::get_associated_token_address,
     solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
-    spl_associated_token_account::get_associated_token_address,
     std::time::Duration,
     tokio::time::sleep,
 };
@@ -44,7 +44,7 @@ pub async fn run_tx_replay_test(ctx: &PrivateChannelContext) {
                 &keypair.pubkey(),
                 &keypair.pubkey(),
                 &mint.pubkey(),
-                &spl_token::id(),
+                &spl_token_2022::id(),
             );
         let sig = ctx
             .write_client

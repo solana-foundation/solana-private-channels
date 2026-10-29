@@ -9,7 +9,7 @@ use solana_sdk::{
     signature::{read_keypair_file, Signer},
     transaction::Transaction,
 };
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::{env, error::Error, str::FromStr};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -58,7 +58,12 @@ fn main() -> Result<()> {
 
     println!("User pubkey: {}", user_keypair.pubkey());
 
-    let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
+    // Channel token accounts are Token-2022 ATAs.
+    let user_ata = get_associated_token_address_with_program_id(
+        &user_keypair.pubkey(),
+        &mint,
+        &spl_token_2022::ID,
+    );
 
     // The fee, where it goes and the minimum live in the mint's config on
     // PrivateChannel. The operator writes it on the mint's deposits, so a mint
@@ -116,7 +121,7 @@ fn main() -> Result<()> {
         user: user_keypair.pubkey(),
         mint,
         token_account: user_ata,
-        token_program: spl_token::ID,
+        token_program: spl_token_2022::ID,
         associated_token_program: spl_associated_token_account::ID,
         withdraw_config: withdraw_config_pda,
         treasury_token_account: withdraw_config.treasury_token_account,

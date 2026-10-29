@@ -55,9 +55,10 @@ pub async fn run_admin_vm_initialize_mint_malformed_test(ctx: &PrivateChannelCon
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Build a tx signed by the admin (operator) key, carrying a single
+/// Build a tx signed by the admin (operator) key, carrying the permanent
+/// delegate ix (the suite's node delegate is the operator) and then an
 /// `InitializeMint` instruction with the supplied raw data. Bypasses
-/// `spl_token::instruction::initialize_mint` so the data layout can be
+/// `spl_token_2022::instruction::initialize_mint` so the data layout can be
 /// deliberately malformed.
 fn build_admin_init_mint_tx_raw(
     admin: &Keypair,
@@ -66,7 +67,7 @@ fn build_admin_init_mint_tx_raw(
     blockhash: solana_sdk::hash::Hash,
 ) -> Transaction {
     let ix = Instruction {
-        program_id: spl_token::id(),
+        program_id: spl_token_2022::id(),
         accounts: vec![
             AccountMeta::new(*mint, false),
             // Solana's legacy InitializeMint shape includes a rent sysvar;
@@ -76,7 +77,13 @@ fn build_admin_init_mint_tx_raw(
         ],
         data,
     };
-    Transaction::new_signed_with_payer(&[ix], Some(&admin.pubkey()), &[admin], blockhash)
+    let delegate = spl_token_2022::instruction::initialize_permanent_delegate(
+        &spl_token_2022::id(),
+        mint,
+        &admin.pubkey(),
+    )
+    .unwrap();
+    Transaction::new_signed_with_payer(&[delegate, ix], Some(&admin.pubkey()), &[admin], blockhash)
 }
 
 /// Submit the tx with preflight disabled so a malformed AdminVm payload

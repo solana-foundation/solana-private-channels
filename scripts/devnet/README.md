@@ -84,6 +84,31 @@ Prints the mint's withdraw fee and minimum before sending, and stops if `<AMOUNT
 
 The tool reads the mint's withdraw config before sending. With JWT on (`JWT_SECRET` set) the public gateway refuses that read without a token, so point it at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`. Sending still goes through the gateway URL.
 
+## Seize (permanent delegate, channel only)
+
+Moves a user's channel balance into the compliance ATA, `ATA(<COMPLIANCE_OWNER>, <MINT>)`
+under Token-2022, signed by the permanent delegate key. It is the only move the node admits
+from that key; anything else is refused at ingress.
+
+```bash
+cargo run --bin seize -- \
+  http://localhost:8899 \
+  ./keypairs/delegate.json \
+  <MINT> \
+  <SOURCE_OWNER> \
+  <COMPLIANCE_OWNER> \
+  [--amount <BASE_UNITS>] [--freeze-authority ./keypairs/admin.json]
+```
+
+One transaction creates the compliance ATA if needed, thaws a frozen source, moves the whole
+balance (or `--amount`) with `TransferChecked`, and freezes the source again. The freeze
+authority defaults to the delegate key. It simulates with `sigVerify` first, because the node
+drops a refused delegate move without an RPC error.
+
+With JWT on (`JWT_SECRET` set) the public gateway refuses the account reads and the simulation
+without a token, so point them at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`.
+Sending still goes through the gateway URL.
+
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script
 prints the current gates before sending and warns when a flag re-opens one.

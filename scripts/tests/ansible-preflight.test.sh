@@ -119,8 +119,12 @@ test_preflight_cases() {
   solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/admin.json" >/dev/null
   local data="$TMP/host"
   mkdir -p "$data/config"
-  local common=(-e env=dev -e "admin_keypair_path=$TMP/admin.json" -e "host_data_dir=$data")
+  local base=(-e env=dev -e "admin_keypair_path=$TMP/admin.json" -e "host_data_dir=$data")
+  local common=("${base[@]}" -e permanent_delegate=De1egate11111111111111111111111111111111111)
   local devnet=("${common[@]}" -e network=devnet -e fallback_rpc_url=https://fallback.invalid)
+
+  # No fallback to the admin key, so a missing delegate stops the deploy.
+  expect_refused no_permanent_delegate "permanent_delegate is not set" "${base[@]}" -e escrow_instance_id=$INSTANCE
 
   # An unknown name would pick the localnet compose file without its validator assets.
   expect_refused unknown_network "localnet, devnet or mainnet" "${devnet[@]}" -e network=mainnet-beta \

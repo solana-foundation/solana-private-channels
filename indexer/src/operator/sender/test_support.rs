@@ -18,7 +18,6 @@ use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROG
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use spl_token::solana_program::program_pack::Pack;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,6 +38,11 @@ pub(crate) fn ensure_test_signer() {
         std::env::set_var(
             "ADMIN_PRIVATE_KEY",
             bs58::encode(keypair.to_bytes()).into_string(),
+        );
+        // Not the admin key, so code that uses the admin key as the delegate fails.
+        std::env::set_var(
+            "OPERATOR_PERMANENT_DELEGATE",
+            solana_sdk::pubkey::Pubkey::new_unique().to_string(),
         );
     });
 }
@@ -435,28 +439,23 @@ pub(super) fn mock_bitmap_account_counted(
         .create()
 }
 
-/// Answer `getAccountInfo` with an initialized SPL mint owned by `authority`,
-/// which is the verdict that sends the JIT path down its retry arm.
+/// Answer `getAccountInfo` with an initialized channel mint owned by `authority`
+/// and carrying the operator's permanent delegate, which is the verdict that
+/// sends the JIT path down its retry arm.
 pub(super) fn mock_initialized_mint(
     server: &mut mockito::ServerGuard,
     authority: Pubkey,
 ) -> mockito::Mock {
-    let mint = spl_token::state::Mint {
-        mint_authority: solana_sdk::program_option::COption::Some(authority),
-        supply: 0,
-        decimals: 6,
-        is_initialized: true,
-        freeze_authority: solana_sdk::program_option::COption::None,
-    };
-    let mut data = vec![0u8; spl_token::state::Mint::LEN];
-    spl_token::state::Mint::pack(mint, &mut data).expect("pack mint");
+    let delegate = crate::operator::SignerUtil::permanent_delegate();
+    let data =
+        private_channel_core::t22_fixtures::t22_mint(6, &authority, None, Some(&delegate), 0);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "result": {
             "context": {"slot": 1},
             "value": {
-                "owner": spl_token::id().to_string(),
+                "owner": spl_token_2022::id().to_string(),
                 "lamports": 1_000_000u64,
                 "data": [STANDARD.encode(&data), "base64"],
                 "executable": false,

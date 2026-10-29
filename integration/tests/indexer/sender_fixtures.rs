@@ -39,12 +39,10 @@ use {
     },
     serde_json::{json, Value},
     solana_keychain::SolanaSigner,
+    solana_sdk::program_option::COption,
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     spl_associated_token_account::get_associated_token_address_with_program_id,
-    spl_token::{
-        solana_program::{program_option::COption, program_pack::Pack},
-        state::Mint,
-    },
+    spl_token_2022::{extension::StateWithExtensionsMut, state::Mint},
     std::sync::{Arc, Once},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -60,6 +58,11 @@ pub fn ensure_admin_signer_env() {
         let key = bs58::encode(kp.to_bytes()).into_string();
         std::env::set_var("ADMIN_SIGNER", "memory");
         std::env::set_var("ADMIN_PRIVATE_KEY", &key);
+        // Not the admin key, so code that uses the admin key as the delegate fails.
+        std::env::set_var(
+            "OPERATOR_PERMANENT_DELEGATE",
+            Pubkey::new_unique().to_string(),
+        );
         std::env::set_var("OPERATOR_SIGNER", "memory");
         std::env::set_var("OPERATOR_PRIVATE_KEY", &key);
     });
@@ -171,21 +174,24 @@ pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
     }
 }
 
-/// Packed SPL `Mint` bytes, initialized, with the supplied mint authority.
+/// Channel mint bytes (Token-2022 with the operator's permanent delegate),
+/// initialized, with the supplied mint authority.
 pub fn pack_mint_with_authority(authority: COption<Pubkey>) -> Vec<u8> {
-    let mint = Mint {
-        mint_authority: authority,
-        supply: 0,
-        decimals: 6,
-        is_initialized: true,
-        freeze_authority: COption::None,
-    };
-    let mut data = vec![0u8; Mint::LEN];
-    Mint::pack(mint, &mut data).expect("pack mint");
+    let delegate = SignerUtil::permanent_delegate();
+    let mut data = private_channel_core::t22_fixtures::t22_mint(
+        6,
+        &Pubkey::new_unique(),
+        None,
+        Some(&delegate),
+        0,
+    );
+    let mut state = StateWithExtensionsMut::<Mint>::unpack(&mut data).expect("channel mint");
+    state.base.mint_authority = authority;
+    state.pack_base();
     data
 }
 
-/// `getAccountInfo` reply wrapping raw account bytes as an SPL-token-owned account.
+/// `getAccountInfo` reply wrapping raw account bytes as a Token-2022-owned account.
 pub fn account_info_reply_bytes(data: &[u8]) -> Reply {
     Reply::result(json!({
         "context": { "slot": 100 },
@@ -193,7 +199,7 @@ pub fn account_info_reply_bytes(data: &[u8]) -> Reply {
             "data": [STANDARD.encode(data), "base64"],
             "executable": false,
             "lamports": 1_461_600u64,
-            "owner": spl_token::id().to_string(),
+            "owner": spl_token_2022::id().to_string(),
             "rentEpoch": 0u64,
             "space": data.len(),
         }
@@ -220,7 +226,7 @@ pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
 pub fn make_remint_info(transaction_id: i64) -> WithdrawalRemintInfo {
     let mint = Pubkey::new_unique();
     let user = Pubkey::new_unique();
-    let token_program = spl_token::id();
+    let token_program = spl_token_2022::id();
     let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
     WithdrawalRemintInfo {
         transaction_id,

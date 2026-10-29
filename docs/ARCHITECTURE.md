@@ -7,7 +7,7 @@ Solana Private Channels is a **payment channel** with direct access to Solana Ma
 - **Instant Finality**: Transactions settle in ~100ms (configurable)
 - **Zero Fees**: Gasless transactions via synthetic fee payer accounts
 - **Privacy**: Private transaction batching with controlled access
-- **Solana Compatible**: Runs standard Solana programs: SPL Token, Associated Token Account, and Memo
+- **Solana Compatible**: Runs standard Solana programs: Token-2022 (classic token instructions), Associated Token Account, and Memo
 - **Mainnet Access**: Cryptographically secure token deposits and withdrawals
 
 Solana Private Channels achieves these features through escrow/withdraw programs and an indexer/operator that syncs deposits/withdrawals with Solana Mainnet.
@@ -32,6 +32,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 - PostgreSQL-backed state with replication support
 - Read/write node separation for horizontal scaling
 - GaslessCallback for zero-fee transactions
+- Token-2022 channel mints, each carrying the configured permanent delegate; the delegate may move balances only into the compliance account (see [Core](CORE.md#stage-1-sigverify))
 
 ### Escrow & Withdrawal Programs
 

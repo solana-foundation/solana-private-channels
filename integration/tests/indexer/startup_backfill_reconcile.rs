@@ -47,7 +47,7 @@ use solana_sdk::{
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token_2022::ID as TOKEN_PROGRAM_ID;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use test_utils::mock_rpc::{MockRpcServer, Reply};

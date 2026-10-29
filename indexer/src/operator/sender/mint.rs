@@ -23,8 +23,10 @@ use solana_transaction_status::{
     UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
 };
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token::solana_program::program_pack::Pack;
-use spl_token::state::Mint;
+use spl_token_2022::extension::{
+    permanent_delegate::get_permanent_delegate, ExtensionType, StateWithExtensions,
+};
+use spl_token_2022::state::Mint;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -64,7 +66,7 @@ pub enum JitOutcome {
 }
 
 /// Outcome of decoding raw mint account bytes and comparing the embedded
-/// `mint_authority` to the operator's admin pubkey. Drives the
+/// `mint_authority` and permanent delegate to the operator's. Drives the
 /// `JitOutcome` branching in `try_jit_mint_initialization`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AuthorityCheck {
@@ -75,8 +77,12 @@ pub(super) enum AuthorityCheck {
     /// equal the expected authority. Holds the actual authority for log /
     /// error context. Quarantine to ManualReview.
     Mismatch(Pubkey),
+    /// Authority matches but the mint's permanent delegate is missing, revoked
+    /// or another key, so the operator would mint without the expected seize
+    /// authority. Holds the actual delegate. Quarantine to ManualReview.
+    DelegateMismatch(Option<Pubkey>),
     /// Mint decoded but `is_initialized = false`. The account is allocated
-    /// and SPL-Token-owned but not yet a mint. JIT proceeds to
+    /// and Token-2022-owned but not yet a mint. JIT proceeds to
     /// InitializeMint.
     Uninitialized,
     /// Decode failed: data length wrong, COption discriminant invalid, or
@@ -85,43 +91,49 @@ pub(super) enum AuthorityCheck {
     CorruptData,
 }
 
-/// Decode `data` as an SPL `Mint` and classify it relative to the supplied
-/// expected authority.
+/// Decode `data` as a Token-2022 `Mint` and classify it relative to the
+/// supplied expected authority and permanent delegate.
 ///
-/// SPL's `Mint::unpack` rejects uninitialized data (returns `Err`), which
-/// would conflate the legitimate "mint allocated but `is_initialized =
-/// false`" state with genuine corruption. To distinguish, this helper uses
-/// `Mint::unpack_unchecked` and inspects `is_initialized` itself.
+/// `unpack` refuses an uninitialized base with `UninitializedAccount`, which
+/// is mapped to `Uninitialized` so the legitimate "mint allocated but not yet
+/// initialized" state is not conflated with corruption.
 ///
 /// Returns:
-/// - `Match` if decoded, initialized, and `mint_authority` equals the
-///   supplied `expected_authority`.
-/// - `Mismatch(actual)` if decoded and initialized but the authority
-///   differs. A mint with `mint_authority = COption::None` is treated as
-///   `Mismatch(Pubkey::default())` — the operator cannot `mint_to` a
-///   no-authority mint either way.
-/// - `Uninitialized` if the bytes decode but `is_initialized = false`
-///   (allocated, SPL-Token-owned, but not yet a mint).
-/// - `CorruptData` for any decode failure (wrong length, invalid `COption`
-///   discriminant, etc.).
+/// - `Match` if decoded, initialized, `mint_authority` equals
+///   `expected_authority` and the permanent delegate equals `expected_delegate`.
+/// - `Mismatch(actual)` if the authority differs. A mint with no authority
+///   is `Mismatch(Pubkey::default())`: the operator cannot `mint_to` it either way.
+/// - `DelegateMismatch(actual)` if the authority matches but the delegate does
+///   not (missing extension, revoked, or another key).
+/// - `Uninitialized` if the account is allocated but not yet a mint.
+/// - `CorruptData` for any other decode failure.
 pub(super) fn decode_and_check_authority(
     data: &[u8],
     expected_authority: &Pubkey,
+    expected_delegate: &Pubkey,
 ) -> AuthorityCheck {
-    // `unpack_unchecked` differs from `unpack` only in skipping the
-    // is_initialized check, so wrong-length / invalid-discriminant inputs
-    // still surface as `Err` here.
-    let mint = match Mint::unpack_unchecked(data) {
+    let mint = match StateWithExtensions::<Mint>::unpack(data) {
         Ok(m) => m,
+        // Any zeroed buffer of at least a base mint unpacks as uninitialized; only the
+        // channel mint's own size can become one.
+        Err(solana_sdk::program_error::ProgramError::UninitializedAccount)
+            if Ok(data.len())
+                == ExtensionType::try_calculate_account_len::<Mint>(&[
+                    ExtensionType::PermanentDelegate,
+                ]) =>
+        {
+            return AuthorityCheck::Uninitialized
+        }
         Err(_) => return AuthorityCheck::CorruptData,
     };
-    if !mint.is_initialized {
-        return AuthorityCheck::Uninitialized;
+    match mint.base.mint_authority {
+        COption::Some(actual) if actual == *expected_authority => {}
+        COption::Some(actual) => return AuthorityCheck::Mismatch(actual),
+        COption::None => return AuthorityCheck::Mismatch(Pubkey::default()),
     }
-    match mint.mint_authority {
-        COption::Some(actual) if actual == *expected_authority => AuthorityCheck::Match,
-        COption::Some(actual) => AuthorityCheck::Mismatch(actual),
-        COption::None => AuthorityCheck::Mismatch(Pubkey::default()),
+    match get_permanent_delegate(&mint) {
+        Some(actual) if actual == *expected_delegate => AuthorityCheck::Match,
+        actual => AuthorityCheck::DelegateMismatch(actual),
     }
 }
 
@@ -134,6 +146,8 @@ const MR_AUTHORITY_MISMATCH_POSTINIT: &str =
     "Mint instruction failed after JIT: mint_authority mismatch — race with concurrent admin rotation during InitializeMint";
 const MR_CORRUPT_MINT_STATE: &str =
     "Mint instruction failed after JIT: corrupt mint state on-chain — decode failed";
+const MR_PERMANENT_DELEGATE_MISMATCH: &str =
+    "Mint instruction failed after JIT: permanent delegate mismatch, the mint lacks the configured seize authority";
 
 /// Attempt JIT mint initialization. Returns a `JitOutcome` verdict for the
 /// caller to dispatch (Retry / ManualReview / Transient).
@@ -157,10 +171,11 @@ pub(super) async fn try_jit_mint_initialization(
     };
 
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
+    let delegate = SignerUtil::permanent_delegate();
 
     // 2. Pre-check on-chain mint state.
     match state.rpc_client.get_account_data(&mint).await {
-        Ok(data) => match decode_and_check_authority(&data, &admin_pubkey) {
+        Ok(data) => match decode_and_check_authority(&data, &admin_pubkey, &delegate) {
             AuthorityCheck::Match => return JitOutcome::Retry(instruction),
             AuthorityCheck::Mismatch(actual) => {
                 warn!(
@@ -169,9 +184,16 @@ pub(super) async fn try_jit_mint_initialization(
                 );
                 return JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_PRECHECK.to_string());
             }
+            AuthorityCheck::DelegateMismatch(actual) => {
+                warn!(
+                    "JIT pre-check: mint {} has permanent delegate {:?} (expected {})",
+                    mint, actual, delegate
+                );
+                return JitOutcome::ManualReview(MR_PERMANENT_DELEGATE_MISMATCH.to_string());
+            }
             AuthorityCheck::CorruptData => {
                 warn!(
-                    "JIT pre-check: mint {} bytes do not decode as SPL Mint",
+                    "JIT pre-check: mint {} bytes do not decode as a Token-2022 mint",
                     mint
                 );
                 return JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string());
@@ -220,6 +242,7 @@ pub(super) async fn try_jit_mint_initialization(
         admin_pubkey,
         state.mint_cache.get_private_channel_token_program(),
         admin_pubkey,
+        delegate,
     );
 
     let init_tx_builder = TransactionBuilder::InitializeMint(Box::new(init_mint_builder));
@@ -288,9 +311,15 @@ pub(super) async fn try_jit_mint_initialization(
             // party initialized the same mint with a different authority
             // during our send window.
             let check = match state.rpc_client.get_account_data(&mint).await {
-                Ok(data) => decode_and_check_authority(&data, &admin_pubkey),
+                Ok(data) => decode_and_check_authority(&data, &admin_pubkey, &delegate),
                 Err(_) => {
-                    mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await
+                    mint_authority_check_with_backoff(
+                        &state.rpc_client,
+                        &mint,
+                        &admin_pubkey,
+                        &delegate,
+                    )
+                    .await
                 }
             };
             jit_verdict(check, instruction, &mint, None)
@@ -298,8 +327,13 @@ pub(super) async fn try_jit_mint_initialization(
         _ => {
             // Fallback for unknown failures (network blips, timeouts): re-read
             // the mint on-chain with backoff in case it was initialized out-of-band.
-            let check =
-                mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await;
+            let check = mint_authority_check_with_backoff(
+                &state.rpc_client,
+                &mint,
+                &admin_pubkey,
+                &delegate,
+            )
+            .await;
             jit_verdict(check, instruction, &mint, Some(&result))
         }
     }
@@ -346,8 +380,18 @@ fn jit_verdict(
             );
             JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_POSTINIT.to_string())
         }
+        AuthorityCheck::DelegateMismatch(actual) => {
+            warn!(
+                "JIT: mint {} has permanent delegate {:?} (expected the configured one)",
+                mint, actual
+            );
+            JitOutcome::ManualReview(MR_PERMANENT_DELEGATE_MISMATCH.to_string())
+        }
         AuthorityCheck::CorruptData => {
-            warn!("JIT: mint {} bytes do not decode as SPL Mint", mint);
+            warn!(
+                "JIT: mint {} bytes do not decode as a Token-2022 mint",
+                mint
+            );
             JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string())
         }
         AuthorityCheck::Uninitialized => match fallback_result {
@@ -384,6 +428,7 @@ async fn mint_authority_check_with_backoff(
     rpc_client: &RpcClientWithRetry,
     mint: &Pubkey,
     expected_authority: &Pubkey,
+    expected_delegate: &Pubkey,
 ) -> AuthorityCheck {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 250;
@@ -392,7 +437,8 @@ async fn mint_authority_check_with_backoff(
     for attempt in 0..ATTEMPTS {
         match rpc_client.get_account_data(mint).await {
             Ok(data) => {
-                let check = decode_and_check_authority(&data, expected_authority);
+                let check =
+                    decode_and_check_authority(&data, expected_authority, expected_delegate);
                 if !matches!(check, AuthorityCheck::Uninitialized) {
                     return check;
                 }
@@ -1439,36 +1485,34 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 #[cfg(test)]
 mod tests {
     use super::{decode_and_check_authority, AuthorityCheck};
+    use private_channel_core::t22_fixtures::{t22_mint, T22_MINT_LEN};
     use solana_sdk::pubkey::Pubkey;
-    use spl_token::solana_program::program_option::COption;
-    use spl_token::solana_program::program_pack::Pack;
-    use spl_token::state::Mint;
+    use spl_token_2022::extension::{
+        permanent_delegate::PermanentDelegate, BaseStateWithExtensionsMut, StateWithExtensionsMut,
+    };
+    use spl_token_2022::state::Mint;
 
     // Tests for `decode_and_check_authority`, the pure helper that drives
-    // the JIT pre-check, post-confirm re-check, and fallback backoff. Four
-    // variants must each be reachable: Match / Mismatch / Uninitialized /
-    // CorruptData.
+    // the JIT pre-check, post-confirm re-check, and fallback backoff. Each
+    // variant must be reachable: Match / Mismatch / DelegateMismatch /
+    // Uninitialized / CorruptData.
 
-    fn pack_mint(is_initialized: bool, authority: COption<Pubkey>) -> Vec<u8> {
-        let mint = Mint {
-            mint_authority: authority,
-            supply: 0,
-            decimals: 6,
-            is_initialized,
-            freeze_authority: COption::None,
-        };
-        let mut data = vec![0u8; Mint::LEN];
-        Mint::pack(mint, &mut data).expect("pack mint");
+    /// A channel mint with `authority` and the permanent delegate `delegate`.
+    fn channel_mint(authority: Option<Pubkey>, delegate: Option<Pubkey>) -> Vec<u8> {
+        let mut data = t22_mint(6, &Pubkey::new_unique(), None, delegate.as_ref(), 0);
+        let mut state = StateWithExtensionsMut::<Mint>::unpack(&mut data).unwrap();
+        state.base.mint_authority = authority.into();
+        state.pack_base();
         data
     }
 
-    /// Initialized mint with `mint_authority` matching the supplied admin.
+    /// Initialized mint with `mint_authority` and delegate matching the operator's.
     #[test]
     fn decode_and_check_authority_match_returns_match() {
-        let admin = Pubkey::new_unique();
-        let data = pack_mint(true, COption::Some(admin));
+        let (admin, delegate) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let data = channel_mint(Some(admin), Some(delegate));
         assert_eq!(
-            decode_and_check_authority(&data, &admin),
+            decode_and_check_authority(&data, &admin, &delegate),
             AuthorityCheck::Match
         );
     }
@@ -1478,79 +1522,108 @@ mod tests {
     /// surface the actual authority for log/error context.
     #[test]
     fn decode_and_check_authority_mismatch_returns_mismatch() {
-        let admin = Pubkey::new_unique();
-        let other = Pubkey::new_unique();
-        let data = pack_mint(true, COption::Some(other));
-        match decode_and_check_authority(&data, &admin) {
+        let (admin, delegate, other) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let data = channel_mint(Some(other), Some(delegate));
+        match decode_and_check_authority(&data, &admin, &delegate) {
             AuthorityCheck::Mismatch(actual) => assert_eq!(actual, other),
             other => panic!("expected Mismatch, got {:?}", other),
         }
     }
 
     /// Initialized mint whose authority has been cleared (`COption::None`)
-    /// is treated as a mismatch with `Pubkey::default()` — the operator
+    /// is treated as a mismatch with `Pubkey::default()`: the operator
     /// cannot mint without an authority either way.
     #[test]
     fn decode_and_check_authority_no_authority_returns_mismatch_default() {
-        let admin = Pubkey::new_unique();
-        let data = pack_mint(true, COption::None);
-        match decode_and_check_authority(&data, &admin) {
+        let (admin, delegate) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let data = channel_mint(None, Some(delegate));
+        match decode_and_check_authority(&data, &admin, &delegate) {
             AuthorityCheck::Mismatch(actual) => assert_eq!(actual, Pubkey::default()),
             other => panic!("expected Mismatch, got {:?}", other),
         }
     }
 
-    /// Mint allocated and SPL-Token-owned but with `is_initialized = false`
-    /// (the legitimate JIT case where InitializeMint should run).
+    /// The operator never mints into a mint that lacks the seize authority it expects.
+    #[test]
+    fn decode_and_check_authority_wrong_or_missing_delegate_returns_delegate_mismatch() {
+        let (admin, delegate, other) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mut revoked = channel_mint(Some(admin), Some(delegate));
+        StateWithExtensionsMut::<Mint>::unpack(&mut revoked)
+            .unwrap()
+            .get_extension_mut::<PermanentDelegate>()
+            .unwrap()
+            .delegate = None.try_into().unwrap();
+        // A legacy 82-byte mint decodes as a Token-2022 mint with no extension.
+        let cases = [
+            (
+                "other delegate",
+                channel_mint(Some(admin), Some(other)),
+                Some(other),
+            ),
+            ("no extension", channel_mint(Some(admin), None), None),
+            ("revoked delegate", revoked, None),
+        ];
+        for (label, data, actual) in cases {
+            assert_eq!(
+                decode_and_check_authority(&data, &admin, &delegate),
+                AuthorityCheck::DelegateMismatch(actual),
+                "{label}"
+            );
+        }
+    }
+
+    /// Mint allocated and Token-2022-owned but not yet initialized (the
+    /// legitimate JIT case where InitializeMint should run).
     #[test]
     fn decode_and_check_authority_uninitialized_returns_uninitialized() {
         let admin = Pubkey::new_unique();
-        let data = pack_mint(false, COption::Some(admin));
         assert_eq!(
-            decode_and_check_authority(&data, &admin),
+            decode_and_check_authority(&[0u8; T22_MINT_LEN], &admin, &admin),
             AuthorityCheck::Uninitialized
         );
     }
 
-    /// Empty account data — the mint account was never created. Pre-fix
-    /// this returned `false` from the old bool helper; the new helper
-    /// reports `CorruptData` (decode-fail) rather than `Uninitialized`,
-    /// because there is no reliable way to distinguish "account doesn't
-    /// exist" from "account has wrong-length corrupt data" via account
-    /// data alone. Both cases need JIT to attempt InitializeMint, but the
-    /// caller distinguishes by also checking `Err` from the RPC; this test
-    /// pins that empty/short data lands in `CorruptData`.
+    /// Empty account data: there is no reliable way to tell "account doesn't
+    /// exist" from corrupt data via the bytes alone, so it lands in `CorruptData`;
+    /// the caller distinguishes by also checking `Err` from the RPC.
     #[test]
     fn decode_and_check_authority_empty_returns_corrupt() {
         let admin = Pubkey::new_unique();
         assert_eq!(
-            decode_and_check_authority(&[], &admin),
+            decode_and_check_authority(&[], &admin, &admin),
             AuthorityCheck::CorruptData
         );
     }
 
-    /// Data of the wrong length cannot decode as a mint.
+    /// Zeroed data of any size but the channel mint's is not a mint waiting to be created.
     #[test]
     fn decode_and_check_authority_wrong_length_returns_corrupt() {
         let admin = Pubkey::new_unique();
-        assert_eq!(
-            decode_and_check_authority(&[0u8; 10], &admin),
-            AuthorityCheck::CorruptData
-        );
-        assert_eq!(
-            decode_and_check_authority(&[0xFFu8; Mint::LEN + 1], &admin),
-            AuthorityCheck::CorruptData
-        );
+        for len in [10, 82, 100, 201, 203] {
+            assert_eq!(
+                decode_and_check_authority(&vec![0u8; len], &admin, &admin),
+                AuthorityCheck::CorruptData,
+                "{len} bytes"
+            );
+        }
     }
 
-    /// Random bytes of the correct length usually contain an invalid
-    /// `COption` discriminant byte — `Mint::unpack` rejects them.
+    /// Random bytes of the base length usually contain an invalid `COption`
+    /// discriminant byte, which the unpack rejects.
     #[test]
     fn decode_and_check_authority_random_bytes_returns_corrupt() {
         let admin = Pubkey::new_unique();
-        let data: Vec<u8> = (0u8..Mint::LEN as u8).collect();
+        let data: Vec<u8> = (0u8..82).collect();
         assert_eq!(
-            decode_and_check_authority(&data, &admin),
+            decode_and_check_authority(&data, &admin, &admin),
             AuthorityCheck::CorruptData
         );
     }

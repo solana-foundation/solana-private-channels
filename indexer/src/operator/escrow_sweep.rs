@@ -25,9 +25,9 @@ use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
-use spl_token::state::Mint;
 use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::state::Account as Token2022Account;
+use spl_token_2022::state::Mint as Token2022Mint;
 use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::warn;
@@ -556,7 +556,7 @@ async fn sweep_once(
 
 /// Channel supply for `mint` and the context slot the node answered at. The node reads
 /// its slot before the account, so the supply is at least as new as that slot. An absent
-/// mint account (nothing minted yet), or one SPL Token does not own, reads as supply 0.
+/// mint account (nothing minted yet), or one no token program owns, reads as supply 0.
 pub async fn fetch_channel_supply_at(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
@@ -578,17 +578,26 @@ pub async fn fetch_channel_supply_at(
         None => return Ok((0, slot)),
     };
 
-    // Only SPL Token can mint, so an account it does not own (lamports someone sent to the
-    // address) has minted nothing. A token-owned account that will not decode stays an error.
-    if account.owner != spl_token::id() {
+    // A legacy mint can only be state the reset missed, and its supply is real, so it is an
+    // error rather than zero.
+    if account.owner == spl_token::id() {
+        return Err(EscrowSweepError {
+            reason: format!("Channel mint {mint} is a legacy SPL Token mint: reset incomplete"),
+        });
+    }
+
+    // Channel mints are Token-2022, so an account it does not own (lamports someone sent to
+    // the address) has minted nothing. A token-owned account that will not decode stays an error.
+    if account.owner != spl_token_2022::id() {
         return Ok((0, slot));
     }
 
-    // The channel program mints classic SPL tokens (not Token-2022).
-    let mint_state = Mint::unpack(&account.data).map_err(|e| EscrowSweepError {
-        reason: format!("Failed to parse channel mint account {mint}: {e}"),
+    let mint_state = StateWithExtensions::<Token2022Mint>::unpack(&account.data).map_err(|e| {
+        EscrowSweepError {
+            reason: format!("Failed to parse channel mint account {mint}: {e}"),
+        }
     })?;
-    Ok((mint_state.supply, slot))
+    Ok((mint_state.base.supply, slot))
 }
 
 /// Extra reads a channel supply answer behind the anchor gets before it counts as stale.
@@ -736,6 +745,7 @@ pub(crate) mod tests {
     use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
     use spl_token::solana_program::program_option::COption;
     use spl_token::state::AccountState;
+    use spl_token::state::Mint;
     use spl_token_2022::extension::transfer_hook::TransferHookAccount;
     use spl_token_2022::extension::{
         BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
@@ -1222,22 +1232,51 @@ pub(crate) mod tests {
         assert!(result.is_err());
     }
 
-    /// getAccountInfo response wrapping an 82-byte SPL Mint blob with `supply`.
+    /// getAccountInfo response wrapping a 202-byte channel mint (permanent delegate) with `supply`.
     fn mint_account_body(supply: u64) -> String {
+        let buf = private_channel_core::t22_fixtures::t22_mint(
+            6,
+            &Pubkey::new_unique(),
+            None,
+            Some(&Pubkey::new_unique()),
+            supply,
+        );
+        account_body(spl_token_2022::id(), &buf)
+    }
+
+    /// getAccountInfo response for an account with `owner` and `data`.
+    fn account_body(owner: Pubkey, data: &[u8]) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{owner}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+        )
+    }
+
+    /// A legacy SPL mint at a channel mint address is state a reset missed, so it errors
+    /// rather than reading as zero and hiding its supply from the solvency check.
+    #[tokio::test]
+    async fn fetch_channel_supply_legacy_spl_mint_is_err() {
         let mint = Mint {
             mint_authority: COption::Some(Pubkey::new_unique()),
-            supply,
+            supply: 77,
             decimals: 6,
             is_initialized: true,
             freeze_authority: COption::None,
         };
         let mut buf = vec![0u8; Mint::LEN];
         mint.pack_into_slice(&mut buf);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-        format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-            prog = spl_token::id(),
-        )
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(account_body(spl_token::id(), &buf))
+            .create_async()
+            .await;
+
+        let err = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
+            .await
+            .unwrap_err();
+        assert!(err.reason.contains("reset incomplete"), "{}", err.reason);
     }
 
     #[tokio::test]
@@ -1276,9 +1315,9 @@ pub(crate) mod tests {
     }
 
     /// Anyone can send lamports to a mint address on the channel before the mint exists, which
-    /// leaves a System account there. Only SPL Token can mint, so that account has supply 0.
+    /// leaves a System account there. Only Token-2022 can mint, so that account has supply 0.
     #[tokio::test]
-    async fn fetch_channel_supply_account_not_owned_by_spl_token_is_zero() {
+    async fn fetch_channel_supply_account_not_owned_by_a_token_program_is_zero() {
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/")
@@ -1324,17 +1363,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn fetch_channel_supply_undecodable_mint_is_err() {
-        // An SPL Token account that is not a mint must never read as 0 supply. Only a non-token
-        // owner can be written off as 0.
+        // A Token-2022 account that is not a mint must never read as 0 supply. Only a
+        // non-token owner can be written off as 0.
         let mut server = mockito::Server::new_async().await;
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode(spl_account_bytes(Pubkey::new_unique(), 1_000));
         server
             .mock("POST", "/")
             .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
-                prog = spl_token::id(),
+            .with_body(account_body(
+                spl_token_2022::id(),
+                &private_channel_core::t22_fixtures::golden_t22_ata(),
             ))
             .create_async()
             .await;

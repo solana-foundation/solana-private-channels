@@ -157,7 +157,7 @@ mod tests {
         STANDARD.encode(&bytes)
     }
 
-    /// Builds a v0 transaction whose static keys are [payer, spl_token], plus
+    /// Builds a v0 transaction whose static keys are [payer, Token-2022], plus
     /// `num_lookups` declared lookup tables. With `ix_uses_lookup` the
     /// instruction indexes a key only a resolved lookup table could supply.
     fn v0_tx(num_lookups: usize, ix_uses_lookup: bool) -> VersionedTransaction {
@@ -177,12 +177,12 @@ mod tests {
                 num_readonly_signed_accounts: 0,
                 num_readonly_unsigned_accounts: 1,
             },
-            account_keys: vec![payer.pubkey(), spl_token::id()],
+            account_keys: vec![payer.pubkey(), spl_token_2022::id()],
             recent_blockhash: Hash::default(),
             instructions: vec![CompiledInstruction {
                 program_id_index: 1,
                 accounts,
-                // SPL Token Transfer: tag 3 followed by a u64 amount.
+                // Token-2022 Transfer: tag 3 followed by a u64 amount.
                 data: vec![3, 1, 0, 0, 0, 0, 0, 0, 0],
             }],
             address_table_lookups,
@@ -250,13 +250,15 @@ mod tests {
         let payer = Keypair::new();
         let from_ata = Pubkey::new_unique();
         let to_ata = Pubkey::new_unique();
-        let ix = spl_token::instruction::transfer(
-            &spl_token::id(),
+        let ix = spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
             &from_ata,
+            &Pubkey::new_unique(),
             &to_ata,
             &payer.pubkey(),
             &[],
             1_000,
+            6,
         )
         .unwrap();
         Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], Hash::default())
@@ -359,7 +361,7 @@ mod tests {
         assert!(result.is_err(), "disallowed program should be rejected");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Only SPL token"),
+            err_msg.contains("Only Token-2022"),
             "expected allowlist error, got: {err_msg}"
         );
     }
@@ -369,13 +371,15 @@ mod tests {
         let payer = Keypair::new();
         let from_ata = Pubkey::new_unique();
         let to_ata = Pubkey::new_unique();
-        let ix = spl_token::instruction::transfer(
-            &spl_token::id(),
+        let ix = spl_token_2022::instruction::transfer_checked(
+            &spl_token_2022::id(),
             &from_ata,
+            &Pubkey::new_unique(),
             &to_ata,
             &payer.pubkey(),
             &[],
             1_000,
+            6,
         )
         .unwrap();
         let tx = Transaction::new_signed_with_payer(
@@ -389,7 +393,7 @@ mod tests {
         let (deps, _rx) = make_write_deps();
 
         let result = send_transaction_impl(&deps, encoded, None).await;
-        assert!(result.is_ok(), "SPL token tx should pass allowlist");
+        assert!(result.is_ok(), "Token-2022 tx should pass allowlist");
     }
 
     // The rx assertion is load bearing: it proves the tx never entered the pipeline.
@@ -462,7 +466,7 @@ mod tests {
             .expect_err("System CreateAccount must be rejected");
         assert_eq!(err.code(), INVALID_PARAMS_CODE);
         assert!(
-            err.to_string().contains("Only SPL token"),
+            err.to_string().contains("Only Token-2022"),
             "expected allowlist error, got: {err}"
         );
         assert!(
@@ -492,7 +496,7 @@ mod tests {
             .expect_err("System Allocate must be rejected");
         assert_eq!(err.code(), INVALID_PARAMS_CODE);
         assert!(
-            err.to_string().contains("Only SPL token"),
+            err.to_string().contains("Only Token-2022"),
             "expected allowlist error, got: {err}"
         );
         assert!(
@@ -526,7 +530,7 @@ mod tests {
             .expect_err("System Transfer + Memo must be rejected");
         assert_eq!(err.code(), INVALID_PARAMS_CODE);
         assert!(
-            err.to_string().contains("Only SPL token"),
+            err.to_string().contains("Only Token-2022"),
             "expected allowlist error, got: {err}"
         );
         assert!(
@@ -676,8 +680,8 @@ mod tests {
     // one, even through an instruction it is given to, serializes them all behind it.
     #[tokio::test]
     async fn writable_program_or_reserved_account_rejected() {
-        // spl_token is a loaded program, the clock sysvar a reserved key.
-        for protected_key in [spl_token::ID, solana_sdk_ids::sysvar::clock::ID] {
+        // Token-2022 is a loaded program, the clock sysvar a reserved key.
+        for protected_key in [spl_token_2022::ID, solana_sdk_ids::sysvar::clock::ID] {
             let payer = Keypair::new();
             // Key 1 is writable and given to an ATA instruction, so it is not unused.
             let message = Message {

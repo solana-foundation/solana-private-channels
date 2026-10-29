@@ -185,6 +185,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test ingress_backpressure -- --nocapture
 	@cd integration && cargo test --test ordered_shutdown_e2e -- --nocapture
 	@cd integration && cargo test --test v1_transaction_e2e -- --nocapture
+	@cd integration && cargo test --test t22_golden -- --nocapture
 	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture

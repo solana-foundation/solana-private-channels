@@ -977,7 +977,7 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
         user,
         instance,
         mint,
-        spl_token::id(),
+        spl_token_2022::id(),
         DEPOSIT_AMOUNT,
     )
     .await
@@ -1023,7 +1023,7 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
         user.pubkey(),
         WITHDRAWAL_AMOUNT,
         NONCE,
-        spl_token::id(),
+        spl_token_2022::id(),
     )
     .await
     .expect("release funds");
@@ -1033,7 +1033,7 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
         &rpc_url,
         instance,
         mint,
-        spl_token::id(),
+        spl_token_2022::id(),
         DEPOSIT_AMOUNT - WITHDRAWAL_AMOUNT,
     )
     .await;
@@ -1247,7 +1247,7 @@ async fn unreadable_custody_halts_without_quarantine() {
         .upsert_mints_batch(&[DbMint::new(
             mint.to_string(),
             MINT_DECIMALS as i16,
-            spl_token::id().to_string(),
+            spl_token_2022::id().to_string(),
             TokenAmount(1),
         )])
         .await

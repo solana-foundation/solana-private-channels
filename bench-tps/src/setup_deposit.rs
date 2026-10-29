@@ -23,8 +23,8 @@ use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
         types::{
-            BenchState, DepositConfig, BENCH_MIN_DEPOSIT_AMOUNT, BENCH_MIN_WITHDRAW_AMOUNT,
-            BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
+            channel_permanent_delegate, BenchState, DepositConfig, BENCH_MIN_DEPOSIT_AMOUNT,
+            BENCH_MIN_WITHDRAW_AMOUNT, BENCH_WITHDRAW_FEE, MINT_DECIMALS, SETUP_BATCH_SIZE,
         },
     },
     anyhow::{Context, Result},
@@ -454,9 +454,9 @@ pub async fn run_setup_deposit_phase(
     // ------------------------------------------------------------------
     // Task 6b: Initialise the same mint on PrivateChannel
     //
-    // The PrivateChannel write-node creates accounts implicitly (gasless), so
-    // create_admin_initialize_mint only sends the initialize_mint
-    // instruction — no preceding create_account is needed.
+    // The PrivateChannel write-node creates the mint account itself (gasless),
+    // so create_admin_initialize_mint sends only the Token-2022 permanent
+    // delegate and InitializeMint2 instructions, no preceding create_account.
     //
     // Without this step the operator would attempt JIT initialisation for
     // every first deposit, blocking the sender loop ~200 ms each time.
@@ -480,6 +480,7 @@ pub async fn run_setup_deposit_phase(
                         &admin_keypair,
                         &mint,
                         MINT_DECIMALS,
+                        &channel_permanent_delegate(&admin_keypair.pubkey()),
                         blockhash,
                     );
                     match private_channel_rpc.send_transaction(&init_tx).await {
@@ -624,7 +625,8 @@ pub async fn run_setup_deposit_phase(
                         let owner = kp.pubkey();
                         let m = mint;
                         async move {
-                            let tx = create_ata_transaction(&admin, &owner, &m, bh);
+                            let tx =
+                                create_ata_transaction(&admin, &owner, &m, &spl_token::id(), bh);
                             rpc.send_transaction(&tx).await
                         }
                     },
@@ -728,7 +730,14 @@ pub async fn run_setup_deposit_phase(
                         let rpc = Arc::clone(&rpc);
                         let ata = get_associated_token_address(&kp.pubkey(), &mint);
                         async move {
-                            let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, bh);
+                            let tx = create_admin_mint_to(
+                                &admin,
+                                &mint,
+                                &ata,
+                                initial_balance,
+                                &spl_token::id(),
+                                bh,
+                            );
                             rpc.send_transaction_with_config(
                                 &tx,
                                 RpcSendTransactionConfig {

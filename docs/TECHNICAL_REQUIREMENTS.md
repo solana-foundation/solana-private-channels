@@ -48,13 +48,13 @@ and ~30 MB RAM, and are not material to sizing.*
 
 Storage has two independent drivers.
 
-**1. Working state, token accounts.** ~165 bytes per token account.
+**1. Working state, token accounts.** ~170 bytes per token account (a Token-2022 ATA with `ImmutableOwner`); each mint is 202 bytes.
 
 | Token accounts | Disk |
 |---|---|
 | 100k | 17 MB |
-| 1M | 165 MB |
-| 10M | 1.65 GB |
+| 1M | 170 MB |
+| 10M | 1.7 GB |
 
 **2. Block + transaction history.** Linear in TPS × retention.
 

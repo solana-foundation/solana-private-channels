@@ -226,6 +226,8 @@ patch_env() {
 }
 
 patch_env "PRIVATE_CHANNEL_ADMIN_KEYS" "${ADMIN_PUBKEY}"
+# The node requires a delegate; the bench creates its mints with the admin key as one.
+patch_env "PRIVATE_CHANNEL_PERMANENT_DELEGATE" "${ADMIN_PUBKEY}"
 patch_env "ADMIN_PRIVATE_KEY" "${ADMIN_PRIVKEY_JSON}"
 
 echo "Patched PRIVATE_CHANNEL_ADMIN_KEYS and ADMIN_PRIVATE_KEY in ${BENCH_ENV}"

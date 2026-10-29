@@ -862,7 +862,7 @@ impl SenderState {
             transactions.len()
         );
 
-        // PrivateChannel only supports SPL Token for now.
+        // Channel mints and accounts are Token-2022.
         let private_channel_token_program = self.mint_cache.get_private_channel_token_program();
 
         // Id of the last row fully handled, where a failed journal read rewinds the cursor.
@@ -1203,7 +1203,7 @@ mod tests {
         assert_ne!(entry.remint_info.user, recipient);
         assert_eq!(
             entry.remint_info.user_ata,
-            get_associated_token_address_with_program_id(&initiator, &mint, &spl_token::id()),
+            get_associated_token_address_with_program_id(&initiator, &mint, &spl_token_2022::id()),
             "remint must mint into the initiator's private channel ATA"
         );
 
