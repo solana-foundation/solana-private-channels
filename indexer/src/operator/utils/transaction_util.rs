@@ -12,9 +12,13 @@ use private_channel_metrics::MetricLabel;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keychain::SolanaSigner;
+use solana_sdk::hash::Hash;
 use solana_sdk::instruction::InstructionError;
 use solana_sdk::{
-    message::Message, pubkey::Pubkey, signature::Signature, transaction::Transaction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Signature, SIGNATURE_BYTES},
+    transaction::Transaction,
 };
 use tracing::{debug, warn};
 
@@ -68,30 +72,14 @@ pub async fn sign_and_send_transaction(
 /// verdict knows the earliest block the signature could appear in.
 pub async fn build_and_sign(
     rpc_client: &RpcClientWithRetry,
-    mut ix_with_signers: InstructionWithSigners,
+    ix_with_signers: InstructionWithSigners,
 ) -> Result<(Transaction, Signature, u64, u64), TransactionError> {
-    if let Some(compute_unit_price) = ix_with_signers.compute_unit_price {
-        let compute_budget_ix =
-            ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
-        ix_with_signers.instructions.insert(0, compute_budget_ix);
-    }
-
-    // Prepend compute budget instruction if specified
-    if let Some(compute_units) = ix_with_signers.compute_budget {
-        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(compute_units);
-        ix_with_signers.instructions.insert(0, compute_budget_ix);
-    }
-
     let (recent_blockhash, blockhash_slot, last_valid_block_height) = rpc_client
         .get_latest_blockhash_with_commitment_and_context()
         .await
         .map_err(TransactionError::Rpc)?;
 
-    let message = Message::new_with_blockhash(
-        &ix_with_signers.instructions,
-        Some(&ix_with_signers.fee_payer),
-        &recent_blockhash,
-    );
+    let message = build_message(&ix_with_signers, &recent_blockhash);
 
     let mut transaction = Transaction::new_unsigned(message);
 
@@ -110,6 +98,40 @@ pub async fn build_and_sign(
         last_valid_block_height,
         blockhash_slot,
     ))
+}
+
+/// The message `build_and_sign` signs: the compute-unit limit and price, when set,
+/// ahead of `ix_with_signers`' own instructions, paid by its fee payer.
+fn build_message(ix_with_signers: &InstructionWithSigners, recent_blockhash: &Hash) -> Message {
+    let mut instructions = Vec::with_capacity(ix_with_signers.instructions.len() + 2);
+    if let Some(compute_units) = ix_with_signers.compute_budget {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+            compute_units,
+        ));
+    }
+    if let Some(compute_unit_price) = ix_with_signers.compute_unit_price {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+            compute_unit_price,
+        ));
+    }
+    instructions.extend(ix_with_signers.instructions.iter().cloned());
+
+    Message::new_with_blockhash(
+        &instructions,
+        Some(&ix_with_signers.fee_payer),
+        recent_blockhash,
+    )
+}
+
+/// Bytes the transaction `build_and_sign` makes from `ix_with_signers` takes on the
+/// wire. The blockhash and each signature are fixed-width, and the signature count
+/// comes from the message, so `signers` may be empty.
+pub fn legacy_wire_len(ix_with_signers: &InstructionWithSigners) -> usize {
+    let message = build_message(ix_with_signers, &Hash::default());
+    let signatures = usize::from(message.header.num_required_signatures);
+    // The signature count is a short_vec: one byte below 128, two up to u8::MAX.
+    let count_len = if signatures < 128 { 1 } else { 2 };
+    count_len + signatures * SIGNATURE_BYTES + message.serialize().len()
 }
 
 /// Broadcast an already-signed transaction.
@@ -299,6 +321,8 @@ fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> 
         12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
         13 => Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
         14 => Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+        20 => Some(PrivateChannelEscrowProgramError::WalletNotAllowed),
+        21 => Some(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda),
         _ => None,
     }
 }
@@ -419,6 +443,11 @@ mod tests {
             (
                 14,
                 Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+            ),
+            (20, Some(PrivateChannelEscrowProgramError::WalletNotAllowed)),
+            (
+                21,
+                Some(PrivateChannelEscrowProgramError::InvalidAllowedWalletPda),
             ),
             (99, None),
         ];

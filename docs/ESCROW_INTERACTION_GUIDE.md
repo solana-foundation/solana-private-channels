@@ -104,7 +104,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
 
 **Security Notes:**
 - Supports Token Program and Token-2022
-- Token-2022 mints with the `TransferHook` extension are supported. `Deposit` and `ReleaseFunds` forward their trailing accounts to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. The client resolves those accounts (see [Transfer-hook mints](#transfer-hook-mints)). The program caps them at 32, but a legacy-transaction release fits 12, and the withdrawal operator parks anything past that rather than build a transaction it cannot send. A deposit's room depends on how the client builds the transaction; its two whitelist accounts take two of it
+- Token-2022 mints with the `TransferHook` extension are supported. `Deposit` and `ReleaseFunds` forward their trailing accounts to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. The client resolves those accounts (see [Transfer-hook mints](#transfer-hook-mints)). The program caps them at 32, but a legacy-transaction release fits 12 (13 to the withdrawer's own wallet) with a separate operator key, or 15 (16) when the operator key is the fee payer's, as in the bundled compose files, and the withdrawal operator parks anything past that rather than build a transaction it cannot send. A deposit's room depends on how the client builds the transaction; its two whitelist accounts take two of it
 - Token-2022 mints with `PermanentDelegate` or `PausableConfig` extensions are accepted; the operator enforces drain detection and pause state off-chain via a withdrawal pre-flight
 - Only the instance admin can allow mints
 - `withdrawFee` is required and may be `0`. It is charged on top of every channel withdrawal and paid to the operator admin, and is the only thing that pays for a release, successful or failed. The AllowMint admin owns sizing it to cover one release's SOL cost.
@@ -313,6 +313,7 @@ const enableIx = getSetWhitelistEnabledInstruction({
 - The operator names the withdrawer, as it already names the destination and amount
 - While withdrawals are whitelisted, the operator admin (treasury) and its sweep destination must be allowed to withdraw. While deposits are whitelisted, the reprice or rotation deposit must come from an allowed wallet
 - Not gated: transfers inside the channel. A wallet that cannot withdraw can still move its balance to one that can
+- Not gated either: the tokens after a release. The escrow pays the destination's canonical ATA, so an allowed wallet can move them on, or on SPL Token have already handed that ATA to another owner
 - Whitelisting withdrawals on a live instance stops unlisted wallets withdrawing; each attempt is reminted and costs them the mint's withdraw fee, if it has one
 - Whitelisting withdrawals but not deposits lets unlisted wallets deposit but not withdraw; each release they try is reminted, costs them the mint's withdraw fee, if it has one, and raises an alert
 - While withdrawals are whitelisted, give every mint a nonzero withdraw fee. On a zero-fee mint nothing limits how often a refused wallet triggers remints and alerts

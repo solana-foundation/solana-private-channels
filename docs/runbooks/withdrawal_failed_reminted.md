@@ -27,9 +27,9 @@ by `remint_signature`. Check the row's status, then:
 
 ## Expected cause: escrow whitelist
 
-While withdrawals are whitelisted, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw, with `custom program error: 0x14` (`WalletNotAllowed`). The message alone does not prove it: Token-2022 and transfer hooks can also return `0x14`, and a refusal can show as `None` or `recovered from persistent storage`. Confirm that withdrawals are whitelisted and the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set. If so, reconcile as usual; repeats need no ticket. With the gateway check on, a whitelist refusal that still reaches a remint means the check could not run (look for `Withdraw whitelist not checked` in the gateway log), or the wallet was removed after it sent.
+While withdrawals are whitelisted, the escrow refuses a release whose withdrawer or destination is not allowed to withdraw, with `custom program error: 0x14` (`WalletNotAllowed`). `Some(WalletNotAllowed)` proves it: the operator traced it to the escrow. A bare `0x14` or `recovered from persistent storage` does not, since Token-2022 and hooks can return `0x14` too. For those, confirm that withdrawals are whitelisted, that the withdrawer's or destination's AllowedWallet PDA is missing or has `withdrawals_blocked` set, and that the history (`getSignaturesForAddress`) of every admin the instance has had since the row's `created_at` shows neither changed since then. If so, reconcile as usual; repeats need no ticket. Otherwise ticket it. With the gateway check on, a whitelist refusal that still reaches a remint means the check could not run (look for `Withdraw whitelist not checked` in the gateway log), or the wallet was removed after it sent.
 
-`custom program error: 0x15` is never an expected refusal. With withdrawals whitelisted it most likely means `InvalidAllowedWalletPda`, an operator bug that passed the wrong account: [escalate](_escalation.md) (Tier 3).
+`custom program error: 0x15` or `Some(InvalidAllowedWalletPda)` is never an expected refusal: [escalate](_escalation.md) (Tier 3). `Some(InvalidAllowedWalletPda)` is an operator bug that passed the wrong account, and a bare `0x15` most likely is too while withdrawals are whitelisted.
 
 ## Reconciliation steps
 

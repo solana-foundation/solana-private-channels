@@ -8,6 +8,7 @@ use crate::operator::instruction_util::{
 use crate::operator::recovery::{
     check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
 };
+use crate::operator::sender::types::InstructionWithSigners;
 use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
 };
@@ -15,6 +16,7 @@ use crate::operator::utils::mint_util::{HookExtras, MintCache};
 use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
 };
+use crate::operator::utils::transaction_util::legacy_wire_len;
 use crate::operator::{
     find_allowed_mint_pda, find_allowed_wallet_pda, find_event_authority_pda, find_operator_pda,
     find_withdrawal_bitmap_pda, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
@@ -24,6 +26,7 @@ use crate::storage::common::storage::RequeueOutcome;
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
+use private_channel_core::rpc::constants::PACKET_DATA_SIZE;
 use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_escrow_program_client::AllowedMint;
@@ -977,27 +980,24 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
-/// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
-/// `token_utils`, which codama does not export), but the transport binds first:
-/// the sender builds a legacy message with no lookup tables, and the 1232-byte
-/// packet holds 830 bytes of release plus 33 per extra, so 12 fit and 13 do
-/// not. Raise it toward 32 if the sender ever moves to versioned transactions
-/// with a lookup table, or to v1 transactions with their larger limit.
+/// The program's cap on extras (`MAX_HOOK_REMAINING_ACCOUNTS` in its `token_utils`,
+/// which codama does not export), checked before the list is resolved.
 ///
-/// The release grew by one account key plus its index byte, the same 33 bytes
-/// an extra costs, each time ReleaseFunds gained a slot: memo_program, then
-/// user_allowed_wallet_pda, then withdrawer_allowed_wallet_pda. The withdrawer argument
-/// added 32 bytes of data alongside the last one.
-const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 12;
+/// The legacy packet binds first, at 12 new accounts, or 15 when the operator key is
+/// the fee payer's, so `attach_hook_extras` also measures the built release. The message
+/// lists a key once, so a withdrawal to the withdrawer's own wallet, whose two whitelist
+/// entries are one account, fits one more. Versioned transactions with a lookup table,
+/// or v1 transactions, would make room for all 32.
+const MAX_HOOK_EXTRAS: usize = 32;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
 ///
-/// Returns a bail when the mint's validation account is unparseable or declares
-/// more accounts than a release can carry: no transfer of that mint can
-/// resolve, so the row parks rather than the task restarting on a transient
-/// forever. A failed read stays an error, since that is a node problem and not a
-/// row problem.
+/// Returns a bail when the mint's validation account is unparseable, declares
+/// more accounts than the program takes, or makes the release too large for a
+/// legacy packet: no release of that withdrawal can be sent, so the row parks
+/// rather than the task restarting on a transient forever. A failed read stays
+/// an error, since that is a node problem and not a row problem.
 async fn attach_hook_extras(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
@@ -1005,6 +1005,8 @@ async fn attach_hook_extras(
     allowed_mint: &AllowedMint,
     gate_slot: u64,
 ) -> Result<Option<BailReason>, OperatorError> {
+    let compute_unit_price = release_funds_tx.compute_unit_price();
+    let compute_budget = release_funds_tx.compute_budget();
     let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
         return Ok(None);
     };
@@ -1048,7 +1050,7 @@ async fn attach_hook_extras(
             &recipient_ata,
             &instance_pda,
             transaction.amount.value(),
-            MAX_HOOK_EXTRAS_LEGACY_TX,
+            MAX_HOOK_EXTRAS,
             gate_slot,
         )
         .await?
@@ -1064,7 +1066,7 @@ async fn attach_hook_extras(
             return Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
                 format!(
-                    "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {extras} > {MAX_HOOK_EXTRAS_LEGACY_TX}"
+                    "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {extras} > {MAX_HOOK_EXTRAS}"
                 ),
             )));
         }
@@ -1072,6 +1074,23 @@ async fn attach_hook_extras(
 
     if !hook_extras.is_empty() {
         release.builder.add_remaining_accounts(&hook_extras);
+    }
+
+    // Sized as the sender builds it, since only the compiled message drops a repeated key.
+    let release_len = legacy_wire_len(&InstructionWithSigners {
+        instructions: vec![release.builder.instruction()],
+        fee_payer: processor_state.admin_pubkey,
+        signers: Vec::new(),
+        compute_unit_price,
+        compute_budget,
+    });
+    if release_len > PACKET_DATA_SIZE {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+            format!(
+                "transfer-hook accounts exceed the per-transfer cap for mint {mint}: the release is {release_len} bytes > {PACKET_DATA_SIZE}"
+            ),
+        )));
     }
 
     Ok(None)
@@ -1514,7 +1533,6 @@ mod tests {
     use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
     use crate::operator::find_allowed_mint_pda;
     use crate::operator::rpc_util::RpcClientWithRetry;
-    use crate::operator::sender::types::InstructionWithSigners;
     use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::transaction_util::build_and_sign;
     use crate::storage::common::amount::TokenAmount;
@@ -1523,13 +1541,14 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use private_channel_core::rpc::constants::PACKET_DATA_SIZE;
     use private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
     use solana_client::rpc_request::RpcRequest;
     use solana_sdk::hash::Hash;
     use solana_sdk::instruction::AccountMeta;
     use solana_sdk::program_option::COption;
     use solana_sdk::program_pack::Pack;
+    use spl_tlv_account_resolution::account::ExtraAccountMeta;
+    use spl_tlv_account_resolution::state::ExtraAccountMetaList;
     use spl_token_2022::extension::{
         confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
         BaseStateWithExtensionsMut, StateWithExtensionsMut,
@@ -1537,6 +1556,7 @@ mod tests {
     use spl_token_2022::state::{
         Account as Token2022AccountState, AccountState, Mint as Token2022MintState,
     };
+    use spl_transfer_hook_interface::instruction::ExecuteInstruction;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fee the seeded mints rows carry, as their AllowMint would have set it.
@@ -3783,11 +3803,12 @@ mod tests {
 
     // ── transfer-hook extras wire budget ────────────────────────────
 
-    /// Serialized size of a release carrying `extras` transfer-hook accounts,
-    /// assembled the way the sender assembles one: same compute-budget prefix,
-    /// same legacy message. Every extra is a fresh key, so none of them dedupes
-    /// against the fixed prefix and the size is the worst case for that count.
-    async fn release_wire_len(extras: usize) -> usize {
+    /// The hook check holds a release to `legacy_wire_len`, so hold that to the wire:
+    /// a release with hook accounts, signed the way the sender signs it, must
+    /// serialize to exactly the size it reports.
+    #[tokio::test]
+    async fn legacy_wire_len_is_the_size_of_the_signed_release() {
+        let hook_accounts = 12;
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let allowed_mint = AllowedMint::from_bytes(&allowed_mint_bytes(false, false, false))
@@ -3814,10 +3835,20 @@ mod tests {
         let TransactionBuilder::ReleaseFunds(release) = &mut tx_builder else {
             unreachable!("build_release_funds returns a release");
         };
-        let hook_extras: Vec<AccountMeta> = (0..extras)
+        let hook_extras: Vec<AccountMeta> = (0..hook_accounts)
             .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false))
             .collect();
         release.builder.add_remaining_accounts(&hook_extras);
+        let ix_with_signers = InstructionWithSigners {
+            instructions: vec![release.builder.instruction()],
+            fee_payer: processor_state.admin_pubkey,
+            // A signature is fixed-width, so an unsigned transaction weighs
+            // exactly what the signed one the sender broadcasts weighs.
+            signers: vec![],
+            compute_unit_price,
+            compute_budget,
+        };
+        let measured = legacy_wire_len(&ix_with_signers);
 
         let mut mocks = std::collections::HashMap::new();
         mocks.insert(
@@ -3831,43 +3862,15 @@ mod tests {
             }),
         );
 
-        let (transaction, ..) = build_and_sign(
-            &RpcClientWithRetry::new_mocked(mocks),
-            InstructionWithSigners {
-                instructions: vec![release.builder.instruction()],
-                fee_payer: processor_state.admin_pubkey,
-                // A signature is fixed-width, so an unsigned transaction weighs
-                // exactly what the signed one the sender broadcasts weighs.
-                signers: vec![],
-                compute_unit_price,
-                compute_budget,
-            },
-        )
-        .await
-        .expect("the mocked blockhash read must succeed");
+        let (transaction, ..) =
+            build_and_sign(&RpcClientWithRetry::new_mocked(mocks), ix_with_signers)
+                .await
+                .expect("the mocked blockhash read must succeed");
 
-        bincode::serialize(&transaction)
+        let signed_len = bincode::serialize(&transaction)
             .expect("a built transaction serializes")
-            .len()
-    }
-
-    /// The cap is a wire-size budget, so hold it to the wire rather than to the
-    /// arithmetic in the comment above it: the next account added to the release
-    /// path fails here instead of landing as a production "transaction too
-    /// large", and a cap left lower than the packet allows fails too.
-    #[tokio::test]
-    async fn hook_extras_cap_is_the_widest_release_a_legacy_packet_holds() {
-        let at_cap = release_wire_len(MAX_HOOK_EXTRAS_LEGACY_TX).await;
-        let past_cap = release_wire_len(MAX_HOOK_EXTRAS_LEGACY_TX + 1).await;
-
-        assert!(
-            at_cap <= PACKET_DATA_SIZE,
-            "a release with {MAX_HOOK_EXTRAS_LEGACY_TX} extras serializes to {at_cap} bytes, past the {PACKET_DATA_SIZE}-byte packet"
-        );
-        assert!(
-            past_cap > PACKET_DATA_SIZE,
-            "a release with one extra past the cap serializes to {past_cap} bytes and still fits the packet, so the cap is lower than it needs to be"
-        );
+            .len();
+        assert_eq!(measured, signed_len);
     }
 
     // ── transient rescue before the sender handoff ──────────────────
@@ -4029,7 +4032,7 @@ mod tests {
                     update
                         .error_message
                         .as_deref()
-                        .is_some_and(|m| m.contains("freshness")),
+                        .is_some_and(|message| message.contains("freshness")),
                     "{update:?}"
                 );
             }
@@ -4089,6 +4092,121 @@ mod tests {
             Some(&AccountMeta::new_readonly(hook_program, false))
         );
         assert!(accounts.iter().all(|meta| meta.pubkey != validation_pda));
+    }
+
+    /// The packet decides, not the number of hook accounts. With separate fee-payer and
+    /// operator keys, 12 hook accounts fit a withdrawal to another wallet and 13 park.
+    /// A withdrawal to the withdrawer's own wallet carries one whitelist entry for both
+    /// wallets, so it fits 13. When the operator key is the fee payer's, 15 fit (16 to the
+    /// withdrawer's own wallet) and 16 to another wallet park.
+    #[tokio::test]
+    async fn a_hook_release_parks_only_past_the_packet() {
+        // (hook accounts, to the withdrawer's own wallet, operator key is the fee payer's, released)
+        let cases = [
+            (12, false, false, true),
+            (13, false, false, false),
+            (13, true, false, true),
+            (15, false, true, true),
+            (16, false, true, false),
+            (16, true, true, true),
+        ];
+
+        for (hook_accounts, to_own_wallet, shared_key, released) in cases {
+            // The entries plus the hook program and the validation account.
+            let entry_count = hook_accounts - 2;
+            let mint = Pubkey::new_unique();
+            let hook_program = Pubkey::new_unique();
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            insert_token_2022_mint_row(&storage, &mint);
+            let hook_bit = 1u64 << EXTENSION_BIT_TRANSFER_HOOK;
+            let (mut ps, mut server) =
+                processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(hook_bit)).await;
+            mock_account_read(
+                &mut server,
+                &mint,
+                &spl_token_2022::id(),
+                transfer_hook_mint_bytes(&hook_program),
+            );
+
+            if shared_key {
+                ps.admin_pubkey = ps
+                    .release_funds_state
+                    .as_ref()
+                    .expect("the release state is set")
+                    .operator_pubkey;
+            }
+
+            let entry_addresses: Vec<Pubkey> =
+                (0..entry_count).map(|_| Pubkey::new_unique()).collect();
+            let entries: Vec<ExtraAccountMeta> = entry_addresses
+                .iter()
+                .map(|address| {
+                    ExtraAccountMeta::new_with_pubkey(address, false, false)
+                        .expect("a literal entry is valid")
+                })
+                .collect();
+            let mut validation_data =
+                vec![0u8; ExtraAccountMetaList::size_of(entries.len()).expect("the list sizes")];
+            ExtraAccountMetaList::init::<ExecuteInstruction>(&mut validation_data, &entries)
+                .expect("the list fits its sized buffer");
+            let validation_pda =
+                spl_transfer_hook_interface::get_extra_account_metas_address(&mint, &hook_program);
+            mock_account_read(&mut server, &validation_pda, &hook_program, validation_data);
+
+            let mut txn = withdrawal_for(&mint, 5);
+            if to_own_wallet {
+                txn.recipient = txn.initiator.clone();
+            }
+
+            // The resolver reads the transfer's accounts and every entry; none need exist.
+            let instance_pda = ps
+                .release_funds_state
+                .as_ref()
+                .expect("the release state is set")
+                .instance_pda;
+            let recipient = Pubkey::from_str(&txn.recipient).expect("the recipient is a pubkey");
+            let token_program = spl_token_2022::id();
+            let transfer_accounts = [
+                get_associated_token_address_with_program_id(&instance_pda, &mint, &token_program),
+                get_associated_token_address_with_program_id(&recipient, &mint, &token_program),
+                instance_pda,
+            ];
+            for address in transfer_accounts.iter().chain(&entry_addresses) {
+                server
+                    .mock("POST", "/")
+                    .match_body(mockito::Matcher::Regex(address.to_string()))
+                    .with_status(200)
+                    .with_body(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":500},"value":null}}"#,
+                    )
+                    .create();
+            }
+
+            let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
+
+            let case = format!(
+                "hook_accounts={hook_accounts} to_own_wallet={to_own_wallet} shared_key={shared_key}"
+            );
+            assert!(outcome.is_ok(), "{case}: {outcome:?}");
+            if released {
+                assert!(update.is_none(), "{case}: {update:?}");
+                assert!(
+                    matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+                    "{case}: the withdrawal must be dispatched"
+                );
+            } else {
+                let update = update.expect("a release past the packet parks");
+                assert_eq!(update.status, TransactionStatus::ManualReview, "{case}");
+                assert!(
+                    update
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("exceed the per-transfer cap")),
+                    "{case}: {update:?}"
+                );
+                assert!(builder.is_none(), "{case}: nothing reaches the sender");
+            }
+        }
     }
 
     /// The rescue is capped on the durable counter the fetched row carries, so
