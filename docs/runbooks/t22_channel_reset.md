@@ -128,8 +128,8 @@ the `pg-backup-*` sidecars stay up.
    `redis-cli -u <redis-url> FLUSHDB`.
 
 3. Check the wipe: `SELECT count(*) FROM accounts` must return 0. Do not skip this.
-   The solvency check reads a channel mint that Token-2022 does not own as supply 0,
-   so a leftover SPL mint would hide its old supply without any alert.
+   A leftover SPL mint fails the solvency check's supply read with `reset incomplete`,
+   and after a few ticks reconciliation halts both pipelines until it is wiped.
 
 ## 5. Configure
 

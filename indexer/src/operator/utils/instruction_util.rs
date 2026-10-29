@@ -310,7 +310,7 @@ pub struct WithdrawConfigSetup {
     pub min_withdraw_amount: u64,
 }
 
-/// Builder for simple SPL token mint instructions (deposit flow)
+/// Builder for channel Token-2022 mint instructions (deposit flow)
 /// Creates ATA idempotently, then mints tokens
 #[derive(Clone, Debug, Default)]
 pub struct MintToBuilder {

@@ -341,8 +341,15 @@ struct Signers {
 /// different delegate from the node's.
 fn read_permanent_delegate(env: Env) -> Result<Pubkey, String> {
     match env(OPERATOR_PERMANENT_DELEGATE) {
-        Some(value) if !value.trim().is_empty() => Pubkey::from_str(value.trim())
-            .map_err(|e| format!("{OPERATOR_PERMANENT_DELEGATE} is not a pubkey: {e}")),
+        Some(value) if !value.trim().is_empty() => match Pubkey::from_str(value.trim()) {
+            Ok(key) if key == Pubkey::default() => Err(format!(
+                "{OPERATOR_PERMANENT_DELEGATE} must not be the zero key"
+            )),
+            Ok(key) => Ok(key),
+            Err(e) => Err(format!(
+                "{OPERATOR_PERMANENT_DELEGATE} is not a pubkey: {e}"
+            )),
+        },
         _ => Err(format!("{OPERATOR_PERMANENT_DELEGATE} not set")),
     }
 }
@@ -595,6 +602,10 @@ mod tests {
         let err =
             read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, "nope")])).unwrap_err();
         assert!(err.contains(OPERATOR_PERMANENT_DELEGATE), "got: {err}");
+        let zero = Pubkey::default().to_string();
+        let err =
+            read_permanent_delegate(&env_of(&[(OPERATOR_PERMANENT_DELEGATE, &zero)])).unwrap_err();
+        assert!(err.contains("zero key"), "got: {err}");
     }
 
     #[test]

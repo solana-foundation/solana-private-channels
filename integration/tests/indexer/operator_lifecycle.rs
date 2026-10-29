@@ -20,6 +20,8 @@
 //!    recorded must be reconciled in place and let the operator start.
 //! 10. Double release: the same nonce submitted under two different rows must move
 //!     tokens exactly once, and the loser must not be reminted.
+//! 11. Delegate rotation: after a restart with a new delegate configured, the old key
+//!     rotates a mint to it.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -28,7 +30,9 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use helpers::private_channel_node::start_private_channel_node;
+use helpers::private_channel_node::{
+    start_private_channel_node, start_private_channel_node_with_delegate,
+};
 use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
@@ -51,6 +55,11 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
+use solana_sdk::transaction::Transaction;
+use spl_token_2022::extension::{
+    permanent_delegate::PermanentDelegate, BaseStateWithExtensions, StateWithExtensions,
+};
+use spl_token_2022::instruction::AuthorityType;
 use std::sync::Arc;
 use std::time::Duration;
 use test_utils::mint_helper::TEST_WITHDRAW_FEE;
@@ -471,22 +480,77 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     assert_eq!(db_tx.status, "completed");
     assert!(db_tx.counterpart_signature.is_some());
 
-    // The operator JIT-created the channel mint on the real Token-2022 program.
-    use spl_token_2022::extension::{
-        permanent_delegate::PermanentDelegate, BaseStateWithExtensions, StateWithExtensions,
-    };
-    let channel_mint = RpcClient::new(pc_node.url.clone())
-        .get_account(&env.mint)
-        .await?;
-    assert_eq!(channel_mint.owner, spl_token_2022::id());
-    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&channel_mint.data)?;
-    let delegate = state.get_extension::<PermanentDelegate>()?.delegate;
-    assert_eq!(Option::<Pubkey>::from(delegate), Some(admin.pubkey()));
+    // The operator JIT-created the channel mint, a Token-2022 mint with the delegate.
+    assert_eq!(
+        channel_mint_delegate(&pc_node.url, &env.mint).await?,
+        Some(admin.pubkey())
+    );
 
     operator_handle.shutdown().await;
     pc_node.shutdown().await;
 
     Ok(())
+}
+
+/// The channel mint's permanent delegate, after checking Token-2022 owns it.
+async fn channel_mint_delegate(
+    url: &str,
+    mint: &Pubkey,
+) -> Result<Option<Pubkey>, Box<dyn std::error::Error>> {
+    let account = RpcClient::new(url.to_string()).get_account(mint).await?;
+    assert_eq!(account.owner, spl_token_2022::id());
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&account.data)?;
+    Ok(state.get_extension::<PermanentDelegate>()?.delegate.into())
+}
+
+/// Delegate rotation: the node restarts with the new key configured, then the old key
+/// hands the mint over with an admin signing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (admin, old, new) = (Keypair::new(), Keypair::new(), Pubkey::new_unique());
+    let mut node = start_private_channel_node_with_delegate(admin.pubkey(), old.pubkey()).await?;
+    let program = spl_token_2022::id();
+    let mint = Pubkey::new_unique();
+    let create = [
+        spl_token_2022::instruction::initialize_permanent_delegate(&program, &mint, &old.pubkey())?,
+        spl_token_2022::instruction::initialize_mint2(&program, &mint, &admin.pubkey(), None, 6)?,
+    ];
+    send_on_channel(&node.url, &create, &[&admin]).await?;
+    assert_eq!(
+        channel_mint_delegate(&node.url, &mint).await?,
+        Some(old.pubkey())
+    );
+
+    node.restart_with_delegate(new).await?;
+    let rotate = spl_token_2022::instruction::set_authority(
+        &program,
+        &mint,
+        Some(&new),
+        AuthorityType::PermanentDelegate,
+        &old.pubkey(),
+        &[],
+    )?;
+    send_on_channel(&node.url, &[rotate], &[&admin, &old]).await?;
+    assert_eq!(channel_mint_delegate(&node.url, &mint).await?, Some(new));
+
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn send_on_channel(
+    url: &str,
+    ixs: &[solana_sdk::instruction::Instruction],
+    signers: &[&Keypair],
+) -> Result<Signature, Box<dyn std::error::Error>> {
+    let client = RpcClient::new(url.to_string());
+    let tx = Transaction::new_signed_with_payer(
+        ixs,
+        Some(&signers[0].pubkey()),
+        signers,
+        client.get_latest_blockhash().await?,
+    );
+    Ok(client.send_and_confirm_transaction(&tx).await?)
 }
 
 /// Inserts the same deposit row twice (same signature), starts the operator,

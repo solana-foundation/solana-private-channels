@@ -56,6 +56,42 @@ async fn land(
     .expect("send must not error")
 }
 
+/// Asserts the node refuses `ix` for `rule` (sigverify simulate names it) and that it never lands.
+async fn assert_refused(
+    ctx: &PrivateChannelContext,
+    ix: Instruction,
+    signer: &Keypair,
+    rule: &str,
+) {
+    let blockhash = ctx.get_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        std::slice::from_ref(&ix),
+        Some(&signer.pubkey()),
+        &[signer],
+        blockhash,
+    );
+    let simulation = ctx
+        .read_client
+        .simulate_transaction_with_config(
+            &tx,
+            RpcSimulateTransactionConfig {
+                sig_verify: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    let message = format!("{simulation:?}");
+    assert!(
+        message.contains(rule),
+        "simulate must name {rule:?}: {message}"
+    );
+    assert_eq!(
+        land(ctx, &[ix], &[signer]).await,
+        None,
+        "{rule}: must never land"
+    );
+}
+
 async fn meta_err(ctx: &PrivateChannelContext, sig: &Signature) -> serde_json::Value {
     let response = ctx
         .get_transaction(sig)
@@ -238,33 +274,7 @@ async fn case_delegate_cannot_move_elsewhere(ctx: &PrivateChannelContext) {
         DECIMALS,
     )
     .unwrap();
-    let blockhash = ctx.get_blockhash().await.unwrap();
-    let tx = Transaction::new_signed_with_payer(
-        std::slice::from_ref(&steal),
-        Some(&operator.pubkey()),
-        &[operator],
-        blockhash,
-    );
-    let simulation = ctx
-        .read_client
-        .simulate_transaction_with_config(
-            &tx,
-            RpcSimulateTransactionConfig {
-                sig_verify: true,
-                ..Default::default()
-            },
-        )
-        .await;
-    let message = format!("{simulation:?}");
-    assert!(
-        message.contains("compliance account"),
-        "simulate must name the rule: {message}"
-    );
-    assert_eq!(
-        land(ctx, &[steal], &[operator]).await,
-        None,
-        "the move must never land"
-    );
+    assert_refused(ctx, steal, operator, "compliance account").await;
 
     #[allow(deprecated)]
     let unchecked = spl_token_2022::instruction::transfer(
@@ -360,11 +370,7 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
         DECIMALS,
     )
     .unwrap();
-    assert_eq!(
-        land(ctx, &[to_own], &[operator]).await,
-        None,
-        "escrow drain to own ATA refused"
-    );
+    assert_refused(ctx, to_own, operator, "compliance account").await;
 
     let plan = SeizePlan {
         mint: mint_a,
@@ -410,8 +416,8 @@ async fn case_seize_out_of_a_dvp_escrow(ctx: &PrivateChannelContext) {
     println!("  ✓ DvP escrow seized only into compliance; Cancel refunds the rest");
 }
 
-/// Admin-signed SetAuthority(PermanentDelegate) lands only when it names the configured
-/// delegate. The harness can only create mints with that delegate, so it rotates to itself.
+/// Admin-signed SetAuthority(PermanentDelegate) to any key but the configured delegate
+/// never lands. The rotation to a newly configured key is in operator_lifecycle.
 async fn case_delegate_rotation(ctx: &PrivateChannelContext) {
     let operator = &ctx.operator_key;
     let (mint, _) = mint_with_balance(ctx, &Keypair::new().pubkey()).await;
@@ -427,45 +433,12 @@ async fn case_delegate_rotation(ctx: &PrivateChannelContext) {
         .unwrap()
     };
 
-    let sig = land(ctx, &[rotate(Some(&operator.pubkey()))], &[operator])
-        .await
-        .expect("rotation to the configured delegate lands");
-    assert!(meta_err(ctx, &sig).await.is_null(), "rotation must succeed");
-    assert_eq!(mint_delegate(ctx, &mint).await, Some(operator.pubkey()));
-
     let other = Keypair::new().pubkey();
-    for (label, new) in [("another key", Some(&other)), ("None", None)] {
-        let ix = rotate(new);
-        let blockhash = ctx.get_blockhash().await.unwrap();
-        let tx = Transaction::new_signed_with_payer(
-            std::slice::from_ref(&ix),
-            Some(&operator.pubkey()),
-            &[operator],
-            blockhash,
-        );
-        let simulation = ctx
-            .read_client
-            .simulate_transaction_with_config(
-                &tx,
-                RpcSimulateTransactionConfig {
-                    sig_verify: true,
-                    ..Default::default()
-                },
-            )
-            .await;
-        let message = format!("{simulation:?}");
-        assert!(
-            message.contains("configured delegate"),
-            "{label}: simulate must name the rule: {message}"
-        );
-        assert_eq!(
-            land(ctx, &[ix], &[operator]).await,
-            None,
-            "rotation to {label} must never land"
-        );
+    for new in [Some(&other), None] {
+        assert_refused(ctx, rotate(new), operator, "unconfigured key").await;
         assert_eq!(mint_delegate(ctx, &mint).await, Some(operator.pubkey()));
     }
-    println!("  ✓ delegate rotation lands only to the configured key");
+    println!("  ✓ delegate rotation to an unconfigured key or None refused");
 }
 
 /// The delegate burning a user's balance, Burn or BurnChecked, never lands.
@@ -488,11 +461,7 @@ async fn case_delegate_burn_refused(ctx: &PrivateChannelContext) {
     )
     .unwrap();
     for (label, ix) in [("Burn", burn), ("BurnChecked", burn_checked)] {
-        assert_eq!(
-            land(ctx, &[ix], &[operator]).await,
-            None,
-            "delegate {label} must never land"
-        );
+        assert_refused(ctx, ix, operator, "compliance account").await;
         assert_eq!(
             token_account(ctx, &alice_ata).await.amount,
             BALANCE,

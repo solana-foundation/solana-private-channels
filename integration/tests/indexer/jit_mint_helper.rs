@@ -83,6 +83,13 @@ fn foreign_authority_initialized_mint_bytes() -> Vec<u8> {
     pack_mint_bytes(true, COption::Some(Pubkey::new_unique()))
 }
 
+/// Initialized admin-owned mint whose delegate is the admin key, not the configured
+/// delegate: what a mint created under an admin-key fallback looks like.
+fn admin_delegate_initialized_mint_bytes() -> Vec<u8> {
+    let admin = SignerUtil::admin_signer().pubkey();
+    private_channel_core::t22_fixtures::t22_mint(6, &admin, None, Some(&admin), 0)
+}
+
 /// Build base-mint-sized bytes that fail to decode. Setting the
 /// `mint_authority` `COption` discriminant (offset 0..4) to an invalid
 /// value makes the unpack reject the buffer with `InvalidAccountData`.
@@ -275,6 +282,39 @@ async fn jit_returns_manual_review_when_mint_authority_mismatch() {
         mock.call_count("sendTransaction"),
         0,
         "authority mismatch must abort before sending InitializeMint"
+    );
+    mock.shutdown().await;
+}
+
+// Pre-check: the authority matches but the permanent delegate is not the
+// configured one. Pins the `AuthorityCheck::DelegateMismatch` branch.
+#[tokio::test]
+async fn jit_returns_manual_review_when_mint_delegate_mismatch() {
+    let Fixture {
+        mut state,
+        mock,
+        txn_id,
+        instruction,
+    } = build_fixture(true).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply(&admin_delegate_initialized_mint_bytes()),
+    );
+
+    let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
+
+    match outcome {
+        JitOutcome::ManualReview(reason) => assert!(
+            reason.contains("permanent delegate mismatch"),
+            "ManualReview reason must carry the runbook-dispatch substring; got {reason:?}"
+        ),
+        other => panic!("expected ManualReview, got {:?}", debug_outcome(&other)),
+    }
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "delegate mismatch must abort before sending InitializeMint"
     );
     mock.shutdown().await;
 }

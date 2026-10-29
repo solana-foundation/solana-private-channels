@@ -30,6 +30,7 @@ pub struct PrivateChannelNode {
     handles: Option<NodeHandles>,
     _db: ContainerAsync<Postgres>,
     admin_pubkey: Pubkey,
+    delegate: Pubkey,
     accountsdb_connection_url: String,
 }
 
@@ -55,8 +56,29 @@ impl PrivateChannelNode {
             handles.shutdown().await;
         }
         container_pg_restore(&self._db, "private_channel_node", dump);
-        let (url, handles) =
-            run_on(self.admin_pubkey, self.accountsdb_connection_url.clone()).await?;
+        self.start().await
+    }
+
+    /// Stop the node and start it again on the same accountsdb with `delegate`
+    /// configured, as an operator does when rotating the permanent delegate.
+    pub async fn restart_with_delegate(
+        &mut self,
+        delegate: Pubkey,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(handles) = self.handles.take() {
+            handles.shutdown().await;
+        }
+        self.delegate = delegate;
+        self.start().await
+    }
+
+    async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let (url, handles) = run_on(
+            self.admin_pubkey,
+            self.delegate,
+            self.accountsdb_connection_url.clone(),
+        )
+        .await?;
         self.url = url;
         self.handles = Some(handles);
         Ok(())
@@ -150,6 +172,14 @@ fn get_free_port() -> u16 {
 pub async fn start_private_channel_node(
     admin_pubkey: Pubkey,
 ) -> Result<PrivateChannelNode, Box<dyn std::error::Error>> {
+    start_private_channel_node_with_delegate(admin_pubkey, admin_pubkey).await
+}
+
+/// Same, with `delegate` as the configured permanent delegate.
+pub async fn start_private_channel_node_with_delegate(
+    admin_pubkey: Pubkey,
+    delegate: Pubkey,
+) -> Result<PrivateChannelNode, Box<dyn std::error::Error>> {
     let db_container = Postgres::default()
         .with_db_name("private_channel_node")
         .with_user("postgres")
@@ -163,7 +193,7 @@ pub async fn start_private_channel_node(
         host, port
     );
 
-    let (url, handles) = run_on(admin_pubkey, accountsdb_connection_url.clone()).await?;
+    let (url, handles) = run_on(admin_pubkey, delegate, accountsdb_connection_url.clone()).await?;
     println!("=== PrivateChannel node started at {} ===", url);
 
     Ok(PrivateChannelNode {
@@ -171,6 +201,7 @@ pub async fn start_private_channel_node(
         handles: Some(handles),
         _db: db_container,
         admin_pubkey,
+        delegate,
         accountsdb_connection_url,
     })
 }
@@ -178,6 +209,7 @@ pub async fn start_private_channel_node(
 /// Run a node on `accountsdb_connection_url` and wait for its first block.
 async fn run_on(
     admin_pubkey: Pubkey,
+    delegate: Pubkey,
     accountsdb_connection_url: String,
 ) -> Result<(String, NodeHandles), Box<dyn std::error::Error>> {
     let node_port = get_free_port();
@@ -200,7 +232,7 @@ async fn run_on(
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![admin_pubkey],
-        permanent_delegate: Some(admin_pubkey),
+        permanent_delegate: Some(delegate),
         compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,

@@ -39,9 +39,10 @@ pub(crate) fn ensure_test_signer() {
             "ADMIN_PRIVATE_KEY",
             bs58::encode(keypair.to_bytes()).into_string(),
         );
+        // Not the admin key, so code that uses the admin key as the delegate fails.
         std::env::set_var(
             "OPERATOR_PERMANENT_DELEGATE",
-            solana_sdk::signer::Signer::pubkey(&keypair).to_string(),
+            solana_sdk::pubkey::Pubkey::new_unique().to_string(),
         );
     });
 }

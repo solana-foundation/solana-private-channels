@@ -1498,6 +1498,26 @@ pub async fn execute_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        accounts::bob::BOB, stage_metrics::NoopMetrics, stages::retained_account_bytes,
+        test_helpers::start_test_postgres,
+    };
+
+    use solana_sdk::account::AccountSharedData;
+    use solana_sdk::{
+        hash::Hash,
+        message::Message,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::collections::{HashMap, HashSet, LinkedList};
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
 
     /// Delegate the test admin VM writes into mints.
     const TEST_DELEGATE: Pubkey = crate::t22_fixtures::GOLDEN_DELEGATE;
@@ -1519,25 +1539,6 @@ mod tests {
         deps.admin_vm = AdminVm::new(Some(TEST_DELEGATE));
         deps
     }
-    use crate::{
-        accounts::bob::BOB, stage_metrics::NoopMetrics, stages::retained_account_bytes,
-        test_helpers::start_test_postgres,
-    };
-    use solana_sdk::account::AccountSharedData;
-    use solana_sdk::{
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        transaction::Transaction,
-    };
-    use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
-    use std::collections::{HashMap, HashSet, LinkedList};
-    use std::sync::{Arc, RwLock};
-    use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
 
     /// Helper: live-blockhash window containing only `Hash::default()` so the
     /// canned test transactions (built with `Hash::default()` as their recent

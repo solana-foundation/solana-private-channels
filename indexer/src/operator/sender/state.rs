@@ -862,7 +862,7 @@ impl SenderState {
             transactions.len()
         );
 
-        // PrivateChannel only supports SPL Token for now.
+        // Channel mints and accounts are Token-2022.
         let private_channel_token_program = self.mint_cache.get_private_channel_token_program();
 
         // Id of the last row fully handled, where a failed journal read rewinds the cursor.

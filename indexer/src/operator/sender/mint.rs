@@ -23,7 +23,9 @@ use solana_transaction_status::{
     UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
 };
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token_2022::extension::{permanent_delegate::get_permanent_delegate, StateWithExtensions};
+use spl_token_2022::extension::{
+    permanent_delegate::get_permanent_delegate, ExtensionType, StateWithExtensions,
+};
 use spl_token_2022::state::Mint;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -112,7 +114,14 @@ pub(super) fn decode_and_check_authority(
 ) -> AuthorityCheck {
     let mint = match StateWithExtensions::<Mint>::unpack(data) {
         Ok(m) => m,
-        Err(solana_sdk::program_error::ProgramError::UninitializedAccount) => {
+        // Any zeroed buffer of at least a base mint unpacks as uninitialized; only the
+        // channel mint's own size can become one.
+        Err(solana_sdk::program_error::ProgramError::UninitializedAccount)
+            if Ok(data.len())
+                == ExtensionType::try_calculate_account_len::<Mint>(&[
+                    ExtensionType::PermanentDelegate,
+                ]) =>
+        {
             return AuthorityCheck::Uninitialized
         }
         Err(_) => return AuthorityCheck::CorruptData,
@@ -1594,13 +1603,13 @@ mod tests {
         );
     }
 
-    /// Data of the wrong length cannot decode as a mint.
+    /// Zeroed data of any size but the channel mint's is not a mint waiting to be created.
     #[test]
     fn decode_and_check_authority_wrong_length_returns_corrupt() {
         let admin = Pubkey::new_unique();
-        for len in [10, 100] {
+        for len in [10, 82, 100, 201, 203] {
             assert_eq!(
-                decode_and_check_authority(&vec![0xFFu8; len], &admin, &admin),
+                decode_and_check_authority(&vec![0u8; len], &admin, &admin),
                 AuthorityCheck::CorruptData,
                 "{len} bytes"
             );

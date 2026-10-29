@@ -320,6 +320,16 @@ pub fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
                 .into(),
         );
     }
+    if config.permanent_delegate == Some(Pubkey::default()) {
+        return Err(
+            "permanent_delegate (PRIVATE_CHANNEL_PERMANENT_DELEGATE) must not be the zero key: \
+             Token-2022 refuses it, so no mint could be created"
+                .into(),
+        );
+    }
+    if config.mode == NodeMode::Read && config.permanent_delegate.is_none() {
+        warn!("no permanent delegate configured: simulate admits every delegate move");
+    }
     if config.compliance_owner.is_some() && config.compliance_owner == config.permanent_delegate {
         return Err(
             "compliance_owner (PRIVATE_CHANNEL_COMPLIANCE_OWNER) must differ from \
@@ -1296,6 +1306,17 @@ mod tests {
             );
         }
         assert!(validate_seize_config(&seize_config(NodeMode::Read, None, None)).is_ok());
+    }
+
+    /// Token-2022 refuses a zero delegate, so a node configured with it refuses to start.
+    #[test]
+    fn zero_key_delegate_refuses_to_start() {
+        for mode in [NodeMode::Read, NodeMode::Write, NodeMode::Aio] {
+            let err =
+                validate_seize_config(&seize_config(mode.clone(), Some(Pubkey::default()), None))
+                    .expect_err("must refuse");
+            assert!(err.contains("zero key"), "{mode:?}: {err}");
+        }
     }
 
     /// The delegate's own ATA is exempt from the seize rule, so the compliance owner

@@ -58,9 +58,10 @@ pub fn ensure_admin_signer_env() {
         let key = bs58::encode(kp.to_bytes()).into_string();
         std::env::set_var("ADMIN_SIGNER", "memory");
         std::env::set_var("ADMIN_PRIVATE_KEY", &key);
+        // Not the admin key, so code that uses the admin key as the delegate fails.
         std::env::set_var(
             "OPERATOR_PERMANENT_DELEGATE",
-            solana_sdk::signer::Signer::pubkey(&kp).to_string(),
+            Pubkey::new_unique().to_string(),
         );
         std::env::set_var("OPERATOR_SIGNER", "memory");
         std::env::set_var("OPERATOR_PRIVATE_KEY", &key);

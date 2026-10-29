@@ -443,16 +443,34 @@ mod tests {
 
     /// Runs `seize_keys` under a subscriber and returns what it logged.
     fn seize_keys_log(extra: &[&str]) -> String {
+        let args = parse(extra).unwrap();
+        captured_log(|| {
+            seize_keys(&args).unwrap();
+        })
+    }
+
+    /// Runs `f` under a subscriber and returns what it logged.
+    fn captured_log(f: impl FnOnce()) -> String {
         let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_writer(move || CapturedLog(writer.clone()))
             .finish();
-        let args = parse(extra).unwrap();
-        tracing::subscriber::with_default(subscriber, || seize_keys(&args).unwrap());
+        tracing::subscriber::with_default(subscriber, f);
         let out = buf.lock().unwrap().clone();
         String::from_utf8(out).unwrap()
+    }
+
+    /// A read node may run without a delegate, but it says so: simulate polices nothing.
+    #[test]
+    fn read_node_without_a_delegate_warns() {
+        let config = NodeConfig {
+            mode: NodeMode::Read,
+            ..NodeConfig::default()
+        };
+        let log = captured_log(|| validate_seize_config(&config).unwrap());
+        assert!(log.contains("no permanent delegate configured"), "{log}");
     }
 
     struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);

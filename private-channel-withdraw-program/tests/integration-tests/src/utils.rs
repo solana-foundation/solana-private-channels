@@ -337,12 +337,13 @@ pub fn set_token_balance(
     state.pack_base();
     state.init_account_type().unwrap();
 
+    let lamports = context.svm.minimum_balance_for_rent_exemption(data.len());
     context
         .svm
         .set_account(
             *ata,
             Account {
-                lamports: 2039280, // Rent-exempt minimum for token account
+                lamports,
                 data,
                 owner: TOKEN_PROGRAM_ID,
                 executable: false,

@@ -140,7 +140,7 @@ pub fn delegate_move(
         T22_BURN | T22_BURN_CHECKED => 2,
         _ => return None,
     };
-    // Checked first so a normal transaction pays one key compare and no derivation.
+    // Checked before the source and compliance ATAs are derived.
     if accounts.get(authority_index) != Some(delegate) {
         return None;
     }

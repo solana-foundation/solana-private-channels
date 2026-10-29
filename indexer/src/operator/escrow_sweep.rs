@@ -556,7 +556,7 @@ async fn sweep_once(
 
 /// Channel supply for `mint` and the context slot the node answered at. The node reads
 /// its slot before the account, so the supply is at least as new as that slot. An absent
-/// mint account (nothing minted yet), or one SPL Token does not own, reads as supply 0.
+/// mint account (nothing minted yet), or one no token program owns, reads as supply 0.
 pub async fn fetch_channel_supply_at(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
@@ -577,6 +577,14 @@ pub async fn fetch_channel_supply_at(
         Some(account) => account,
         None => return Ok((0, slot)),
     };
+
+    // A legacy mint can only be state the reset missed, and its supply is real, so it is an
+    // error rather than zero.
+    if account.owner == spl_token::id() {
+        return Err(EscrowSweepError {
+            reason: format!("Channel mint {mint} is a legacy SPL Token mint: reset incomplete"),
+        });
+    }
 
     // Channel mints are Token-2022, so an account it does not own (lamports someone sent to
     // the address) has minted nothing. A token-owned account that will not decode stays an error.
@@ -1244,10 +1252,10 @@ pub(crate) mod tests {
         )
     }
 
-    /// Channel mints are Token-2022; a legacy SPL mint at the address has minted
-    /// nothing on the channel, like any other non-token owner.
+    /// A legacy SPL mint at a channel mint address is state a reset missed, so it errors
+    /// rather than reading as zero and hiding its supply from the solvency check.
     #[tokio::test]
-    async fn fetch_channel_supply_legacy_spl_mint_is_zero() {
+    async fn fetch_channel_supply_legacy_spl_mint_is_err() {
         let mint = Mint {
             mint_authority: COption::Some(Pubkey::new_unique()),
             supply: 77,
@@ -1265,11 +1273,10 @@ pub(crate) mod tests {
             .create_async()
             .await;
 
-        let supply = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
+        let err = fetch_channel_supply_at(&client(&server.url()), &Pubkey::new_unique())
             .await
-            .map(|(supply, _)| supply)
-            .unwrap();
-        assert_eq!(supply, 0);
+            .unwrap_err();
+        assert!(err.reason.contains("reset incomplete"), "{}", err.reason);
     }
 
     #[tokio::test]
@@ -1308,9 +1315,9 @@ pub(crate) mod tests {
     }
 
     /// Anyone can send lamports to a mint address on the channel before the mint exists, which
-    /// leaves a System account there. Only SPL Token can mint, so that account has supply 0.
+    /// leaves a System account there. Only Token-2022 can mint, so that account has supply 0.
     #[tokio::test]
-    async fn fetch_channel_supply_account_not_owned_by_spl_token_is_zero() {
+    async fn fetch_channel_supply_account_not_owned_by_a_token_program_is_zero() {
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/")

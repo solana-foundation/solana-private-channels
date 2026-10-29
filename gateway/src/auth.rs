@@ -163,9 +163,8 @@ pub fn redacts_transaction_errors_for(claims: Option<&Claims>, method: &str) -> 
 /// SPL Token program — owns both regular token accounts and mints.
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-/// Token-2022 program — same account layout for the base 165 bytes; extensions
-/// are appended after that. We support it now so future programs using Token-2022
-/// work without changes.
+/// Token-2022 program, which owns channel mints and accounts. Same layout as SPL
+/// Token for the base 165 bytes; extensions are appended after that.
 const SPL_TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 // ---------------------------------------------------------------------------
