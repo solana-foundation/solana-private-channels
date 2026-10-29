@@ -435,7 +435,7 @@ async fn case_delegate_rotation(ctx: &PrivateChannelContext) {
 
     let other = Keypair::new().pubkey();
     for new in [Some(&other), None] {
-        assert_refused(ctx, rotate(new), operator, "unconfigured key").await;
+        assert_refused(ctx, rotate(new), operator, "configured delegate").await;
         assert_eq!(mint_delegate(ctx, &mint).await, Some(operator.pubkey()));
     }
     println!("  ✓ delegate rotation to an unconfigured key or None refused");
