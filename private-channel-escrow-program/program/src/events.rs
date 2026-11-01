@@ -5,6 +5,7 @@ use codama::CodamaType;
 use pinocchio::Address as Pubkey;
 
 use crate::constants::EVENT_IX_TAG_LE;
+use crate::processor::shared::confidential_utils::SplitCiphertext;
 
 #[repr(u8)]
 pub enum EventDiscriminators {
@@ -20,6 +21,12 @@ pub enum EventDiscriminators {
     AddOrUpdateAllowedWallet = 9,
     RemoveAllowedWallet = 10,
     SetWhitelistEnabled = 11,
+    ConfigureConfidentialAccount = 12,
+    ConfidentialDeposit = 13,
+    ConfidentialReleaseFunds = 14,
+    ApplyPendingBalance = 15,
+    MoveToConfidential = 16,
+    MoveToPublic = 17,
 }
 
 #[derive(CodamaType)]
@@ -484,6 +491,263 @@ impl SetWhitelistEnabledEvent {
     }
 }
 
+#[derive(CodamaType)]
+pub struct ConfigureConfidentialAccountEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Mint whose escrow account was configured
+    pub mint: Pubkey,
+}
+
+impl ConfigureConfidentialAccountEvent {
+    pub fn new(instance_seed: Pubkey, mint: Pubkey) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::ConfigureConfidentialAccount as u8,
+            instance_seed,
+            mint,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(73);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data
+    }
+}
+
+/// The deposit amount is the difference between the pending balances, decrypted
+/// with the instance key. Nothing else can credit the escrow account in between.
+#[derive(CodamaType)]
+pub struct ConfidentialDepositEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// User who made the deposit
+    pub user: Pubkey,
+    /// Recipient (for PrivateChannel tracking)
+    pub recipient: Pubkey,
+    /// Mint of the deposited tokens
+    pub mint: Pubkey,
+    /// Escrow pending balance, low bits, before the transfer
+    pub pending_balance_lo_before: [u8; 64],
+    /// Escrow pending balance, high bits, before the transfer
+    pub pending_balance_hi_before: [u8; 64],
+    /// Escrow pending balance, low bits, after the transfer
+    pub pending_balance_lo_after: [u8; 64],
+    /// Escrow pending balance, high bits, after the transfer
+    pub pending_balance_hi_after: [u8; 64],
+}
+
+impl ConfidentialDepositEvent {
+    pub fn new(
+        instance_seed: Pubkey,
+        user: Pubkey,
+        recipient: Pubkey,
+        mint: Pubkey,
+        pending_before: SplitCiphertext,
+        pending_after: SplitCiphertext,
+    ) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::ConfidentialDeposit as u8,
+            instance_seed,
+            user,
+            recipient,
+            mint,
+            pending_balance_lo_before: pending_before.lo,
+            pending_balance_hi_before: pending_before.hi,
+            pending_balance_lo_after: pending_after.lo,
+            pending_balance_hi_after: pending_after.hi,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (user) + 32 (recipient)
+    // + 32 (mint) + 4 * 64 (pending lo and hi, before and after)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(393);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.user.as_ref());
+        data.extend_from_slice(self.recipient.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.pending_balance_lo_before);
+        data.extend_from_slice(&self.pending_balance_hi_before);
+        data.extend_from_slice(&self.pending_balance_lo_after);
+        data.extend_from_slice(&self.pending_balance_hi_after);
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct ConfidentialReleaseFundsEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Operator who released the funds
+    pub operator: Pubkey,
+    /// User receiving the funds
+    pub user: Pubkey,
+    /// Mint of the released tokens
+    pub mint: Pubkey,
+    /// Amount that left the escrow, low bits, encrypted under the instance key
+    pub amount_lo: [u8; 64],
+    /// Amount that left the escrow, high bits, encrypted under the instance key
+    pub amount_hi: [u8; 64],
+}
+
+impl ConfidentialReleaseFundsEvent {
+    pub fn new(
+        instance_seed: Pubkey,
+        operator: Pubkey,
+        user: Pubkey,
+        mint: Pubkey,
+        amount: SplitCiphertext,
+    ) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::ConfidentialReleaseFunds as u8,
+            instance_seed,
+            operator,
+            user,
+            mint,
+            amount_lo: amount.lo,
+            amount_hi: amount.hi,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (user)
+    // + 32 (mint) + 64 (amount lo) + 64 (amount hi)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(265);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.operator.as_ref());
+        data.extend_from_slice(self.user.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.amount_lo);
+        data.extend_from_slice(&self.amount_hi);
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct ApplyPendingBalanceEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Operator who applied the pending balance
+    pub operator: Pubkey,
+    /// Mint of the escrow account
+    pub mint: Pubkey,
+}
+
+impl ApplyPendingBalanceEvent {
+    pub fn new(instance_seed: Pubkey, operator: Pubkey, mint: Pubkey) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::ApplyPendingBalance as u8,
+            instance_seed,
+            operator,
+            mint,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (mint)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(105);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.operator.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct MoveToConfidentialEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Operator who moved the funds
+    pub operator: Pubkey,
+    /// Mint of the escrow account
+    pub mint: Pubkey,
+    /// Amount moved from the public to the pending balance
+    pub amount: u64,
+}
+
+impl MoveToConfidentialEvent {
+    pub fn new(instance_seed: Pubkey, operator: Pubkey, mint: Pubkey, amount: u64) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::MoveToConfidential as u8,
+            instance_seed,
+            operator,
+            mint,
+            amount,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (mint) + 8 (amount)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(113);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.operator.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.amount.to_le_bytes());
+        data
+    }
+}
+
+#[derive(CodamaType)]
+pub struct MoveToPublicEvent {
+    /// Unique u8 byte for event type.
+    pub event_discriminator: u8,
+    /// Instance seed pubkey
+    pub instance_seed: Pubkey,
+    /// Operator who moved the funds
+    pub operator: Pubkey,
+    /// Mint of the escrow account
+    pub mint: Pubkey,
+    /// Amount moved from the available to the public balance
+    pub amount: u64,
+}
+
+impl MoveToPublicEvent {
+    pub fn new(instance_seed: Pubkey, operator: Pubkey, mint: Pubkey, amount: u64) -> Self {
+        Self {
+            event_discriminator: EventDiscriminators::MoveToPublic as u8,
+            instance_seed,
+            operator,
+            mint,
+            amount,
+        }
+    }
+
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (mint) + 8 (amount)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(113);
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(self.event_discriminator);
+        data.extend_from_slice(self.instance_seed.as_ref());
+        data.extend_from_slice(self.operator.as_ref());
+        data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.amount.to_le_bytes());
+        data
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +1004,134 @@ mod tests {
         // Opposite values pin the flag byte order.
         assert_eq!(bytes[41], 1);
         assert_eq!(bytes[42], 0);
+    }
+
+    #[test]
+    fn test_configure_confidential_account_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let mint = Pubkey::new_from_array([2u8; 32]);
+        let event = ConfigureConfidentialAccountEvent::new(instance_seed, mint);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(
+            bytes[8],
+            EventDiscriminators::ConfigureConfidentialAccount as u8
+        );
+        assert_eq!(&bytes[41..73], mint.as_ref());
+    }
+
+    #[test]
+    fn test_confidential_deposit_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let user = Pubkey::new_from_array([2u8; 32]);
+        let recipient = Pubkey::new_from_array([3u8; 32]);
+        let mint = Pubkey::new_from_array([4u8; 32]);
+        let pending_before = SplitCiphertext {
+            lo: [5u8; 64],
+            hi: [6u8; 64],
+        };
+        let pending_after = SplitCiphertext {
+            lo: [7u8; 64],
+            hi: [8u8; 64],
+        };
+        let event = ConfidentialDepositEvent::new(
+            instance_seed,
+            user,
+            recipient,
+            mint,
+            pending_before,
+            pending_after,
+        );
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (user) + 32 (recipient) + 32 (mint)
+        // + 4 * 64 (pending lo and hi, before and after)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 393);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::ConfidentialDeposit as u8);
+        assert_eq!(&bytes[41..73], user.as_ref());
+        assert_eq!(&bytes[73..105], recipient.as_ref());
+        assert_eq!(&bytes[105..137], mint.as_ref());
+        assert_eq!(&bytes[137..201], &[5u8; 64]);
+        assert_eq!(&bytes[201..265], &[6u8; 64]);
+        assert_eq!(&bytes[265..329], &[7u8; 64]);
+        assert_eq!(&bytes[329..393], &[8u8; 64]);
+    }
+
+    #[test]
+    fn test_confidential_release_funds_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let user = Pubkey::new_from_array([3u8; 32]);
+        let mint = Pubkey::new_from_array([4u8; 32]);
+        let amount = SplitCiphertext {
+            lo: [5u8; 64],
+            hi: [6u8; 64],
+        };
+        let event = ConfidentialReleaseFundsEvent::new(instance_seed, operator, user, mint, amount);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (user) + 32 (mint)
+        // + 64 (amount lo) + 64 (amount hi)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 265);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(
+            bytes[8],
+            EventDiscriminators::ConfidentialReleaseFunds as u8
+        );
+        assert_eq!(&bytes[73..105], user.as_ref());
+        assert_eq!(&bytes[105..137], mint.as_ref());
+        assert_eq!(&bytes[137..201], &[5u8; 64]);
+        assert_eq!(&bytes[201..265], &[6u8; 64]);
+    }
+
+    #[test]
+    fn test_apply_pending_balance_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let mint = Pubkey::new_from_array([3u8; 32]);
+        let event = ApplyPendingBalanceEvent::new(instance_seed, operator, mint);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (mint)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 105);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::ApplyPendingBalance as u8);
+        assert_eq!(&bytes[73..105], mint.as_ref());
+    }
+
+    #[test]
+    fn test_move_to_confidential_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let mint = Pubkey::new_from_array([3u8; 32]);
+        let amount = 1_234_567u64;
+        let event = MoveToConfidentialEvent::new(instance_seed, operator, mint, amount);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (mint) + 8 (amount)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 113);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::MoveToConfidential as u8);
+        assert_eq!(&bytes[105..113], &amount.to_le_bytes());
+    }
+
+    #[test]
+    fn test_move_to_public_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let mint = Pubkey::new_from_array([3u8; 32]);
+        let amount = 1_234_567u64;
+        let event = MoveToPublicEvent::new(instance_seed, operator, mint, amount);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (mint) + 8 (amount)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 113);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::MoveToPublic as u8);
+        assert_eq!(&bytes[105..113], &amount.to_le_bytes());
     }
 }

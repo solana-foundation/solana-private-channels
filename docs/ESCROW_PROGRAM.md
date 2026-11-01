@@ -27,6 +27,12 @@
 | [`AddOrUpdateAllowedWallet`](#addorupdateallowedwallet) | Add a wallet to the instance whitelist, or rewrite its flags (admin-only) | 9 |
 | [`RemoveAllowedWallet`](#removeallowedwallet) | Remove a wallet from the instance whitelist (admin-only) | 10 |
 | [`SetWhitelistEnabled`](#setwhitelistenabled) | Set which directions the instance whitelist gates (admin-only) | 11 |
+| [`ConfigureConfidentialAccount`](#configureconfidentialaccount) | Turn on confidential transfers for a mint's escrow account (admin-only) | 12 |
+| [`ConfidentialDeposit`](#confidentialdeposit) | Deposit a hidden amount from the user's confidential balance (permissionless unless deposits are whitelisted) | 13 |
+| [`ConfidentialReleaseFunds`](#confidentialreleasefunds) | Release a hidden amount to the user's confidential balance (operator-only) | 14 |
+| [`ApplyPendingBalance`](#applypendingbalance) | Move the escrow's pending balance into its available balance (operator-only) | 15 |
+| [`MoveToConfidential`](#movetoconfidential) | Move escrow funds from the public to the confidential balance (operator-only) | 16 |
+| [`MoveToPublic`](#movetopublic) | Move escrow funds from the confidential to the public balance (operator-only) | 17 |
 | [`EmitEvent`](#emitevent) | Emit event via CPI | 228 |
 
 ### Instruction Details
@@ -333,6 +339,161 @@ Discriminator: `11`
 | 4 | `event_authority` | | | Event authority PDA for emitting events |
 | 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
+#### ConfigureConfidentialAccount
+Turns on Token-2022 confidential transfers for the instance's escrow account of an allowed mint (admin-only). The program grows the account, configures it with the instance ElGamal key proven by a `VerifyPubkeyValidity` instruction in the same transaction, and then turns confidential credits off, so they only arrive through `ConfidentialDeposit` and `MoveToConfidential`. Public credits stay on. Token-2022 refuses a mint without `ConfidentialTransferMint` and an account configured before. On a mint that requires approval, the issuer's confidential authority has to approve the account before it can be used.
+
+Every other confidential instruction needs a configured account, so this is the switch. Do not run it before the indexer supports confidential transfers: a confidential deposit would lock the user's tokens with nothing minted on the channel.
+
+Discriminator: `12`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `decryptable_zero_balance` | [u8; 36] | Zero, encrypted under the instance AES key |
+| `proof_instruction_offset` | i8 | Position of the `VerifyPubkeyValidity` instruction relative to this one, never 0 |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Pays for the larger escrow account |
+| 1 | `admin` | ✓ | | Admin of Instance |
+| 2 | `instance` | | | Instance PDA, owner of the escrow account |
+| 3 | `mint` | | | Token mint of the escrow account |
+| 4 | `allowed_mint` | | | AllowedMint PDA of the mint |
+| 5 | `instance_ata` | | ✓ | Instance's Associated Token Account for this mint |
+| 6 | `system_program` | | | System program |
+| 7 | `token_program` | | | Token-2022 program |
+| 8 | `instructions_sysvar` | | | Instructions sysvar, holding the key's proof |
+| 9 | `event_authority` | | | Event authority PDA for emitting events |
+| 10 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### ConfidentialDeposit
+Deposits a hidden amount from the user's available confidential balance into the escrow's pending balance (permissionless unless deposits are whitelisted). The gates are `Deposit`'s, except the minimum deposit and the zero check, which need the amount. The event carries the escrow's pending balance before and after the transfer, and the indexer decrypts the difference with the instance key. On a fee mint the difference is net of the fee.
+
+Each deposit takes one of the pending balance's 65,536 credits until the operator applies it, so dust deposits can use them up.
+
+Each proof offset is the proof instruction's position relative to this one, or 0 for a proof in a context account. The fee offsets are read only for mints with a transfer fee. After the fixed accounts come one context account per zero offset, in Token-2022's order (equality, ciphertext validity, fee sigma, fee ciphertext validity, range), then the mint's transfer-hook extras, resolved with an amount of `u64::MAX`.
+
+Discriminator: `13`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `new_source_decryptable_available_balance` | [u8; 36] | User's available balance after the deposit, encrypted under their AES key |
+| `auditor_ciphertext_lo` | [u8; 64] | Low bits of the amount, encrypted under the mint's auditor key |
+| `auditor_ciphertext_hi` | [u8; 64] | High bits of the amount, encrypted under the mint's auditor key |
+| `equality_proof_instruction_offset` | i8 | Equality proof position |
+| `ciphertext_validity_proof_instruction_offset` | i8 | Ciphertext validity proof position |
+| `range_proof_instruction_offset` | i8 | Range proof position |
+| `fee_sigma_proof_instruction_offset` | i8 | Fee sigma proof position, fee mints only |
+| `fee_ciphertext_validity_proof_instruction_offset` | i8 | Fee ciphertext validity proof position, fee mints only |
+| `recipient` | Option&lt;Pubkey&gt; | Optional recipient on the channel (wallet address, not the ATA; if None, defaults to user) |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `user` | ✓ | | User depositing tokens |
+| 2 | `instance` | | | Instance PDA, owner of the escrow account |
+| 3 | `mint` | | | Token mint being deposited |
+| 4 | `allowed_mint` | | | AllowedMint PDA to validate mint is allowed |
+| 5 | `user_ata` | | ✓ | User's Associated Token Account for this mint |
+| 6 | `instance_ata` | | ✓ | Instance's Associated Token Account for this mint |
+| 7 | `token_program` | | | Token-2022 program |
+| 8 | `instructions_sysvar` | | | Instructions sysvar, read when a proof is an instruction |
+| 9 | `event_authority` | | | Event authority PDA for emitting events |
+| 10 | `private_channel_escrow_program` | | | Current program for CPI |
+| 11 | `user_allowed_wallet_pda` | | | AllowedWallet PDA of `user`; read only while deposits are whitelisted |
+| 12 | `recipient_allowed_wallet_pda` | | | AllowedWallet PDA of the credited wallet; read only while deposits are whitelisted |
+
+#### ConfidentialReleaseFunds
+`ReleaseFunds` for a hidden amount (operator-only): the escrow's available balance pays the user's pending balance. The checks and the nonce are `ReleaseFunds`'s. The event carries the amount encrypted under the instance key, read from the ciphertext validity proof Token-2022 accepted. On a fee mint the escrow pays the whole amount and the fee comes off the user's side. Proofs and trailing accounts are placed as in `ConfidentialDeposit`.
+
+Discriminator: `14`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `user` | Pubkey | User receiving the funds (wallet address, not the ATA) |
+| `transaction_nonce` | u64 | Transaction nonce to consume from the withdrawal bitmap |
+| `withdrawer` | Pubkey | Wallet whose channel burn this release settles; may differ from `user` |
+| `new_source_decryptable_available_balance` | [u8; 36] | Escrow's available balance after the release, encrypted under the instance AES key |
+| `auditor_ciphertext_lo`, `auditor_ciphertext_hi` | [u8; 64] | The amount under the mint's auditor key |
+| Proof offsets | i8 | As in `ConfidentialDeposit` |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `operator` | ✓ | | Operator releasing the funds |
+| 2 | `instance` | | | Instance PDA to validate and sign the transfer |
+| 3 | `withdrawal_bitmap` | | ✓ | Withdrawal bitmap PDA to consume the nonce |
+| 4 | `operator_pda` | | | Operator PDA to validate operator permissions |
+| 5 | `mint` | | | Token mint being released |
+| 6 | `allowed_mint` | | | AllowedMint PDA to validate mint is allowed |
+| 7 | `user_ata` | | ✓ | User's Associated Token Account for this mint |
+| 8 | `instance_ata` | | ✓ | Instance's Associated Token Account for this mint |
+| 9 | `token_program` | | | Token-2022 program |
+| 10 | `instructions_sysvar` | | | Instructions sysvar, read when a proof is an instruction |
+| 11 | `event_authority` | | | Event authority PDA for emitting events |
+| 12 | `private_channel_escrow_program` | | | Current program for CPI |
+| 13 | `memo_program` | | | SPL Memo program; invoked only when `user_ata` requires a memo |
+| 14 | `user_allowed_wallet_pda` | | | AllowedWallet PDA of `user`; read only while withdrawals are whitelisted |
+| 15 | `withdrawer_allowed_wallet_pda` | | | AllowedWallet PDA of `withdrawer`; read only while withdrawals are whitelisted |
+
+#### ApplyPendingBalance
+Moves the escrow's pending balance into its available balance (operator-only). It fails with `PendingCounterMismatch` when a credit arrived after the operator read the account, since the AES balance it supplies would miss that credit; the operator reads again and retries. If deposits keep landing in between, block deposits, apply, and unblock.
+
+An apply, a release and `MoveToPublic` all change the available balance, which turns proofs built against the old one stale. Confidential releases of a mint therefore go one at a time.
+
+Discriminator: `15`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `expected_credit_counter` | u64 | Pending credits the operator saw |
+| `new_decryptable_available_balance` | [u8; 36] | Available balance after the apply, encrypted under the instance AES key |
+
+**Accounts:**
+| Account | Name | Signer | Writable | Description |
+|---------|------|--------|----------|-------------|
+| 0 | `payer` | ✓ | ✓ | Transaction fee payer |
+| 1 | `operator` | ✓ | | Operator applying the balance |
+| 2 | `instance` | | | Instance PDA, owner of the escrow account |
+| 3 | `operator_pda` | | | Operator PDA to validate operator permissions |
+| 4 | `mint` | | | Token mint of the escrow account |
+| 5 | `instance_ata` | | ✓ | Instance's Associated Token Account for this mint |
+| 6 | `token_program` | | | Token-2022 program |
+| 7 | `event_authority` | | | Event authority PDA for emitting events |
+| 8 | `private_channel_escrow_program` | | | Current program for CPI |
+
+#### MoveToConfidential
+Moves escrow funds from the public balance into the pending balance (operator-only), for when confidential releases run short. The amount is public, and custody as a whole does not change. Token-2022 refuses it on a `ConfidentialMintBurn` mint.
+
+Discriminator: `16`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `amount` | u64 | Amount to move |
+
+**Accounts:** as `ApplyPendingBalance`, with `operator` moving the funds.
+
+#### MoveToPublic
+Moves escrow funds from the available balance into the public balance (operator-only), for when public releases run short. The amount is public, and custody as a whole does not change. It takes an equality and a range proof, placed as a transfer's: one context account per zero offset, equality first. Token-2022 refuses it on a `ConfidentialMintBurn` mint.
+
+Discriminator: `17`
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `amount` | u64 | Amount to move |
+| `new_decryptable_available_balance` | [u8; 36] | Available balance after the move, encrypted under the instance AES key |
+| `equality_proof_instruction_offset` | i8 | Equality proof position, 0 for a context account |
+| `range_proof_instruction_offset` | i8 | Range proof position, 0 for a context account |
+
+**Accounts:** as `ApplyPendingBalance`, with `operator` moving the funds and `instructions_sysvar` after `token_program`.
+
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.
 
@@ -351,9 +512,9 @@ The program trusts each kind of signer for a fixed set of decisions.
 
 | Principal | Trusted for | Instructions |
 |-----------|-------------|--------------|
-| Admin | Instance configuration: the mint allowlist, the operator set, the wallet whitelist, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `AddOrUpdateAllowedWallet`, `RemoveAllowedWallet`, `SetWhitelistEnabled`, `SetNewAdmin` |
-| Operator | Every release parameter (amount, recipient, withdrawer, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
-| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens (allowed wallets only while deposits are whitelisted) | `CreateInstance`, `Deposit` |
+| Admin | Instance configuration: the mint allowlist, the operator set, the wallet whitelist, which escrow accounts take confidential transfers, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `AddOrUpdateAllowedWallet`, `RemoveAllowedWallet`, `SetWhitelistEnabled`, `ConfigureConfidentialAccount`, `SetNewAdmin` |
+| Operator | Every release parameter (amount, recipient, withdrawer, allowlisted mint, nonce), when to rotate the withdrawal bitmap, and the escrow's confidential balance: applying it and moving funds between it and the public balance | `ReleaseFunds`, `ConfidentialReleaseFunds`, `RotateBitmap`, `ApplyPendingBalance`, `MoveToConfidential`, `MoveToPublic` |
+| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens (allowed wallets only while deposits are whitelisted) | `CreateInstance`, `Deposit`, `ConfidentialDeposit` |
 
 Beyond the mint allowlist, the program constrains an operator in three ways.
 Each nonce is released at most once, and only while the bitmap covers its
@@ -516,6 +677,8 @@ The program defines the following custom errors:
 | 19 | `BelowMinimumDeposit` | Deposit received less than the mint's minimum deposit |
 | 20 | `WalletNotAllowed` | The direction is whitelisted and the wallet has no entry, or its entry blocks it |
 | 21 | `InvalidAllowedWalletPda` | AllowedWallet PDA does not belong to the wallet being checked |
+| 22 | `ConfidentialAccountNotConfigured` | The escrow account has no confidential transfer extension |
+| 23 | `PendingCounterMismatch` | The pending balance took a credit after the caller read it |
 
 ## Other Constants
 

@@ -211,7 +211,7 @@ const MEMO_TEXT: &[u8] = b"escrow release";
 /// True when `to` carries Token-2022's `MemoTransfer` extension, so an incoming
 /// transfer has to be preceded by a memo.
 #[inline(always)]
-fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
+pub fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
     if !to.owned_by(&TOKEN_2022_PROGRAM_ID) {
         return Ok(false);
     }
@@ -229,7 +229,7 @@ fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
 ///
 /// Memo handling ported from <https://github.com/solana-foundation/dvp>.
 #[inline(always)]
-fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
+pub fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
     if memo_program.address() != &MEMO_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }

@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**70 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **154 integration tests** (end-to-end behavior).
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **189 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -222,7 +222,60 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### Unit Tests (60 tests across processor and program modules)
+### ConfigureConfidentialAccount (7 integration tests)
+
+- `test_configure_confidential_account_success` — escrow account carries the instance key, approved, confidential credits off and public credits on
+- `test_configure_confidential_account_fee_mint` — a fee mint's escrow account also gets `ConfidentialTransferFeeAmount`
+- `test_configure_confidential_account_manual_approval_mint_leaves_account_unapproved`
+- `test_configure_confidential_account_rejects_non_admin`
+- `test_configure_confidential_account_rejects_spl_token_program`
+- `test_configure_confidential_account_rejects_mint_without_extension` — Token-2022 refuses with InvalidAccountData
+- `test_configure_confidential_account_twice_fails` — the key cannot change
+
+### ConfidentialDeposit (9 integration tests)
+
+- `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
+- `test_confidential_deposit_context_account_proofs`
+- `test_confidential_deposit_with_recipient`
+- `test_confidential_deposit_direct_transfer_to_escrow_refused` — a confidential transfer outside the escrow finds credits off
+- `test_confidential_deposit_unconfigured_escrow_rejected`
+- `test_confidential_deposit_blocked_mint_rejected`
+- `test_confidential_deposit_whitelist_unlisted_user_rejected`
+- `test_confidential_deposit_transfer_hook_forwards_extras`
+- `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
+
+### ConfidentialReleaseFunds (10 integration tests)
+
+- `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
+- `test_confidential_release_funds_context_account_proofs`
+- `test_confidential_release_funds_nonce_replay_rejected` — fresh proofs, same nonce
+- `test_confidential_release_funds_stale_proof_rejected` — an apply in between turns the proofs stale
+- `test_confidential_release_funds_destination_credits_disabled_rejected`
+- `test_confidential_release_funds_memo_required_destination`
+- `test_confidential_release_funds_not_operator_rejected`
+- `test_confidential_release_funds_blocked_withdrawals_rejected`
+- `test_confidential_release_funds_transfer_hook_forwards_extras`
+- `test_confidential_release_funds_transfer_fee` — the escrow pays the whole amount, the user receives it net of the fee
+
+### ApplyPendingBalance (4 integration tests)
+
+- `test_apply_pending_balance_success` — available and its AES copy hold the applied amount
+- `test_apply_pending_balance_stale_counter_rejected`
+- `test_apply_pending_balance_not_operator_rejected`
+- `test_apply_pending_balance_unconfigured_escrow_rejected`
+
+### MoveToConfidential (2 integration tests)
+
+- `test_move_to_confidential_success` — public balance to pending; credits off again after
+- `test_move_to_confidential_not_operator_rejected`
+
+### MoveToPublic (3 integration tests)
+
+- `test_move_to_public_inline_proofs`
+- `test_move_to_public_context_account_proofs`
+- `test_move_to_public_not_operator_rejected`
+
+### Unit Tests (95 tests across processor and program modules)
 
 **Instruction data parsing** (processor modules):
 
@@ -234,6 +287,13 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)
 - `set_whitelist_enabled`: 1 test (non-canonical flag byte rejected in either position)
 - `add_or_update_allowed_wallet`: 1 test (non-canonical flag byte rejected in either position)
+- `configure_confidential_account`: 3 tests (valid data, zero proof offset rejected, too short)
+- `confidential_deposit`: 3 tests (with/without recipient, non-canonical recipient tag)
+- `confidential_release_funds`: 2 tests (valid data, too short)
+- `apply_pending_balance`: 2 tests (valid data, too short)
+- `move_to_confidential`: 2 tests (zero amount rejected before the accounts, too short)
+- `move_to_public`: 2 tests (valid data, zero amount rejected before the accounts)
+- `shared/confidential_utils`: 4 tests (transfer fields parse, too short, Token-2022 proof order with and without a fee, context account count)
 
 **Withdrawal bitmap logic** (`state/withdrawal_bitmap.rs`):
 
@@ -245,7 +305,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
 - `allowed_wallet`: 1 test (wrong discriminator rejected, so no other escrow account passes as a whitelist entry)
 - `instance`: 7 tests (constructor, serialization roundtrip with length check and opposite whitelist flags, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, a 0.1.0 instance reads with the whitelist off, a cut-short instance rejected)
-- `discriminator`: 2 tests (all 13 valid instruction discriminator bytes accepted, unmapped bytes rejected)
+- `discriminator`: 2 tests (all 19 valid instruction discriminator bytes accepted, unmapped bytes rejected)
 
 **Error ABI stability** (`error.rs`):
 
@@ -253,7 +313,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 
 **Event encoding** (`events.rs`):
 
-- 11 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap, AddOrUpdateAllowedWallet, SetWhitelistEnabled) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix. RemoveAllowedWallet shares the operator events' layout and is asserted emitted by the integration tests
+- 17 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap, AddOrUpdateAllowedWallet, SetWhitelistEnabled, and the six confidential ones) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix. RemoveAllowedWallet shares the operator events' layout and is asserted emitted by the integration tests
 
 ## Documented Gaps
 

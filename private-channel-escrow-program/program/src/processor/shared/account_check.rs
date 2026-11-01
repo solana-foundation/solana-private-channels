@@ -1,5 +1,8 @@
 use crate::ID as PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
-use pinocchio::{account::AccountView, address::Address, error::ProgramError};
+use pinocchio::{
+    account::AccountView, address::Address, error::ProgramError,
+    sysvars::instructions::INSTRUCTIONS_ID,
+};
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
 use pinocchio_token::ID as TOKEN_PROGRAM_ID;
 use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
@@ -85,6 +88,25 @@ pub fn verify_current_program(info: &AccountView) -> Result<(), ProgramError> {
 pub fn verify_token_programs(info: &AccountView) -> Result<(), ProgramError> {
     if info.address().ne(&TOKEN_PROGRAM_ID) && info.address().ne(&TOKEN_2022_PROGRAM_ID) {
         return Err(ProgramError::IncorrectProgramId);
+    }
+
+    Ok(())
+}
+
+/// Confidential transfers exist only in Token-2022.
+#[inline(always)]
+pub fn verify_token_2022_program(info: &AccountView) -> Result<(), ProgramError> {
+    if info.address().ne(&TOKEN_2022_PROGRAM_ID) {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+pub fn verify_instructions_sysvar(info: &AccountView) -> Result<(), ProgramError> {
+    if info.address().ne(&INSTRUCTIONS_ID) {
+        return Err(ProgramError::UnsupportedSysvar);
     }
 
     Ok(())
