@@ -5,12 +5,14 @@ use crate::{
         assert_get_or_set_whitelist_enabled, setup_confidential_escrow,
     },
     utils::{
-        assert_program_error, combine_lo_hi, confidential_state, create_confidential_account,
-        create_confidential_mint, decrypt_available, decrypt_change, decrypt_pending, event_data,
-        fund_confidential_balance, hook_extras_for_mint, prepare_transfer, ConfidentialKeys,
+        assert_failed_first, combine_lo_hi, confidential_state, create_confidential_account,
+        create_confidential_mint, custom_error, decrypt_available, decrypt_change, decrypt_pending,
+        event_data, fund_confidential_balance, hook_extras_for_mint, malicious_hook_extras,
+        prepare_transfer, set_malicious_extra_account_meta_list, ConfidentialKeys,
         ConfidentialMintOptions, ProofPlacement, TestContext,
         CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR, DEPOSITS_BLOCKED_FOR_MINT_ERROR,
-        TOKEN_2022_PROGRAM_ID, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WALLET_NOT_ALLOWED_ERROR,
+        HOOK_FIXTURE_PROGRAM_ID, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WALLET_NOT_ALLOWED_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfidentialDepositBuilder;
@@ -181,6 +183,80 @@ fn test_confidential_deposit_context_account_proofs() {
     );
 }
 
+// The indexer mints the change in pending, so a deposit onto an unapplied one must
+// report only its own amount.
+#[test]
+fn test_confidential_deposit_onto_a_non_empty_pending_balance() {
+    const SECOND_DEPOSIT_AMOUNT: u64 = 250_000;
+
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let mut deposited = Vec::new();
+    for amount in [DEPOSIT_AMOUNT, SECOND_DEPOSIT_AMOUNT] {
+        let transfer = prepare_transfer(
+            &mut context,
+            &user_ata,
+            &user_keys,
+            escrow.keys.elgamal.pubkey(),
+            &escrow.mint,
+            amount,
+            ProofPlacement::Inline,
+        );
+        let instruction = ConfidentialDepositBuilder::new()
+            .payer(context.payer.pubkey())
+            .user(user.pubkey())
+            .instance(escrow.instance_pda)
+            .mint(escrow.mint.address)
+            .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+            .user_ata(user_ata)
+            .instance_ata(escrow.escrow_ata)
+            .user_allowed_wallet_pda(user_allowed_wallet_pda)
+            .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+            .new_source_decryptable_available_balance(
+                transfer.new_source_decryptable_available_balance,
+            )
+            .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+            .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+            .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+            .ciphertext_validity_proof_instruction_offset(
+                transfer.ciphertext_validity_proof_instruction_offset,
+            )
+            .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+            .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+            .fee_ciphertext_validity_proof_instruction_offset(
+                transfer.fee_ciphertext_validity_proof_instruction_offset,
+            )
+            .instruction();
+        let transaction_metadata = context
+            .send_v1(&transfer.proofs.with(instruction), &[&user])
+            .expect("ConfidentialDeposit should succeed");
+        deposited.push(deposited_amount(
+            &escrow.keys,
+            &event_data(&transaction_metadata, 13),
+        ));
+    }
+
+    assert_eq!(deposited, [DEPOSIT_AMOUNT, SECOND_DEPOSIT_AMOUNT]);
+    assert_eq!(
+        decrypt_pending(&mut context, &escrow.escrow_ata, &escrow.keys),
+        DEPOSIT_AMOUNT + SECOND_DEPOSIT_AMOUNT
+    );
+}
+
 #[test]
 fn test_confidential_deposit_with_recipient() {
     let mut context = TestContext::new();
@@ -289,9 +365,10 @@ fn test_confidential_deposit_direct_transfer_to_escrow_refused() {
 
     let result = context.send_v1(&instructions, &[&user]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR),
     );
 }
 
@@ -367,9 +444,10 @@ fn test_confidential_deposit_unconfigured_escrow_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR,
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR),
     );
 }
 
@@ -438,7 +516,11 @@ fn test_confidential_deposit_blocked_mint_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
 
-    assert_program_error(result.map(|_| ()), DEPOSITS_BLOCKED_FOR_MINT_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(DEPOSITS_BLOCKED_FOR_MINT_ERROR),
+    );
 }
 
 #[test]
@@ -503,7 +585,11 @@ fn test_confidential_deposit_whitelist_unlisted_user_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
 
-    assert_program_error(result.map(|_| ()), WALLET_NOT_ALLOWED_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(WALLET_NOT_ALLOWED_ERROR),
+    );
 }
 
 // Token-2022 runs the hook on confidential transfers too, with the extras the
@@ -582,6 +668,92 @@ fn test_confidential_deposit_transfer_hook_forwards_extras() {
         decrypt_pending(&mut context, &escrow.escrow_ata, &escrow.keys),
         DEPOSIT_AMOUNT
     );
+}
+
+// A hook whose account list names the payer as a signer must not drain it. The
+// payer is the victim because it is the one account here that is both writable
+// and signing, as in the public deposit test. Token-2022's confidential path also
+// withholds signer bits from the hook, so this pins the outcome, not which layer
+// stops it.
+#[test]
+fn test_confidential_deposit_rejects_signer_bearing_hook_extra() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            transfer_hook: true,
+            ..Default::default()
+        },
+    );
+    let user = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = context.payer.pubkey();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    set_malicious_extra_account_meta_list(
+        &mut context,
+        &escrow.mint.address,
+        &victim,
+        &attacker.pubkey(),
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .add_remaining_accounts(&malicious_hook_extras(
+            &escrow.mint.address,
+            &victim,
+            &attacker.pubkey(),
+        ))
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    // The hook runs, but its drain lacks the payer's signature.
+    assert_failed_first(
+        result,
+        &HOOK_FIXTURE_PROGRAM_ID,
+        "Cross-program invocation with unauthorized signer or writable account",
+    );
+    assert!(context.get_account(&attacker.pubkey()).is_none());
 }
 
 // The fee comes off the escrow's pending balance, so the event carries the net

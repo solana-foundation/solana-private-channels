@@ -370,7 +370,7 @@ Discriminator: `12`
 #### ConfidentialDeposit
 Deposits a hidden amount from the user's available confidential balance into the escrow's pending balance (permissionless unless deposits are whitelisted). The gates are `Deposit`'s, except the minimum deposit and the zero check, which need the amount. The event carries the escrow's pending balance before and after the transfer, and the indexer decrypts the difference with the instance key. On a fee mint the difference is net of the fee.
 
-Each deposit takes one of the pending balance's 65,536 credits until the operator applies it, so dust deposits can use them up.
+Each deposit takes one of the pending balance's 65,536 credits until the operator applies it, so dust deposits can use them up only while the operator is not applying.
 
 Each proof offset is the proof instruction's position relative to this one, or 0 for a proof in a context account. The fee offsets are read only for mints with a transfer fee. After the fixed accounts come one context account per zero offset, in Token-2022's order (equality, ciphertext validity, fee sigma, fee ciphertext validity, range), then the mint's transfer-hook extras, resolved with an amount of `u64::MAX`.
 
@@ -442,7 +442,7 @@ Discriminator: `14`
 | 15 | `withdrawer_allowed_wallet_pda` | | | AllowedWallet PDA of `withdrawer`; read only while withdrawals are whitelisted |
 
 #### ApplyPendingBalance
-Moves the escrow's pending balance into its available balance (operator-only). It fails with `PendingCounterMismatch` when a credit arrived after the operator read the account, since the AES balance it supplies would miss that credit; the operator reads again and retries. If deposits keep landing in between, block deposits, apply, and unblock.
+Moves the escrow's pending balance into its available balance (operator-only). A credit that arrives after the operator read the account is applied too, but is missing from the AES balance the operator supplies, so the AES copy can lag the real balance. Refusing the apply instead would let dust deposits starve it. The event carries the pending balance actually applied, read in the same instruction. Only applies, releases and `MoveToPublic` change the available balance, so the operator counts it from those, builds release proofs from that count rather than from the AES copy, and writes a correct copy with every release.
 
 An apply, a release and `MoveToPublic` all change the available balance, which turns proofs built against the old one stale. Confidential releases of a mint therefore go one at a time.
 
@@ -678,7 +678,6 @@ The program defines the following custom errors:
 | 20 | `WalletNotAllowed` | The direction is whitelisted and the wallet has no entry, or its entry blocks it |
 | 21 | `InvalidAllowedWalletPda` | AllowedWallet PDA does not belong to the wallet being checked |
 | 22 | `ConfidentialAccountNotConfigured` | The escrow account has no confidential transfer extension |
-| 23 | `PendingCounterMismatch` | The pending balance took a credit after the caller read it |
 
 ## Other Constants
 

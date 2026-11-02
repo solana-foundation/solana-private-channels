@@ -1690,8 +1690,8 @@ fn test_release_funds_token_2022_transfer_hook_forwards_extras() {
 
 // The release leg is where a hostile hook has the most to gain: the escrow
 // signs it, and the operator's payer wallet is hot. The mint names that
-// payer as a signer-bearing extra and the fixture tries to drain it; only
-// the program stripping the signer bit stops it.
+// payer as a signer-bearing extra and the fixture tries to drain it. Both
+// the program's signer strip and Token-2022 stop it.
 #[test]
 fn test_release_funds_rejects_signer_bearing_hook_extra() {
     let mut context = TestContext::new();

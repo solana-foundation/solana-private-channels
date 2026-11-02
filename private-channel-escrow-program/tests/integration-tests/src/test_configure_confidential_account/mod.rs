@@ -4,10 +4,10 @@ use crate::{
         assert_get_or_allow_mint, assert_get_or_create_instance, setup_confidential_escrow,
     },
     utils::{
-        assert_event_discriminator_present, assert_program_error, confidential_state,
-        create_confidential_mint, set_mint_2022_basic, ConfidentialKeys, ConfidentialMintOptions,
-        TestContext, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
-        TOKEN_2022_PROGRAM_ID,
+        assert_event_discriminator_present, assert_failed_first, confidential_state,
+        create_confidential_mint, custom_error, set_mint_2022_basic, ConfidentialKeys,
+        ConfidentialMintOptions, TestContext, INCORRECT_PROGRAM_ID_LOG, INVALID_ACCOUNT_DATA_LOG,
+        INVALID_ADMIN_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfigureConfidentialAccountBuilder;
@@ -158,7 +158,11 @@ fn test_configure_confidential_account_rejects_non_admin() {
 
     let result = context.send_v1(&[instruction, proof], &[&attacker]);
 
-    assert_program_error(result.map(|_| ()), INVALID_ADMIN_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_ADMIN_ERROR),
+    );
 }
 
 #[test]
@@ -204,7 +208,11 @@ fn test_configure_confidential_account_rejects_spl_token_program() {
 
     let result = context.send_v1(&[instruction, proof], &[&admin]);
 
-    assert_program_error(result.map(|_| ()), INCORRECT_PROGRAM_ID_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        INCORRECT_PROGRAM_ID_LOG,
+    );
 }
 
 // Token-2022 refuses to configure an account of a mint without confidential transfers.
@@ -251,7 +259,7 @@ fn test_configure_confidential_account_rejects_mint_without_extension() {
 
     let result = context.send_v1(&[instruction, proof], &[&admin]);
 
-    assert_program_error(result.map(|_| ()), INVALID_ACCOUNT_DATA_ERROR);
+    assert_failed_first(result, &TOKEN_2022_PROGRAM_ID, INVALID_ACCOUNT_DATA_LOG);
 }
 
 // An account's ElGamal key never changes, so a second configure must fail.
@@ -278,9 +286,10 @@ fn test_configure_confidential_account_twice_fails() {
 
     let result = context.send_v1(&[instruction, proof], &[&escrow.admin]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        TokenError::ExtensionAlreadyInitialized as u32,
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TokenError::ExtensionAlreadyInitialized as u32),
     );
     assert_eq!(
         confidential_state(&mut context, &escrow.escrow_ata).elgamal_pubkey,

@@ -1,8 +1,9 @@
 use crate::{
     state_utils::setup_confidential_escrow,
     utils::{
-        assert_program_error, confidential_state, decrypt_pending, event_data, get_token_balance,
-        ConfidentialMintOptions, TestContext, INVALID_OPERATOR_ERROR, TOKEN_2022_PROGRAM_ID,
+        assert_failed_first, confidential_state, custom_error, decrypt_pending, event_data,
+        get_token_balance, ConfidentialMintOptions, TestContext, INVALID_OPERATOR_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::MoveToConfidentialBuilder;
@@ -76,5 +77,9 @@ fn test_move_to_confidential_not_operator_rejected() {
 
     let result = context.send_v1(&[instruction], &[&other.operator]);
 
-    assert_program_error(result.map(|_| ()), INVALID_OPERATOR_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_OPERATOR_ERROR),
+    );
 }

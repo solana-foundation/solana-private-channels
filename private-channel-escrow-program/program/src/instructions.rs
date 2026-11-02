@@ -556,8 +556,9 @@ pub enum PrivateChannelEscrowProgramInstruction {
     } = 14,
 
     /// Move the escrow's pending balance into its available balance
-    /// (operator-only). Refused if a credit arrived since the operator read the
-    /// account; read again and retry.
+    /// (operator-only). A credit that arrived after the operator read the account
+    /// is applied too but missing from the AES balance; the event carries the
+    /// pending balance actually applied, so the operator counts available itself.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "operator", docs = "Operator applying the balance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]

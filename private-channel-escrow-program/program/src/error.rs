@@ -98,10 +98,6 @@ pub enum PrivateChannelEscrowProgramError {
     /// (22) The escrow account has no confidential transfer extension
     #[error("Escrow account is not configured for confidential transfers")]
     ConfidentialAccountNotConfigured,
-
-    /// (23) The pending balance took a credit after the caller read it
-    #[error("Pending balance credit counter differs from the expected one")]
-    PendingCounterMismatch,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -146,7 +142,6 @@ mod tests {
             (WalletNotAllowed, 20),
             (InvalidAllowedWalletPda, 21),
             (ConfidentialAccountNotConfigured, 22),
-            (PendingCounterMismatch, 23),
         ];
 
         for (error, expected_code) in cases {

@@ -638,6 +638,9 @@ impl ConfidentialReleaseFundsEvent {
     }
 }
 
+/// The applied pending balance lets the operator keep its own count of the
+/// available balance: the AES copy it supplies misses credits that land after it
+/// read the account.
 #[derive(CodamaType)]
 pub struct ApplyPendingBalanceEvent {
     /// Unique u8 byte for event type.
@@ -648,26 +651,40 @@ pub struct ApplyPendingBalanceEvent {
     pub operator: Pubkey,
     /// Mint of the escrow account
     pub mint: Pubkey,
+    /// Pending balance moved into available, low bits
+    pub applied_pending_balance_lo: [u8; 64],
+    /// Pending balance moved into available, high bits
+    pub applied_pending_balance_hi: [u8; 64],
 }
 
 impl ApplyPendingBalanceEvent {
-    pub fn new(instance_seed: Pubkey, operator: Pubkey, mint: Pubkey) -> Self {
+    pub fn new(
+        instance_seed: Pubkey,
+        operator: Pubkey,
+        mint: Pubkey,
+        applied_pending: SplitCiphertext,
+    ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::ApplyPendingBalance as u8,
             instance_seed,
             operator,
             mint,
+            applied_pending_balance_lo: applied_pending.lo,
+            applied_pending_balance_hi: applied_pending.hi,
         }
     }
 
     // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (mint)
+    // + 64 (applied pending lo) + 64 (applied pending hi)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(105);
+        let mut data = Vec::with_capacity(233);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.operator.as_ref());
         data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.applied_pending_balance_lo);
+        data.extend_from_slice(&self.applied_pending_balance_hi);
         data
     }
 }
@@ -1093,14 +1110,21 @@ mod tests {
         let instance_seed = Pubkey::new_from_array([1u8; 32]);
         let operator = Pubkey::new_from_array([2u8; 32]);
         let mint = Pubkey::new_from_array([3u8; 32]);
-        let event = ApplyPendingBalanceEvent::new(instance_seed, operator, mint);
+        let applied_pending = SplitCiphertext {
+            lo: [4u8; 64],
+            hi: [5u8; 64],
+        };
+        let event = ApplyPendingBalanceEvent::new(instance_seed, operator, mint, applied_pending);
 
         // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (mint)
+        // + 64 (applied pending lo) + 64 (applied pending hi)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 105);
+        assert_eq!(bytes.len(), 233);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::ApplyPendingBalance as u8);
         assert_eq!(&bytes[73..105], mint.as_ref());
+        assert_eq!(&bytes[105..169], &[4u8; 64]);
+        assert_eq!(&bytes[169..233], &[5u8; 64]);
     }
 
     #[test]

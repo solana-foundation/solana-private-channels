@@ -26,7 +26,7 @@
 ### Programs
 - The withdraw program runs on Token-2022: `token_program` must be the Token-2022 id, with the same account order, and the treasury ATA derives under Token-2022. The generated clients default `token_program` to Token-2022
 - Optional per-instance whitelist with independent deposit and withdrawal flags: `Deposit` requires the depositor and channel recipient to be allowed to deposit, `ReleaseFunds` the channel withdrawer and the destination to be allowed to withdraw
-- Confidential transfers on the escrow, additive: `ConfigureConfidentialAccount` (12), `ConfidentialDeposit` (13), `ConfidentialReleaseFunds` (14), `ApplyPendingBalance` (15), `MoveToConfidential` (16) and `MoveToPublic` (17), errors 22 and 23. A configured escrow account takes confidential credits only inside the escrow's own instructions. Public deposits and releases are unchanged and share the account
+- Confidential transfers on the escrow, additive: `ConfigureConfidentialAccount` (12), `ConfidentialDeposit` (13), `ConfidentialReleaseFunds` (14), `ApplyPendingBalance` (15), `MoveToConfidential` (16) and `MoveToPublic` (17), error 22. A configured escrow account takes confidential credits only inside the escrow's own instructions. Public deposits and releases are unchanged and share the account
 
 ### Indexer and operators
 - The escrow operator creates channel mints with `InitializePermanentDelegate(OPERATOR_PERMANENT_DELEGATE)` and `InitializeMint2`, and never mints into a channel mint whose delegate is missing or another key (manual review, `permanent delegate mismatch`)

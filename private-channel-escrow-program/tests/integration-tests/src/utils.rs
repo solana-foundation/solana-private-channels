@@ -115,8 +115,6 @@ pub const INVALID_ALLOWED_WALLET_PDA_ERROR: u32 =
     PrivateChannelEscrowProgramError::InvalidAllowedWalletPda as u32;
 pub const CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR: u32 =
     PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured as u32;
-pub const PENDING_COUNTER_MISMATCH_ERROR: u32 =
-    PrivateChannelEscrowProgramError::PendingCounterMismatch as u32;
 
 // Token-2022 errors the confidential tests expect
 pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =
@@ -628,6 +626,38 @@ pub fn assert_program_error(
     }
 }
 
+pub const INVALID_ACCOUNT_DATA_LOG: &str = "invalid account data for instruction";
+pub const INCORRECT_PROGRAM_ID_LOG: &str = "incorrect program id for instruction";
+
+/// How the runtime logs a program's custom error.
+pub fn custom_error(code: u32) -> String {
+    format!("custom program error: {code:#x}")
+}
+
+/// Asserts that `program_id` failed first, with `reason` in its log. Escrow and
+/// Token-2022 error numbers overlap, and a failed CPI fails its caller with the
+/// same error, so only the first failure names the program that refused.
+pub fn assert_failed_first(
+    result: Result<TransactionMetadata, Box<dyn std::error::Error>>,
+    program_id: &Pubkey,
+    reason: &str,
+) {
+    let message = result.expect_err("Transaction should fail").to_string();
+    // Skip the "Transaction failed: ..." text before the first program log.
+    let first_failure = message
+        .split("Program ")
+        .skip(1)
+        .find(|log| log.contains(" failed: "))
+        .expect("A program should have failed");
+    let (failed_program, failed_reason) = first_failure.split_once(" failed: ").unwrap();
+    // The log line ends at its closing quote.
+    let failed_reason = failed_reason.split('"').next().unwrap();
+    assert_eq!(
+        (failed_program, failed_reason),
+        (program_id.to_string().as_str(), reason)
+    );
+}
+
 pub fn assert_event_discriminator_present(
     transaction_metadata: &TransactionMetadata,
     discriminator: u8,
@@ -980,7 +1010,17 @@ pub fn setup_malicious_hook_mint(
     attacker: &Pubkey,
 ) {
     set_mint_2022_with_transfer_hook(context, mint, &HOOK_FIXTURE_PROGRAM_ID);
+    set_malicious_extra_account_meta_list(context, mint, victim, attacker);
+}
 
+/// The `ExtraAccountMetaList` of [`setup_malicious_hook_mint`], for a hook mint
+/// that already exists.
+pub fn set_malicious_extra_account_meta_list(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    victim: &Pubkey,
+    attacker: &Pubkey,
+) {
     // victim: signer + writable, since a System transfer's source needs
     // both. attacker: the writable sink. system program: so the hook can
     // CPI it.

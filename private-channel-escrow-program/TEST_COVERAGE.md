@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **189 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **191 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -232,16 +232,18 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_configure_confidential_account_rejects_mint_without_extension` — Token-2022 refuses with InvalidAccountData
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
-### ConfidentialDeposit (9 integration tests)
+### ConfidentialDeposit (11 integration tests)
 
 - `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
 - `test_confidential_deposit_context_account_proofs`
+- `test_confidential_deposit_onto_a_non_empty_pending_balance` — the second of two unapplied deposits reports only its own amount
 - `test_confidential_deposit_with_recipient`
 - `test_confidential_deposit_direct_transfer_to_escrow_refused` — a confidential transfer outside the escrow finds credits off
 - `test_confidential_deposit_unconfigured_escrow_rejected`
 - `test_confidential_deposit_blocked_mint_rejected`
 - `test_confidential_deposit_whitelist_unlisted_user_rejected`
 - `test_confidential_deposit_transfer_hook_forwards_extras`
+- `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
 
 ### ConfidentialReleaseFunds (10 integration tests)
@@ -260,7 +262,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 ### ApplyPendingBalance (4 integration tests)
 
 - `test_apply_pending_balance_success` — available and its AES copy hold the applied amount
-- `test_apply_pending_balance_stale_counter_rejected`
+- `test_apply_pending_balance_lands_with_a_late_credit` — applied anyway; the event carries the full applied pending while the AES copy lags
 - `test_apply_pending_balance_not_operator_rejected`
 - `test_apply_pending_balance_unconfigured_escrow_rejected`
 

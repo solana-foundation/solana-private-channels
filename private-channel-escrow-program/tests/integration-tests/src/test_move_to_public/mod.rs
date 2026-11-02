@@ -1,8 +1,9 @@
 use crate::{
     state_utils::{fund_escrow_available, setup_confidential_escrow},
     utils::{
-        assert_program_error, decrypt_available, event_data, get_token_balance, prepare_withdraw,
-        ConfidentialMintOptions, ProofPlacement, TestContext, INVALID_OPERATOR_ERROR,
+        assert_failed_first, custom_error, decrypt_available, event_data, get_token_balance,
+        prepare_withdraw, ConfidentialMintOptions, ProofPlacement, TestContext,
+        INVALID_OPERATOR_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::MoveToPublicBuilder;
@@ -124,5 +125,9 @@ fn test_move_to_public_not_operator_rejected() {
 
     let result = context.send_v1(&withdraw.proofs.with(instruction), &[&other.operator]);
 
-    assert_program_error(result.map(|_| ()), INVALID_OPERATOR_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_OPERATOR_ERROR),
+    );
 }

@@ -3,12 +3,12 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_withdrawal_bitmap_pda},
     state_utils::{assert_get_or_block_mint, fund_escrow_available, setup_confidential_escrow},
     utils::{
-        assert_program_error, combine_lo_hi, create_confidential_account, decrypt_available,
-        decrypt_change, decrypt_pending, event_data, hook_extras_for_mint, prepare_transfer,
-        ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
-        INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR, TOKEN_2022_PROGRAM_ID,
-        TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
-        WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
+        assert_failed_first, combine_lo_hi, create_confidential_account, custom_error,
+        decrypt_available, decrypt_change, decrypt_pending, event_data, hook_extras_for_mint,
+        prepare_transfer, ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
+        INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID, TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR,
+        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfidentialReleaseFundsBuilder;
@@ -228,9 +228,10 @@ fn test_confidential_release_funds_nonce_replay_rejected() {
         .next()
         .unwrap()
         .expect("first release should succeed");
-    assert_program_error(
-        results.next().unwrap().map(|_| ()),
-        NONCE_ALREADY_USED_ERROR,
+    assert_failed_first(
+        results.next().unwrap(),
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(NONCE_ALREADY_USED_ERROR),
     );
 }
 
@@ -288,9 +289,10 @@ fn test_confidential_release_funds_stale_proof_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR,
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR),
     );
 }
 
@@ -355,9 +357,10 @@ fn test_confidential_release_funds_destination_credits_disabled_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR),
     );
 }
 
@@ -490,7 +493,11 @@ fn test_confidential_release_funds_not_operator_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&other.operator]);
 
-    assert_program_error(result.map(|_| ()), INVALID_OPERATOR_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_OPERATOR_ERROR),
+    );
 }
 
 #[test]
@@ -556,7 +563,11 @@ fn test_confidential_release_funds_blocked_withdrawals_rejected() {
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
 
-    assert_program_error(result.map(|_| ()), WITHDRAWALS_BLOCKED_FOR_MINT_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(WITHDRAWALS_BLOCKED_FOR_MINT_ERROR),
+    );
 }
 
 #[test]

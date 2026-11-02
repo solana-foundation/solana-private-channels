@@ -176,17 +176,6 @@ pub fn read_pending_balance(token_account: &AccountView) -> Result<SplitCipherte
     Ok(pending)
 }
 
-/// Credits the escrow account's pending balance has taken since the last apply.
-pub fn read_pending_credit_counter(token_account: &AccountView) -> Result<u64, ProgramError> {
-    let data = token_account.try_borrow()?;
-    let state = StateWithExtensions::<Account>::unpack(&data)
-        .map_err(|_| PrivateChannelEscrowProgramError::InvalidTokenAccount)?;
-    let extension = state
-        .get_extension::<ConfidentialTransferAccount>()
-        .map_err(|_| PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured)?;
-    Ok(extension.pending_balance_credit_counter.into())
-}
-
 /// The transfer amount under the source key, taken from the ciphertext validity
 /// proof Token-2022 has just accepted. A proof instruction's data is a one-byte
 /// tag and then the proof context; a context account's data is a header and then

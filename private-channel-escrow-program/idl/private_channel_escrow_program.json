@@ -1078,6 +1078,38 @@
               "type": {
                 "kind": "publicKeyTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "appliedPendingBalanceLo",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 64
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "appliedPendingBalanceHi",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 64
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -1318,12 +1350,6 @@
         "kind": "errorNode",
         "message": "Escrow account is not configured for confidential transfers",
         "name": "confidentialAccountNotConfigured"
-      },
-      {
-        "code": 23,
-        "kind": "errorNode",
-        "message": "Pending balance credit counter differs from the expected one",
-        "name": "pendingCounterMismatch"
       }
     ],
     "instructions": [

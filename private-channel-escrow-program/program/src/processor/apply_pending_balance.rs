@@ -7,7 +7,7 @@ use crate::{
     processor::{
         shared::{
             account_check::{verify_signer, verify_token_2022_program},
-            confidential_utils::{apply_pending_balance_cpi, read_pending_credit_counter},
+            confidential_utils::{apply_pending_balance_cpi, read_pending_balance},
             event_utils::emit_event,
             token_utils::validate_ata,
         },
@@ -27,10 +27,11 @@ use pinocchio::{
 /// Processes the ApplyPendingBalance instruction.
 ///
 /// Moves the escrow's pending balance into its available balance. Token-2022
-/// stores the new AES balance as given and only records a stale counter, so
-/// this refuses one instead: a credit that arrived after the operator read the
-/// account would be missing from the AES balance. The operator reads again and
-/// retries.
+/// stores the new AES balance as given, even when a credit arrived after the
+/// operator read the account and so is missing from it. Refusing that case would
+/// let anyone starve the apply with dust deposits. The event carries the pending
+/// balance actually applied instead, so the operator counts the available balance
+/// itself and builds release proofs from that count, not from the AES copy.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for transaction fees
@@ -93,9 +94,8 @@ pub fn process_apply_pending_balance(
         token_program_info,
     )?;
 
-    if read_pending_credit_counter(instance_ata_info)? != args.expected_credit_counter {
-        return Err(PrivateChannelEscrowProgramError::PendingCounterMismatch.into());
-    }
+    // Read in the same instruction as the apply, so nothing can credit in between.
+    let applied_pending = read_pending_balance(instance_ata_info)?;
 
     let bump_slice = [instance.bump];
     let signer_seeds = [
@@ -119,6 +119,7 @@ pub fn process_apply_pending_balance(
         instance.instance_seed,
         *operator_info.address(),
         *mint_info.address(),
+        applied_pending,
     );
     emit_event(
         program_id,

@@ -4,10 +4,11 @@ use crate::{
         setup_confidential_escrow,
     },
     utils::{
-        assert_event_discriminator_present, assert_program_error, confidential_state,
-        create_confidential_mint, decrypt_available, decrypt_pending, ConfidentialKeys,
-        ConfidentialMintOptions, TestContext, CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR,
-        INVALID_OPERATOR_ERROR, PENDING_COUNTER_MISMATCH_ERROR, TOKEN_2022_PROGRAM_ID,
+        assert_event_discriminator_present, assert_failed_first, combine_lo_hi, confidential_state,
+        create_confidential_mint, custom_error, decrypt_available, decrypt_change, decrypt_pending,
+        event_data, ConfidentialKeys, ConfidentialMintOptions, TestContext,
+        CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR, INVALID_OPERATOR_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::{
@@ -78,9 +79,11 @@ fn test_apply_pending_balance_success() {
     assert_event_discriminator_present(&transaction_metadata, 15);
 }
 
-// A credit the operator did not see would be missing from the AES balance it writes.
+// A credit the operator did not see still lands, so dust deposits cannot starve the
+// apply. The AES copy it wrote misses that credit, but the event carries everything
+// applied, so the operator's own count of the available balance stays right.
 #[test]
-fn test_apply_pending_balance_stale_counter_rejected() {
+fn test_apply_pending_balance_lands_with_a_late_credit() {
     let mut context = TestContext::new();
     let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
     let mint_to = spl_token_2022::instruction::mint_to(
@@ -116,12 +119,29 @@ fn test_apply_pending_balance_stale_counter_rejected() {
         .new_decryptable_available_balance(escrow.keys.decryptable(0).0)
         .instruction();
 
-    let result = context.send_v1(&[instruction], &[&escrow.operator]);
+    let transaction_metadata = context
+        .send_v1(&[instruction], &[&escrow.operator])
+        .expect("ApplyPendingBalance should succeed");
 
-    assert_program_error(result.map(|_| ()), PENDING_COUNTER_MISMATCH_ERROR);
+    let event = event_data(&transaction_metadata, 15);
+    // After the instance seed, operator and mint: applied pending lo, then hi.
+    let applied = combine_lo_hi(
+        decrypt_change(&escrow.keys, &[0; 64], event[96..160].try_into().unwrap()),
+        decrypt_change(&escrow.keys, &[0; 64], event[160..224].try_into().unwrap()),
+    );
+    assert_eq!(applied, PENDING_AMOUNT);
     assert_eq!(
-        decrypt_pending(&mut context, &escrow.escrow_ata, &escrow.keys),
+        decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
         PENDING_AMOUNT
+    );
+    let state = confidential_state(&mut context, &escrow.escrow_ata);
+    assert_eq!(
+        escrow
+            .keys
+            .aes
+            .decrypt(&state.decryptable_available_balance.try_into().unwrap()),
+        Some(0),
+        "the AES copy misses the late credit"
     );
 }
 
@@ -145,7 +165,11 @@ fn test_apply_pending_balance_not_operator_rejected() {
 
     let result = context.send_v1(&[instruction], &[&other.operator]);
 
-    assert_program_error(result.map(|_| ()), INVALID_OPERATOR_ERROR);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_OPERATOR_ERROR),
+    );
 }
 
 #[test]
@@ -195,8 +219,9 @@ fn test_apply_pending_balance_unconfigured_escrow_rejected() {
 
     let result = context.send_v1(&[instruction], &[&operator]);
 
-    assert_program_error(
-        result.map(|_| ()),
-        CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR,
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR),
     );
 }

@@ -1,5 +1,6 @@
 import { expect } from '@jest/globals';
 import { AccountRole } from '@solana/kit';
+import { TOKEN_2022_PROGRAM_ADDRESS } from '@solana-program/token-2022';
 import {
     CONFIDENTIAL_RELEASE_FUNDS_DISCRIMINATOR,
     getConfidentialReleaseFundsInstruction,
@@ -47,7 +48,8 @@ describe('confidentialReleaseFunds', () => {
         });
     });
 
-    it('should mark payer and operator as signers and bitmap and both token accounts writable', () => {
+    it('should default to Token-2022 and mark payer and operator as signers and bitmap and both token accounts writable', () => {
+        expect(instruction.accounts[9].address).toBe(TOKEN_2022_PROGRAM_ADDRESS);
         expect(instruction.accounts.map(account => account.role)).toEqual([
             AccountRole.WRITABLE_SIGNER, // payer
             AccountRole.READONLY_SIGNER, // operator
