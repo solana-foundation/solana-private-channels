@@ -13,14 +13,15 @@ use crate::{
         assert_get_or_set_whitelist_enabled,
     },
     utils::{
-        assert_program_error, create_mint_2022_with_transfer_fee,
-        get_or_create_associated_token_account_2022, get_token_balance, hook_extras_for_mint,
-        malicious_hook_extras, set_mint, set_mint_2022_basic, set_token_2022_with_hook_account,
-        set_token_2022_with_memo_account, setup_hook_mint, setup_malicious_hook_mint,
-        setup_test_balances, TestContext, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR,
-        INSTANCE_V1_LEN, INVALID_ALLOWED_WALLET_PDA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
-        INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
+        assert_failed_first, assert_program_error, create_mint_2022_with_transfer_fee,
+        custom_error, get_or_create_associated_token_account_2022, get_token_balance,
+        hook_extras_for_mint, malicious_hook_extras, set_mint, set_mint_2022_basic,
+        set_token_2022_with_hook_account, set_token_2022_with_memo_account, setup_hook_mint,
+        setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        INCORRECT_PROGRAM_ID_ERROR, INSTANCE_V1_LEN, INVALID_ALLOWED_WALLET_PDA_ERROR,
+        INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR, INVALID_RECIPIENT_ERROR,
+        INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR, NONCES_PER_GENERATION,
+        NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
         WALLET_NOT_ALLOWED_ERROR,
     },
@@ -971,6 +972,107 @@ fn test_release_funds_wrong_user_ata() {
     let result = context.send_transaction_with_signers(instruction, &[&operator]);
 
     assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}
+
+// The channel lets a withdrawal name any destination. Naming the instance would
+// make the release a self-transfer, which the token program treats as a no-op, so
+// the nonce would be spent with nothing released.
+#[test]
+fn test_release_funds_to_instance_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit should succeed");
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&instance_pda).0)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(find_allowed_mint_pda(&instance_pda, &mint.pubkey()).0)
+        .user_ata(instance_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(find_event_authority_pda().0)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(find_allowed_wallet_pda(&instance_pda, &instance_pda).0)
+        .withdrawer_allowed_wallet_pda(find_allowed_wallet_pda(&instance_pda, &user.pubkey()).0)
+        .amount(RELEASE_AMOUNT)
+        .user(instance_pda)
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .instruction();
+
+    let result = context.send_v1(&[instruction], &[&operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_RECIPIENT_ERROR),
+    );
 }
 
 #[test]

@@ -209,7 +209,7 @@ Discriminator: `6`
 | 13 | `recipient_allowed_wallet_pda` | | | AllowedWallet PDA of the credited wallet; read only while deposits are whitelisted |
 
 #### ReleaseFunds
-Releases funds from escrow to user (operator-only). While withdrawals are whitelisted, fails with `WalletNotAllowed` unless `withdrawer` and `user` are allowed to withdraw.
+Releases funds from escrow to user (operator-only). While withdrawals are whitelisted, fails with `WalletNotAllowed` unless `withdrawer` and `user` are allowed to withdraw. Fails with `InvalidRecipient` when `user` is the instance itself, since the release would be a self-transfer that spends the nonce and moves nothing.
 
 Discriminator: `7`
 
@@ -679,6 +679,7 @@ The program defines the following custom errors:
 | 21 | `InvalidAllowedWalletPda` | AllowedWallet PDA does not belong to the wallet being checked |
 | 22 | `ConfidentialAccountNotConfigured` | The escrow account has no confidential transfer extension |
 | 23 | `UnsupportedConfidentialMint` | ConfigureConfidentialAccount on a mint whose confidential transfers could never work through the escrow |
+| 24 | `InvalidRecipient` | A release names the instance itself as `user` |
 
 ## Other Constants
 

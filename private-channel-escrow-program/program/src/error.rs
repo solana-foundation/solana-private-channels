@@ -102,6 +102,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (23) The mint's confidential transfers could never work through the escrow
     #[error("Mint is not supported for confidential transfers")]
     UnsupportedConfidentialMint,
+
+    /// (24) A release names the instance itself as the recipient
+    #[error("Release recipient cannot be the instance")]
+    InvalidRecipient,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -147,6 +151,7 @@ mod tests {
             (InvalidAllowedWalletPda, 21),
             (ConfidentialAccountNotConfigured, 22),
             (UnsupportedConfidentialMint, 23),
+            (InvalidRecipient, 24),
         ];
 
         for (error, expected_code) in cases {

@@ -118,6 +118,7 @@ pub const CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR: u32 =
     PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured as u32;
 pub const UNSUPPORTED_CONFIDENTIAL_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::UnsupportedConfidentialMint as u32;
+pub const INVALID_RECIPIENT_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidRecipient as u32;
 
 // Token-2022 errors the confidential tests expect
 pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =

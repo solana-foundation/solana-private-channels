@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **196 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **198 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -164,7 +164,7 @@ The whitelist tests below turn on only the deposit flag.
 - `test_deposit_whitelist_empty_wrong_account_rejected` — an empty account at the wrong address in a listed wallet's slot is InvalidAllowedWalletPda, not WalletNotAllowed
 - `test_deposit_whitelist_empty_wrong_recipient_account_rejected` — the same in the recipient slot, which is checked after the user's
 
-### ReleaseFunds (38 integration tests)
+### ReleaseFunds (39 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_from_a_0_1_0_instance_succeeds` — a 0.1.0 instance reads with the whitelist off and releases
@@ -184,6 +184,7 @@ The whitelist tests below turn on only the deposit flag.
 - `test_double_spend_bitmap_rejects_used_nonce` — replay within a generation rejected by the bit alone
 - `test_double_spend_sequential_releases_then_replay` — three neighbouring nonces in one byte, then a replay of the first
 - `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
+- `test_release_funds_to_instance_rejected` — InvalidRecipient; otherwise a self-transfer that spends the nonce and moves nothing
 - `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
 - `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
 - `test_release_funds_token_2022_transfer_hook_forwards_extras` — the hook runs once on the way out of escrow and the nonce is consumed
@@ -249,7 +250,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
 
-### ConfidentialReleaseFunds (12 integration tests)
+### ConfidentialReleaseFunds (13 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
@@ -258,6 +259,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_destination_credits_disabled_rejected`
 - `test_confidential_release_funds_memo_required_destination`
 - `test_confidential_release_funds_not_operator_rejected`
+- `test_confidential_release_funds_to_instance_rejected` — InvalidRecipient instead of Token-2022's credits-disabled error
 - `test_confidential_release_funds_blocked_withdrawals_rejected`
 - `test_confidential_release_funds_whitelist_requires_withdrawer_and_user` — listing only one of the two is refused
 - `test_confidential_release_funds_transfer_hook_forwards_extras`

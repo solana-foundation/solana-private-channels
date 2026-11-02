@@ -10,8 +10,8 @@ use crate::{
         decrypt_available, decrypt_change, decrypt_pending, event_data, get_token_balance,
         hook_extras_for_mint, prepare_transfer, prepare_withdraw, set_extra_account_meta_list,
         ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
-        HOOK_FIXTURE_PROGRAM_ID, INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        HOOK_FIXTURE_PROGRAM_ID, INVALID_OPERATOR_ERROR, INVALID_RECIPIENT_ERROR,
+        NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
         TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
         WALLET_NOT_ALLOWED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
@@ -509,6 +509,66 @@ fn test_confidential_release_funds_not_operator_rejected() {
         result,
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
         &custom_error(INVALID_OPERATOR_ERROR),
+    );
+}
+
+// The channel lets a withdrawal name any destination. Naming the instance would
+// make the escrow account both sides of the transfer.
+#[test]
+fn test_confidential_release_funds_to_instance_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let withdrawer = Keypair::new();
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(escrow.escrow_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(
+            find_allowed_wallet_pda(&escrow.instance_pda, &escrow.instance_pda).0,
+        )
+        .withdrawer_allowed_wallet_pda(
+            find_allowed_wallet_pda(&escrow.instance_pda, &withdrawer.pubkey()).0,
+        )
+        .user(escrow.instance_pda)
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(withdrawer.pubkey())
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(INVALID_RECIPIENT_ERROR),
     );
 }
 

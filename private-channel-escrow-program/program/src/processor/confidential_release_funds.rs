@@ -144,6 +144,11 @@ pub fn process_confidential_release_funds(
         )?;
     }
 
+    // The escrow account would pay itself, which Token-2022 refuses.
+    if &args.user == instance_info.address() {
+        return Err(PrivateChannelEscrowProgramError::InvalidRecipient.into());
+    }
+
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
     validate_ata(
         instance_ata_info,

@@ -1381,6 +1381,12 @@
         "kind": "errorNode",
         "message": "Mint is not supported for confidential transfers",
         "name": "unsupportedConfidentialMint"
+      },
+      {
+        "code": 24,
+        "kind": "errorNode",
+        "message": "Release recipient cannot be the instance",
+        "name": "invalidRecipient"
       }
     ],
     "instructions": [

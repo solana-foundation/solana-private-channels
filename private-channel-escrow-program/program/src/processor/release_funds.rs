@@ -142,6 +142,12 @@ pub fn process_release_funds(
         )?;
     }
 
+    // The token program treats a transfer to itself as a no-op, so the nonce would
+    // be spent with nothing released.
+    if &args.user == instance_info.address() {
+        return Err(PrivateChannelEscrowProgramError::InvalidRecipient.into());
+    }
+
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
     validate_ata(
         instance_ata_info,
