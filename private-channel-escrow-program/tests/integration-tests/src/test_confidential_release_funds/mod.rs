@@ -7,25 +7,33 @@ use crate::{
     },
     utils::{
         assert_failed_first, combine_lo_hi, create_confidential_account, custom_error,
-        decrypt_available, decrypt_change, decrypt_pending, event_data, hook_extras_for_mint,
-        prepare_transfer, ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
-        INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-        TOKEN_2022_PROGRAM_ID, TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR,
-        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WALLET_NOT_ALLOWED_ERROR,
-        WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
+        decrypt_available, decrypt_change, decrypt_pending, event_data, get_token_balance,
+        hook_extras_for_mint, prepare_transfer, prepare_withdraw, set_extra_account_meta_list,
+        ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
+        HOOK_FIXTURE_PROGRAM_ID, INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
+        WALLET_NOT_ALLOWED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
-use private_channel_escrow_program_client::instructions::ConfidentialReleaseFundsBuilder;
-use solana_sdk::signature::{Keypair, Signer};
+use private_channel_escrow_program_client::instructions::{
+    ConfidentialReleaseFundsBuilder, MoveToPublicBuilder, ReleaseFundsBuilder,
+};
+use solana_sdk::{
+    instruction::AccountMeta,
+    signature::{Keypair, Signer},
+};
 use spl_token_2022::extension::{
     memo_transfer::instruction::enable_required_transfer_memos, ExtensionType,
 };
 use spl_token_2022_interface::extension::confidential_transfer::instruction as confidential_instruction;
+use spl_transfer_hook_interface::get_extra_account_metas_address;
 
 const ESCROW_BALANCE: u64 = 3_000_000;
 const RELEASE_AMOUNT: u64 = 1_000_000;
 const TRANSACTION_NONCE: u64 = 42;
 const HOOK_LOG: &str = "hook accounts: 6";
+const HOOK_REFUSED_LOG: &str = "invalid program argument";
 
 /// The amount in a ConfidentialReleaseFundsEvent, decrypted with the instance key.
 fn released_amount(keys: &ConfidentialKeys, event: &[u8]) -> u64 {
@@ -731,6 +739,137 @@ fn test_confidential_release_funds_transfer_hook_forwards_extras() {
     assert_eq!(
         decrypt_pending(&mut context, &user_ata, &user_keys),
         RELEASE_AMOUNT
+    );
+}
+
+// Token-2022 hands the hook u64::MAX for a confidential transfer, so a hook that
+// refuses it blocks every confidential release. MoveToPublic skips the hook, and a
+// public ReleaseFunds then settles the same nonce, with the amount visible.
+#[test]
+fn test_confidential_release_funds_hook_refusing_u64_max_settled_publicly() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            transfer_hook: true,
+            ..Default::default()
+        },
+    );
+    // With no extras declared, the hook fixture refuses u64::MAX.
+    set_extra_account_meta_list(&mut context, &escrow.mint.address, &[]);
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&escrow.instance_pda);
+    let hook_accounts = [
+        AccountMeta::new_readonly(HOOK_FIXTURE_PROGRAM_ID, false),
+        AccountMeta::new_readonly(
+            get_extra_account_metas_address(&escrow.mint.address, &HOOK_FIXTURE_PROGRAM_ID),
+            false,
+        ),
+    ];
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let confidential_release = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .add_remaining_accounts(&hook_accounts)
+        .instruction();
+
+    let result = context.send_v1(
+        &transfer.proofs.with(confidential_release),
+        &[&escrow.operator],
+    );
+
+    assert_failed_first(result, &HOOK_FIXTURE_PROGRAM_ID, HOOK_REFUSED_LOG);
+
+    let withdraw = prepare_withdraw(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let move_to_public = MoveToPublicBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .instance_ata(escrow.escrow_ata)
+        .amount(RELEASE_AMOUNT)
+        .new_decryptable_available_balance(withdraw.new_decryptable_available_balance)
+        .equality_proof_instruction_offset(withdraw.equality_proof_instruction_offset)
+        .range_proof_instruction_offset(withdraw.range_proof_instruction_offset)
+        .instruction();
+    context
+        .send_v1(&withdraw.proofs.with(move_to_public), &[&escrow.operator])
+        .expect("MoveToPublic should skip the hook");
+
+    let public_release = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .add_remaining_accounts(&hook_accounts)
+        .instruction();
+    context
+        .send_v1(&[public_release], &[&escrow.operator])
+        .expect("ReleaseFunds should pass the hook with the real amount");
+
+    assert_eq!(get_token_balance(&mut context, &user_ata), RELEASE_AMOUNT);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        true,
     );
 }
 

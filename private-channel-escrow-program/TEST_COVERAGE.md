@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **193 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **194 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -247,7 +247,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
 
-### ConfidentialReleaseFunds (11 integration tests)
+### ConfidentialReleaseFunds (12 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
@@ -259,6 +259,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_blocked_withdrawals_rejected`
 - `test_confidential_release_funds_whitelist_requires_withdrawer_and_user` — listing only one of the two is refused
 - `test_confidential_release_funds_transfer_hook_forwards_extras`
+- `test_confidential_release_funds_hook_refusing_u64_max_settled_publicly` — the hook blocks the confidential release; `MoveToPublic` then `ReleaseFunds` settle the same nonce
 - `test_confidential_release_funds_transfer_fee` — the escrow pays the whole amount, the user receives it net of the fee
 
 ### ApplyPendingBalance (4 integration tests)

@@ -1,7 +1,9 @@
 //! Token-2022 transfer-hook program used only by the escrow program's
 //! integration tests.
 //!
-//! Two behaviours, picked by how many accounts Token-2022 passes in:
+//! Three behaviours, picked by how many accounts Token-2022 passes in:
+//! - No extras: refuses `u64::MAX`, the amount Token-2022 passes for every
+//!   confidential transfer, as a hook that caps amounts would.
 //! - Benign: logs the account count. Tests assert the log to confirm the
 //!   escrow forwarded everything the mint's `ExtraAccountMetaList` declares.
 //! - Malicious drain: with two or more extras, moves lamports out of the
@@ -40,6 +42,12 @@ const DRAIN_LAMPORTS: u64 = 100_000_000;
 /// so anything past index 4 is a declared extra. Two of them arm the drain.
 const DRAIN_ACCOUNTS_LEN: usize = 7;
 
+/// With no extras declared, the hook refuses confidential transfers.
+const NO_EXTRAS_ACCOUNTS_LEN: usize = 5;
+
+/// The amount Token-2022 passes the hook for a confidential transfer.
+const HIDDEN_AMOUNT: u64 = u64::MAX;
+
 /// Seed prefix of the `ExtraAccountMetaList` account.
 const EXTRA_ACCOUNT_METAS_SEED: &[u8] = b"extra-account-metas";
 
@@ -58,12 +66,19 @@ pub fn process_instruction(
         Some(&INIT_EXTRA_ACCOUNT_METAS_TAG) => {
             process_init_extra_account_metas(program_id, accounts, &instruction_data[1..])
         }
-        _ => process_execute(accounts),
+        _ => process_execute(accounts, instruction_data),
     }
 }
 
-fn process_execute(accounts: &[AccountView]) -> ProgramResult {
+fn process_execute(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
     log!("hook accounts: {}", accounts.len());
+
+    // Execute data is the 8-byte discriminator, then the amount.
+    if accounts.len() == NO_EXTRAS_ACCOUNTS_LEN
+        && instruction_data.get(8..16) == Some(&HIDDEN_AMOUNT.to_le_bytes()[..])
+    {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     if accounts.len() >= DRAIN_ACCOUNTS_LEN {
         Transfer {

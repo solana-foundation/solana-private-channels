@@ -943,7 +943,7 @@ pub fn set_mint_2022_with_transfer_hook(
 
 /// Writes the `ExtraAccountMetaList` validation PDA the hook fixture reads.
 /// Token-2022 resolves the transfer's hook accounts from it.
-fn set_extra_account_meta_list(
+pub fn set_extra_account_meta_list(
     context: &mut TestContext,
     mint: &Pubkey,
     extras: &[ExtraAccountMeta],
