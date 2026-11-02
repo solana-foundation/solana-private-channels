@@ -1375,6 +1375,12 @@
         "kind": "errorNode",
         "message": "Escrow account is not configured for confidential transfers",
         "name": "confidentialAccountNotConfigured"
+      },
+      {
+        "code": 23,
+        "kind": "errorNode",
+        "message": "Mint is not supported for confidential transfers",
+        "name": "unsupportedConfidentialMint"
       }
     ],
     "instructions": [

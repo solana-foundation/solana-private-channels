@@ -340,7 +340,7 @@ Discriminator: `11`
 | 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### ConfigureConfidentialAccount
-Turns on Token-2022 confidential transfers for the instance's escrow account of an allowed mint (admin-only). The program grows the account, configures it with the instance ElGamal key proven by a `VerifyPubkeyValidity` instruction in the same transaction, and then turns confidential credits off, so they only arrive through `ConfidentialDeposit` and `MoveToConfidential`. Public credits stay on. Token-2022 refuses a mint without `ConfidentialTransferMint` and an account configured before. On a mint that requires approval, the issuer's confidential authority has to approve the account before it can be used.
+Turns on Token-2022 confidential transfers for the instance's escrow account of an allowed mint (admin-only). The program grows the account, configures it with the instance ElGamal key proven by a `VerifyPubkeyValidity` instruction in the same transaction, and then turns confidential credits off, so they only arrive through `ConfidentialDeposit` and `MoveToConfidential`. Public credits stay on. It refuses a mint without `ConfidentialTransferMint`, a fee mint without `ConfidentialTransferFeeConfig` (every confidential transfer would fail) and a `ConfidentialMintBurn` mint (it has no public balance, so a public withdrawal could never be released). Token-2022 refuses an account configured before. On a mint that requires approval, the issuer's confidential authority has to approve the account before it can be used.
 
 Every other confidential instruction needs a configured account, so this is the switch. Do not run it before the indexer supports confidential transfers: a confidential deposit would lock the user's tokens with nothing minted on the channel. The event carries the configured ElGamal key, so the indexer can refuse a key it does not hold before any deposit lands under it.
 
@@ -468,7 +468,7 @@ Discriminator: `15`
 | 8 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### MoveToConfidential
-Moves escrow funds from the public balance into the pending balance (operator-only), for when confidential releases run short. The amount is public, and custody as a whole does not change. Token-2022 refuses it on a `ConfidentialMintBurn` mint.
+Moves escrow funds from the public balance into the pending balance (operator-only), for when confidential releases run short. The amount is public, and custody as a whole does not change.
 
 Discriminator: `16`
 
@@ -480,7 +480,7 @@ Discriminator: `16`
 **Accounts:** as `ApplyPendingBalance`, with `operator` moving the funds.
 
 #### MoveToPublic
-Moves escrow funds from the available balance into the public balance (operator-only), for when public releases run short. The amount is public, and custody as a whole does not change. It takes an equality and a range proof, placed as a transfer's: one context account per zero offset, equality first. Token-2022 refuses it on a `ConfidentialMintBurn` mint.
+Moves escrow funds from the available balance into the public balance (operator-only), for when public releases run short. The amount is public, and custody as a whole does not change. It takes an equality and a range proof, placed as a transfer's: one context account per zero offset, equality first.
 
 Discriminator: `17`
 
@@ -678,6 +678,7 @@ The program defines the following custom errors:
 | 20 | `WalletNotAllowed` | The direction is whitelisted and the wallet has no entry, or its entry blocks it |
 | 21 | `InvalidAllowedWalletPda` | AllowedWallet PDA does not belong to the wallet being checked |
 | 22 | `ConfidentialAccountNotConfigured` | The escrow account has no confidential transfer extension |
+| 23 | `UnsupportedConfidentialMint` | ConfigureConfidentialAccount on a mint whose confidential transfers could never work through the escrow |
 
 ## Other Constants
 

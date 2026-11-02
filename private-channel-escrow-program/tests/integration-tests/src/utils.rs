@@ -36,7 +36,7 @@ use spl_token_2022::error::TokenError;
 use spl_token_2022::{
     extension::{
         confidential_transfer::{
-            ConfidentialTransferAccount, DecryptableBalance,
+            ConfidentialTransferAccount, ConfidentialTransferMint, DecryptableBalance,
             DEFAULT_MAXIMUM_PENDING_BALANCE_CREDIT_COUNTER,
         },
         confidential_transfer_fee::instruction::initialize_confidential_transfer_fee_config,
@@ -44,7 +44,7 @@ use spl_token_2022::{
         metadata_pointer::MetadataPointer,
         pausable::PausableConfig,
         permanent_delegate::PermanentDelegate,
-        transfer_fee::instruction::initialize_transfer_fee_config,
+        transfer_fee::{instruction::initialize_transfer_fee_config, TransferFeeConfig},
         transfer_hook::{
             instruction::initialize as initialize_transfer_hook, TransferHook, TransferHookAccount,
         },
@@ -52,6 +52,7 @@ use spl_token_2022::{
     },
     state::Mint as Token2022Mint,
 };
+use spl_token_2022_interface::extension::confidential_mint_burn::instruction as confidential_mint_burn_instruction;
 use spl_token_2022_interface::extension::confidential_transfer::instruction as confidential_instruction;
 use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation;
 use spl_token_confidential_transfer_proof_generation::{
@@ -115,6 +116,8 @@ pub const INVALID_ALLOWED_WALLET_PDA_ERROR: u32 =
     PrivateChannelEscrowProgramError::InvalidAllowedWalletPda as u32;
 pub const CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR: u32 =
     PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured as u32;
+pub const UNSUPPORTED_CONFIDENTIAL_MINT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::UnsupportedConfidentialMint as u32;
 
 // Token-2022 errors the confidential tests expect
 pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =
@@ -941,6 +944,50 @@ pub fn set_mint_2022_with_transfer_hook(
         .expect("Failed to set Token 2022 mint account with TransferHook");
 }
 
+/// A fee mint with confidential transfers but no `ConfidentialTransferFeeConfig`.
+/// Token-2022 refuses to create one since v0.9, so this writes the bytes of a mint
+/// from before that.
+pub fn set_legacy_confidential_fee_mint(context: &mut TestContext, mint: &Pubkey) {
+    let extensions = [
+        ExtensionType::TransferFeeConfig,
+        ExtensionType::ConfidentialTransferMint,
+    ];
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+    state.init_extension::<TransferFeeConfig>(true).unwrap();
+    state
+        .init_extension::<ConfidentialTransferMint>(true)
+        .unwrap();
+
+    *state.base = PodMint {
+        mint_authority: COption::Some(context.payer.pubkey()).into(),
+        supply: 0u64.into(),
+        decimals: CONFIDENTIAL_MINT_DECIMALS,
+        is_initialized: true.into(),
+        freeze_authority: COption::None.into(),
+    };
+
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set legacy confidential fee mint");
+}
+
 /// Writes the `ExtraAccountMetaList` validation PDA the hook fixture reads.
 /// Token-2022 resolves the transfer's hook accounts from it.
 pub fn set_extra_account_meta_list(
@@ -1310,6 +1357,7 @@ pub struct ConfidentialMintOptions {
     pub transfer_fee: Option<(u16, u64)>,
     pub transfer_hook: bool,
     pub manual_approval: bool,
+    pub confidential_mint_burn: bool,
 }
 
 /// A confidential mint and the keys its transfer proofs name. The fee
@@ -1340,6 +1388,9 @@ pub fn create_confidential_mint(
     }
     if options.transfer_hook {
         extensions.push(ExtensionType::TransferHook);
+    }
+    if options.confidential_mint_burn {
+        extensions.push(ExtensionType::ConfidentialMintBurn);
     }
     let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
 
@@ -1389,6 +1440,18 @@ pub fn create_confidential_mint(
                 &mint.pubkey(),
                 Some(payer),
                 Some(HOOK_FIXTURE_PROGRAM_ID),
+            )
+            .unwrap(),
+        );
+    }
+    if options.confidential_mint_burn {
+        let supply_keys = ConfidentialKeys::new();
+        instructions.push(
+            confidential_mint_burn_instruction::initialize_mint(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                &(*supply_keys.elgamal.pubkey()).into(),
+                &supply_keys.decryptable(0),
             )
             .unwrap(),
         );

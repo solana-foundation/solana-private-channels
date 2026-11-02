@@ -5,9 +5,10 @@ use crate::{
     },
     utils::{
         assert_failed_first, confidential_state, create_confidential_mint, custom_error,
-        event_data, set_mint_2022_basic, ConfidentialKeys, ConfidentialMintOptions, TestContext,
-        INCORRECT_PROGRAM_ID_LOG, INVALID_ACCOUNT_DATA_LOG, INVALID_ADMIN_ERROR,
+        event_data, set_legacy_confidential_fee_mint, set_mint_2022_basic, ConfidentialKeys,
+        ConfidentialMintOptions, TestContext, INCORRECT_PROGRAM_ID_LOG, INVALID_ADMIN_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        UNSUPPORTED_CONFIDENTIAL_MINT_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfigureConfidentialAccountBuilder;
@@ -261,7 +262,122 @@ fn test_configure_confidential_account_rejects_mint_without_extension() {
 
     let result = context.send_v1(&[instruction, proof], &[&admin]);
 
-    assert_failed_first(result, &TOKEN_2022_PROGRAM_ID, INVALID_ACCOUNT_DATA_LOG);
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(UNSUPPORTED_CONFIDENTIAL_MINT_ERROR),
+    );
+}
+
+// Token-2022 refuses every confidential transfer of a fee mint without the
+// confidential fee config. It no longer creates such a mint, but an older one can
+// still have it.
+#[test]
+fn test_configure_confidential_account_rejects_fee_mint_without_confidential_fee_config() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+    let mint = Keypair::new();
+    let keys = ConfidentialKeys::new();
+    set_legacy_confidential_fee_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let instruction = ConfigureConfidentialAccountBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(get_associated_token_address_with_program_id(
+            &instance_pda,
+            &mint.pubkey(),
+            &TOKEN_2022_PROGRAM_ID,
+        ))
+        .decryptable_zero_balance(keys.decryptable(0).0)
+        .proof_instruction_offset(1)
+        .instruction();
+    let proof = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(
+        None,
+        &build_pubkey_validity_proof_data(&keys.elgamal).unwrap(),
+    );
+
+    let result = context.send_v1(&[instruction, proof], &[&admin]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(UNSUPPORTED_CONFIDENTIAL_MINT_ERROR),
+    );
+}
+
+// Token-2022 refuses public mint and burn on a ConfidentialMintBurn mint, so the
+// escrow would hold no public balance, and a public withdrawal from the channel
+// could never be released.
+#[test]
+fn test_configure_confidential_account_rejects_confidential_mint_burn() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+    let keys = ConfidentialKeys::new();
+    let mint = create_confidential_mint(
+        &mut context,
+        ConfidentialMintOptions {
+            confidential_mint_burn: true,
+            ..Default::default()
+        },
+    );
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.address,
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let instruction = ConfigureConfidentialAccountBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.address)
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(get_associated_token_address_with_program_id(
+            &instance_pda,
+            &mint.address,
+            &TOKEN_2022_PROGRAM_ID,
+        ))
+        .decryptable_zero_balance(keys.decryptable(0).0)
+        .proof_instruction_offset(1)
+        .instruction();
+    let proof = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(
+        None,
+        &build_pubkey_validity_proof_data(&keys.elgamal).unwrap(),
+    );
+
+    let result = context.send_v1(&[instruction, proof], &[&admin]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(UNSUPPORTED_CONFIDENTIAL_MINT_ERROR),
+    );
 }
 
 // An account's ElGamal key never changes, so a second configure must fail.

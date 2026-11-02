@@ -35,9 +35,10 @@ use spl_token_2022::extension::ExtensionType;
 ///
 /// Turns on confidential transfers for the instance's escrow account of an allowed
 /// mint, then turns confidential credits off so they only arrive through
-/// ConfidentialDeposit and MoveToConfidential. Public credits stay on. Token-2022
-/// refuses a mint without `ConfidentialTransferMint` and an account configured
-/// before.
+/// ConfidentialDeposit and MoveToConfidential. Public credits stay on. Refuses a
+/// mint without `ConfidentialTransferMint`, a fee mint without
+/// `ConfidentialTransferFeeConfig` and a `ConfidentialMintBurn` mint. Token-2022
+/// refuses an account configured before.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for the larger escrow account
@@ -98,6 +99,17 @@ pub fn process_configure_confidential_account(
             allowed_mint_info,
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
+
+    // Token-2022 refuses every confidential transfer of a fee mint without the
+    // confidential fee config. A ConfidentialMintBurn mint has no public balance,
+    // so a public withdrawal from the channel could never be released.
+    if !allowed_mint.has_extension(ExtensionType::ConfidentialTransferMint)
+        || (allowed_mint.has_extension(ExtensionType::TransferFeeConfig)
+            && !allowed_mint.has_extension(ExtensionType::ConfidentialTransferFeeConfig))
+        || allowed_mint.has_extension(ExtensionType::ConfidentialMintBurn)
+    {
+        return Err(PrivateChannelEscrowProgramError::UnsupportedConfidentialMint.into());
+    }
 
     validate_ata(
         instance_ata_info,

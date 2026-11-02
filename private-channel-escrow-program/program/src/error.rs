@@ -98,6 +98,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (22) The escrow account has no confidential transfer extension
     #[error("Escrow account is not configured for confidential transfers")]
     ConfidentialAccountNotConfigured,
+
+    /// (23) The mint's confidential transfers could never work through the escrow
+    #[error("Mint is not supported for confidential transfers")]
+    UnsupportedConfidentialMint,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -142,6 +146,7 @@ mod tests {
             (WalletNotAllowed, 20),
             (InvalidAllowedWalletPda, 21),
             (ConfidentialAccountNotConfigured, 22),
+            (UnsupportedConfidentialMint, 23),
         ];
 
         for (error, expected_code) in cases {

@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **194 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **196 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -222,14 +222,16 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### ConfigureConfidentialAccount (7 integration tests)
+### ConfigureConfidentialAccount (9 integration tests)
 
 - `test_configure_confidential_account_success` — escrow account carries the instance key, approved, confidential credits off and public credits on
 - `test_configure_confidential_account_fee_mint` — a fee mint's escrow account also gets `ConfidentialTransferFeeAmount`
 - `test_configure_confidential_account_manual_approval_mint_leaves_account_unapproved`
 - `test_configure_confidential_account_rejects_non_admin`
 - `test_configure_confidential_account_rejects_spl_token_program`
-- `test_configure_confidential_account_rejects_mint_without_extension` — Token-2022 refuses with InvalidAccountData
+- `test_configure_confidential_account_rejects_mint_without_extension` — UnsupportedConfidentialMint
+- `test_configure_confidential_account_rejects_fee_mint_without_confidential_fee_config` — a pre-v0.9 mint, written by hand
+- `test_configure_confidential_account_rejects_confidential_mint_burn` — no public balance to release a public withdrawal from
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
 ### ConfidentialDeposit (12 integration tests)
