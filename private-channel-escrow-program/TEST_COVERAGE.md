@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **198 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **199 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -235,7 +235,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_configure_confidential_account_rejects_confidential_mint_burn` — no public balance to release a public withdrawal from
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
-### ConfidentialDeposit (12 integration tests)
+### ConfidentialDeposit (13 integration tests)
 
 - `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
 - `test_confidential_deposit_context_account_proofs`
@@ -246,6 +246,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_blocked_mint_rejected`
 - `test_confidential_deposit_whitelist_unlisted_user_rejected`
 - `test_confidential_deposit_whitelist_unlisted_recipient_rejected` — a listed user does not vouch for the recipient
+- `test_confidential_deposit_whitelist_unlisted_user_with_listed_recipient_rejected` — a listed recipient does not vouch for the user
 - `test_confidential_deposit_transfer_hook_forwards_extras`
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part

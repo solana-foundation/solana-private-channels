@@ -407,7 +407,7 @@ Discriminator: `13`
 | 12 | `recipient_allowed_wallet_pda` | | | AllowedWallet PDA of the credited wallet; read only while deposits are whitelisted |
 
 #### ConfidentialReleaseFunds
-`ReleaseFunds` for a hidden amount (operator-only): the escrow's available balance pays the user's pending balance. The checks and the nonce are `ReleaseFunds`'s. The event carries the amount encrypted under the instance key, read from the ciphertext validity proof Token-2022 accepted. On a fee mint the escrow pays the whole amount and the fee comes off the user's side. Token-2022 calls the mint's hook with `u64::MAX`, so a hook that refuses it blocks these releases; `MoveToPublic` and then `ReleaseFunds` settle the nonce publicly. Proofs and trailing accounts are placed as in `ConfidentialDeposit`.
+`ReleaseFunds` for a hidden amount (operator-only): the escrow's available balance pays the user's pending balance. The checks and the nonce are `ReleaseFunds`'s. The event carries the amount encrypted under the instance key, read from the ciphertext validity proof Token-2022 accepted. On a fee mint the escrow pays the whole amount and the fee comes off the user's side. Token-2022 calls the mint's hook with `u64::MAX`, so a hook that refuses it blocks these releases; `MoveToPublic` and then `ReleaseFunds` settle the nonce publicly. Token-2022 also caps a confidential transfer at 2^48 - 1 base units, so a larger withdrawal settles the same way. Proofs and trailing accounts are placed as in `ConfidentialDeposit`.
 
 Discriminator: `14`
 

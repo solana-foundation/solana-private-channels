@@ -218,7 +218,7 @@ fn test_configure_confidential_account_rejects_spl_token_program() {
     );
 }
 
-// Token-2022 refuses to configure an account of a mint without confidential transfers.
+// The escrow refuses a mint without confidential transfers.
 #[test]
 fn test_configure_confidential_account_rejects_mint_without_extension() {
     let mut context = TestContext::new();
