@@ -264,7 +264,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 ### ApplyPendingBalance (4 integration tests)
 
 - `test_apply_pending_balance_success` — available and its AES copy hold the applied amount
-- `test_apply_pending_balance_late_credit_recovered_by_release` — applied anyway; the event carries the full applied pending while the AES copy lags, and a release proved from that count writes a correct copy
+- `test_apply_pending_balance_late_credit_recovered_by_release` — applied anyway; the event carries the full applied pending and its credit count while the AES copy lags, and a release proved from that count writes a correct copy
 - `test_apply_pending_balance_not_operator_rejected`
 - `test_apply_pending_balance_unconfigured_escrow_rejected`
 

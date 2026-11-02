@@ -1126,6 +1126,15 @@
                 },
                 "kind": "arrayTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "appliedCreditCounter",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"

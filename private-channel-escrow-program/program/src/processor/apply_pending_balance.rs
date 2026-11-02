@@ -7,7 +7,9 @@ use crate::{
     processor::{
         shared::{
             account_check::{verify_signer, verify_token_2022_program},
-            confidential_utils::{apply_pending_balance_cpi, read_pending_balance},
+            confidential_utils::{
+                apply_pending_balance_cpi, read_pending_balance, read_pending_credit_counter,
+            },
             event_utils::emit_event,
             token_utils::validate_ata,
         },
@@ -30,8 +32,9 @@ use pinocchio::{
 /// stores the new AES balance as given, even when a credit arrived after the
 /// operator read the account and so is missing from it. Refusing that case would
 /// let anyone starve the apply with dust deposits. The event carries the pending
-/// balance actually applied instead, so the operator counts the available balance
-/// itself and builds release proofs from that count, not from the AES copy.
+/// balance actually applied and its credit count instead, so the operator counts
+/// the available balance itself and builds release proofs from that count, not
+/// from the AES copy.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for transaction fees
@@ -95,7 +98,9 @@ pub fn process_apply_pending_balance(
     )?;
 
     // Read in the same instruction as the apply, so nothing can credit in between.
+    // The apply zeroes both.
     let applied_pending = read_pending_balance(instance_ata_info)?;
+    let applied_credit_counter = read_pending_credit_counter(instance_ata_info)?;
 
     let bump_slice = [instance.bump];
     let signer_seeds = [
@@ -120,6 +125,7 @@ pub fn process_apply_pending_balance(
         *operator_info.address(),
         *mint_info.address(),
         applied_pending,
+        applied_credit_counter,
     );
     emit_event(
         program_id,

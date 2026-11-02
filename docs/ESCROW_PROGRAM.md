@@ -442,7 +442,7 @@ Discriminator: `14`
 | 15 | `withdrawer_allowed_wallet_pda` | | | AllowedWallet PDA of `withdrawer`; read only while withdrawals are whitelisted |
 
 #### ApplyPendingBalance
-Moves the escrow's pending balance into its available balance (operator-only). A credit that arrives after the operator read the account is applied too, but is missing from the AES balance the operator supplies, so the AES copy can lag the real balance. Refusing the apply instead would let dust deposits starve it. The event carries the pending balance actually applied, read in the same instruction. Only applies, releases and `MoveToPublic` change the available balance, so the operator counts it from those, builds release proofs from that count rather than from the AES copy, and writes a correct copy with every release.
+Moves the escrow's pending balance into its available balance (operator-only). A credit that arrives after the operator read the account is applied too, but is missing from the AES balance the operator supplies, so the AES copy can lag the real balance. Refusing the apply instead would let dust deposits starve it. The event carries the pending balance actually applied and its credit count, read in the same instruction. Only applies, releases and `MoveToPublic` change the available balance, so the operator counts it from those, builds release proofs from that count rather than from the AES copy, and writes a correct copy with every release.
 
 An apply, a release and `MoveToPublic` all change the available balance, which turns proofs built against the old one stale. Confidential releases of a mint therefore go one at a time.
 

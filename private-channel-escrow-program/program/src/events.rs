@@ -646,7 +646,8 @@ impl ConfidentialReleaseFundsEvent {
 
 /// The applied pending balance lets the operator keep its own count of the
 /// available balance: the AES copy it supplies misses credits that land after it
-/// read the account.
+/// read the account. The credit count says which deposits the apply took in, so
+/// the operator can sum their amounts instead of decrypting the total.
 #[derive(CodamaType)]
 pub struct ApplyPendingBalanceEvent {
     /// Unique u8 byte for event type.
@@ -661,6 +662,8 @@ pub struct ApplyPendingBalanceEvent {
     pub applied_pending_balance_lo: [u8; 64],
     /// Pending balance moved into available, high bits
     pub applied_pending_balance_hi: [u8; 64],
+    /// Pending credits moved into available
+    pub applied_credit_counter: u64,
 }
 
 impl ApplyPendingBalanceEvent {
@@ -669,6 +672,7 @@ impl ApplyPendingBalanceEvent {
         operator: Pubkey,
         mint: Pubkey,
         applied_pending: SplitCiphertext,
+        applied_credit_counter: u64,
     ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::ApplyPendingBalance as u8,
@@ -677,13 +681,14 @@ impl ApplyPendingBalanceEvent {
             mint,
             applied_pending_balance_lo: applied_pending.lo,
             applied_pending_balance_hi: applied_pending.hi,
+            applied_credit_counter,
         }
     }
 
     // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 32 (mint)
-    // + 64 (applied pending lo) + 64 (applied pending hi)
+    // + 64 (applied pending lo) + 64 (applied pending hi) + 8 (applied credit counter)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(233);
+        let mut data = Vec::with_capacity(241);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -691,6 +696,7 @@ impl ApplyPendingBalanceEvent {
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&self.applied_pending_balance_lo);
         data.extend_from_slice(&self.applied_pending_balance_hi);
+        data.extend_from_slice(&self.applied_credit_counter.to_le_bytes());
         data
     }
 }
@@ -1122,17 +1128,25 @@ mod tests {
             lo: [4u8; 64],
             hi: [5u8; 64],
         };
-        let event = ApplyPendingBalanceEvent::new(instance_seed, operator, mint, applied_pending);
+        let applied_credit_counter = 1_234u64;
+        let event = ApplyPendingBalanceEvent::new(
+            instance_seed,
+            operator,
+            mint,
+            applied_pending,
+            applied_credit_counter,
+        );
 
         // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 32 (mint)
-        // + 64 (applied pending lo) + 64 (applied pending hi)
+        // + 64 (applied pending lo) + 64 (applied pending hi) + 8 (applied credit counter)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 233);
+        assert_eq!(bytes.len(), 241);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::ApplyPendingBalance as u8);
         assert_eq!(&bytes[73..105], mint.as_ref());
         assert_eq!(&bytes[105..169], &[4u8; 64]);
         assert_eq!(&bytes[169..233], &[5u8; 64]);
+        assert_eq!(&bytes[233..241], &applied_credit_counter.to_le_bytes());
     }
 
     #[test]

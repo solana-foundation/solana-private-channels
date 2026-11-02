@@ -195,6 +195,15 @@ pub fn read_pending_balance(token_account: &AccountView) -> Result<SplitCipherte
     Ok(pending)
 }
 
+/// Credits in the escrow account's pending balance since the last apply.
+pub fn read_pending_credit_counter(token_account: &AccountView) -> Result<u64, ProgramError> {
+    let extension = read_confidential_extension(token_account)?;
+    let start = offset_of!(ConfidentialTransferAccount, pending_balance_credit_counter);
+    let mut counter = [0u8; 8];
+    counter.copy_from_slice(&extension[start..start + 8]);
+    Ok(u64::from_le_bytes(counter))
+}
+
 /// The transfer amount under the source key, taken from the ciphertext validity
 /// proof Token-2022 has just accepted. A proof instruction's data is a one-byte
 /// tag and then the proof context; a context account's data is a header and then

@@ -128,12 +128,18 @@ fn test_apply_pending_balance_late_credit_recovered_by_release() {
         .expect("ApplyPendingBalance should succeed");
 
     let event = event_data(&transaction_metadata, 15);
-    // After the instance seed, operator and mint: applied pending lo, then hi.
+    // After the instance seed, operator and mint: applied pending lo, then hi,
+    // then the credit count.
     let applied = combine_lo_hi(
         decrypt_change(&escrow.keys, &[0; 64], event[96..160].try_into().unwrap()),
         decrypt_change(&escrow.keys, &[0; 64], event[160..224].try_into().unwrap()),
     );
     assert_eq!(applied, PENDING_AMOUNT);
+    assert_eq!(
+        u64::from_le_bytes(event[224..232].try_into().unwrap()),
+        1,
+        "the event counts the credit the operator missed"
+    );
     assert_eq!(
         decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
         PENDING_AMOUNT
