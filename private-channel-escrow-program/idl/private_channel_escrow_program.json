@@ -851,6 +851,22 @@
               "type": {
                 "kind": "publicKeyTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "elgamalPubkey",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 32
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"

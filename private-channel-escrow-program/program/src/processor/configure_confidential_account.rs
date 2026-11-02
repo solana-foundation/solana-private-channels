@@ -11,7 +11,8 @@ use crate::{
                 verify_token_2022_program,
             },
             confidential_utils::{
-                configure_account_cpi, reallocate_cpi, set_confidential_credits_cpi,
+                configure_account_cpi, read_elgamal_pubkey, reallocate_cpi,
+                set_confidential_credits_cpi,
             },
             event_utils::emit_event,
             token_utils::validate_ata,
@@ -135,8 +136,11 @@ pub fn process_configure_confidential_account(
     )?;
     set_confidential_credits_cpi(instance_ata_info, instance_info, false, &signers)?;
 
-    let event =
-        ConfigureConfidentialAccountEvent::new(instance.instance_seed, *mint_info.address());
+    let event = ConfigureConfidentialAccountEvent::new(
+        instance.instance_seed,
+        *mint_info.address(),
+        read_elgamal_pubkey(instance_ata_info)?,
+    );
     emit_event(
         program_id,
         event_authority_info,

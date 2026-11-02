@@ -1,8 +1,9 @@
 use crate::{
     pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda},
     state_utils::{
-        assert_get_or_allow_mint, assert_get_or_block_mint, assert_get_or_create_instance,
-        assert_get_or_set_whitelist_enabled, setup_confidential_escrow,
+        assert_get_or_add_allowed_wallet, assert_get_or_allow_mint, assert_get_or_block_mint,
+        assert_get_or_create_instance, assert_get_or_set_whitelist_enabled,
+        setup_confidential_escrow,
     },
     utils::{
         assert_failed_first, combine_lo_hi, confidential_state, create_confidential_account,
@@ -581,6 +582,88 @@ fn test_confidential_deposit_whitelist_unlisted_user_rejected() {
         .fee_ciphertext_validity_proof_instruction_offset(
             transfer.fee_ciphertext_validity_proof_instruction_offset,
         )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(WALLET_NOT_ALLOWED_ERROR),
+    );
+}
+
+// The recipient credited on the channel must be allowed too, not just the sender.
+#[test]
+fn test_confidential_deposit_whitelist_unlisted_recipient_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    let user = Keypair::new();
+    let recipient = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    assert_get_or_set_whitelist_enabled(
+        &mut context,
+        &escrow.admin,
+        &escrow.instance_pda,
+        true,
+        false,
+        false,
+    )
+    .expect("SetWhitelistEnabled should succeed");
+    assert_get_or_add_allowed_wallet(
+        &mut context,
+        &escrow.admin,
+        &escrow.instance_pda,
+        &user.pubkey(),
+        false,
+        false,
+        false,
+    )
+    .expect("AddOrUpdateAllowedWallet should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey()).0)
+        .recipient_allowed_wallet_pda(
+            find_allowed_wallet_pda(&escrow.instance_pda, &recipient.pubkey()).0,
+        )
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .recipient(recipient.pubkey())
         .instruction();
 
     let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);

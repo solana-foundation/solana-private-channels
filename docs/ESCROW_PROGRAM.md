@@ -342,7 +342,7 @@ Discriminator: `11`
 #### ConfigureConfidentialAccount
 Turns on Token-2022 confidential transfers for the instance's escrow account of an allowed mint (admin-only). The program grows the account, configures it with the instance ElGamal key proven by a `VerifyPubkeyValidity` instruction in the same transaction, and then turns confidential credits off, so they only arrive through `ConfidentialDeposit` and `MoveToConfidential`. Public credits stay on. Token-2022 refuses a mint without `ConfidentialTransferMint` and an account configured before. On a mint that requires approval, the issuer's confidential authority has to approve the account before it can be used.
 
-Every other confidential instruction needs a configured account, so this is the switch. Do not run it before the indexer supports confidential transfers: a confidential deposit would lock the user's tokens with nothing minted on the channel.
+Every other confidential instruction needs a configured account, so this is the switch. Do not run it before the indexer supports confidential transfers: a confidential deposit would lock the user's tokens with nothing minted on the channel. The event carries the configured ElGamal key, so the indexer can refuse a key it does not hold before any deposit lands under it.
 
 Discriminator: `12`
 

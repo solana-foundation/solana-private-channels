@@ -152,15 +152,34 @@ pub fn split_proof_contexts<'a>(
     Ok(accounts.split_at(count))
 }
 
-/// The escrow account's pending balance. Fails if the account was never configured.
-pub fn read_pending_balance(token_account: &AccountView) -> Result<SplitCiphertext, ProgramError> {
+/// A copy of the account's `ConfidentialTransferAccount` bytes, so no borrow
+/// outlives the read. Fails if the account was never configured.
+fn read_confidential_extension(
+    token_account: &AccountView,
+) -> Result<[u8; size_of::<ConfidentialTransferAccount>()], ProgramError> {
     let data = token_account.try_borrow()?;
     let state = StateWithExtensions::<Account>::unpack(&data)
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidTokenAccount)?;
     let extension = state
         .get_extension_bytes::<ConfidentialTransferAccount>()
         .map_err(|_| PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured)?;
+    extension
+        .try_into()
+        .map_err(|_| PrivateChannelEscrowProgramError::InvalidTokenAccount.into())
+}
 
+/// The ElGamal key the escrow account was configured with.
+pub fn read_elgamal_pubkey(token_account: &AccountView) -> Result<[u8; 32], ProgramError> {
+    let extension = read_confidential_extension(token_account)?;
+    let start = offset_of!(ConfidentialTransferAccount, elgamal_pubkey);
+    let mut elgamal_pubkey = [0u8; 32];
+    elgamal_pubkey.copy_from_slice(&extension[start..start + 32]);
+    Ok(elgamal_pubkey)
+}
+
+/// The escrow account's pending balance. Fails if the account was never configured.
+pub fn read_pending_balance(token_account: &AccountView) -> Result<SplitCiphertext, ProgramError> {
+    let extension = read_confidential_extension(token_account)?;
     let lo = offset_of!(ConfidentialTransferAccount, pending_balance_lo);
     let hi = offset_of!(ConfidentialTransferAccount, pending_balance_hi);
     let mut pending = SplitCiphertext {

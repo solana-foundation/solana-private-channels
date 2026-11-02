@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **191 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **193 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -232,7 +232,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_configure_confidential_account_rejects_mint_without_extension` — Token-2022 refuses with InvalidAccountData
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
-### ConfidentialDeposit (11 integration tests)
+### ConfidentialDeposit (12 integration tests)
 
 - `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
 - `test_confidential_deposit_context_account_proofs`
@@ -242,11 +242,12 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_unconfigured_escrow_rejected`
 - `test_confidential_deposit_blocked_mint_rejected`
 - `test_confidential_deposit_whitelist_unlisted_user_rejected`
+- `test_confidential_deposit_whitelist_unlisted_recipient_rejected` — a listed user does not vouch for the recipient
 - `test_confidential_deposit_transfer_hook_forwards_extras`
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
 
-### ConfidentialReleaseFunds (10 integration tests)
+### ConfidentialReleaseFunds (11 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
@@ -256,6 +257,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_memo_required_destination`
 - `test_confidential_release_funds_not_operator_rejected`
 - `test_confidential_release_funds_blocked_withdrawals_rejected`
+- `test_confidential_release_funds_whitelist_requires_withdrawer_and_user` — listing only one of the two is refused
 - `test_confidential_release_funds_transfer_hook_forwards_extras`
 - `test_confidential_release_funds_transfer_fee` — the escrow pays the whole amount, the user receives it net of the fee
 

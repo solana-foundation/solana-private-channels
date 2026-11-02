@@ -491,6 +491,8 @@ impl SetWhitelistEnabledEvent {
     }
 }
 
+/// Carries the configured key so the indexer can refuse one it does not hold
+/// before any deposit lands under it.
 #[derive(CodamaType)]
 pub struct ConfigureConfidentialAccountEvent {
     /// Unique u8 byte for event type.
@@ -499,24 +501,28 @@ pub struct ConfigureConfidentialAccountEvent {
     pub instance_seed: Pubkey,
     /// Mint whose escrow account was configured
     pub mint: Pubkey,
+    /// ElGamal key the escrow account was configured with
+    pub elgamal_pubkey: [u8; 32],
 }
 
 impl ConfigureConfidentialAccountEvent {
-    pub fn new(instance_seed: Pubkey, mint: Pubkey) -> Self {
+    pub fn new(instance_seed: Pubkey, mint: Pubkey, elgamal_pubkey: [u8; 32]) -> Self {
         Self {
             event_discriminator: EventDiscriminators::ConfigureConfidentialAccount as u8,
             instance_seed,
             mint,
+            elgamal_pubkey,
         }
     }
 
-    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint)
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint) + 32 (elgamal_pubkey)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(73);
+        let mut data = Vec::with_capacity(105);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.mint.as_ref());
+        data.extend_from_slice(&self.elgamal_pubkey);
         data
     }
 }
@@ -1027,17 +1033,19 @@ mod tests {
     fn test_configure_confidential_account_event() {
         let instance_seed = Pubkey::new_from_array([1u8; 32]);
         let mint = Pubkey::new_from_array([2u8; 32]);
-        let event = ConfigureConfidentialAccountEvent::new(instance_seed, mint);
+        let elgamal_pubkey = [3u8; 32];
+        let event = ConfigureConfidentialAccountEvent::new(instance_seed, mint, elgamal_pubkey);
 
-        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint)
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 32 (elgamal_pubkey)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 73);
+        assert_eq!(bytes.len(), 105);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(
             bytes[8],
             EventDiscriminators::ConfigureConfidentialAccount as u8
         );
         assert_eq!(&bytes[41..73], mint.as_ref());
+        assert_eq!(&bytes[73..105], &elgamal_pubkey);
     }
 
     #[test]

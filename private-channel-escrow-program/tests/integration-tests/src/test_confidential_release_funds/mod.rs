@@ -1,14 +1,18 @@
 use crate::{
     assertions::assert_nonce_consumed,
     pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_withdrawal_bitmap_pda},
-    state_utils::{assert_get_or_block_mint, fund_escrow_available, setup_confidential_escrow},
+    state_utils::{
+        assert_get_or_add_allowed_wallet, assert_get_or_block_mint,
+        assert_get_or_set_whitelist_enabled, fund_escrow_available, setup_confidential_escrow,
+    },
     utils::{
         assert_failed_first, combine_lo_hi, create_confidential_account, custom_error,
         decrypt_available, decrypt_change, decrypt_pending, event_data, hook_extras_for_mint,
         prepare_transfer, ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
         INVALID_OPERATOR_ERROR, NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
         TOKEN_2022_PROGRAM_ID, TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR,
-        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
+        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WALLET_NOT_ALLOWED_ERROR,
+        WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfidentialReleaseFundsBuilder;
@@ -568,6 +572,93 @@ fn test_confidential_release_funds_blocked_withdrawals_rejected() {
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
         &custom_error(WITHDRAWALS_BLOCKED_FOR_MINT_ERROR),
     );
+}
+
+// The wallet that burned on the channel and the destination must both be allowed
+// to withdraw, so listing only one of them is refused either way.
+#[test]
+fn test_confidential_release_funds_whitelist_requires_withdrawer_and_user() {
+    let user = Keypair::new();
+    let withdrawer = Keypair::new();
+
+    for listed in [user.pubkey(), withdrawer.pubkey()] {
+        let mut context = TestContext::new();
+        let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+        fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+        let user_keys = ConfidentialKeys::new();
+        let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+        assert_get_or_set_whitelist_enabled(
+            &mut context,
+            &escrow.admin,
+            &escrow.instance_pda,
+            false,
+            true,
+            false,
+        )
+        .expect("SetWhitelistEnabled should succeed");
+        assert_get_or_add_allowed_wallet(
+            &mut context,
+            &escrow.admin,
+            &escrow.instance_pda,
+            &listed,
+            false,
+            false,
+            false,
+        )
+        .expect("AddOrUpdateAllowedWallet should succeed");
+
+        let transfer = prepare_transfer(
+            &mut context,
+            &escrow.escrow_ata,
+            &escrow.keys,
+            user_keys.elgamal.pubkey(),
+            &escrow.mint,
+            RELEASE_AMOUNT,
+            ProofPlacement::Inline,
+        );
+        let instruction = ConfidentialReleaseFundsBuilder::new()
+            .payer(context.payer.pubkey())
+            .operator(escrow.operator.pubkey())
+            .instance(escrow.instance_pda)
+            .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+            .operator_pda(escrow.operator_pda)
+            .mint(escrow.mint.address)
+            .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+            .user_ata(user_ata)
+            .instance_ata(escrow.escrow_ata)
+            .user_allowed_wallet_pda(
+                find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey()).0,
+            )
+            .withdrawer_allowed_wallet_pda(
+                find_allowed_wallet_pda(&escrow.instance_pda, &withdrawer.pubkey()).0,
+            )
+            .user(user.pubkey())
+            .transaction_nonce(TRANSACTION_NONCE)
+            .withdrawer(withdrawer.pubkey())
+            .new_source_decryptable_available_balance(
+                transfer.new_source_decryptable_available_balance,
+            )
+            .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+            .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+            .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+            .ciphertext_validity_proof_instruction_offset(
+                transfer.ciphertext_validity_proof_instruction_offset,
+            )
+            .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+            .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+            .fee_ciphertext_validity_proof_instruction_offset(
+                transfer.fee_ciphertext_validity_proof_instruction_offset,
+            )
+            .instruction();
+
+        let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+        assert_failed_first(
+            result,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &custom_error(WALLET_NOT_ALLOWED_ERROR),
+        );
+    }
 }
 
 #[test]

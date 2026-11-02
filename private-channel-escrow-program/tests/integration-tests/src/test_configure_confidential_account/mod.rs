@@ -4,10 +4,10 @@ use crate::{
         assert_get_or_allow_mint, assert_get_or_create_instance, setup_confidential_escrow,
     },
     utils::{
-        assert_event_discriminator_present, assert_failed_first, confidential_state,
-        create_confidential_mint, custom_error, set_mint_2022_basic, ConfidentialKeys,
-        ConfidentialMintOptions, TestContext, INCORRECT_PROGRAM_ID_LOG, INVALID_ACCOUNT_DATA_LOG,
-        INVALID_ADMIN_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        assert_failed_first, confidential_state, create_confidential_mint, custom_error,
+        event_data, set_mint_2022_basic, ConfidentialKeys, ConfidentialMintOptions, TestContext,
+        INCORRECT_PROGRAM_ID_LOG, INVALID_ACCOUNT_DATA_LOG, INVALID_ADMIN_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfigureConfidentialAccountBuilder;
@@ -73,7 +73,9 @@ fn test_configure_confidential_account_success() {
     // Confidential credits only arrive through the escrow's own instructions.
     assert!(!bool::from(state.allow_confidential_credits));
     assert!(bool::from(state.allow_non_confidential_credits));
-    assert_event_discriminator_present(&transaction_metadata, 12);
+    // After the instance seed and mint: the key the indexer must hold.
+    let event = event_data(&transaction_metadata, 12);
+    assert_eq!(&event[64..96], &keys.elgamal.pubkey().to_bytes());
 }
 
 // ConfigureAccount adds the fee extension too, so Reallocate has to make room for it.
