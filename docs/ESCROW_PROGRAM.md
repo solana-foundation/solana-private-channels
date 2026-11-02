@@ -368,7 +368,7 @@ Discriminator: `12`
 | 10 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### ConfidentialDeposit
-Deposits a hidden amount from the user's available confidential balance into the escrow's pending balance (permissionless unless deposits are whitelisted). The gates are `Deposit`'s, except the minimum deposit and the zero check, which need the amount. The event carries the escrow's pending balance before and after the transfer, and the indexer decrypts the difference with the instance key. On a fee mint the difference is net of the fee.
+Deposits a hidden amount from the user's available confidential balance into the escrow's pending balance (permissionless unless deposits are whitelisted). The gates are `Deposit`'s, except the minimum deposit and the zero check, which need the amount. The event carries the escrow's pending balance before and after the transfer, and the indexer decrypts the difference with the instance key. On a fee mint the difference is net of the fee, and its low part can be negative: the fee comes off the low and high parts separately, so decrypt each part as signed.
 
 Each deposit takes one of the pending balance's 65,536 credits until the operator applies it, so dust deposits can use them up only while the operator is not applying.
 
@@ -442,7 +442,7 @@ Discriminator: `14`
 | 15 | `withdrawer_allowed_wallet_pda` | | | AllowedWallet PDA of `withdrawer`; read only while withdrawals are whitelisted |
 
 #### ApplyPendingBalance
-Moves the escrow's pending balance into its available balance (operator-only). A credit that arrives after the operator read the account is applied too, but is missing from the AES balance the operator supplies, so the AES copy can lag the real balance. Refusing the apply instead would let dust deposits starve it. The event carries the pending balance actually applied and its credit count, read in the same instruction. Only applies, releases and `MoveToPublic` change the available balance, so the operator counts it from those, builds release proofs from that count rather than from the AES copy, and writes a correct copy with every release.
+Moves the escrow's pending balance into its available balance (operator-only). A credit that arrives after the operator read the account is applied too, but is missing from the AES balance the operator supplies, so the AES copy can lag the real balance. Refusing the apply instead would let dust deposits starve it. The event carries the pending balance actually applied and its credit count, read in the same instruction. On a fee mint its low part can be negative too. Only applies, releases and `MoveToPublic` change the available balance, so the operator counts it from those, builds release proofs from that count rather than from the AES copy, and writes a correct copy with every release.
 
 An apply, a release and `MoveToPublic` all change the available balance, which turns proofs built against the old one stale. Confidential releases of a mint therefore go one at a time.
 

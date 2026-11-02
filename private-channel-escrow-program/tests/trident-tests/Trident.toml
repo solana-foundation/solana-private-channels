@@ -4,3 +4,9 @@ enabled = true
 [[fuzz.programs]]
 address = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU"
 program = "../../../target/deploy/private_channel_escrow_program.so"
+
+# Mainnet's Token-2022, the build the integration tests pin, in place of the
+# v7.0.0 trident-svm bundles. Loaded after the bundled one, so it replaces it.
+[[fuzz.programs]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+program = "../../../core/precompiles/spl_token_2022-11.1.0.so"

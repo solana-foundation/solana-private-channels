@@ -167,6 +167,8 @@ jobs:
               - '.github/workflows/rust.yml'
               - '.github/actions/setup-environment/**'
               - 'private-channel-escrow-program/**'
+              # Trident.toml loads it in place of Trident's bundled Token-2022.
+              - 'core/precompiles/spl_token_2022-11.1.0.so'
             dvp_precompile:
               # Anything that can change the DvP provenance check or its answer.
               - 'Makefile'
