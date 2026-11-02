@@ -2,18 +2,9 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, feat/confidential-transfers]
   pull_request:
-    branches:
-      [
-        main,
-        hardening/pre-release-audit,
-        hardening/cantina-reaudit,
-        audit/apex-audit-scan-remediation,
-        cantina-audit,
-        ottersec-audit,
-        feature/smt-to-bitmap-migration,
-      ]
+    branches: [main, feat/confidential-transfers, feature/smt-to-bitmap-migration]
 
 permissions:
   contents: read
