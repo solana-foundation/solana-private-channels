@@ -185,7 +185,8 @@ impl TestContext {
 
         // Mainnet's Token-2022 build, the one confidential transfers run against.
         let token_2022 = include_bytes!("../../../../core/precompiles/spl_token_2022-11.1.0.so");
-        let _ = svm.add_program(TOKEN_2022_PROGRAM_ID, token_2022);
+        svm.add_program(TOKEN_2022_PROGRAM_ID, token_2022)
+            .expect("Failed to load the pinned Token-2022 program");
 
         let payer = Keypair::new();
 
@@ -1695,7 +1696,6 @@ pub struct PreparedTransfer {
 
 /// Proves a transfer of `amount` from `source`'s available balance to an account
 /// under `destination`, for the mint's auditor, and its fee when it has one.
-#[allow(clippy::too_many_arguments)]
 pub fn prepare_transfer(
     context: &mut TestContext,
     source: &Pubkey,
@@ -1706,9 +1706,38 @@ pub fn prepare_transfer(
     placement: ProofPlacement,
 ) -> PreparedTransfer {
     let state = confidential_state(context, source);
-    let available: ElGamalCiphertext = state.available_balance.try_into().unwrap();
     let decryptable: AeCiphertext = state.decryptable_available_balance.try_into().unwrap();
-    let new_balance = source_keys.aes.decrypt(&decryptable).unwrap() - amount;
+    let balance = source_keys.aes.decrypt(&decryptable).unwrap();
+    prepare_transfer_from_balance(
+        context,
+        source,
+        source_keys,
+        balance,
+        destination,
+        mint,
+        amount,
+        placement,
+    )
+}
+
+/// `prepare_transfer` from a known available balance instead of the AES copy, which
+/// can lag after an apply.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_transfer_from_balance(
+    context: &mut TestContext,
+    source: &Pubkey,
+    source_keys: &ConfidentialKeys,
+    balance: u64,
+    destination: &ElGamalPubkey,
+    mint: &ConfidentialMint,
+    amount: u64,
+    placement: ProofPlacement,
+) -> PreparedTransfer {
+    let state = confidential_state(context, source);
+    let available: ElGamalCiphertext = state.available_balance.try_into().unwrap();
+    // The proof generators read the balance from an AES ciphertext.
+    let decryptable = source_keys.aes.encrypt(balance);
+    let new_balance = balance - amount;
     let mut proofs = PlacedProofs::new(placement);
 
     // Placed in Token-2022's order, so the context accounts line up with it.

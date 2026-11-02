@@ -1,23 +1,27 @@
 use crate::{
+    pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_withdrawal_bitmap_pda},
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
         setup_confidential_escrow,
     },
     utils::{
         assert_event_discriminator_present, assert_failed_first, combine_lo_hi, confidential_state,
-        create_confidential_mint, custom_error, decrypt_available, decrypt_change, decrypt_pending,
-        event_data, ConfidentialKeys, ConfidentialMintOptions, TestContext,
+        create_confidential_account, create_confidential_mint, custom_error, decrypt_available,
+        decrypt_change, decrypt_pending, event_data, prepare_transfer_from_balance,
+        ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
         CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR, INVALID_OPERATOR_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::{
-    ApplyPendingBalanceBuilder, MoveToConfidentialBuilder,
+    ApplyPendingBalanceBuilder, ConfidentialReleaseFundsBuilder, MoveToConfidentialBuilder,
 };
 use solana_sdk::signature::{Keypair, Signer};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 const PENDING_AMOUNT: u64 = 1_000_000;
+const RELEASE_AMOUNT: u64 = 400_000;
+const TRANSACTION_NONCE: u64 = 42;
 
 #[test]
 fn test_apply_pending_balance_success() {
@@ -81,9 +85,9 @@ fn test_apply_pending_balance_success() {
 
 // A credit the operator did not see still lands, so dust deposits cannot starve the
 // apply. The AES copy it wrote misses that credit, but the event carries everything
-// applied, so the operator's own count of the available balance stays right.
+// applied, and a release proved from that count writes a correct copy again.
 #[test]
-fn test_apply_pending_balance_lands_with_a_late_credit() {
+fn test_apply_pending_balance_late_credit_recovered_by_release() {
     let mut context = TestContext::new();
     let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
     let mint_to = spl_token_2022::instruction::mint_to(
@@ -142,6 +146,67 @@ fn test_apply_pending_balance_lands_with_a_late_credit() {
             .decrypt(&state.decryptable_available_balance.try_into().unwrap()),
         Some(0),
         "the AES copy misses the late credit"
+    );
+
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let transfer = prepare_transfer_from_balance(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        applied,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let release = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    context
+        .send_v1(&transfer.proofs.with(release), &[&escrow.operator])
+        .expect("ConfidentialReleaseFunds should succeed");
+
+    assert_eq!(
+        decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
+        applied - RELEASE_AMOUNT
+    );
+    let state = confidential_state(&mut context, &escrow.escrow_ata);
+    assert_eq!(
+        escrow
+            .keys
+            .aes
+            .decrypt(&state.decryptable_available_balance.try_into().unwrap()),
+        Some(applied - RELEASE_AMOUNT),
+        "the release wrote a correct AES copy"
     );
 }
 
