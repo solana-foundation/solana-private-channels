@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **216 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **228 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -223,7 +223,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### ConfigureConfidentialAccount (9 integration tests)
+### ConfigureConfidentialAccount (10 integration tests)
 
 - `test_configure_confidential_account_success` — escrow account carries the instance key, approved, confidential credits off and public credits on
 - `test_configure_confidential_account_fee_mint` — a fee mint's escrow account also gets `ConfidentialTransferFeeAmount`
@@ -233,13 +233,14 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_configure_confidential_account_rejects_mint_without_extension` — UnsupportedConfidentialMint
 - `test_configure_confidential_account_rejects_fee_mint_without_confidential_fee_config` — a pre-v0.9 mint, written by hand
 - `test_configure_confidential_account_rejects_confidential_mint_burn` — no public balance to release a public withdrawal from
+- `test_configure_confidential_account_rejects_recreated_mint` — MintProfileChanged, so a ConfidentialMintBurn added after AllowMint can't slip through
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
-### ConfidentialDeposit (13 integration tests)
+### ConfidentialDeposit (17 integration tests)
 
 - `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
 - `test_confidential_deposit_context_account_proofs`
-- `test_confidential_deposit_onto_a_non_empty_pending_balance` — the second of two unapplied deposits reports only its own amount
+- `test_confidential_deposit_onto_a_non_empty_pending_balance` — the second of two unapplied deposits reports only its own amount; the events carry credit counters 1 and 2
 - `test_confidential_deposit_with_recipient`
 - `test_confidential_deposit_direct_transfer_to_escrow_refused` — a confidential transfer outside the escrow finds credits off
 - `test_confidential_deposit_unconfigured_escrow_rejected`
@@ -250,8 +251,12 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_transfer_hook_forwards_extras`
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
+- `test_confidential_deposit_paused_mint_rejected` — Token-2022's MintPaused
+- `test_confidential_deposit_frozen_user_account_rejected` — Token-2022's AccountFrozen
+- `test_confidential_deposit_frozen_escrow_account_rejected` — Token-2022's AccountFrozen, though the escrow turned its credits on
+- `test_confidential_deposit_cpi_guard_rejected` — Token-2022's CpiGuardTransferBlocked: the escrow spends from the user's account inside a CPI
 
-### ConfidentialReleaseFunds (30 integration tests)
+### ConfidentialReleaseFunds (35 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
@@ -263,6 +268,8 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_destination_not_approved_rejected` — RecipientNotApproved, manual-approval mint
 - `test_confidential_release_funds_destination_pending_full_rejected` — the release taking the last pending slot lands, the next is RecipientPendingFull
 - `test_confidential_release_funds_destination_frozen_rejected` — RecipientFrozen
+- `test_confidential_release_funds_frozen_escrow_account_rejected` — Token-2022's AccountFrozen, which on a release now means the escrow's account
+- `test_confidential_release_funds_destination_cpi_guard_accepted` — CpiGuard doesn't block incoming credits
 - `test_confidential_release_funds_destination_key_changed_rejected` — RecipientKeyChanged
 - `test_confidential_release_funds_resent_after_destination_change_reports_nonce_used` — the landed release sent again as is, with stale proofs and a destination refusing credits: every check runs after the nonce
 - `test_confidential_release_funds_resent_after_account_closed_reports_nonce_used` — the user ATA check runs after the nonce too
@@ -283,13 +290,18 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_transfer_hook_forwards_extras`
 - `test_confidential_release_funds_hook_refusing_u64_max_settled_publicly` — the hook blocks the confidential release; `MoveToPublic` then `ReleaseFunds` settle the same nonce
 - `test_confidential_release_funds_transfer_fee` — the escrow pays the whole amount, the user receives it net of the fee
+- `test_confidential_release_funds_mixed_proofs` — equality inline, validity in the first context account: the event amount is read from it by position
+- `test_confidential_release_funds_transfer_fee_hook_context_account_proofs` — the most accounts: fee, five context accounts and the 32 hook accounts the escrow allows, the most its CPI can carry (41 of the 42 it allows)
+- `test_confidential_release_funds_transfer_fee_hook_inline_proofs` — fee, a 3-account hook and five inline proofs: 3,844 of 4,096 bytes, room for about 7 more hook accounts
 
-### ApplyPendingBalance (4 integration tests)
+### ApplyPendingBalance (6 integration tests)
 
 - `test_apply_pending_balance_success` — available and its AES copy hold the applied amount
 - `test_apply_pending_balance_late_credit_recovered_by_release` — applied anyway; the event carries the full applied pending and its credit count while the AES copy lags, and a release proved from that count writes a correct copy
 - `test_apply_pending_balance_not_operator_rejected`
 - `test_apply_pending_balance_unconfigured_escrow_rejected`
+- `test_apply_pending_balance_counts_deposits_and_moves` — three deposits and a move: the deposit events' amounts plus the move add up to the applied amount, the apply counts 4, and the deposit counters read 1, 3, 4
+- `test_apply_pending_balance_clears_a_full_credit_counter` — at 65,536 credits a deposit is refused by Token-2022 and moves nothing; apply resets the counter and the next deposit lands
 
 ### MoveToConfidential (2 integration tests)
 

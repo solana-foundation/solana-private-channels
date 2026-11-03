@@ -977,6 +977,15 @@
                 },
                 "kind": "arrayTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "pendingCreditCounter",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"

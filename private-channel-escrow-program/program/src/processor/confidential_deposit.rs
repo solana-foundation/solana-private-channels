@@ -8,8 +8,8 @@ use crate::{
         shared::{
             account_check::{verify_instructions_sysvar, verify_signer, verify_token_2022_program},
             confidential_utils::{
-                confidential_transfer_cpi, read_pending_balance, set_confidential_credits_cpi,
-                split_proof_contexts, ConfidentialTransferArgs,
+                confidential_transfer_cpi, read_pending_balance, read_pending_credit_counter,
+                set_confidential_credits_cpi, split_proof_contexts, ConfidentialTransferArgs,
             },
             event_utils::emit_event,
             token_utils::{read_mint_profile, validate_ata},
@@ -37,8 +37,8 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 /// pending balance with a Token-2022 confidential transfer. The escrow takes
 /// confidential credits only for the length of that transfer. The amount is the
 /// growth of the pending balance, which the event carries for the indexer to
-/// decrypt. Nothing on chain sees the amount, so neither a zero amount nor the
-/// mint's minimum deposit is enforced.
+/// decrypt, with the credit counter after it. Nothing on chain sees the amount,
+/// so neither a zero amount nor the mint's minimum deposit is enforced.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for transaction fees
@@ -184,6 +184,7 @@ pub fn process_confidential_deposit(
     set_confidential_credits_cpi(instance_ata_info, instance_info, false, &signers)?;
 
     let pending_after = read_pending_balance(instance_ata_info)?;
+    let pending_credit_counter = read_pending_credit_counter(instance_ata_info)?;
 
     let event = ConfidentialDepositEvent::new(
         instance.instance_seed,
@@ -192,6 +193,7 @@ pub fn process_confidential_deposit(
         *mint_info.address(),
         pending_before,
         pending_after,
+        pending_credit_counter,
     );
     emit_event(
         program_id,

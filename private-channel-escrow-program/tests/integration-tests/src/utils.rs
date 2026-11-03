@@ -138,6 +138,11 @@ pub const STALE_CONFIDENTIAL_BALANCE_ERROR: u32 =
 // Token-2022 errors the confidential tests expect
 pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =
     TokenError::ConfidentialTransferDepositsAndTransfersDisabled as u32;
+pub const TOKEN_CONFIDENTIAL_CREDITS_EXCEEDED_ERROR: u32 =
+    TokenError::MaximumPendingBalanceCreditCounterExceeded as u32;
+pub const TOKEN_MINT_PAUSED_ERROR: u32 = TokenError::MintPaused as u32;
+pub const TOKEN_ACCOUNT_FROZEN_ERROR: u32 = TokenError::AccountFrozen as u32;
+pub const TOKEN_CPI_GUARD_TRANSFER_BLOCKED_ERROR: u32 = TokenError::CpiGuardTransferBlocked as u32;
 
 /// Withdraw fee every test AllowMint sets. The escrow records it but does not
 /// act on it.
@@ -1693,6 +1698,9 @@ pub enum ProofPlacement {
     Inline,
     /// Context accounts, verified in earlier transactions.
     ContextAccounts,
+    /// Alternating, first inline, so the validity proof goes in a context account
+    /// behind an inline equality proof.
+    Mixed,
 }
 
 /// The proofs of one escrow instruction, in Token-2022's proof order.
@@ -1718,19 +1726,23 @@ impl PlacedProofs {
         instruction: ProofInstruction,
         proof: &T,
     ) -> i8 {
-        match self.placement {
-            ProofPlacement::Inline => {
-                self.instructions
-                    .push(instruction.encode_verify_proof(None, proof));
-                self.instructions.len() as i8
+        let inline = match self.placement {
+            ProofPlacement::Inline => true,
+            ProofPlacement::ContextAccounts => false,
+            ProofPlacement::Mixed => {
+                (self.instructions.len() + self.context_accounts.len()).is_multiple_of(2)
             }
-            ProofPlacement::ContextAccounts => {
-                let account = create_context_account(context, instruction, proof);
-                self.context_accounts
-                    .push(AccountMeta::new_readonly(account, false));
-                0
-            }
+        };
+        if inline {
+            self.instructions
+                .push(instruction.encode_verify_proof(None, proof));
+            // Counts only the inline proofs, so it stays right when they are mixed.
+            return self.instructions.len() as i8;
         }
+        let account = create_context_account(context, instruction, proof);
+        self.context_accounts
+            .push(AccountMeta::new_readonly(account, false));
+        0
     }
 
     /// The escrow instruction followed by the inline proofs, if any.

@@ -549,6 +549,9 @@ pub struct ConfidentialDepositEvent {
     pub pending_balance_lo_after: [u8; 64],
     /// Escrow pending balance, high bits, after the transfer
     pub pending_balance_hi_after: [u8; 64],
+    /// Credits in the escrow pending balance after the transfer, out of the
+    /// account's maximum, so the operator can apply before deposits run out
+    pub pending_credit_counter: u64,
 }
 
 impl ConfidentialDepositEvent {
@@ -559,6 +562,7 @@ impl ConfidentialDepositEvent {
         mint: Pubkey,
         pending_before: SplitCiphertext,
         pending_after: SplitCiphertext,
+        pending_credit_counter: u64,
     ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::ConfidentialDeposit as u8,
@@ -570,13 +574,14 @@ impl ConfidentialDepositEvent {
             pending_balance_hi_before: pending_before.hi,
             pending_balance_lo_after: pending_after.lo,
             pending_balance_hi_after: pending_after.hi,
+            pending_credit_counter,
         }
     }
 
     // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (user) + 32 (recipient)
-    // + 32 (mint) + 4 * 64 (pending lo and hi, before and after)
+    // + 32 (mint) + 4 * 64 (pending lo and hi, before and after) + 8 (credit counter)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(393);
+        let mut data = Vec::with_capacity(401);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -587,6 +592,7 @@ impl ConfidentialDepositEvent {
         data.extend_from_slice(&self.pending_balance_hi_before);
         data.extend_from_slice(&self.pending_balance_lo_after);
         data.extend_from_slice(&self.pending_balance_hi_after);
+        data.extend_from_slice(&self.pending_credit_counter.to_le_bytes());
         data
     }
 }
@@ -1068,6 +1074,7 @@ mod tests {
             lo: [7u8; 64],
             hi: [8u8; 64],
         };
+        let pending_credit_counter: u64 = 65_535;
         let event = ConfidentialDepositEvent::new(
             instance_seed,
             user,
@@ -1075,12 +1082,13 @@ mod tests {
             mint,
             pending_before,
             pending_after,
+            pending_credit_counter,
         );
 
         // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (user) + 32 (recipient) + 32 (mint)
-        // + 4 * 64 (pending lo and hi, before and after)
+        // + 4 * 64 (pending lo and hi, before and after) + 8 (credit counter)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 393);
+        assert_eq!(bytes.len(), 401);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::ConfidentialDeposit as u8);
         assert_eq!(&bytes[41..73], user.as_ref());
@@ -1090,6 +1098,7 @@ mod tests {
         assert_eq!(&bytes[201..265], &[6u8; 64]);
         assert_eq!(&bytes[265..329], &[7u8; 64]);
         assert_eq!(&bytes[329..393], &[8u8; 64]);
+        assert_eq!(&bytes[393..401], &pending_credit_counter.to_le_bytes());
     }
 
     #[test]

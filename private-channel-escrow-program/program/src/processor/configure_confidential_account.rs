@@ -15,7 +15,7 @@ use crate::{
                 set_confidential_credits_cpi,
             },
             event_utils::emit_event,
-            token_utils::validate_ata,
+            token_utils::{read_mint_profile, validate_ata},
         },
         verify_account_owner, verify_current_program,
     },
@@ -36,9 +36,10 @@ use spl_token_2022::extension::ExtensionType;
 /// Turns on confidential transfers for the instance's escrow account of an allowed
 /// mint, then turns confidential credits off so they only arrive through
 /// ConfidentialDeposit and MoveToConfidential. Public credits stay on. Refuses a
-/// mint without `ConfidentialTransferMint`, a fee mint without
-/// `ConfidentialTransferFeeConfig` and a `ConfidentialMintBurn` mint. Token-2022
-/// refuses an account configured before.
+/// mint recreated since AllowMint, as Deposit does, a mint without
+/// `ConfidentialTransferMint`, a fee mint without `ConfidentialTransferFeeConfig`
+/// and a `ConfidentialMintBurn` mint. Token-2022 refuses an account configured
+/// before.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for the larger escrow account
@@ -99,6 +100,13 @@ pub fn process_configure_confidential_account(
             allowed_mint_info,
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
+
+    // Same recreate check as Deposit, so the decisions below read the extensions
+    // the mint has, not only the ones recorded at AllowMint.
+    let mint_profile = read_mint_profile(mint_info)?;
+    if allowed_mint.profile_changed(&mint_profile, token_program_info.address()) {
+        return Err(PrivateChannelEscrowProgramError::MintProfileChanged.into());
+    }
 
     // Token-2022 refuses every confidential transfer of a fee mint without the
     // confidential fee config. A ConfidentialMintBurn mint has no public balance,

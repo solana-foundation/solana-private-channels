@@ -13,12 +13,19 @@ use crate::{
         ConfidentialMintOptions, ProofPlacement, TestContext,
         CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR, DEPOSITS_BLOCKED_FOR_MINT_ERROR,
         HOOK_FIXTURE_PROGRAM_ID, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
-        TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR, WALLET_NOT_ALLOWED_ERROR,
+        TOKEN_ACCOUNT_FROZEN_ERROR, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
+        TOKEN_CPI_GUARD_TRANSFER_BLOCKED_ERROR, TOKEN_MINT_PAUSED_ERROR, WALLET_NOT_ALLOWED_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::ConfidentialDepositBuilder;
 use solana_sdk::signature::{Keypair, Signer};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_token_2022::{
+    extension::{
+        cpi_guard::instruction::enable_cpi_guard, pausable::instruction::pause, ExtensionType,
+    },
+    instruction::freeze_account,
+};
 use spl_token_2022_interface::extension::confidential_transfer::instruction as confidential_instruction;
 use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation;
 
@@ -207,6 +214,7 @@ fn test_confidential_deposit_onto_a_non_empty_pending_balance() {
         find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
 
     let mut deposited = Vec::new();
+    let mut pending_credits = Vec::new();
     for amount in [DEPOSIT_AMOUNT, SECOND_DEPOSIT_AMOUNT] {
         let transfer = prepare_transfer(
             &mut context,
@@ -245,13 +253,14 @@ fn test_confidential_deposit_onto_a_non_empty_pending_balance() {
         let transaction_metadata = context
             .send_v1(&transfer.proofs.with(instruction), &[&user])
             .expect("ConfidentialDeposit should succeed");
-        deposited.push(deposited_amount(
-            &escrow.keys,
-            &event_data(&transaction_metadata, 13),
-        ));
+        let event = event_data(&transaction_metadata, 13);
+        deposited.push(deposited_amount(&escrow.keys, &event));
+        // After the pending balances: the credit counter.
+        pending_credits.push(u64::from_le_bytes(event[384..392].try_into().unwrap()));
     }
 
     assert_eq!(deposited, [DEPOSIT_AMOUNT, SECOND_DEPOSIT_AMOUNT]);
+    assert_eq!(pending_credits, [1, 2]);
     assert_eq!(
         decrypt_pending(&mut context, &escrow.escrow_ata, &escrow.keys),
         DEPOSIT_AMOUNT + SECOND_DEPOSIT_AMOUNT
@@ -997,5 +1006,314 @@ fn test_confidential_deposit_transfer_fee_net_amount() {
     assert_eq!(
         decrypt_pending(&mut context, &escrow.escrow_ata, &escrow.keys),
         DEPOSIT_AMOUNT - fee
+    );
+}
+
+// The escrow passes the deposit on while the mint is paused; Token-2022 refuses it.
+#[test]
+fn test_confidential_deposit_paused_mint_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            pausable: true,
+            ..Default::default()
+        },
+    );
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let pause_mint = pause(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[pause_mint], &[])
+        .expect("Pause should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_MINT_PAUSED_ERROR),
+    );
+}
+
+#[test]
+fn test_confidential_deposit_frozen_user_account_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            freeze_authority: true,
+            ..Default::default()
+        },
+    );
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let freeze_user_ata = freeze_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &user_ata,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[freeze_user_ata], &[])
+        .expect("FreezeAccount should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_ACCOUNT_FROZEN_ERROR),
+    );
+}
+
+// The escrow turns its credits on for the deposit, but a frozen escrow account
+// still refuses it.
+#[test]
+fn test_confidential_deposit_frozen_escrow_account_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            freeze_authority: true,
+            ..Default::default()
+        },
+    );
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let freeze_escrow_ata = freeze_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.escrow_ata,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[freeze_escrow_ata], &[])
+        .expect("FreezeAccount should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_ACCOUNT_FROZEN_ERROR),
+    );
+}
+
+// The escrow spends from the user's account inside a CPI, which CpiGuard forbids
+// for its owner.
+#[test]
+fn test_confidential_deposit_cpi_guard_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    fund_confidential_balance(
+        &mut context,
+        &user,
+        &user_ata,
+        &escrow.mint.address,
+        &user_keys,
+        USER_BALANCE,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let add_cpi_guard = spl_token_2022::instruction::reallocate(
+        &TOKEN_2022_PROGRAM_ID,
+        &user_ata,
+        &context.payer.pubkey(),
+        &user.pubkey(),
+        &[],
+        &[ExtensionType::CpiGuard],
+    )
+    .unwrap();
+    let enable_guard =
+        enable_cpi_guard(&TOKEN_2022_PROGRAM_ID, &user_ata, &user.pubkey(), &[]).unwrap();
+    context
+        .send_v1(&[add_cpi_guard, enable_guard], &[&user])
+        .expect("EnableCpiGuard should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        DEPOSIT_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&user]);
+
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_CPI_GUARD_TRANSFER_BLOCKED_ERROR),
     );
 }
