@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **199 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **216 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -251,13 +251,30 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
 - `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
 
-### ConfidentialReleaseFunds (13 integration tests)
+### ConfidentialReleaseFunds (30 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
 - `test_confidential_release_funds_nonce_replay_rejected` — fresh proofs, same nonce
-- `test_confidential_release_funds_stale_proof_rejected` — an apply in between turns the proofs stale
-- `test_confidential_release_funds_destination_credits_disabled_rejected`
+- `test_confidential_release_funds_stale_proof_rejected` — StaleConfidentialBalance: an apply in between turns the proofs stale
+- `test_confidential_release_funds_destination_credits_disabled_rejected` — RecipientCreditsDisabled
+- `test_confidential_release_funds_destination_not_configured_rejected` — RecipientNotConfidential
+- `test_confidential_release_funds_destination_missing_rejected` — RecipientNotConfidential for an account never created
+- `test_confidential_release_funds_destination_not_approved_rejected` — RecipientNotApproved, manual-approval mint
+- `test_confidential_release_funds_destination_pending_full_rejected` — the release taking the last pending slot lands, the next is RecipientPendingFull
+- `test_confidential_release_funds_destination_frozen_rejected` — RecipientFrozen
+- `test_confidential_release_funds_destination_key_changed_rejected` — RecipientKeyChanged
+- `test_confidential_release_funds_resent_after_destination_change_reports_nonce_used` — the landed release sent again as is, with stale proofs and a destination refusing credits: every check runs after the nonce
+- `test_confidential_release_funds_resent_after_account_closed_reports_nonce_used` — the user ATA check runs after the nonce too
+- `test_confidential_release_funds_auditor_rotated_rejected` — StaleAuditorKey
+- `test_confidential_release_funds_auditor_removed_rejected` — StaleAuditorKey: Token-2022 then expects the zero key
+- `test_confidential_release_funds_paused_mint_rejected` — MintPaused
+- `test_confidential_release_funds_mint_without_auditor` — proofs naming the zero key land
+- `test_confidential_release_funds_misplaced_validity_proof_rejected` — the range proof at the validity offset is refused, not read
+- `test_confidential_release_funds_foreign_validity_context_rejected` — a validity context the ZK program doesn't own
+- `test_confidential_release_funds_uninitialized_validity_context_rejected` — a full-size zeroed context is refused by its proof type, not read as zero keys
+- `test_confidential_release_funds_short_validity_context_rejected` — a context shorter than its header is an error, not a panic
+- `test_confidential_release_funds_validity_proof_for_another_program_rejected` — a copy of the validity proof addressed to another program
 - `test_confidential_release_funds_memo_required_destination`
 - `test_confidential_release_funds_not_operator_rejected`
 - `test_confidential_release_funds_to_instance_rejected` — InvalidRecipient instead of Token-2022's credits-disabled error

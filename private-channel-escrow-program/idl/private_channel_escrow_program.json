@@ -1387,6 +1387,60 @@
         "kind": "errorNode",
         "message": "Release recipient cannot be the instance",
         "name": "invalidRecipient"
+      },
+      {
+        "code": 25,
+        "kind": "errorNode",
+        "message": "Recipient account doesn't exist or is not configured for confidential transfers",
+        "name": "recipientNotConfidential"
+      },
+      {
+        "code": 26,
+        "kind": "errorNode",
+        "message": "Recipient account is not approved for confidential transfers",
+        "name": "recipientNotApproved"
+      },
+      {
+        "code": 27,
+        "kind": "errorNode",
+        "message": "Recipient account refuses confidential credits",
+        "name": "recipientCreditsDisabled"
+      },
+      {
+        "code": 28,
+        "kind": "errorNode",
+        "message": "Recipient account's pending balance credit counter is full",
+        "name": "recipientPendingFull"
+      },
+      {
+        "code": 29,
+        "kind": "errorNode",
+        "message": "Recipient account is frozen",
+        "name": "recipientFrozen"
+      },
+      {
+        "code": 30,
+        "kind": "errorNode",
+        "message": "Recipient account's ElGamal key differs from the proofs'",
+        "name": "recipientKeyChanged"
+      },
+      {
+        "code": 31,
+        "kind": "errorNode",
+        "message": "Mint's auditor key differs from the proofs'",
+        "name": "staleAuditorKey"
+      },
+      {
+        "code": 32,
+        "kind": "errorNode",
+        "message": "Mint is paused",
+        "name": "mintPaused"
+      },
+      {
+        "code": 33,
+        "kind": "errorNode",
+        "message": "Escrow's available balance differs from the one the proofs were built against",
+        "name": "staleConfidentialBalance"
       }
     ],
     "instructions": [
@@ -3500,6 +3554,22 @@
             "name": "withdrawer",
             "type": {
               "kind": "publicKeyTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "expectedAvailableBalance",
+            "type": {
+              "count": {
+                "kind": "fixedCountNode",
+                "value": 64
+              },
+              "item": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              },
+              "kind": "arrayTypeNode"
             }
           },
           {

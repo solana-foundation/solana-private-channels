@@ -15,6 +15,7 @@ describe('confidentialReleaseFunds', () => {
         user: TEST_ADDRESSES.WALLET,
         transactionNonce: BigInt(TEST_TRANSACTION_NONCE),
         withdrawer: TEST_ADDRESSES.ADMIN,
+        expectedAvailableBalance: Array(64).fill(4),
         newSourceDecryptableAvailableBalance: Array(36).fill(1),
         auditorCiphertextLo: Array(64).fill(2),
         auditorCiphertextHi: Array(64).fill(3),

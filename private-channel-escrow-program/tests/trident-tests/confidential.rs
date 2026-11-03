@@ -450,6 +450,8 @@ impl PlacedProofs {
 /// A confidential transfer's proofs and the sender fields the escrow forwards.
 pub struct PreparedTransfer {
     pub proofs: PlacedProofs,
+    /// The source's available balance the proofs were built against.
+    pub expected_available_balance: [u8; 64],
     pub new_source_decryptable_available_balance: [u8; 36],
     pub auditor_ciphertext_lo: [u8; 64],
     pub auditor_ciphertext_hi: [u8; 64],
@@ -509,6 +511,7 @@ pub fn prepare_transfer(
             &data.range_proof_data,
         );
         return Some(PreparedTransfer {
+            expected_available_balance: available.to_bytes(),
             new_source_decryptable_available_balance: source_keys.decryptable_bytes(new_balance),
             auditor_ciphertext_lo: elgamal_bytes(validity.ciphertext_lo),
             auditor_ciphertext_hi: elgamal_bytes(validity.ciphertext_hi),
@@ -561,6 +564,7 @@ pub fn prepare_transfer(
         &data.range_proof_data,
     );
     Some(PreparedTransfer {
+        expected_available_balance: available.to_bytes(),
         new_source_decryptable_available_balance: source_keys.decryptable_bytes(new_balance),
         auditor_ciphertext_lo: elgamal_bytes(validity.ciphertext_lo),
         auditor_ciphertext_hi: elgamal_bytes(validity.ciphertext_hi),

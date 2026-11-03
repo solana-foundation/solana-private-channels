@@ -32,6 +32,24 @@ pub fn validate_ata(
     mint_info: &AccountView,
     token_program_info: &AccountView,
 ) -> ProgramResult {
+    validate_ata_address(ata_info, wallet_key, mint_info, token_program_info)?;
+
+    if ata_info.is_data_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    Ok(())
+}
+
+/// The ATA address check alone, for a caller that types an account that doesn't
+/// exist.
+#[inline(always)]
+pub fn validate_ata_address(
+    ata_info: &AccountView,
+    wallet_key: &Address,
+    mint_info: &AccountView,
+    token_program_info: &AccountView,
+) -> ProgramResult {
     // Validate ATA address is correct for this wallet + mint
     let expected_ata = Address::find_program_address(
         &[
@@ -43,7 +61,7 @@ pub fn validate_ata(
     )
     .0;
 
-    if ata_info.address() != &expected_ata || ata_info.is_data_empty() {
+    if ata_info.address() != &expected_ata {
         return Err(ProgramError::InvalidInstructionData);
     }
 

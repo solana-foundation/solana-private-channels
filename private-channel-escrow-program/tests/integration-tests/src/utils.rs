@@ -42,7 +42,7 @@ use spl_token_2022::{
         confidential_transfer_fee::instruction::initialize_confidential_transfer_fee_config,
         memo_transfer::MemoTransfer,
         metadata_pointer::MetadataPointer,
-        pausable::PausableConfig,
+        pausable::{instruction::initialize as initialize_pausable, PausableConfig},
         permanent_delegate::PermanentDelegate,
         transfer_fee::{instruction::initialize_transfer_fee_config, TransferFeeConfig},
         transfer_hook::{
@@ -119,12 +119,25 @@ pub const CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR: u32 =
 pub const UNSUPPORTED_CONFIDENTIAL_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::UnsupportedConfidentialMint as u32;
 pub const INVALID_RECIPIENT_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidRecipient as u32;
+pub const RECIPIENT_NOT_CONFIDENTIAL_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientNotConfidential as u32;
+pub const RECIPIENT_NOT_APPROVED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientNotApproved as u32;
+pub const RECIPIENT_CREDITS_DISABLED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientCreditsDisabled as u32;
+pub const RECIPIENT_PENDING_FULL_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientPendingFull as u32;
+pub const RECIPIENT_FROZEN_ERROR: u32 = PrivateChannelEscrowProgramError::RecipientFrozen as u32;
+pub const RECIPIENT_KEY_CHANGED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientKeyChanged as u32;
+pub const STALE_AUDITOR_KEY_ERROR: u32 = PrivateChannelEscrowProgramError::StaleAuditorKey as u32;
+pub const MINT_PAUSED_ERROR: u32 = PrivateChannelEscrowProgramError::MintPaused as u32;
+pub const STALE_CONFIDENTIAL_BALANCE_ERROR: u32 =
+    PrivateChannelEscrowProgramError::StaleConfidentialBalance as u32;
 
 // Token-2022 errors the confidential tests expect
 pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =
     TokenError::ConfidentialTransferDepositsAndTransfersDisabled as u32;
-pub const TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR: u32 =
-    TokenError::ConfidentialTransferBalanceMismatch as u32;
 
 /// Withdraw fee every test AllowMint sets. The escrow records it but does not
 /// act on it.
@@ -1359,13 +1372,19 @@ pub struct ConfidentialMintOptions {
     pub transfer_hook: bool,
     pub manual_approval: bool,
     pub confidential_mint_burn: bool,
+    /// The payer can pause the mint.
+    pub pausable: bool,
+    /// The payer can freeze accounts.
+    pub freeze_authority: bool,
+    /// No auditor, so proofs name the default key.
+    pub no_auditor: bool,
 }
 
 /// A confidential mint and the keys its transfer proofs name. The fee
 /// authority's key matters only when the mint has a transfer fee.
 pub struct ConfidentialMint {
     pub address: Pubkey,
-    pub auditor: ElGamalKeypair,
+    pub auditor: Option<ElGamalKeypair>,
     pub transfer_fee: Option<(u16, u64)>,
     pub withdraw_withheld_authority: ElGamalKeypair,
 }
@@ -1378,7 +1397,7 @@ pub fn create_confidential_mint(
     options: ConfidentialMintOptions,
 ) -> ConfidentialMint {
     let mint = Keypair::new();
-    let auditor = ElGamalKeypair::new_rand();
+    let auditor = (!options.no_auditor).then(ElGamalKeypair::new_rand);
     let withdraw_withheld_authority = ElGamalKeypair::new_rand();
     let payer = context.payer.pubkey();
 
@@ -1392,6 +1411,9 @@ pub fn create_confidential_mint(
     }
     if options.confidential_mint_burn {
         extensions.push(ExtensionType::ConfidentialMintBurn);
+    }
+    if options.pausable {
+        extensions.push(ExtensionType::Pausable);
     }
     let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
 
@@ -1408,7 +1430,7 @@ pub fn create_confidential_mint(
             &mint.pubkey(),
             Some(payer),
             !options.manual_approval,
-            Some((*auditor.pubkey()).into()),
+            auditor.as_ref().map(|auditor| (*auditor.pubkey()).into()),
         )
         .unwrap(),
     ];
@@ -1457,12 +1479,16 @@ pub fn create_confidential_mint(
             .unwrap(),
         );
     }
+    if options.pausable {
+        instructions
+            .push(initialize_pausable(&TOKEN_2022_PROGRAM_ID, &mint.pubkey(), &payer).unwrap());
+    }
     instructions.push(
         spl_token_2022::instruction::initialize_mint2(
             &TOKEN_2022_PROGRAM_ID,
             &mint.pubkey(),
             &payer,
-            None,
+            options.freeze_authority.then_some(&payer),
             CONFIDENTIAL_MINT_DECIMALS,
         )
         .unwrap(),
@@ -1748,6 +1774,8 @@ fn create_context_account<T: Pod + ZkProofData<U>, U: Pod>(
 /// A confidential transfer's proofs and the sender fields the escrow forwards.
 pub struct PreparedTransfer {
     pub proofs: PlacedProofs,
+    /// The source's available balance the proofs were built against.
+    pub expected_available_balance: [u8; 64],
     pub new_source_decryptable_available_balance: [u8; 36],
     pub auditor_ciphertext_lo: [u8; 64],
     pub auditor_ciphertext_hi: [u8; 64],
@@ -1813,7 +1841,7 @@ pub fn prepare_transfer_from_balance(
             &source_keys.elgamal,
             &source_keys.aes,
             destination,
-            Some(mint.auditor.pubkey()),
+            mint.auditor.as_ref().map(|auditor| auditor.pubkey()),
         )
         .unwrap();
         let validity = &data.ciphertext_validity_proof_data_with_ciphertext;
@@ -1838,6 +1866,7 @@ pub fn prepare_transfer_from_balance(
             range_proof_instruction_offset,
             fee_sigma_proof_instruction_offset: 0,
             fee_ciphertext_validity_proof_instruction_offset: 0,
+            expected_available_balance: available.to_bytes(),
             new_source_decryptable_available_balance: source_keys.decryptable(new_balance).0,
             auditor_ciphertext_lo: validity.ciphertext_lo.0,
             auditor_ciphertext_hi: validity.ciphertext_hi.0,
@@ -1852,7 +1881,7 @@ pub fn prepare_transfer_from_balance(
         &source_keys.elgamal,
         &source_keys.aes,
         destination,
-        Some(mint.auditor.pubkey()),
+        mint.auditor.as_ref().map(|auditor| auditor.pubkey()),
         mint.withdraw_withheld_authority.pubkey(),
         basis_points,
         maximum_fee,
@@ -1890,6 +1919,7 @@ pub fn prepare_transfer_from_balance(
         range_proof_instruction_offset,
         fee_sigma_proof_instruction_offset,
         fee_ciphertext_validity_proof_instruction_offset,
+        expected_available_balance: available.to_bytes(),
         new_source_decryptable_available_balance: source_keys.decryptable(new_balance).0,
         auditor_ciphertext_lo: validity.ciphertext_lo.0,
         auditor_ciphertext_hi: validity.ciphertext_hi.0,

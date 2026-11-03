@@ -106,6 +106,44 @@ pub enum PrivateChannelEscrowProgramError {
     /// (24) A release names the instance itself as the recipient
     #[error("Release recipient cannot be the instance")]
     InvalidRecipient,
+
+    /// (25) The release's destination doesn't exist or has no confidential
+    /// transfer extension
+    #[error("Recipient account doesn't exist or is not configured for confidential transfers")]
+    RecipientNotConfidential,
+
+    /// (26) The release's destination waits for the mint's confidential authority
+    #[error("Recipient account is not approved for confidential transfers")]
+    RecipientNotApproved,
+
+    /// (27) The release's destination refuses confidential credits
+    #[error("Recipient account refuses confidential credits")]
+    RecipientCreditsDisabled,
+
+    /// (28) The release's destination has as many pending credits as it allows
+    #[error("Recipient account's pending balance credit counter is full")]
+    RecipientPendingFull,
+
+    /// (29) The release's destination is frozen
+    #[error("Recipient account is frozen")]
+    RecipientFrozen,
+
+    /// (30) The release's proofs name another key than the destination's
+    #[error("Recipient account's ElGamal key differs from the proofs'")]
+    RecipientKeyChanged,
+
+    /// (31) The release's proofs name another auditor than the mint's
+    #[error("Mint's auditor key differs from the proofs'")]
+    StaleAuditorKey,
+
+    /// (32) The mint is paused
+    #[error("Mint is paused")]
+    MintPaused,
+
+    /// (33) The release's proofs were built against another available balance
+    /// than the escrow's
+    #[error("Escrow's available balance differs from the one the proofs were built against")]
+    StaleConfidentialBalance,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -152,6 +190,15 @@ mod tests {
             (ConfidentialAccountNotConfigured, 22),
             (UnsupportedConfidentialMint, 23),
             (InvalidRecipient, 24),
+            (RecipientNotConfidential, 25),
+            (RecipientNotApproved, 26),
+            (RecipientCreditsDisabled, 27),
+            (RecipientPendingFull, 28),
+            (RecipientFrozen, 29),
+            (RecipientKeyChanged, 30),
+            (StaleAuditorKey, 31),
+            (MintPaused, 32),
+            (StaleConfidentialBalance, 33),
         ];
 
         for (error, expected_code) in cases {

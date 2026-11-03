@@ -639,6 +639,7 @@ impl FuzzTest {
             .user(escrow.user.client())
             .transaction_nonce(nonce)
             .withdrawer(withdrawer_wallet.client())
+            .expected_available_balance(transfer.expected_available_balance)
             .new_source_decryptable_available_balance(
                 transfer.new_source_decryptable_available_balance,
             )
@@ -923,6 +924,7 @@ impl FuzzTest {
                     .user(escrow.instance.client())
                     .transaction_nonce(nonce)
                     .withdrawer(escrow.user.client())
+                    .expected_available_balance(transfer.expected_available_balance)
                     .new_source_decryptable_available_balance(
                         transfer.new_source_decryptable_available_balance,
                     )

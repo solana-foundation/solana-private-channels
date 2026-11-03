@@ -8,11 +8,12 @@ use crate::{
         shared::{
             account_check::{verify_instructions_sysvar, verify_signer, verify_token_2022_program},
             confidential_utils::{
-                confidential_transfer_cpi, read_source_amount, split_proof_contexts,
-                ConfidentialTransferArgs,
+                check_auditor_key, check_mint_not_paused, check_recipient_ready,
+                confidential_transfer_cpi, read_available_balance, read_validity_context,
+                split_proof_contexts, ConfidentialTransferArgs,
             },
             event_utils::emit_event,
-            token_utils::validate_ata,
+            token_utils::{validate_ata, validate_ata_address},
         },
         verify_account_owner, verify_current_program, verify_mutability,
     },
@@ -28,8 +29,11 @@ use pinocchio::{
 };
 use spl_token_2022::extension::ExtensionType;
 
-// user (32) + transaction_nonce (8) + withdrawer (32), then the transfer fields
-const FIXED_DATA_LEN: usize = 32 + 8 + 32;
+// user (32) + transaction_nonce (8) + withdrawer (32) + expected_available_balance
+// (64), then the transfer fields
+const FIXED_DATA_LEN: usize = 32 + 8 + 32 + AVAILABLE_BALANCE_LEN;
+
+const AVAILABLE_BALANCE_LEN: usize = 64;
 
 /// Fixed account prefix; proof contexts and then hook extras follow.
 const FIXED_ACCOUNTS_LEN: usize = 16;
@@ -39,7 +43,9 @@ const FIXED_ACCOUNTS_LEN: usize = 16;
 /// ReleaseFunds for a hidden amount: the escrow's available balance pays the
 /// user's pending balance with a Token-2022 confidential transfer. The event
 /// carries the amount encrypted under the instance key, taken from the proof
-/// Token-2022 accepted.
+/// Token-2022 accepted. A paused mint, a destination that can't take the credit,
+/// proofs built for other keys and proofs built against another available
+/// balance fail with their own escrow errors.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for transaction fees
@@ -68,6 +74,8 @@ const FIXED_ACCOUNTS_LEN: usize = 16;
 /// * `user` (Pubkey) - User receiving the funds
 /// * `transaction_nonce` (u64) - Transaction nonce to consume from the bitmap
 /// * `withdrawer` (Pubkey) - Wallet whose channel burn this release settles
+/// * `expected_available_balance` ([u8; 64]) - Escrow's available balance ciphertext
+///   the proofs were built against
 /// * Confidential transfer fields - see `ConfidentialTransferArgs`
 pub fn process_confidential_release_funds(
     program_id: &Address,
@@ -149,7 +157,6 @@ pub fn process_confidential_release_funds(
         return Err(PrivateChannelEscrowProgramError::InvalidRecipient.into());
     }
 
-    validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
     validate_ata(
         instance_ata_info,
         instance_info.address(),
@@ -167,9 +174,31 @@ pub fn process_confidential_release_funds(
     WithdrawalBitmap::consume_nonce(&mut bitmap_data, args.transaction_nonce)?;
     drop(bitmap_data);
 
+    // The destination checks all run after the nonce, so a landed release that is
+    // sent again still reports the nonce used, even once the user closed the
+    // account. A missing account is the user's to create, so it is typed below.
+    validate_ata_address(user_ata_info, &args.user, mint_info, token_program_info)?;
+
     let with_fee = allowed_mint.has_extension(ExtensionType::TransferFeeConfig);
     let proof_offsets = args.transfer.proof_offsets.token_2022_order(with_fee);
     let (proof_contexts, hook_extras) = split_proof_contexts(remaining_accounts, &proof_offsets)?;
+
+    let validity = read_validity_context(
+        &args.transfer.proof_offsets,
+        instructions_sysvar_info,
+        proof_contexts,
+    )?;
+
+    // Token-2022 refuses all of these too, but its errors don't say whose account
+    // or which key.
+    check_mint_not_paused(mint_info)?;
+    check_recipient_ready(user_ata_info, &validity.destination_pubkey)?;
+    check_auditor_key(mint_info, &validity.auditor_pubkey)?;
+    // Token-2022 checks the proofs against the available balance with ciphertext
+    // arithmetic; the same bytes the operator read pass it.
+    if read_available_balance(instance_ata_info)? != args.expected_available_balance {
+        return Err(PrivateChannelEscrowProgramError::StaleConfidentialBalance.into());
+    }
 
     let bump_slice = [instance.bump];
     let signer_seeds = [
@@ -195,18 +224,12 @@ pub fn process_confidential_release_funds(
         &signers,
     )?;
 
-    let amount = read_source_amount(
-        &args.transfer.proof_offsets,
-        instructions_sysvar_info,
-        proof_contexts,
-    )?;
-
     let event = ConfidentialReleaseFundsEvent::new(
         instance.instance_seed,
         *operator_info.address(),
         args.user,
         *mint_info.address(),
-        amount,
+        validity.source_amount,
     );
     emit_event(
         program_id,
@@ -222,6 +245,7 @@ struct ConfidentialReleaseFundsArgs {
     user: Address,
     transaction_nonce: u64,
     withdrawer: Address,
+    expected_available_balance: [u8; AVAILABLE_BALANCE_LEN],
     transfer: ConfidentialTransferArgs,
 }
 
@@ -247,12 +271,17 @@ fn process_instruction_data(data: &[u8]) -> Result<ConfidentialReleaseFundsArgs,
     let withdrawer = Address::new_from_array(withdrawer_bytes);
     offset += 32;
 
+    let mut expected_available_balance = [0u8; AVAILABLE_BALANCE_LEN];
+    expected_available_balance.copy_from_slice(&data[offset..offset + AVAILABLE_BALANCE_LEN]);
+    offset += AVAILABLE_BALANCE_LEN;
+
     let transfer = ConfidentialTransferArgs::try_from_bytes(&data[offset..])?;
 
     Ok(ConfidentialReleaseFundsArgs {
         user,
         transaction_nonce,
         withdrawer,
+        expected_available_balance,
         transfer,
     })
 }
@@ -269,10 +298,12 @@ mod tests {
         let user = Address::new_from_array([7u8; 32]);
         let transaction_nonce = 42u64;
         let withdrawer = Address::new_from_array([9u8; 32]);
+        let expected_available_balance = [5u8; AVAILABLE_BALANCE_LEN];
         let mut instruction_data = vec![];
         instruction_data.extend_from_slice(user.as_ref());
         instruction_data.extend_from_slice(&transaction_nonce.to_le_bytes());
         instruction_data.extend_from_slice(withdrawer.as_ref());
+        instruction_data.extend_from_slice(&expected_available_balance);
         instruction_data.extend_from_slice(&[0u8; TRANSFER_ARGS_LEN]);
 
         let args = process_instruction_data(&instruction_data).unwrap();
@@ -280,11 +311,12 @@ mod tests {
         assert_eq!(args.user, user);
         assert_eq!(args.transaction_nonce, transaction_nonce);
         assert_eq!(args.withdrawer, withdrawer);
+        assert_eq!(args.expected_available_balance, expected_available_balance);
     }
 
     #[test]
     fn test_process_confidential_release_funds_instruction_data_too_short() {
-        let instruction_data = vec![0u8; 32 + 8 + 32 + TRANSFER_ARGS_LEN - 1];
+        let instruction_data = vec![0u8; FIXED_DATA_LEN + TRANSFER_ARGS_LEN - 1];
 
         let result = process_instruction_data(&instruction_data);
 

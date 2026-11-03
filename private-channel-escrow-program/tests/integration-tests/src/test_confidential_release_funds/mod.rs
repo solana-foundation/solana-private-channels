@@ -11,20 +11,35 @@ use crate::{
         hook_extras_for_mint, prepare_transfer, prepare_withdraw, set_extra_account_meta_list,
         ConfidentialKeys, ConfidentialMintOptions, ProofPlacement, TestContext,
         HOOK_FIXTURE_PROGRAM_ID, INVALID_OPERATOR_ERROR, INVALID_RECIPIENT_ERROR,
-        NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
-        TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR, TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR,
-        WALLET_NOT_ALLOWED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
+        MINT_PAUSED_ERROR, NONCE_ALREADY_USED_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        RECIPIENT_CREDITS_DISABLED_ERROR, RECIPIENT_FROZEN_ERROR, RECIPIENT_KEY_CHANGED_ERROR,
+        RECIPIENT_NOT_APPROVED_ERROR, RECIPIENT_NOT_CONFIDENTIAL_ERROR,
+        RECIPIENT_PENDING_FULL_ERROR, STALE_AUDITOR_KEY_ERROR, STALE_CONFIDENTIAL_BALANCE_ERROR,
+        TOKEN_2022_PROGRAM_ID, WALLET_NOT_ALLOWED_ERROR, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::{
     ConfidentialReleaseFundsBuilder, MoveToPublicBuilder, ReleaseFundsBuilder,
 };
 use solana_sdk::{
+    account::Account,
     instruction::AccountMeta,
+    pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_token_2022::extension::{
-    memo_transfer::instruction::enable_required_transfer_memos, ExtensionType,
+use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+use spl_associated_token_account::{
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
+};
+use spl_token_2022::{
+    extension::{
+        confidential_transfer::ConfidentialTransferAccount,
+        memo_transfer::instruction::enable_required_transfer_memos, pausable::instruction::pause,
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    },
+    instruction::freeze_account,
+    state::Account as Token2022Account,
 };
 use spl_token_2022_interface::extension::confidential_transfer::instruction as confidential_instruction;
 use spl_transfer_hook_interface::get_extra_account_metas_address;
@@ -80,6 +95,7 @@ fn test_confidential_release_funds_inline_proofs() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -152,6 +168,7 @@ fn test_confidential_release_funds_context_account_proofs() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -217,6 +234,7 @@ fn test_confidential_release_funds_nonce_replay_rejected() {
             .user(user.pubkey())
             .transaction_nonce(TRANSACTION_NONCE)
             .withdrawer(user.pubkey())
+            .expected_available_balance(transfer.expected_available_balance)
             .new_source_decryptable_available_balance(
                 transfer.new_source_decryptable_available_balance,
             )
@@ -248,7 +266,8 @@ fn test_confidential_release_funds_nonce_replay_rejected() {
 }
 
 // Token-2022 binds the proofs to the escrow's available balance, so anything that
-// changes it first, here an apply, turns them stale. The operator rebuilds them.
+// changes it first, here an apply, turns them stale. The escrow names it; the
+// operator rebuilds them.
 #[test]
 fn test_confidential_release_funds_stale_proof_rejected() {
     let mut context = TestContext::new();
@@ -285,6 +304,7 @@ fn test_confidential_release_funds_stale_proof_rejected() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -303,8 +323,8 @@ fn test_confidential_release_funds_stale_proof_rejected() {
 
     assert_failed_first(
         result,
-        &TOKEN_2022_PROGRAM_ID,
-        &custom_error(TOKEN_CONFIDENTIAL_BALANCE_MISMATCH_ERROR),
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(STALE_CONFIDENTIAL_BALANCE_ERROR),
     );
 }
 
@@ -353,6 +373,7 @@ fn test_confidential_release_funds_destination_credits_disabled_rejected() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -371,8 +392,1223 @@ fn test_confidential_release_funds_destination_credits_disabled_rejected() {
 
     assert_failed_first(
         result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_CREDITS_DISABLED_ERROR),
+    );
+}
+
+// A plain Token-2022 account, never configured for confidential transfers.
+#[test]
+fn test_confidential_release_funds_destination_not_configured_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &escrow.mint.address,
         &TOKEN_2022_PROGRAM_ID,
-        &custom_error(TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR),
+    );
+    let create_user_ata = create_associated_token_account_idempotent(
+        &context.payer.pubkey(),
+        &user.pubkey(),
+        &escrow.mint.address,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    context
+        .send_v1(&[create_user_ata], &[])
+        .expect("CreateIdempotent should succeed");
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_NOT_CONFIDENTIAL_ERROR),
+    );
+}
+
+// The user never created their account. Like an unconfigured one, it can't take
+// the credit until they do.
+#[test]
+fn test_confidential_release_funds_destination_missing_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &escrow.mint.address,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_NOT_CONFIDENTIAL_ERROR),
+    );
+}
+
+// On a manual-approval mint, a new account waits for the mint's confidential
+// authority to approve it.
+#[test]
+fn test_confidential_release_funds_destination_not_approved_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            manual_approval: true,
+            ..Default::default()
+        },
+    );
+    let approve_escrow_ata = confidential_instruction::approve_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.escrow_ata,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[approve_escrow_ata], &[])
+        .expect("ApproveAccount should succeed");
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_NOT_APPROVED_ERROR),
+    );
+}
+
+// The user's account has one pending slot left, as after that many credits
+// without an apply. The release that takes it lands, as on Token-2022, and the
+// next one is refused.
+#[test]
+fn test_confidential_release_funds_destination_pending_full_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let mut user_ata_account = context.svm.get_account(&user_ata).unwrap();
+    {
+        let mut state =
+            StateWithExtensionsMut::<Token2022Account>::unpack(&mut user_ata_account.data).unwrap();
+        let extension = state
+            .get_extension_mut::<ConfidentialTransferAccount>()
+            .unwrap();
+        extension.pending_balance_credit_counter =
+            (u64::from(extension.maximum_pending_balance_credit_counter) - 1).into();
+    }
+    context.svm.set_account(user_ata, user_ata_account).unwrap();
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let mut results = Vec::new();
+    for transaction_nonce in [TRANSACTION_NONCE, TRANSACTION_NONCE + 1] {
+        let transfer = prepare_transfer(
+            &mut context,
+            &escrow.escrow_ata,
+            &escrow.keys,
+            user_keys.elgamal.pubkey(),
+            &escrow.mint,
+            RELEASE_AMOUNT,
+            ProofPlacement::Inline,
+        );
+        let instruction = ConfidentialReleaseFundsBuilder::new()
+            .payer(context.payer.pubkey())
+            .operator(escrow.operator.pubkey())
+            .instance(escrow.instance_pda)
+            .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+            .operator_pda(escrow.operator_pda)
+            .mint(escrow.mint.address)
+            .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+            .user_ata(user_ata)
+            .instance_ata(escrow.escrow_ata)
+            .user_allowed_wallet_pda(user_allowed_wallet_pda)
+            .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+            .user(user.pubkey())
+            .transaction_nonce(transaction_nonce)
+            .withdrawer(user.pubkey())
+            .expected_available_balance(transfer.expected_available_balance)
+            .new_source_decryptable_available_balance(
+                transfer.new_source_decryptable_available_balance,
+            )
+            .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+            .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+            .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+            .ciphertext_validity_proof_instruction_offset(
+                transfer.ciphertext_validity_proof_instruction_offset,
+            )
+            .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+            .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+            .fee_ciphertext_validity_proof_instruction_offset(
+                transfer.fee_ciphertext_validity_proof_instruction_offset,
+            )
+            .instruction();
+        results.push(context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]));
+    }
+
+    let mut results = results.into_iter();
+    results
+        .next()
+        .unwrap()
+        .expect("the release taking the last pending slot should succeed");
+    assert_failed_first(
+        results.next().unwrap(),
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_PENDING_FULL_ERROR),
+    );
+}
+
+#[test]
+fn test_confidential_release_funds_destination_frozen_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            freeze_authority: true,
+            ..Default::default()
+        },
+    );
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let freeze_user_ata = freeze_account(
+        &TOKEN_2022_PROGRAM_ID,
+        &user_ata,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[freeze_user_ata], &[])
+        .expect("FreezeAccount should succeed");
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_FROZEN_ERROR),
+    );
+}
+
+// The proofs name a key the destination doesn't have, as when the user closes
+// their account and recreates it under a new key.
+#[test]
+fn test_confidential_release_funds_destination_key_changed_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let previous_keys = ConfidentialKeys::new();
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        previous_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(RECIPIENT_KEY_CHANGED_ERROR),
+    );
+}
+
+// A release that already landed, sent again as is: its proofs are now stale and
+// its destination refuses credits, but every check runs after the nonce, so the
+// nonce is reported used.
+#[test]
+fn test_confidential_release_funds_resent_after_destination_change_reports_nonce_used() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    context
+        .send_v1(
+            &transfer.proofs.with(instruction.clone()),
+            &[&escrow.operator],
+        )
+        .expect("first release should succeed");
+    let disable_credits = confidential_instruction::disable_confidential_credits(
+        &TOKEN_2022_PROGRAM_ID,
+        &user_ata,
+        &user.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[disable_credits], &[&user])
+        .expect("DisableConfidentialCredits should succeed");
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(NONCE_ALREADY_USED_ERROR),
+    );
+}
+
+// A release that already landed, sent again after the user emptied and closed
+// their account, still reports the nonce used.
+#[test]
+fn test_confidential_release_funds_resent_after_account_closed_reports_nonce_used() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    context
+        .send_v1(
+            &transfer.proofs.with(instruction.clone()),
+            &[&escrow.operator],
+        )
+        .expect("first release should succeed");
+    context
+        .svm
+        .set_account(user_ata, Account::default())
+        .unwrap();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(NONCE_ALREADY_USED_ERROR),
+    );
+}
+
+// The mint's auditor changes after the proofs were built for the old one.
+#[test]
+fn test_confidential_release_funds_auditor_rotated_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let new_auditor = ElGamalKeypair::new_rand();
+    let rotate_auditor = confidential_instruction::update_mint(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+        true,
+        Some((*new_auditor.pubkey()).into()),
+    )
+    .unwrap();
+    context
+        .send_v1(&[rotate_auditor], &[])
+        .expect("UpdateMint should succeed");
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(STALE_AUDITOR_KEY_ERROR),
+    );
+}
+
+// Removing the auditor outdates the proofs too: Token-2022 then expects them to
+// name the zero key.
+#[test]
+fn test_confidential_release_funds_auditor_removed_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let remove_auditor = confidential_instruction::update_mint(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+        true,
+        None,
+    )
+    .unwrap();
+    context
+        .send_v1(&[remove_auditor], &[])
+        .expect("UpdateMint should succeed");
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(STALE_AUDITOR_KEY_ERROR),
+    );
+}
+
+#[test]
+fn test_confidential_release_funds_paused_mint_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            pausable: true,
+            ..Default::default()
+        },
+    );
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let pause_mint = pause(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.mint.address,
+        &context.payer.pubkey(),
+        &[],
+    )
+    .unwrap();
+    context
+        .send_v1(&[pause_mint], &[])
+        .expect("Pause should succeed");
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &custom_error(MINT_PAUSED_ERROR),
+    );
+}
+
+// Without an auditor, Token-2022 expects the proofs to name the zero key, the
+// default proofs name it, and the escrow agrees.
+#[test]
+fn test_confidential_release_funds_mint_without_auditor() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            no_auditor: true,
+            ..Default::default()
+        },
+    );
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    context
+        .send_v1(&transfer.proofs.with(instruction), &[&escrow.operator])
+        .expect("ConfidentialReleaseFunds should succeed");
+
+    assert_eq!(
+        decrypt_pending(&mut context, &user_ata, &user_keys),
+        RELEASE_AMOUNT
+    );
+}
+
+// The validity offset points at the range proof. The escrow refuses it, as
+// Token-2022 would, instead of reading it as the validity proof.
+#[test]
+fn test_confidential_release_funds_misplaced_validity_proof_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .range_proof_instruction_offset(transfer.ciphertext_validity_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        "invalid instruction data",
+    );
+}
+
+// The validity offset points at a copy of the validity proof addressed to
+// another program. Its tag and context are right, so only the program check
+// refuses it, as Token-2022 would. The escrow fails first, so the copy never runs.
+#[test]
+fn test_confidential_release_funds_validity_proof_for_another_program_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    // The copy goes after the proofs, the last of which is the range proof.
+    let copied_validity_proof_instruction_offset = transfer.range_proof_instruction_offset + 1;
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(copied_validity_proof_instruction_offset)
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    let mut instructions = transfer.proofs.with(instruction);
+    let mut copied_validity_proof =
+        instructions[transfer.ciphertext_validity_proof_instruction_offset as usize].clone();
+    copied_validity_proof.program_id = solana_sdk_ids::system_program::ID;
+    instructions.push(copied_validity_proof);
+
+    let result = context.send_v1(&instructions, &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        "invalid instruction data",
+    );
+}
+
+// A validity context account the ZK ElGamal proof program doesn't own.
+#[test]
+fn test_confidential_release_funds_foreign_validity_context_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let mut transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::ContextAccounts,
+    );
+    // Equality comes first, then validity.
+    transfer.proofs.context_accounts[1] = AccountMeta::new_readonly(Pubkey::new_unique(), false);
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .add_remaining_accounts(&transfer.proofs.context_accounts)
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        "Invalid account owner",
+    );
+}
+
+// A full-size context account the ZK ElGamal proof program owns but that holds
+// zeros, as one created and never verified into. Only its proof type gives it
+// away; read as a validity proof, its zero keys would look like a key change.
+#[test]
+fn test_confidential_release_funds_uninitialized_validity_context_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::ContextAccounts,
+    );
+    // Equality comes first, then validity.
+    let validity_context = transfer.proofs.context_accounts[1].pubkey;
+    let mut validity_context_account = context.svm.get_account(&validity_context).unwrap();
+    validity_context_account.data.fill(0);
+    context
+        .svm
+        .set_account(validity_context, validity_context_account)
+        .unwrap();
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .add_remaining_accounts(&transfer.proofs.context_accounts)
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        "invalid instruction data",
+    );
+}
+
+// A context account the ZK ElGamal proof program owns but that is shorter than
+// its header. The escrow returns an error instead of panicking.
+#[test]
+fn test_confidential_release_funds_short_validity_context_rejected() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(&mut context, ConfidentialMintOptions::default());
+    fund_escrow_available(&mut context, &escrow, ESCROW_BALANCE);
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let short_context = Pubkey::new_unique();
+    let short_context_len = 8;
+    context
+        .svm
+        .set_account(
+            short_context,
+            Account {
+                lamports: context
+                    .svm
+                    .minimum_balance_for_rent_exemption(short_context_len),
+                data: vec![0; short_context_len],
+                owner: solana_zk_elgamal_proof_interface::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let mut transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::ContextAccounts,
+    );
+    // Equality comes first, then validity.
+    transfer.proofs.context_accounts[1] = AccountMeta::new_readonly(short_context, false);
+    let instruction = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .add_remaining_accounts(&transfer.proofs.context_accounts)
+        .instruction();
+
+    let result = context.send_v1(&transfer.proofs.with(instruction), &[&escrow.operator]);
+
+    assert_failed_first(
+        result,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        "invalid instruction data",
     );
 }
 
@@ -428,6 +1664,7 @@ fn test_confidential_release_funds_memo_required_destination() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -489,6 +1726,7 @@ fn test_confidential_release_funds_not_operator_rejected() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -549,6 +1787,7 @@ fn test_confidential_release_funds_to_instance_rejected() {
         .user(escrow.instance_pda)
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(withdrawer.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -619,6 +1858,7 @@ fn test_confidential_release_funds_blocked_withdrawals_rejected() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -703,6 +1943,7 @@ fn test_confidential_release_funds_whitelist_requires_withdrawer_and_user() {
             .user(user.pubkey())
             .transaction_nonce(TRANSACTION_NONCE)
             .withdrawer(withdrawer.pubkey())
+            .expected_available_balance(transfer.expected_available_balance)
             .new_source_decryptable_available_balance(
                 transfer.new_source_decryptable_available_balance,
             )
@@ -770,6 +2011,7 @@ fn test_confidential_release_funds_transfer_hook_forwards_extras() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -856,6 +2098,7 @@ fn test_confidential_release_funds_hook_refusing_u64_max_settled_publicly() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
@@ -979,6 +2222,7 @@ fn test_confidential_release_funds_transfer_fee() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)

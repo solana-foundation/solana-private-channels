@@ -540,6 +540,8 @@ pub enum PrivateChannelEscrowProgramInstruction {
         transaction_nonce: u64,
         /// Wallet whose channel burn this release settles; may differ from user
         withdrawer: Pubkey,
+        /// Escrow's available balance ciphertext the proofs were built against
+        expected_available_balance: [u8; 64],
         /// Escrow's available balance after the release, encrypted under the instance AES key
         new_source_decryptable_available_balance: [u8; 36],
         /// Low bits of the amount, encrypted under the mint's auditor key

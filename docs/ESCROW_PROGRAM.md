@@ -407,7 +407,7 @@ Discriminator: `13`
 | 12 | `recipient_allowed_wallet_pda` | | | AllowedWallet PDA of the credited wallet; read only while deposits are whitelisted |
 
 #### ConfidentialReleaseFunds
-`ReleaseFunds` for a hidden amount (operator-only): the escrow's available balance pays the user's pending balance. The checks and the nonce are `ReleaseFunds`'s. The event carries the amount encrypted under the instance key, read from the ciphertext validity proof Token-2022 accepted. On a fee mint the escrow pays the whole amount and the fee comes off the user's side. Token-2022 calls the mint's hook with `u64::MAX`, so a hook that refuses it blocks these releases; `MoveToPublic` and then `ReleaseFunds` settle the nonce publicly. Token-2022 also caps a confidential transfer at 2^48 - 1 base units, so a larger withdrawal settles the same way. Proofs and trailing accounts are placed as in `ConfidentialDeposit`.
+`ReleaseFunds` for a hidden amount (operator-only): the escrow's available balance pays the user's pending balance. The checks and the nonce are `ReleaseFunds`'s, except that the user's account is checked after the nonce, and a missing one fails with `RecipientNotConfidential`. After the nonce, states Token-2022 would refuse with ambiguous errors fail with their own: a paused mint (`MintPaused`), a destination that can't take the credit (`RecipientFrozen`, `RecipientNotConfidential`, `RecipientNotApproved`, `RecipientCreditsDisabled`, `RecipientPendingFull`), proofs built for another destination or auditor key (`RecipientKeyChanged`, `StaleAuditorKey`), and proofs built against another available balance than the escrow's, compared with `expected_available_balance` (`StaleConfidentialBalance`). A validity proof that isn't the ZK ElGamal proof program's is refused before it is read: `InvalidInstructionData` for a proof instruction or a wrong proof type, `InvalidAccountOwner` for a context account that program doesn't own. The event carries the amount encrypted under the instance key, read from the ciphertext validity proof Token-2022 accepted. On a fee mint the escrow pays the whole amount and the fee comes off the user's side. Token-2022 calls the mint's hook with `u64::MAX`, so a hook that refuses it blocks these releases; `MoveToPublic` and then `ReleaseFunds` settle the nonce publicly. Token-2022 also caps a confidential transfer at 2^48 - 1 base units, so a larger withdrawal settles the same way. Proofs and trailing accounts are placed as in `ConfidentialDeposit`.
 
 Discriminator: `14`
 
@@ -417,6 +417,7 @@ Discriminator: `14`
 | `user` | Pubkey | User receiving the funds (wallet address, not the ATA) |
 | `transaction_nonce` | u64 | Transaction nonce to consume from the withdrawal bitmap |
 | `withdrawer` | Pubkey | Wallet whose channel burn this release settles; may differ from `user` |
+| `expected_available_balance` | [u8; 64] | Escrow's available balance ciphertext the proofs were built against |
 | `new_source_decryptable_available_balance` | [u8; 36] | Escrow's available balance after the release, encrypted under the instance AES key |
 | `auditor_ciphertext_lo`, `auditor_ciphertext_hi` | [u8; 64] | The amount under the mint's auditor key |
 | Proof offsets | i8 | As in `ConfidentialDeposit` |
@@ -680,6 +681,15 @@ The program defines the following custom errors:
 | 22 | `ConfidentialAccountNotConfigured` | The escrow account has no confidential transfer extension |
 | 23 | `UnsupportedConfidentialMint` | ConfigureConfidentialAccount on a mint whose confidential transfers could never work through the escrow |
 | 24 | `InvalidRecipient` | A release names the instance itself as `user` |
+| 25 | `RecipientNotConfidential` | `ConfidentialReleaseFunds` to an account that doesn't exist or has no confidential transfer extension |
+| 26 | `RecipientNotApproved` | `ConfidentialReleaseFunds` to an account the mint's confidential authority hasn't approved |
+| 27 | `RecipientCreditsDisabled` | `ConfidentialReleaseFunds` to an account refusing confidential credits |
+| 28 | `RecipientPendingFull` | `ConfidentialReleaseFunds` to an account whose pending credit counter is at its maximum |
+| 29 | `RecipientFrozen` | `ConfidentialReleaseFunds` to a frozen account |
+| 30 | `RecipientKeyChanged` | `ConfidentialReleaseFunds` proofs built for another key than the destination's |
+| 31 | `StaleAuditorKey` | `ConfidentialReleaseFunds` proofs built for another auditor key than the mint's (zero when it has none) |
+| 32 | `MintPaused` | `ConfidentialReleaseFunds` on a paused mint |
+| 33 | `StaleConfidentialBalance` | `ConfidentialReleaseFunds` whose `expected_available_balance` is not the escrow's available balance |
 
 ## Other Constants
 

@@ -8,27 +8,33 @@ use pinocchio::{
     error::ProgramError,
     instruction::{InstructionAccount, InstructionView},
     sysvars::instructions::Instructions,
-    ProgramResult,
+    Address, ProgramResult,
 };
 use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use spl_token_2022::{
     extension::{
         confidential_transfer::{
             instruction::ConfidentialTransferInstruction, ConfidentialTransferAccount,
-            DecryptableBalance, EncryptedBalance, DEFAULT_MAXIMUM_PENDING_BALANCE_CREDIT_COUNTER,
+            ConfidentialTransferMint, DecryptableBalance, EncryptedBalance,
+            DEFAULT_MAXIMUM_PENDING_BALANCE_CREDIT_COUNTER,
         },
+        pausable::PausableConfig,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     solana_zk_sdk::zk_elgamal_proof_program::{
-        proof_data::BatchedGroupedCiphertext3HandlesValidityProofContext,
+        instruction::ProofInstruction,
+        proof_data::{BatchedGroupedCiphertext3HandlesValidityProofContext, ProofType},
         state::ProofContextStateMeta,
     },
-    state::Account,
+    state::{Account, Mint},
 };
 
 use crate::{
     error::PrivateChannelEscrowProgramError,
-    processor::shared::token_utils::{invoke_memo, requires_memo, MAX_HOOK_REMAINING_ACCOUNTS},
+    processor::shared::{
+        account_check::verify_account_owner,
+        token_utils::{invoke_memo, requires_memo, MAX_HOOK_REMAINING_ACCOUNTS},
+    },
     require_len,
 };
 
@@ -38,6 +44,10 @@ const CONFIDENTIAL_TRANSFER_EXTENSION: u8 = 27;
 
 /// `TokenInstruction::Reallocate`.
 const REALLOCATE: u8 = 29;
+
+/// ZK ElGamal proof program, which verifies the transfer proofs.
+const ZK_ELGAMAL_PROOF_PROGRAM_ID: Address =
+    Address::from_str_const("ZkE1Gama1Proof11111111111111111111111111111");
 
 const CIPHERTEXT_LEN: usize = size_of::<EncryptedBalance>();
 const DECRYPTABLE_BALANCE_LEN: usize = size_of::<DecryptableBalance>();
@@ -195,6 +205,18 @@ pub fn read_pending_balance(token_account: &AccountView) -> Result<SplitCipherte
     Ok(pending)
 }
 
+/// The escrow account's available balance ciphertext. Fails if the account was
+/// never configured.
+pub fn read_available_balance(
+    token_account: &AccountView,
+) -> Result<[u8; CIPHERTEXT_LEN], ProgramError> {
+    let extension = read_confidential_extension(token_account)?;
+    let start = offset_of!(ConfidentialTransferAccount, available_balance);
+    let mut available = [0u8; CIPHERTEXT_LEN];
+    available.copy_from_slice(&extension[start..start + CIPHERTEXT_LEN]);
+    Ok(available)
+}
+
 /// Credits in the escrow account's pending balance since the last apply.
 pub fn read_pending_credit_counter(token_account: &AccountView) -> Result<u64, ProgramError> {
     let extension = read_confidential_extension(token_account)?;
@@ -204,35 +226,64 @@ pub fn read_pending_credit_counter(token_account: &AccountView) -> Result<u64, P
     Ok(u64::from_le_bytes(counter))
 }
 
-/// The transfer amount under the source key, taken from the ciphertext validity
-/// proof Token-2022 has just accepted. A proof instruction's data is a one-byte
-/// tag and then the proof context; a context account's data is a header and then
-/// the context.
-pub fn read_source_amount(
+/// What a transfer's ciphertext validity proof names: the amount under the
+/// source key, and the destination and auditor keys it was built for.
+pub struct ValidityContext {
+    pub source_amount: SplitCiphertext,
+    pub destination_pubkey: [u8; 32],
+    pub auditor_pubkey: [u8; 32],
+}
+
+/// The ciphertext validity proof's context. A proof instruction's data is a
+/// one-byte tag and then the proof context; a context account's data is a header
+/// and then the context. Anything but a ZK ElGamal validity proof is refused, as
+/// Token-2022 refuses it, so a misplaced proof is never read as this one.
+pub fn read_validity_context(
     offsets: &TransferProofOffsets,
     instructions_sysvar: &AccountView,
     proof_contexts: &[AccountView],
-) -> Result<SplitCiphertext, ProgramError> {
+) -> Result<ValidityContext, ProgramError> {
     if offsets.ciphertext_validity != 0 {
         let instructions = Instructions::try_from(instructions_sysvar)?;
         let instruction =
             instructions.get_instruction_relative(offsets.ciphertext_validity as i64)?;
-        let (_, context) = instruction
+        if instruction.get_program_id() != &ZK_ELGAMAL_PROOF_PROGRAM_ID {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let (tag, context) = instruction
             .get_instruction_data()
             .split_first()
             .ok_or(ProgramError::InvalidInstructionData)?;
-        return source_amount_from_context(context);
+        if *tag != ProofInstruction::VerifyBatchedGroupedCiphertext3HandlesValidity as u8 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        return validity_context_from(context);
     }
 
     // Equality comes first in Token-2022's order, so its context, if any, is ahead.
     let validity_context = &proof_contexts[(offsets.equality == 0) as usize];
+    verify_account_owner(validity_context, &ZK_ELGAMAL_PROOF_PROGRAM_ID)?;
     let data = validity_context.try_borrow()?;
-    source_amount_from_context(&data[size_of::<ProofContextStateMeta>()..])
+    let proof_type = offset_of!(ProofContextStateMeta, proof_type);
+    if data.get(proof_type) != Some(&(ProofType::BatchedGroupedCiphertext3HandlesValidity as u8)) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // The proof type is the header's last byte, so the context starts in bounds.
+    validity_context_from(&data[size_of::<ProofContextStateMeta>()..])
 }
 
-/// A grouped ciphertext opens with the commitment and the source's handle, which
-/// together are the ciphertext under the source key.
-fn source_amount_from_context(context: &[u8]) -> Result<SplitCiphertext, ProgramError> {
+/// The keys come as source, destination, auditor. A grouped ciphertext opens with
+/// the commitment and the source's handle, which together are the ciphertext
+/// under the source key.
+fn validity_context_from(context: &[u8]) -> Result<ValidityContext, ProgramError> {
+    let destination = offset_of!(
+        BatchedGroupedCiphertext3HandlesValidityProofContext,
+        second_pubkey
+    );
+    let auditor = offset_of!(
+        BatchedGroupedCiphertext3HandlesValidityProofContext,
+        third_pubkey
+    );
     let lo = offset_of!(
         BatchedGroupedCiphertext3HandlesValidityProofContext,
         grouped_ciphertext_lo
@@ -243,13 +294,107 @@ fn source_amount_from_context(context: &[u8]) -> Result<SplitCiphertext, Program
     );
     require_len!(context, hi + CIPHERTEXT_LEN);
 
-    let mut amount = SplitCiphertext {
-        lo: [0u8; CIPHERTEXT_LEN],
-        hi: [0u8; CIPHERTEXT_LEN],
+    let mut validity = ValidityContext {
+        source_amount: SplitCiphertext {
+            lo: [0u8; CIPHERTEXT_LEN],
+            hi: [0u8; CIPHERTEXT_LEN],
+        },
+        destination_pubkey: [0u8; 32],
+        auditor_pubkey: [0u8; 32],
     };
-    amount.lo.copy_from_slice(&context[lo..lo + CIPHERTEXT_LEN]);
-    amount.hi.copy_from_slice(&context[hi..hi + CIPHERTEXT_LEN]);
-    Ok(amount)
+    validity
+        .source_amount
+        .lo
+        .copy_from_slice(&context[lo..lo + CIPHERTEXT_LEN]);
+    validity
+        .source_amount
+        .hi
+        .copy_from_slice(&context[hi..hi + CIPHERTEXT_LEN]);
+    validity
+        .destination_pubkey
+        .copy_from_slice(&context[destination..destination + 32]);
+    validity
+        .auditor_pubkey
+        .copy_from_slice(&context[auditor..auditor + 32]);
+    Ok(validity)
+}
+
+/// Refuses a release destination Token-2022 would refuse, each state with its own
+/// error.
+pub fn check_recipient_ready(
+    token_account: &AccountView,
+    destination_pubkey: &[u8; 32],
+) -> ProgramResult {
+    if token_account.is_data_empty() {
+        return Err(PrivateChannelEscrowProgramError::RecipientNotConfidential.into());
+    }
+
+    let data = token_account.try_borrow()?;
+    let state = StateWithExtensions::<Account>::unpack(&data)
+        .map_err(|_| PrivateChannelEscrowProgramError::InvalidTokenAccount)?;
+    if state.base.is_frozen() {
+        return Err(PrivateChannelEscrowProgramError::RecipientFrozen.into());
+    }
+
+    let extension = state
+        .get_extension_bytes::<ConfidentialTransferAccount>()
+        .map_err(|_| PrivateChannelEscrowProgramError::RecipientNotConfidential)?;
+    // Flags are one byte each, zero when false.
+    if extension[offset_of!(ConfidentialTransferAccount, approved)] == 0 {
+        return Err(PrivateChannelEscrowProgramError::RecipientNotApproved.into());
+    }
+    if extension[offset_of!(ConfidentialTransferAccount, allow_confidential_credits)] == 0 {
+        return Err(PrivateChannelEscrowProgramError::RecipientCreditsDisabled.into());
+    }
+
+    let counter = offset_of!(ConfidentialTransferAccount, pending_balance_credit_counter);
+    let mut pending_credits = [0u8; 8];
+    pending_credits.copy_from_slice(&extension[counter..counter + 8]);
+    let maximum = offset_of!(
+        ConfidentialTransferAccount,
+        maximum_pending_balance_credit_counter
+    );
+    let mut maximum_credits = [0u8; 8];
+    maximum_credits.copy_from_slice(&extension[maximum..maximum + 8]);
+    if u64::from_le_bytes(pending_credits) >= u64::from_le_bytes(maximum_credits) {
+        return Err(PrivateChannelEscrowProgramError::RecipientPendingFull.into());
+    }
+
+    let key = offset_of!(ConfidentialTransferAccount, elgamal_pubkey);
+    if extension[key..key + 32] != destination_pubkey[..] {
+        return Err(PrivateChannelEscrowProgramError::RecipientKeyChanged.into());
+    }
+    Ok(())
+}
+
+/// Refuses a paused mint, which Token-2022 would refuse to transfer.
+pub fn check_mint_not_paused(mint: &AccountView) -> ProgramResult {
+    let data = mint.try_borrow()?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?;
+    if state
+        .get_extension::<PausableConfig>()
+        .is_ok_and(|pausable| bool::from(pausable.paused))
+    {
+        return Err(PrivateChannelEscrowProgramError::MintPaused.into());
+    }
+    Ok(())
+}
+
+/// Refuses proofs built for another auditor than the mint's. A mint without one
+/// stores zeros, which Token-2022 then expects the proofs to name.
+pub fn check_auditor_key(mint: &AccountView, auditor_pubkey: &[u8; 32]) -> ProgramResult {
+    let data = mint.try_borrow()?;
+    let state = StateWithExtensions::<Mint>::unpack(&data)
+        .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?;
+    let extension = state
+        .get_extension_bytes::<ConfidentialTransferMint>()
+        .map_err(|_| PrivateChannelEscrowProgramError::UnsupportedConfidentialMint)?;
+    let key = offset_of!(ConfidentialTransferMint, auditor_elgamal_pubkey);
+    if extension[key..key + 32] != auditor_pubkey[..] {
+        return Err(PrivateChannelEscrowProgramError::StaleAuditorKey.into());
+    }
+    Ok(())
 }
 
 /// The accounts of a Token-2022 CPI, kept in step with their metas.

@@ -184,6 +184,7 @@ fn test_apply_pending_balance_late_credit_recovered_by_release() {
         .user(user.pubkey())
         .transaction_nonce(TRANSACTION_NONCE)
         .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
         .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
         .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
         .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
