@@ -401,6 +401,8 @@ services:
       postgres-indexer:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
@@ -486,6 +488,8 @@ services:
       postgres-indexer:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # Mints go through the gateway (only it routes writes to the write node and
@@ -546,6 +550,8 @@ services:
       write-node:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}

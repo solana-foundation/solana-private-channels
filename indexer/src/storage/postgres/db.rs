@@ -8,6 +8,7 @@ use crate::{
     config::ProgramType,
     error::StorageError,
     indexer::checkpoint::program_key,
+    storage::common::amount::TokenAmount,
     storage::common::models::{
         ChannelFence, DbConsumedMint, DbMint, DbMintStatus, DbObservedRelease, DbTransaction,
         FenceRecord, HaltInfo, MintDbBalance, MintInFlightAmount, MintStatusAtSlot,
@@ -47,6 +48,11 @@ mod transaction_cols {
     pub const INNER_INDEX: &str = "inner_index";
     pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
     pub const RELEASE_REFUSED_ON_CHAIN: &str = "release_refused_on_chain";
+    pub const CONFIDENTIAL: &str = "confidential";
+    pub const NOT_BEFORE: &str = "not_before";
+    pub const WAIT_STARTED_AT: &str = "wait_started_at";
+    pub const CONFIDENTIAL_UNDECRYPTED: &str = "confidential_undecrypted";
+    pub const CONFIDENTIAL_RAW: &str = "confidential_raw";
 }
 
 /// ON CONFLICT target for the transactions composite uniqueness. inner_index is
@@ -221,8 +227,10 @@ fn database_url_password_is_blank(database_url: &str) -> bool {
 
 /// A full reset of every table, in dependency order. Only the pooled `drop_tables` uses it;
 /// resync deletes its own program's rows instead (see `wipe_program_on`).
-const DROP_STATEMENTS: [&str; 13] = [
+const DROP_STATEMENTS: [&str; 15] = [
     "DROP TABLE IF EXISTS resync_state CASCADE",
+    "DROP TABLE IF EXISTS confidential_sender_state CASCADE",
+    "DROP TABLE IF EXISTS rebalance_requests CASCADE",
     "DROP TABLE IF EXISTS consumed_channel_mints CASCADE",
     "DROP TABLE IF EXISTS mint_status_history CASCADE",
     "DROP TABLE IF EXISTS pending_release_signatures CASCADE",
@@ -671,6 +679,40 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("release_refused_on_chain migration complete");
+
+        // Confidential transfers. NOT NULL DEFAULT FALSE: every older row is public.
+        // `not_before` and `wait_started_at` hold a confidential release's wait for
+        // a provable balance; NULL means no wait. An undecryptable deposit keeps its
+        // raw event in `confidential_raw` and poisons its mint while flagged.
+        sqlx::query(
+            "ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS confidential BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS wait_started_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS confidential_undecrypted BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS confidential_raw BYTEA",
+        )
+        .execute(&self.pool)
+        .await?;
+        // The label a confidential release parks with once its journal gate proves no attempt
+        // landed. Persisted so a restart during that wait still parks instead of reminting.
+        sqlx::query(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS confidential_park_label TEXT",
+        )
+        .execute(&self.pool)
+        .await?;
+        // The landing slot of the withdraw sender's last own confirmed confidential transaction.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS confidential_sender_state (
+                id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+                last_landing_slot BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
         // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
@@ -1241,6 +1283,33 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Operator rebalances between the escrow's public and confidential balances.
+        // `expected_available` makes a rerun after a crash refuse instead of moving twice.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rebalance_requests (
+                id BIGSERIAL PRIMARY KEY,
+                mint TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('to_public', 'to_confidential')),
+                amount NUMERIC(20,0) NOT NULL,
+                expected_available NUMERIC(20,0) NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                signature TEXT,
+                error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE rebalance_requests ADD COLUMN IF NOT EXISTS last_valid_block_height BIGINT,
+                                           ADD COLUMN IF NOT EXISTS blockhash_slot BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -1388,8 +1457,8 @@ impl PostgresDb {
         let result: Option<(i64,)> = sqlx::query_as(&format!(
             r#"
             INSERT INTO transactions (
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT {} DO NOTHING
             RETURNING {}
             "#,
@@ -1405,6 +1474,9 @@ impl PostgresDb {
             transaction_cols::TRANSACTION_TYPE,
             transaction_cols::STATUS,
             transaction_cols::TRACE_ID,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             TX_CONFLICT_TARGET,
             transaction_cols::ID,
         ))
@@ -1420,6 +1492,9 @@ impl PostgresDb {
         .bind(transaction.transaction_type)
         .bind(transaction.status)
         .bind(&transaction.trace_id)
+        .bind(transaction.confidential)
+        .bind(transaction.confidential_undecrypted)
+        .bind(&transaction.confidential_raw)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1486,8 +1561,8 @@ impl PostgresDb {
             let result: Option<(i64,)> = sqlx::query_as(&format!(
                 r#"
                 INSERT INTO transactions (
-                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 ON CONFLICT {} DO NOTHING
                 RETURNING {}
                 "#,
@@ -1505,6 +1580,9 @@ impl PostgresDb {
                 transaction_cols::TRACE_ID,
                 transaction_cols::COUNTERPART_SIGNATURE,
                 transaction_cols::LANDED_REMINT_SIGNATURE,
+                transaction_cols::CONFIDENTIAL,
+                transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+                transaction_cols::CONFIDENTIAL_RAW,
                 TX_CONFLICT_TARGET,
                 transaction_cols::ID,
             ))
@@ -1522,6 +1600,9 @@ impl PostgresDb {
             .bind(&transaction.trace_id)
             .bind(&transaction.counterpart_signature)
             .bind(&transaction.landed_remint_signature)
+            .bind(transaction.confidential)
+            .bind(transaction.confidential_undecrypted)
+            .bind(&transaction.confidential_raw)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -1560,7 +1641,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -1591,6 +1672,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -1636,7 +1722,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2 AND {} > $3
             ORDER BY {} ASC
@@ -1667,6 +1753,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -1692,7 +1783,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} DESC
@@ -1723,6 +1814,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::WITHDRAWAL_NONCE,
             transaction_cols::TRANSACTION_TYPE,
@@ -1809,7 +1905,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -1840,6 +1936,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -2042,9 +2143,11 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2 {checkpoint_filter}
+              AND ({} IS NULL OR {} <= NOW())
+              AND NOT {}
             ORDER BY {} ASC
             LIMIT $3
             FOR UPDATE SKIP LOCKED
@@ -2074,9 +2177,19 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
+            // A waiting row stays out of the fetch so the rows behind it keep flowing.
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::NOT_BEFORE,
+            // An undecrypted deposit has no known amount, so it is never minted.
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
             // Ordering (FIFO)
             transaction_cols::CREATED_AT,
         );
@@ -2171,7 +2284,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -2204,6 +2317,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -2414,7 +2532,7 @@ impl PostgresDb {
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'parked'
               AND {} < NOW() - make_interval(secs => $1)
@@ -2447,6 +2565,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -2606,7 +2729,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'withdrawal'
               AND {} = $1
@@ -2648,6 +2771,11 @@ impl PostgresDb {
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            transaction_cols::CONFIDENTIAL,
+            transaction_cols::NOT_BEFORE,
+            transaction_cols::WAIT_STARTED_AT,
+            transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+            transaction_cols::CONFIDENTIAL_RAW,
             // Filters
             transaction_cols::TRANSACTION_TYPE,
             transaction_cols::STATUS,
@@ -3085,6 +3213,59 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Mints with at least one undecrypted confidential deposit.
+    pub async fn get_confidential_poisoned_mints_internal(
+        &self,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT mint FROM transactions WHERE confidential_undecrypted ORDER BY mint",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// A mint's undecrypted deposits as `(id, raw event)`.
+    pub async fn get_confidential_undecrypted_internal(
+        &self,
+        mint: &str,
+    ) -> Result<Vec<(i64, Vec<u8>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, confidential_raw FROM transactions
+             WHERE confidential_undecrypted AND mint = $1 AND confidential_raw IS NOT NULL
+             ORDER BY id",
+        )
+        .bind(mint)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Recovery's write: every re-decrypted amount and its cleared flag, one transaction.
+    /// Only still-flagged rows change, so a rerun is a no-op.
+    pub async fn recover_confidential_on(
+        conn: &mut PgConnection,
+        recovered: &[(i64, TokenAmount)],
+    ) -> Result<(), StorageError> {
+        let mut tx = conn.begin().await?;
+        for (id, amount) in recovered {
+            // A zero deposit mints nothing, as at index time, so its row goes.
+            let query = if amount.0 == 0 {
+                sqlx::query("DELETE FROM transactions WHERE id = $1 AND confidential_undecrypted")
+                    .bind(id)
+            } else {
+                sqlx::query(
+                    "UPDATE transactions SET amount = $2, confidential_undecrypted = FALSE,
+                         updated_at = NOW()
+                     WHERE id = $1 AND confidential_undecrypted",
+                )
+                .bind(id)
+                .bind(amount)
+            };
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3881,6 +4062,259 @@ impl PostgresDb {
         .await?;
 
         Ok(nonces.into_iter().map(|(n,)| n).collect())
+    }
+}
+
+// Confidential sender: balance waits, the read-freshness seed and rebalance requests.
+impl PostgresDb {
+    pub async fn requeue_confidential_wait_internal(
+        &self,
+        transaction_id: i64,
+        lease: chrono::DateTime<chrono::Utc>,
+        not_before: chrono::DateTime<chrono::Utc>,
+        wait_started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        // Same lease and journal guard as `requeue_unclaimed`; the attempt counter is untouched.
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending',
+                not_before = $3,
+                wait_started_at = COALESCE(wait_started_at, $4)
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+              )
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(lease)
+        .bind(not_before)
+        .bind(wait_started_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn oldest_confidential_park_internal(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT MIN(updated_at) FROM transactions \
+             WHERE confidential AND status = 'manual_review' AND transaction_type = 'withdrawal'",
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn set_confidential_park_label_internal(
+        &self,
+        transaction_id: i64,
+        label: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE transactions SET confidential_park_label = $2 \
+             WHERE id = $1 AND status IN ('processing', 'pending_remint')",
+        )
+        .bind(transaction_id)
+        .bind(label)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_confidential_park_labels_internal(
+        &self,
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, confidential_park_label FROM transactions \
+             WHERE confidential_park_label IS NOT NULL \
+               AND status IN ('processing', 'pending_remint') ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn record_confidential_landing_slot_internal(
+        &self,
+        slot: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO confidential_sender_state (id, last_landing_slot) VALUES (TRUE, $1) \
+             ON CONFLICT (id) DO UPDATE SET \
+               last_landing_slot = GREATEST(confidential_sender_state.last_landing_slot, $1), \
+               updated_at = NOW()",
+        )
+        .bind(i64::try_from(slot).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn confidential_landing_slot_internal(&self) -> Result<Option<u64>, sqlx::Error> {
+        let slot: Option<i64> =
+            sqlx::query_scalar("SELECT last_landing_slot FROM confidential_sender_state WHERE id")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(slot.and_then(|slot| u64::try_from(slot).ok()))
+    }
+
+    pub async fn max_release_journal_slot_internal(&self) -> Result<Option<u64>, sqlx::Error> {
+        let slot: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(blockhash_slot) FROM pending_release_signatures")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(slot.and_then(|slot| u64::try_from(slot).ok()))
+    }
+
+    pub async fn insert_rebalance_request_internal(
+        &self,
+        mint: &str,
+        direction: crate::storage::common::storage::confidential_sender::RebalanceDirection,
+        amount: u64,
+        expected_available: u64,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO rebalance_requests (mint, direction, amount, expected_available)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            "#,
+        )
+        .bind(mint)
+        .bind(direction.as_str())
+        .bind(TokenAmount(amount))
+        .bind(TokenAmount(expected_available))
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn get_rebalance_requests_internal(
+        &self,
+        status: &str,
+    ) -> Result<
+        Vec<crate::storage::common::storage::confidential_sender::RebalanceRequest>,
+        sqlx::Error,
+    > {
+        use crate::storage::common::storage::confidential_sender::{
+            RebalanceDirection, RebalanceRequest,
+        };
+        type Row = (
+            i64,
+            String,
+            String,
+            TokenAmount,
+            TokenAmount,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            r#"
+            SELECT id, mint, direction, amount, expected_available, status, signature, error,
+                   last_valid_block_height, blockhash_slot
+            FROM rebalance_requests
+            WHERE status = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(status)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    mint,
+                    direction,
+                    amount,
+                    expected,
+                    status,
+                    signature,
+                    error,
+                    last_valid_block_height,
+                    blockhash_slot,
+                )| {
+                    let direction = RebalanceDirection::parse(&direction).ok_or_else(|| {
+                        sqlx::Error::Decode(
+                            format!("unknown rebalance direction {direction}").into(),
+                        )
+                    })?;
+                    Ok(RebalanceRequest {
+                        id,
+                        mint,
+                        direction,
+                        amount: amount.value(),
+                        expected_available: expected.value(),
+                        status,
+                        signature,
+                        error,
+                        last_valid_block_height: last_valid_block_height
+                            .and_then(|h| u64::try_from(h).ok()),
+                        blockhash_slot: blockhash_slot.and_then(|s| u64::try_from(s).ok()),
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn claim_rebalance_request_internal(
+        &self,
+        id: i64,
+        signature: &str,
+        last_valid_block_height: u64,
+        blockhash_slot: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE rebalance_requests
+            SET status = 'sent',
+                signature = $2,
+                last_valid_block_height = $3,
+                blockhash_slot = $4,
+                updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            "#,
+        )
+        .bind(id)
+        .bind(signature)
+        .bind(i64::try_from(last_valid_block_height).unwrap_or(i64::MAX))
+        .bind(i64::try_from(blockhash_slot).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn transition_rebalance_request_internal(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        signature: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE rebalance_requests
+            SET status = $3,
+                signature = COALESCE($4, signature),
+                error = COALESCE($5, error),
+                updated_at = NOW()
+            WHERE id = $1 AND status = $2
+            "#,
+        )
+        .bind(id)
+        .bind(from)
+        .bind(to)
+        .bind(signature)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 }
 

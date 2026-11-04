@@ -21,7 +21,7 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use helpers::db;
+use helpers::{db, init_extra_account_meta_list};
 use private_channel_escrow_program_client::{
     instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
@@ -35,7 +35,6 @@ use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TE
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
@@ -45,13 +44,9 @@ use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
-use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token_2022::extension::{transfer_hook, ExtensionType};
 use spl_token_2022::state::Mint as Token2022Mint;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
-use spl_transfer_hook_interface::{
-    get_extra_account_metas_address, instruction::ExecuteInstruction,
-};
 use std::time::Duration;
 use test_utils::channel_shim::ChannelShim;
 use test_utils::mint_helper::{
@@ -62,10 +57,6 @@ use test_utils::validator_helper::{start_test_validator_no_geyser, HOOK_FIXTURE_
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
-
-/// Selects the fixture's `ExtraAccountMetaList` initializer. Must match
-/// `INIT_EXTRA_ACCOUNT_METAS_TAG` in the fixture.
-const INIT_EXTRA_ACCOUNT_METAS_TAG: u8 = 0;
 
 const WITHDRAW_AMOUNT: u64 = 50_000;
 
@@ -126,49 +117,6 @@ async fn generate_hook_mint_2022(
     client.send_and_confirm_transaction(&tx).await?;
 
     Ok(mint.pubkey())
-}
-
-/// Create the mint's validation account, declaring one extra account (the
-/// system program). Serialized here and copied in by the fixture, because the
-/// address is a PDA of the fixture and nothing else can create it.
-async fn init_extra_account_meta_list(
-    client: &RpcClient,
-    payer: &Keypair,
-    mint: &Pubkey,
-) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let extras = [ExtraAccountMeta::new_with_pubkey(
-        &SYSTEM_PROGRAM_ID,
-        false,
-        false,
-    )?];
-    let mut metas = vec![0u8; ExtraAccountMetaList::size_of(extras.len())?];
-    ExtraAccountMetaList::init::<ExecuteInstruction>(&mut metas, &extras)?;
-
-    let mut data = vec![INIT_EXTRA_ACCOUNT_METAS_TAG];
-    data.extend_from_slice(&metas);
-
-    let validation_pda = get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID);
-    let ix = Instruction {
-        program_id: HOOK_FIXTURE_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(validation_pda, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-        ],
-        data,
-    };
-
-    let recent_blockhash = client.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &[payer],
-        recent_blockhash,
-    );
-    client.send_and_confirm_transaction(&tx).await?;
-
-    Ok(validation_pda)
 }
 
 /// Mint Token-2022 tokens to `owner`, creating their ATA if needed. `MintTo` is
@@ -287,6 +235,11 @@ fn make_withdrawal_transaction(
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     }
 }
 

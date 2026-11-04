@@ -138,6 +138,7 @@ fn withdraw_meta(
             data: WithdrawFundsData {
                 amount,
                 destination,
+                confidential: false,
             },
         })),
         slot,

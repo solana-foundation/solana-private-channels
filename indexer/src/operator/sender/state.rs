@@ -108,6 +108,7 @@ impl SenderState {
             solvency_fence,
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         })
     }
 }
@@ -1112,6 +1113,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         }
     }
 
@@ -2204,6 +2210,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
 
         if let Some(sig) = signature {

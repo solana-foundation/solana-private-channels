@@ -1038,7 +1038,7 @@ async fn process_pending_remints_within(
                     entry,
                     &nonce_label,
                     &reason,
-                    &state.storage,
+                    state,
                     storage_tx,
                 )
                 .await;
@@ -1065,7 +1065,7 @@ async fn process_pending_remints_within(
                             entry,
                             &nonce_label,
                             &reason,
-                            &state.storage,
+                            state,
                             storage_tx,
                         )
                         .await;
@@ -1084,7 +1084,7 @@ async fn process_pending_remints_within(
                             entry,
                             &nonce_label,
                             &reason,
-                            &state.storage,
+                            state,
                             storage_tx,
                         )
                         .await;
@@ -1113,11 +1113,22 @@ async fn process_pending_remints_within(
                                     entry,
                                     &nonce_label,
                                     &reason,
-                                    &state.storage,
+                                    state,
                                     storage_tx,
                                 )
                                 .await;
                             }
+                            // A confidential park waited on the same proof; it parks instead.
+                            ReleaseRecord::ProvenAbsent
+                                if super::confidential::finish_gated_park(
+                                    state,
+                                    entry.ctx.transaction_id.unwrap_or_default(),
+                                    entry.ctx.trace_id.clone(),
+                                    &entry.original_error,
+                                    super::confidential::PROVEN_ABSENT,
+                                    storage_tx,
+                                )
+                                .await => {}
                             ReleaseRecord::ProvenAbsent => {
                                 info!(
                                 "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
@@ -1133,7 +1144,7 @@ async fn process_pending_remints_within(
                                             *entry,
                                             &nonce_label,
                                             &reason,
-                                            &state.storage,
+                                            state,
                                             storage_tx,
                                         )
                                         .await;
@@ -1496,7 +1507,7 @@ async fn defer_or_escalate(
     entry: PendingRemint,
     nonce_label: &str,
     reason: &str,
-    storage: &crate::storage::Storage,
+    state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     let attempt = entry.finality_check_attempts + 1;
@@ -1506,6 +1517,20 @@ async fn defer_or_escalate(
             "Pending remint for nonce {} reached attempt cap ({}); escalating to ManualReview: {}",
             nonce_label, attempt, reason
         );
+        let escalated = format!("escalated to ManualReview after {attempt} attempts: {reason}");
+        // A confidential park waiting on this gate ends as that park.
+        if super::confidential::finish_gated_park(
+            state,
+            entry.ctx.transaction_id.unwrap_or_default(),
+            entry.ctx.trace_id.clone(),
+            &entry.original_error,
+            &escalated,
+            storage_tx,
+        )
+        .await
+        {
+            return;
+        }
         if let Some(transaction_id) = entry.ctx.transaction_id {
             send_guaranteed(
                 storage_tx,
@@ -1537,7 +1562,8 @@ async fn defer_or_escalate(
     // ambiguity. Escalate to ManualReview rather than continue deferring with
     // a counter we can't trust to survive a restart.
     if let Some(transaction_id) = entry.ctx.transaction_id {
-        if let Err(persist_err) = storage
+        if let Err(persist_err) = state
+            .storage
             .bump_pending_remint_finality_attempt(transaction_id, attempt as i32, new_deadline)
             .await
         {
@@ -1706,6 +1732,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }
@@ -1745,6 +1772,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -1794,6 +1826,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: true,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -1912,6 +1949,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }
@@ -2020,6 +2058,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }

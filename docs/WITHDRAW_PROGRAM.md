@@ -19,6 +19,7 @@ The program runs on the channel, where Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC
 |-------------|-------------|---------------|
 | [`WithdrawFunds`](#withdrawfunds) | Burns tokens from the user's token account and emits a withdrawal event with an optional destination | 0 |
 | [`SetWithdrawConfig`](#setwithdrawconfig) | Creates or overwrites the mint's withdraw config: fee, minimum and treasury (mint authority only) | 1 |
+| [`ConfidentialWithdrawFunds`](#confidentialwithdrawfunds) | `WithdrawFunds` whose release lands in the destination's confidential balance on Solana | 2 |
 
 ### Instruction Details
 
@@ -54,6 +55,15 @@ The instruction emits a `WithdrawFundsEvent` via program log:
 | 4 | `associated_token_program` | | | Associated token program |
 | 5 | `withdraw_config` | | | Withdraw config PDA for the mint |
 | 6 | `treasury_token_account` | | ✓ | Treasury token account the fee is paid to |
+
+#### ConfidentialWithdrawFunds
+`WithdrawFunds` with the same parameters, accounts, fee, minimum and event, asking for a confidential release: the operator sends `ConfidentialReleaseFunds`, so the amount lands hidden in the destination's confidential pending balance on Solana. The amount is at most 2^48 - 1 base units, Token-2022's cap on one confidential transfer; a larger one fails before anything moves. The burn is public on the channel; only the Solana side is hidden.
+
+The destination's Token-2022 account on Solana must exist, be configured for confidential transfers, be approved when the mint requires it, accept confidential credits, have room in its pending credit counter and not be frozen, or the operator parks the withdrawal (`destination_not_ready`). It is not a refund: the burn already happened, and an operator resolves the park by re-arming it, releasing it publicly or reminting. `scripts/devnet/src/bin/confidential_withdraw.rs` checks the destination first when `SOLANA_RPC_URL` is set.
+
+The withdraw indexer allow-lists discriminators 0, 1 and 2 and fails the slot on any other, so an indexer older than this instruction stops rather than skip a burn. Roll indexers out before the program.
+
+Discriminator: `2`
 
 #### SetWithdrawConfig
 Creates the mint's withdraw config on first use and overwrites it on later calls whose `allow_mint_slot` is at or after the stored one. Only the mint authority can sign it, and the channel node also requires a configured admin signer. The operator sends it in every deposit mint transaction with the fee, minimum and slot of the escrow's latest `AllowMint` and its own admin as the treasury, so re-allowing a mint with new values reprices it from the next deposit on. Deposits land in any order, so a deposit built before a reprice carries an older `allow_mint_slot`; its write succeeds without changing the config, and the deposit still mints.

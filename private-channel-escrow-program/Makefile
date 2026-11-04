@@ -34,6 +34,7 @@ build-test:
 # lands in target/deploy/ next to the escrow program's.
 build-hook-fixture:
 	cd tests/transfer-hook-fixture && cargo-build-sbf
+	cd tests/cpi-forwarder-fixture && cargo-build-sbf
 
 # Build the prod program WITHOUT regenerating IDL / clients. Use after
 # `make build` (or after restoring a CI artifact that already contains

@@ -5,8 +5,11 @@ use crate::{
     error::{IndexerError, StorageError},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointUpdate},
+        confidential,
         datasource::common::{
-            parser::{escrow_instance_of, EscrowInstruction, WithdrawInstruction},
+            parser::{
+                escrow_instance_of, ConfidentialEventBody, EscrowInstruction, WithdrawInstruction,
+            },
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
         },
     },
@@ -24,6 +27,7 @@ use crate::{
         Storage,
     },
 };
+use private_channel_confidential::Keys;
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeSet, HashMap};
@@ -85,6 +89,9 @@ pub struct TransactionProcessor {
 
     configured_escrow_instance_id: Option<Pubkey>,
 
+    // The escrow's confidential keys; `None` leaves confidential events undecrypted.
+    confidential_keys: Option<Arc<Keys>>,
+
     // Bounded-backoff policy applied to a slot's DB writes before the failure
     // is treated as fatal.
     retry: WriteRetryPolicy,
@@ -108,6 +115,7 @@ impl TransactionProcessor {
             slot_buffers: HashMap::new(),
             health: None,
             configured_escrow_instance_id: None,
+            confidential_keys: None,
             retry: WriteRetryPolicy::default(),
             consumed: None,
             validate_only: false,
@@ -127,6 +135,11 @@ impl TransactionProcessor {
 
     pub fn with_escrow_instance_id(mut self, escrow_instance_id: Pubkey) -> Self {
         self.configured_escrow_instance_id = Some(escrow_instance_id);
+        self
+    }
+
+    pub fn with_confidential_keys(mut self, keys: Option<Arc<Keys>>) -> Self {
+        self.confidential_keys = keys;
         self
     }
 
@@ -297,9 +310,32 @@ impl TransactionProcessor {
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
         let mut transactions = Vec::new();
         let mut observed_releases: Vec<DbObservedRelease> = Vec::new();
+        let mut poisoned_mints: BTreeSet<String> = BTreeSet::new();
 
         let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
-        for instruction_meta in &slot_instructions {
+        // Decryption is CPU-bound, so it runs off the async executor; rows keep their order.
+        let instance = self.configured_escrow_instance_id;
+        let keys = self.confidential_keys.clone();
+        let (slot_instructions, confidential_rows) = match tokio::task::spawn_blocking(move || {
+            let rows: Vec<_> = slot_instructions
+                .iter()
+                .map(|ix| convert_confidential(ix, instance.as_ref(), keys.as_deref()))
+                .collect();
+            (slot_instructions, rows)
+        })
+        .await
+        {
+            Ok(converted) => converted,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => return Err(IndexerError::ProcessorPanicked),
+        };
+        for (instruction_meta, confidential) in slot_instructions.iter().zip(confidential_rows) {
+            if let Some(rows) = confidential {
+                poisoned_mints.extend(rows.poisoned);
+                transactions.extend(rows.transaction);
+                observed_releases.extend(rows.release);
+                continue;
+            }
             let (mint_opt, status_opt, transaction_opt, release_opt) = convert_to_db_models(
                 instruction_meta,
                 self.configured_escrow_instance_id.as_ref(),
@@ -389,6 +425,10 @@ impl TransactionProcessor {
                     attempt += 1;
                 }
             }
+        }
+
+        for mint in &poisoned_mints {
+            confidential::report_poisoned(mint);
         }
 
         // Count saved mints once here rather than in write_slot, which may
@@ -745,6 +785,7 @@ fn convert_to_db_models(
                         .transaction_type(TransactionType::Withdrawal)
                         .instruction_index(instruction_meta.instruction_index as i32)
                         .inner_index(instruction_meta.inner_index.map(|i| i as i32))
+                        .confidential(data.confidential)
                         .build(),
                     ),
                     None,
@@ -752,6 +793,106 @@ fn convert_to_db_models(
             }
         },
     }
+}
+
+/// What one confidential instruction writes: a deposit row or an observed release when it
+/// carries one, and the mint when the instruction poisons it.
+struct ConfidentialRows {
+    transaction: Option<DbTransaction>,
+    release: Option<DbObservedRelease>,
+    poisoned: Option<String>,
+}
+
+/// Convert a confidential escrow instruction on the configured instance. `None` for anything
+/// else. An undecryptable deposit is stored flagged with its raw event, and a configure under
+/// a key that is not ours is reported; either poisons the mint, and the slot still indexes.
+fn convert_confidential(
+    instruction_meta: &InstructionWithMetadata,
+    configured_escrow_instance_id: Option<&Pubkey>,
+    keys: Option<&Keys>,
+) -> Option<ConfidentialRows> {
+    let signature = instruction_meta.signature.as_ref()?;
+    let ProgramInstruction::Escrow(escrow_ix) = &instruction_meta.instruction else {
+        return None;
+    };
+    let EscrowInstruction::Confidential {
+        accounts,
+        release,
+        event,
+    } = escrow_ix.as_ref()
+    else {
+        return None;
+    };
+    if configured_escrow_instance_id != Some(&accounts.instance) {
+        debug!(%signature, "dropping confidential instruction: instance mismatch");
+        return None;
+    }
+    let mint = accounts.mint.to_string();
+    let mut rows = ConfidentialRows {
+        transaction: None,
+        release: None,
+        poisoned: None,
+    };
+    let failed = |kind: &'static str| {
+        metrics::CONFIDENTIAL_DECRYPT_FAILURES
+            .with_label_values(&[kind])
+            .inc();
+        error!(
+            %signature,
+            %mint,
+            kind,
+            "confidential event not readable with our key; the mint is poisoned"
+        );
+    };
+
+    if confidential::configured_with_foreign_key(event, keys) {
+        failed("configure");
+        rows.poisoned = Some(mint.clone());
+    } else if let ConfidentialEventBody::Configure { elgamal_pubkey } = &event.body {
+        use base64::Engine;
+        let elgamal_pubkey = base64::engine::general_purpose::STANDARD.encode(elgamal_pubkey);
+        info!(%mint, %elgamal_pubkey, %signature, "{}", confidential::CONFIGURED_UNDER_INSTANCE_KEY);
+    }
+    if let ConfidentialEventBody::Deposit { user, recipient } = &event.body {
+        let amount = confidential::deposit_amount(event, keys);
+        if amount.is_none() {
+            failed("deposit");
+            rows.poisoned = Some(mint.clone());
+        }
+        // Zero deposits are dropped like public ones; undecryptable ones keep a row.
+        if amount != Some(0) {
+            let builder = DbTransactionBuilder::new(
+                signature.clone(),
+                instruction_meta.slot,
+                mint.clone(),
+                amount.unwrap_or(0),
+            )
+            .initiator(user.to_string())
+            .recipient(recipient.to_string())
+            .transaction_type(TransactionType::Deposit)
+            .instruction_index(instruction_meta.instruction_index as i32)
+            .inner_index(instruction_meta.inner_index.map(|i| i as i32))
+            .confidential(true);
+            rows.transaction = Some(match amount {
+                Some(_) => builder.build(),
+                None => builder.undecrypted(event.raw.clone()).build(),
+            });
+        }
+    }
+    // Written even when the amount is unknown, so remint still sees the nonce was paid.
+    if let Some(data) = release {
+        let amount = confidential::release_amount(event, keys);
+        if amount.is_none() {
+            failed("release");
+        }
+        rows.release = Some(DbObservedRelease {
+            withdrawal_nonce: data.transaction_nonce as i64,
+            signature: signature.clone(),
+            slot: instruction_meta.slot as i64,
+            amount: amount.map(TokenAmount),
+        });
+    }
+    Some(rows)
 }
 
 #[cfg(test)]
@@ -933,6 +1074,7 @@ mod tests {
                     data: WithdrawFundsData {
                         amount: 500,
                         destination: make_pubkey(20),
+                        confidential: false,
                     },
                 },
             )),
@@ -3048,5 +3190,562 @@ mod tests {
         // Neither N nor N+1 was persisted.
         let inserted = mock.inserted_transactions.lock().unwrap();
         assert!(inserted.iter().flatten().all(|t| t.slot != N1 as i64));
+    }
+}
+
+#[cfg(test)]
+mod confidential_tests {
+    use super::*;
+    use crate::indexer::datasource::common::parser::{
+        decode_confidential_event, ConfidentialAccounts, ConfidentialReleaseData, DepositAccounts,
+        DepositData, DepositEvent, WithdrawFundsAccounts, WithdrawFundsData,
+    };
+    use crate::storage::common::storage::mock::MockStorage;
+    use private_channel_confidential::{test_support as cts, Ciphertext, Keys};
+
+    const MINT_A: [u8; 32] = [21; 32];
+    const MINT_B: [u8; 32] = [22; 32];
+
+    fn instance() -> Pubkey {
+        Pubkey::new_from_array([200; 32])
+    }
+
+    fn processor_with(keys: Option<Keys>) -> (TransactionProcessor, MockStorage) {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        // The receiver is dropped on purpose: tests inspect storage, not checkpoints.
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel(100);
+        std::mem::forget(checkpoint_rx);
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(instance())
+            .with_confidential_keys(keys.map(Arc::new))
+            .with_write_retry(WriteRetryPolicy {
+                max_attempts: 1,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            });
+        (processor, mock)
+    }
+
+    struct At {
+        slot: u64,
+        signature: &'static str,
+        transaction_index: u32,
+        instruction_index: u32,
+        inner_index: Option<u32>,
+    }
+
+    fn at(slot: u64, signature: &'static str) -> At {
+        At {
+            slot,
+            signature,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+        }
+    }
+
+    fn confidential_ix(
+        position: &At,
+        discriminator: u8,
+        mint: [u8; 32],
+        raw: Vec<u8>,
+        nonce: Option<u64>,
+    ) -> InstructionWithMetadata {
+        let event = decode_confidential_event(discriminator, &raw).expect("valid event");
+        InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::Confidential {
+                accounts: ConfidentialAccounts {
+                    signer: Pubkey::new_from_array([1; 32]),
+                    instance: instance(),
+                    mint: Pubkey::new_from_array(mint),
+                    instance_ata: Pubkey::new_from_array([2; 32]),
+                },
+                release: nonce.map(|transaction_nonce| ConfidentialReleaseData {
+                    user: Pubkey::new_from_array([3; 32]),
+                    transaction_nonce,
+                    withdrawer: Pubkey::new_from_array([3; 32]),
+                }),
+                event,
+            })),
+            slot: position.slot,
+            program_type: ProgramType::Escrow,
+            signature: Some(position.signature.to_string()),
+            transaction_index: position.transaction_index,
+            instruction_index: position.instruction_index,
+            inner_index: position.inner_index,
+        }
+    }
+
+    fn configure(position: &At, mint: [u8; 32], pubkey: [u8; 32]) -> InstructionWithMetadata {
+        confidential_ix(
+            position,
+            12,
+            mint,
+            cts::configure_event([0; 32], mint, pubkey),
+            None,
+        )
+    }
+
+    /// A deposit of `amount` net of `fee`, encrypted under `encrypted_for`, onto an empty pending.
+    fn deposit(
+        position: &At,
+        mint: [u8; 32],
+        encrypted_for: &Keys,
+        amount: u64,
+        fee: u64,
+    ) -> InstructionWithMetadata {
+        let zero: Ciphertext = [0; 64];
+        let (lo, hi) = cts::net_of_fee(amount, fee);
+        let (lo_after, hi_after) = cts::credit(encrypted_for, &zero, &zero, lo, hi);
+        let raw = cts::deposit_event(
+            [0; 32], [4; 32], [5; 32], mint, &zero, &zero, &lo_after, &hi_after,
+        );
+        confidential_ix(position, 13, mint, raw, None)
+    }
+
+    fn release(
+        position: &At,
+        mint: [u8; 32],
+        encrypted_for: &Keys,
+        amount: u64,
+        nonce: u64,
+    ) -> InstructionWithMetadata {
+        let (lo, hi) = private_channel_confidential::split(amount);
+        let raw = cts::release_event(
+            [0; 32],
+            [6; 32],
+            [3; 32],
+            mint,
+            &cts::encrypt(encrypted_for, lo),
+            &cts::encrypt(encrypted_for, hi),
+        );
+        confidential_ix(position, 14, mint, raw, Some(nonce))
+    }
+
+    fn apply(position: &At, mint: [u8; 32], credits: u64) -> InstructionWithMetadata {
+        let zero: Ciphertext = [0; 64];
+        confidential_ix(
+            position,
+            15,
+            mint,
+            cts::apply_event([0; 32], [6; 32], mint, &zero, &zero, credits),
+            None,
+        )
+    }
+
+    fn public_deposit(slot: u64, signature: &str) -> InstructionWithMetadata {
+        InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::Deposit {
+                accounts: DepositAccounts {
+                    payer: Pubkey::new_unique(),
+                    user: Pubkey::new_unique(),
+                    instance: instance(),
+                    mint: Pubkey::new_from_array(MINT_A),
+                    allowed_mint: Pubkey::new_unique(),
+                    user_ata: Pubkey::new_unique(),
+                    instance_ata: Pubkey::new_unique(),
+                    system_program: Pubkey::new_unique(),
+                    token_program: Pubkey::new_unique(),
+                    associated_token_program: Pubkey::new_unique(),
+                    event_authority: Pubkey::new_unique(),
+                    private_channel_escrow_program: Pubkey::new_unique(),
+                },
+                data: DepositData {
+                    amount: 10,
+                    recipient: None,
+                },
+                event: DepositEvent { amount: 10 },
+            })),
+            slot,
+            program_type: ProgramType::Escrow,
+            signature: Some(signature.to_string()),
+            transaction_index: 0,
+            instruction_index: 9,
+            inner_index: None,
+        }
+    }
+
+    async fn run_slot(
+        processor: &mut TransactionProcessor,
+        slot: u64,
+        instructions: Vec<InstructionWithMetadata>,
+    ) -> Result<(), IndexerError> {
+        for ix in instructions {
+            processor.buffer(ix);
+        }
+        processor
+            .finalize_and_checkpoint(slot, ProgramType::Escrow, None)
+            .await
+    }
+
+    fn inserted(mock: &MockStorage) -> Vec<DbTransaction> {
+        mock.inserted_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn mint(bytes: [u8; 32]) -> String {
+        Pubkey::new_from_array(bytes).to_string()
+    }
+
+    fn gauge(mint_bytes: [u8; 32]) -> f64 {
+        metrics::CONFIDENTIAL_MINT_POISONED
+            .with_label_values(&[&mint(mint_bytes)])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn confidential_deposit_writes_a_confidential_row_net_of_fee() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        run_slot(
+            &mut processor,
+            10,
+            vec![
+                configure(&at(10, "cfg"), MINT_A, keys.pubkey()),
+                deposit(&at(10, "dep"), MINT_A, &keys, 70_000, 5_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = inserted(&mock);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].confidential);
+        assert!(!rows[0].confidential_undecrypted);
+        assert_eq!(rows[0].confidential_raw, None);
+        assert_eq!(rows[0].amount, TokenAmount(65_000));
+        assert_eq!(rows[0].transaction_type, TransactionType::Deposit);
+        assert_eq!(rows[0].mint, mint(MINT_A));
+        assert_eq!(
+            rows[0].initiator,
+            Pubkey::new_from_array([4; 32]).to_string()
+        );
+        assert_eq!(
+            rows[0].recipient,
+            Pubkey::new_from_array([5; 32]).to_string()
+        );
+        assert!(mock
+            .get_confidential_poisoned_mints()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Decryption runs off the async executor: on a single-threaded runtime another task
+    /// keeps running while a slot of confidential deposits is decrypted, and rows keep
+    /// instruction order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slot_of_confidential_deposits_decrypts_off_the_executor_in_order() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let amounts = [1u64, 65_535, 65_536, 70_000, 4_294_967_295];
+        let signatures = ["d0", "d1", "d2", "d3", "d4"];
+        let mut slot: Vec<_> = amounts
+            .iter()
+            .zip(signatures)
+            .map(|(amount, signature)| deposit(&at(10, signature), MINT_A, &keys, *amount, 0))
+            .collect();
+        slot.insert(2, public_deposit(10, "public"));
+
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        let before = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        run_slot(&mut processor, 10, slot).await.unwrap();
+        let during = ticks.load(std::sync::atomic::Ordering::Relaxed) - before;
+        ticker.abort();
+        assert!(during > 5, "the executor was blocked ({during} ticks)");
+
+        let rows = inserted(&mock);
+        let order: Vec<_> = rows.iter().map(|row| row.signature.as_str()).collect();
+        assert_eq!(order, ["d0", "d1", "public", "d2", "d3", "d4"]);
+        let confidential: Vec<_> = rows
+            .iter()
+            .filter(|row| row.confidential)
+            .map(|row| row.amount.value())
+            .collect();
+        assert_eq!(confidential, amounts);
+    }
+
+    #[tokio::test]
+    async fn zero_confidential_deposit_is_dropped() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        run_slot(
+            &mut processor,
+            10,
+            vec![deposit(&at(10, "zero"), MINT_A, &keys, 0, 0)],
+        )
+        .await
+        .unwrap();
+        assert!(inserted(&mock).is_empty());
+    }
+
+    #[tokio::test]
+    async fn confidential_withdrawal_row_is_flagged() {
+        let (mut processor, mock) = processor_with(None);
+        let ix = InstructionWithMetadata {
+            instruction: ProgramInstruction::Withdraw(Box::new(
+                WithdrawInstruction::WithdrawFunds {
+                    accounts: WithdrawFundsAccounts {
+                        user: Pubkey::new_unique(),
+                        mint: Pubkey::new_unique(),
+                        token_account: Pubkey::new_unique(),
+                        token_program: Pubkey::new_unique(),
+                        associated_token_program: Pubkey::new_unique(),
+                    },
+                    data: WithdrawFundsData {
+                        amount: 5,
+                        destination: Pubkey::new_unique(),
+                        confidential: true,
+                    },
+                },
+            )),
+            slot: 3,
+            program_type: ProgramType::Withdraw,
+            signature: Some("w".to_string()),
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
+        };
+        processor.buffer(ix);
+        processor
+            .finalize_and_checkpoint(3, ProgramType::Withdraw, None)
+            .await
+            .unwrap();
+        assert!(inserted(&mock)[0].confidential);
+    }
+
+    #[tokio::test]
+    async fn undecryptable_deposit_is_stored_flagged_and_poisons_only_its_mint() {
+        let keys = cts::keys();
+        let foreign = cts::other_keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let bad = deposit(&at(10, "bad"), MINT_A, &foreign, 1_000, 0);
+        let ProgramInstruction::Escrow(escrow) = &bad.instruction else {
+            unreachable!()
+        };
+        let EscrowInstruction::Confidential { event, .. } = escrow.as_ref() else {
+            unreachable!()
+        };
+        let raw = event.raw.clone();
+        run_slot(
+            &mut processor,
+            10,
+            vec![
+                bad,
+                deposit(&at(10, "good"), MINT_B, &keys, 2_000, 0),
+                public_deposit(10, "public"),
+                release(&at(10, "rel"), MINT_A, &foreign, 300, 11),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = inserted(&mock);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let flagged = rows.iter().find(|r| r.signature == "bad").unwrap();
+        assert!(flagged.confidential && flagged.confidential_undecrypted);
+        assert_eq!(flagged.amount, TokenAmount(0));
+        assert_eq!(flagged.confidential_raw.as_deref(), Some(raw.as_slice()));
+        let good = rows.iter().find(|r| r.signature == "good").unwrap();
+        assert_eq!(
+            (good.confidential_undecrypted, good.amount.0),
+            (false, 2_000)
+        );
+        let public = rows.iter().find(|r| r.signature == "public").unwrap();
+        assert_eq!((public.confidential, public.amount.0), (false, 10));
+
+        assert_eq!(
+            mock.get_confidential_poisoned_mints().await.unwrap(),
+            vec![mint(MINT_A)]
+        );
+        assert_eq!(gauge(MINT_A), 1.0);
+
+        // Written for the poisoned mint too, so remint sees the nonce was paid.
+        let observed = mock.get_observed_release(11).await.unwrap().unwrap();
+        assert_eq!(observed.signature, "rel");
+        assert_eq!(observed.amount, None);
+    }
+
+    #[tokio::test]
+    async fn deposit_without_a_key_is_stored_flagged() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(None);
+        run_slot(
+            &mut processor,
+            10,
+            vec![deposit(&at(10, "dep"), MINT_A, &keys, 900, 0)],
+        )
+        .await
+        .unwrap();
+        assert!(inserted(&mock)[0].confidential_undecrypted);
+        assert_eq!(
+            mock.get_confidential_poisoned_mints().await.unwrap(),
+            vec![mint(MINT_A)]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_records_its_decrypted_amount() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        run_slot(
+            &mut processor,
+            10,
+            vec![release(&at(10, "rel"), MINT_A, &keys, 70_000, 12)],
+        )
+        .await
+        .unwrap();
+        let observed = mock.get_observed_release(12).await.unwrap().unwrap();
+        assert_eq!(observed.amount, Some(TokenAmount(70_000)));
+        assert!(inserted(&mock).is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_with_a_foreign_key_poisons_the_mint() {
+        // Mints no other test touches, since the gauge is process wide.
+        const FOREIGN: [u8; 32] = [24; 32];
+        const OURS: [u8; 32] = [25; 32];
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        run_slot(
+            &mut processor,
+            10,
+            vec![
+                configure(&at(10, "foreign"), FOREIGN, cts::other_keys().pubkey()),
+                configure(&at(10, "ours"), OURS, cts::keys().pubkey()),
+                apply(&at(10, "apply"), OURS, 1),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(gauge(FOREIGN), 1.0);
+        assert_eq!(gauge(OURS), 0.0);
+        assert!(inserted(&mock).is_empty());
+    }
+
+    /// A configure under our key logs one INFO line naming the mint and the ElGamal pubkey,
+    /// worded exactly as the setup ceremony tells the operator to look for it.
+    #[test]
+    fn configure_under_our_key_logs_the_mint_and_pubkey() {
+        use base64::Engine;
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        const OURS: [u8; 32] = [26; 32];
+        const FOREIGN: [u8; 32] = [27; 32];
+        let keys = cts::keys();
+        tracing::subscriber::with_default(subscriber, || {
+            for (name, mint, pubkey) in [
+                ("ours", OURS, keys.pubkey()),
+                ("foreign", FOREIGN, cts::other_keys().pubkey()),
+            ] {
+                let ix = configure(&at(10, name), mint, pubkey);
+                convert_confidential(&ix, Some(&instance()), Some(&keys));
+            }
+        });
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let expected = format!(
+            "{} mint={} elgamal_pubkey={}",
+            crate::indexer::confidential::CONFIGURED_UNDER_INSTANCE_KEY,
+            Pubkey::new_from_array(OURS),
+            base64::engine::general_purpose::STANDARD.encode(keys.pubkey()),
+        );
+        let lines: Vec<_> = logs.lines().filter(|l| l.contains(&expected)).collect();
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(lines[0].contains("INFO"), "{logs}");
+        // configure_confidential and the runbook quote this text.
+        assert_eq!(
+            crate::indexer::confidential::CONFIGURED_UNDER_INSTANCE_KEY,
+            "escrow account configured under the instance key"
+        );
+        let foreign = Pubkey::new_from_array(FOREIGN).to_string();
+        assert!(!logs.lines().any(|l| l.contains(&foreign)
+            && l.contains(crate::indexer::confidential::CONFIGURED_UNDER_INSTANCE_KEY)));
+    }
+
+    /// The live indexer and a resync rebuild, both keyed, write the same rows.
+    #[tokio::test]
+    async fn rebuild_writes_identical_confidential_rows() {
+        let keys = cts::keys();
+        // Built once: ciphertexts are randomized, and a rebuild reads the same bytes.
+        let slot = vec![
+            configure(&at(10, "cfg"), MINT_A, keys.pubkey()),
+            deposit(&at(10, "dep"), MINT_A, &keys, 70_000, 5_000),
+            deposit(&at(10, "bad"), MINT_A, &cts::other_keys(), 9, 0),
+            release(&at(10, "rel"), MINT_A, &keys, 300, 21),
+        ];
+        let (mut live, live_mock) = processor_with(Some(cts::keys()));
+        run_slot(&mut live, 10, slot.clone()).await.unwrap();
+        let (mut rebuild, rebuild_mock) = processor_with(Some(cts::keys()));
+        run_slot(&mut rebuild, 10, slot).await.unwrap();
+
+        // Everything but the per-insert trace id and timestamps.
+        let key = |mock: &MockStorage| {
+            inserted(mock)
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.signature,
+                        r.instruction_index,
+                        r.inner_index,
+                        r.amount,
+                        r.confidential,
+                        r.confidential_undecrypted,
+                        r.confidential_raw,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&live_mock).len(), 2);
+        assert_eq!(key(&live_mock), key(&rebuild_mock));
+        let release = |mock: &MockStorage| mock.observed_releases.lock().unwrap().clone();
+        assert_eq!(release(&live_mock).len(), 1);
+        assert_eq!(
+            format!("{:?}", release(&live_mock)),
+            format!("{:?}", release(&rebuild_mock))
+        );
+    }
+
+    #[tokio::test]
+    async fn confidential_events_on_another_instance_are_dropped() {
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let mut ix = deposit(&at(10, "dep"), MINT_A, &keys, 5, 0);
+        if let ProgramInstruction::Escrow(escrow) = &mut ix.instruction {
+            if let EscrowInstruction::Confidential { accounts, .. } = escrow.as_mut() {
+                accounts.instance = Pubkey::new_unique();
+            }
+        }
+        run_slot(&mut processor, 10, vec![ix]).await.unwrap();
+        assert!(inserted(&mock).is_empty());
     }
 }

@@ -370,6 +370,11 @@ fn make_withdrawal_transaction(
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     }
 }
 
@@ -1291,6 +1296,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
             rpc_client,
             channel_rpc_client,
             instance,
+            None,
             health_for_task,
             recon_token_clone,
             recon_fence,

@@ -203,6 +203,81 @@ newest finalized block, requires it to be under 120 s old, and a custody batch
 answered below it is a failed custody read, so a lagging RPC backend makes the
 tick dark instead of checking an old balance.
 
+### Confidential custody
+
+An escrow ATA configured for confidential transfers holds part of its custody
+encrypted. Reconciliation reads it from one raw (base64) account read, the same
+bytes on every path (startup sweep, runtime read, manual `reconcile`), using
+`ESCROW_CONFIDENTIAL_KEYS`:
+
+- **pending**: `pending_balance_lo` and `pending_balance_hi` are decrypted directly
+  (hi with a 32-bit search, then a bounded 40-bit one).
+- **available**: the AES copy (`decryptable_available_balance`) is decrypted to x,
+  and x is accepted only if the ElGamal `available_balance` opens to it.
+- **custody** = public `amount` + pending + x. No event history is involved.
+
+When x does not open, the credit counters decide. Token-2022 records the counter
+the last apply expected and the one it actually applied. If they differ, a deposit
+raced that apply and the AES copy is known stale: the gap between the ciphertext and
+x (either sign) is decrypted with the bounded search and available is x + gap, so
+custody is still exact; the sender repairs the copy within seconds. Only a gap that
+does not decrypt holds the mint as `stale_aes`. If the counters match, the account
+and the copy really disagree.
+
+Each tick ends every configured mint in one of these states. A mint that is not
+counted is left out of both invariants and keeps its breach streaks; it is never
+read as zero custody.
+
+| State | Metric | Counted as dark | What it means |
+|---|---|---|---|
+| counted | none | no | custody = public + pending + verified available |
+| stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | no | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
+| pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | no | unapplied pending is past the bounded search; the sender's next apply clears it |
+| poisoned | `..._lagging{reason="poisoned"}` = 1 | no | a confidential deposit could not be decrypted |
+| key_mismatch | `..._lagging{reason="key_mismatch"}` = 1 | no | the account's ElGamal key is not ours |
+| mismatch | `private_channel_reconciliation_confidential_mismatch{mint}` = 1 | yes | AES copy does not open with matching counters, pending lo does not decrypt, the total overflows, or no key is loaded |
+
+Every held state also exports
+`private_channel_reconciliation_confidential_hold_age_seconds{mint,reason}`.
+
+A mismatch is an [inputs-dark](#inputs-dark-halt) tick with the reason
+`confidential custody not proven for ...`; three in a row halt as an outage. The
+held states are alert only, so a racing deposit or a failure contained to one mint
+never halts the others. While a mint is held its value is unchecked, so treat a
+hold-age alert as urgent. Startup and manual runs use the same rules: a held mint
+is left out of the comparison, a mismatch stops the run, and a manual
+`indexer reconcile` exits non-zero naming every held mint and its reason.
+
+Deposits that could not be decrypted (each poisons its mint):
+
+```sql
+-- drill: poisoned_rows
+SELECT mint, signature, slot FROM transactions
+WHERE confidential_undecrypted
+ORDER BY mint, slot, signature;
+```
+
+How each state ends. None of them is resolved by reconciliation itself.
+
+- **stale_aes**: should clear within seconds once the sender's repair lands. If it
+  lasts, check the escrow operator is running and not halted, and look for
+  `confidential_aes_repair_deferred{mint}`; any later apply, release or
+  `MoveToPublic` also rewrites the copy.
+- **pending_too_large**: the sender applies pending once it reaches 2^47 base
+  units. If it lasts, check the escrow operator is running, not halted, and the
+  mint is not blocked.
+- **poisoned**: the key that encrypted these rows is not the loaded one. Set
+  `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop the indexer and operators,
+  run `indexer confidential-recover --mint <mint>`, then restart. The mint is
+  counted again once no deposit is flagged `confidential_undecrypted`.
+- **key_mismatch**: the escrow account was configured with another key. Load the
+  right key; if it is lost the confidential custody of this mint is stuck for good,
+  so escalate.
+- **mismatch**: read the reason the operator logged. If no key was loaded, load it
+  and restart the escrow operator. Otherwise the account disagrees with its own AES
+  copy while no race is recorded: do not clear the resulting halt until it is
+  explained.
+
 ### Where the halt is enforced
 
 The halt flag is read at the top of the shared fetcher loop, so it freezes

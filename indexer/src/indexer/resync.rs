@@ -19,6 +19,7 @@ use crate::{
     storage::postgres::lock_connection::PROBE_TIMEOUT,
     storage::Storage,
 };
+use private_channel_confidential::Keys;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::{
@@ -188,6 +189,8 @@ pub struct ResyncService {
     stale_holder_grace: Duration,
     // How long to wait for the channel address index to catch up. Only tests override it.
     index_catch_up_budget: Duration,
+    // Decrypts confidential events in both passes; `None` leaves deposits undecrypted.
+    confidential_keys: Option<Arc<Keys>>,
 }
 
 impl ResyncService {
@@ -209,7 +212,13 @@ impl ResyncService {
             lock_heartbeat_interval: LIVE_LOCK_HEARTBEAT_INTERVAL,
             stale_holder_grace: STALE_HOLDER_GRACE,
             index_catch_up_budget: INDEX_CATCH_UP_BUDGET,
+            confidential_keys: None,
         }
+    }
+
+    pub fn with_confidential_keys(mut self, keys: Option<Arc<Keys>>) -> Self {
+        self.confidential_keys = keys;
+        self
     }
 
     /// Probe the live-state lock on `interval` instead of the production one, so a
@@ -384,6 +393,7 @@ impl ResyncService {
         let (checkpoint_tx, _checkpoint_rx) = mpsc::channel(1);
         let row_mints = Arc::new(Mutex::new(BTreeSet::new()));
         let mut validator = TransactionProcessor::new(self.storage.clone(), checkpoint_tx)
+            .with_confidential_keys(self.confidential_keys.clone())
             .with_consumed_set(consumed)
             .with_row_mint_sink(row_mints.clone())
             .validate_only();
@@ -840,7 +850,8 @@ impl ResyncService {
 
         // Start transaction processor as separate tokio task
         let mut transaction_processor =
-            TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
+            TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone())
+                .with_confidential_keys(self.confidential_keys.clone());
         // Wire the escrow instance scope. Pre-flight 1 guarantees Some for the Escrow
         // program. For Withdraw it names the bitmap checked above; the processor only
         // scopes escrow instructions by it, so withdraw rows are unaffected.
@@ -1196,6 +1207,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 

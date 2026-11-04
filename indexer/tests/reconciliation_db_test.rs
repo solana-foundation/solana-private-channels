@@ -965,6 +965,7 @@ async fn manual_reconciliation_counts_a_stuck_deposit_and_a_trailing_release(
         &healthy.url(),
         Some(&healthy.url()),
         &instance,
+        None,
     )
     .await?;
 
@@ -977,6 +978,7 @@ async fn manual_reconciliation_counts_a_stuck_deposit_and_a_trailing_release(
         &drained.url(),
         Some(&drained.url()),
         &instance,
+        None,
     )
     .await;
     assert!(
@@ -1015,6 +1017,7 @@ async fn manual_reconciliation_is_refused_during_a_resync() -> Result<(), Box<dy
         unreachable_rpc,
         Some(unreachable_rpc),
         &Pubkey::new_unique(),
+        None,
     )
     .await;
     assert!(

@@ -25,4 +25,5 @@
 - **[Configuration & Operations](CONFIG.md)** — Service configuration, tuning guidelines, restart/recovery, and operational tools
 - **[Environment Variable Contract](ENV_CONTRACT.md)** — Canonical key set, per-surface value sources, and load order
 - **[Point-in-Time Recovery](PITR.md)** — WAL archiving, base backups, and PostgreSQL recovery
+- **[Confidential Transfers: Scope Corrections](CONFIDENTIAL_SCOPE_CORRECTIONS.md)** - Where the shipped confidential design differs from the original scope document
 - **[Operator Runbooks](runbooks/README.md)** — Incident response for deposit, withdrawal, indexer, and lock failures

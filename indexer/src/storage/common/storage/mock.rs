@@ -67,6 +67,9 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `consumed_channel_mints` table, keyed by source event.
     pub consumed_mints: Arc<Mutex<HashMap<String, DbConsumedMint>>>,
+    /// Rebalance requests the confidential sender reads and writes.
+    pub confidential_sender:
+        Arc<Mutex<crate::storage::common::storage::confidential_sender::ConfidentialSenderMock>>,
     /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
     pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
     /// Nonce floors the rotation gate has asked for, oldest first. Tests read
@@ -258,6 +261,25 @@ impl MockStorage {
         Ok(())
     }
 
+    /// Mirrors the fenced recovery: every recovered row changes, or none does.
+    pub async fn recover_confidential(
+        &self,
+        recovered: &[(i64, crate::storage::common::amount::TokenAmount)],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("recover_confidential")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for (id, amount) in recovered {
+            let flagged = |row: &DbTransaction| row.id == *id && row.confidential_undecrypted;
+            if amount.0 == 0 {
+                pending.retain(|row| !flagged(row));
+            } else if let Some(row) = pending.iter_mut().find(|row| flagged(row)) {
+                row.amount = *amount;
+                row.confidential_undecrypted = false;
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_unfinished_resync(&self) -> Result<Option<String>, StorageError> {
         self.check_should_fail("get_unfinished_resync")?;
         Ok(self.unfinished_resync.lock().unwrap().clone())
@@ -358,6 +380,8 @@ impl MockStorage {
             .filter(|&i| {
                 pending[i].transaction_type == transaction_type
                     && pending[i].status == TransactionStatus::Pending
+                    && pending[i].not_before.is_none_or(|at| at <= Utc::now())
+                    && !pending[i].confidential_undecrypted
                     && (transaction_type == TransactionType::Withdrawal
                         || escrow_checkpoint.is_some_and(|cp| pending[i].slot <= cp as i64))
             })
@@ -1883,6 +1907,39 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn get_confidential_poisoned_mints(&self) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_confidential_poisoned_mints")?;
+        // Rows the processor inserted count as well as seeded ones.
+        let inserted = self.inserted_transactions.lock().unwrap().concat();
+        let mut mints: Vec<String> = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(&inserted)
+            .filter(|row| row.confidential_undecrypted)
+            .map(|row| row.mint.clone())
+            .collect();
+        mints.sort();
+        mints.dedup();
+        Ok(mints)
+    }
+
+    pub async fn get_confidential_undecrypted(
+        &self,
+        mint: &str,
+    ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
+        self.check_should_fail("get_confidential_undecrypted")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.confidential_undecrypted && row.mint == mint)
+            .filter_map(|row| Some((row.id, row.confidential_raw.clone()?)))
+            .collect())
+    }
+
     pub async fn get_observed_release(
         &self,
         nonce: i64,
@@ -2077,4 +2134,221 @@ fn block_position(record: &DbMintStatus) -> (i64, i32, i32, Option<i32>) {
         record.instruction_index,
         record.inner_index,
     )
+}
+
+// Confidential sender: balance waits, the read-freshness seed and rebalance requests.
+impl MockStorage {
+    pub async fn requeue_confidential_wait(
+        &self,
+        transaction_id: i64,
+        lease: DateTime<Utc>,
+        not_before: DateTime<Utc>,
+        wait_started_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("requeue_confidential_wait")?;
+        let journaled = self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .is_some_and(|sigs| !sigs.is_empty());
+        if journaled {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == lease
+        }) else {
+            return Ok(false);
+        };
+        txn.status = TransactionStatus::Pending;
+        txn.not_before = Some(not_before);
+        txn.wait_started_at = Some(txn.wait_started_at.unwrap_or(wait_started_at));
+        txn.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    pub async fn oldest_confidential_park(&self) -> Result<Option<DateTime<Utc>>, StorageError> {
+        self.check_should_fail("oldest_confidential_park")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.confidential
+                    && t.status == TransactionStatus::ManualReview
+                    && t.transaction_type == TransactionType::Withdrawal
+            })
+            .map(|t| t.updated_at)
+            .min())
+    }
+
+    pub async fn set_confidential_park_label(
+        &self,
+        transaction_id: i64,
+        label: &str,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("set_confidential_park_label")?;
+        let waiting = self.pending_transactions.lock().unwrap().iter().any(|t| {
+            t.id == transaction_id
+                && matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::PendingRemint
+                )
+        });
+        if waiting {
+            self.confidential_sender
+                .lock()
+                .unwrap()
+                .park_labels
+                .insert(transaction_id, label.to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn get_confidential_park_labels(&self) -> Result<Vec<(i64, String)>, StorageError> {
+        self.check_should_fail("get_confidential_park_labels")?;
+        let rows = self.pending_transactions.lock().unwrap();
+        let mut labels: Vec<_> = self
+            .confidential_sender
+            .lock()
+            .unwrap()
+            .park_labels
+            .iter()
+            .filter(|(id, _)| {
+                rows.iter().any(|t| {
+                    t.id == **id
+                        && matches!(
+                            t.status,
+                            TransactionStatus::Processing | TransactionStatus::PendingRemint
+                        )
+                })
+            })
+            .map(|(id, label)| (*id, label.clone()))
+            .collect();
+        labels.sort();
+        Ok(labels)
+    }
+
+    pub async fn record_confidential_landing_slot(&self, slot: u64) -> Result<(), StorageError> {
+        self.check_should_fail("record_confidential_landing_slot")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        state.landing_slot = Some(state.landing_slot.map_or(slot, |old| old.max(slot)));
+        Ok(())
+    }
+
+    pub async fn confidential_landing_slot(&self) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("confidential_landing_slot")?;
+        Ok(self.confidential_sender.lock().unwrap().landing_slot)
+    }
+
+    pub async fn max_release_journal_slot(&self) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("max_release_journal_slot")?;
+        Ok(self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .filter_map(|sig| sig.blockhash_slot)
+            .filter_map(|slot| u64::try_from(slot).ok())
+            .max())
+    }
+
+    pub async fn insert_rebalance_request(
+        &self,
+        mint: &str,
+        direction: crate::storage::common::storage::confidential_sender::RebalanceDirection,
+        amount: u64,
+        expected_available: u64,
+    ) -> Result<i64, StorageError> {
+        use crate::storage::common::storage::confidential_sender::{
+            rebalance_status, RebalanceRequest,
+        };
+        self.check_should_fail("insert_rebalance_request")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        let id = state.rebalance_requests.len() as i64 + 1;
+        state.rebalance_requests.push(RebalanceRequest {
+            id,
+            mint: mint.to_string(),
+            direction,
+            amount,
+            expected_available,
+            status: rebalance_status::PENDING.to_string(),
+            signature: None,
+            error: None,
+            last_valid_block_height: None,
+            blockhash_slot: None,
+        });
+        Ok(id)
+    }
+
+    pub async fn get_rebalance_requests(
+        &self,
+        status: &str,
+    ) -> Result<
+        Vec<crate::storage::common::storage::confidential_sender::RebalanceRequest>,
+        StorageError,
+    > {
+        self.check_should_fail("get_rebalance_requests")?;
+        Ok(self
+            .confidential_sender
+            .lock()
+            .unwrap()
+            .rebalance_requests
+            .iter()
+            .filter(|request| request.status == status)
+            .cloned()
+            .collect())
+    }
+
+    pub async fn claim_rebalance_request(
+        &self,
+        id: i64,
+        signature: &str,
+        last_valid_block_height: u64,
+        blockhash_slot: u64,
+    ) -> Result<bool, StorageError> {
+        use crate::storage::common::storage::confidential_sender::rebalance_status;
+        self.check_should_fail("claim_rebalance_request")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        let Some(request) = state
+            .rebalance_requests
+            .iter_mut()
+            .find(|request| request.id == id && request.status == rebalance_status::PENDING)
+        else {
+            return Ok(false);
+        };
+        request.status = rebalance_status::SENT.to_string();
+        request.signature = Some(signature.to_string());
+        request.last_valid_block_height = Some(last_valid_block_height);
+        request.blockhash_slot = Some(blockhash_slot);
+        Ok(true)
+    }
+
+    pub async fn transition_rebalance_request(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        signature: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("transition_rebalance_request")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        let Some(request) = state
+            .rebalance_requests
+            .iter_mut()
+            .find(|request| request.id == id && request.status == from)
+        else {
+            return Ok(false);
+        };
+        request.status = to.to_string();
+        request.signature = signature.or(request.signature.take());
+        request.error = error.or(request.error.take());
+        Ok(true)
+    }
 }

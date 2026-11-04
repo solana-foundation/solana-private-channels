@@ -98,6 +98,11 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     }
 }
 
@@ -5812,5 +5817,605 @@ async fn try_mark_reminted_cas() -> Result<(), Box<dyn std::error::Error>> {
             .try_mark_reminted(id, updated_at, "sig".into())
             .await?
     );
+    Ok(())
+}
+
+// ── Confidential transfers: columns, undecrypted deposits and recovery ───────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_adds_confidential_columns_and_table_to_legacy_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let container = Postgres::default()
+        .with_db_name("db_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/db_test", host, port);
+    let pool = PgPool::connect(&db_url).await?;
+    sqlx::query(
+        "CREATE TYPE transaction_status AS ENUM ('pending', 'processing', 'completed', 'failed')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal')")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE transactions (
+            id BIGSERIAL PRIMARY KEY,
+            signature TEXT NOT NULL UNIQUE,
+            slot BIGINT NOT NULL,
+            initiator TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            amount NUMERIC(20,0) NOT NULL,
+            memo TEXT,
+            status transaction_status NOT NULL DEFAULT 'pending',
+            transaction_type transaction_type NOT NULL,
+            withdrawal_nonce BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            processed_at TIMESTAMPTZ,
+            counterpart_signature TEXT
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO transactions (signature, slot, initiator, recipient, mint, amount, transaction_type)
+         VALUES ('legacy', 1, 'a', 'b', 'm', 5, 'deposit')",
+    )
+    .execute(&pool)
+    .await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url,
+            max_connections: 5,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+    storage.init_schema().await?;
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text FROM information_schema.columns
+         WHERE table_name = 'transactions'
+           AND column_name IN ('confidential', 'confidential_raw', 'confidential_undecrypted',
+                               'not_before', 'wait_started_at')
+         ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        columns,
+        vec![
+            ("confidential".into(), "boolean".into(), "NO".into()),
+            ("confidential_raw".into(), "bytea".into(), "YES".into()),
+            (
+                "confidential_undecrypted".into(),
+                "boolean".into(),
+                "NO".into()
+            ),
+            (
+                "not_before".into(),
+                "timestamp with time zone".into(),
+                "YES".into()
+            ),
+            (
+                "wait_started_at".into(),
+                "timestamp with time zone".into(),
+                "YES".into()
+            ),
+        ]
+    );
+    let legacy: (bool, bool, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT confidential, confidential_undecrypted, confidential_raw
+         FROM transactions WHERE signature = 'legacy'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        legacy,
+        (false, false, None),
+        "legacy rows default to public"
+    );
+
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name::text FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name IN ('confidential_events', 'rebalance_requests')
+         ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(tables, vec![("rebalance_requests".to_string(),)]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selects_return_confidential_and_wait_columns() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut withdrawal = make_db_transaction("conf_w", TransactionType::Withdrawal);
+    withdrawal.confidential = true;
+    let id = storage.insert_db_transaction(&withdrawal).await?;
+    let mut deposit = make_db_transaction("conf_d", TransactionType::Deposit);
+    deposit.confidential = true;
+    deposit.confidential_undecrypted = true;
+    deposit.confidential_raw = Some(vec![7, 8, 9]);
+    storage
+        .insert_db_transactions_batch(std::slice::from_ref(&deposit))
+        .await?;
+    sqlx::query(
+        "UPDATE transactions SET wait_started_at = NOW() - INTERVAL '1 minute',
+                                 not_before = NOW() - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+
+    let pending = storage
+        .get_pending_db_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    assert!(pending[0].confidential);
+    assert!(pending[0].not_before.is_some() && pending[0].wait_started_at.is_some());
+    let by_nonce = storage
+        .get_withdrawal_by_nonce(pending[0].withdrawal_nonce.unwrap() as u64)
+        .await?
+        .unwrap();
+    assert!(by_nonce.confidential && by_nonce.wait_started_at.is_some());
+    let all = storage
+        .get_all_db_transactions(TransactionType::Deposit, 10)
+        .await
+        .map_err(|e| e.to_string())?;
+    assert!(all[0].confidential && all[0].confidential_undecrypted);
+    assert_eq!(all[0].confidential_raw.as_deref(), Some(&[7u8, 8, 9][..]));
+    assert!(all[0].not_before.is_none());
+    assert!(!by_nonce.confidential_undecrypted && by_nonce.confidential_raw.is_none());
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    assert!(locked[0].confidential && locked[0].not_before.is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_skips_rows_until_not_before() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let waiting = storage
+        .insert_db_transaction(&make_db_transaction("wait", TransactionType::Withdrawal))
+        .await?;
+    let ready = storage
+        .insert_db_transaction(&make_db_transaction("ready", TransactionType::Withdrawal))
+        .await?;
+    sqlx::query("UPDATE transactions SET not_before = NOW() + INTERVAL '1 hour' WHERE id = $1")
+        .bind(waiting)
+        .execute(&pool)
+        .await?;
+
+    let first = storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    assert_eq!(first.iter().map(|t| t.id).collect::<Vec<_>>(), vec![ready]);
+
+    sqlx::query("UPDATE transactions SET not_before = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(waiting)
+        .execute(&pool)
+        .await?;
+    let second = storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    assert_eq!(
+        second.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![waiting]
+    );
+    Ok(())
+}
+
+// A real pubkey: recovery reads the mint's escrow account.
+const CONF_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+
+/// A confidential deposit our key could not read, as the indexer stores it.
+fn undecrypted_deposit(sig: &str, raw: Vec<u8>) -> DbTransaction {
+    let mut row = make_db_transaction(sig, TransactionType::Deposit);
+    row.mint = CONF_MINT.to_string();
+    row.amount = TokenAmount(0);
+    row.confidential = true;
+    row.confidential_undecrypted = true;
+    row.confidential_raw = Some(raw);
+    row
+}
+
+/// A deposit event of `amount` encrypted for `keys`.
+fn deposit_event(keys: &private_channel_confidential::Keys, amount: u64) -> Vec<u8> {
+    use private_channel_confidential::test_support as cts;
+    let zero = [0u8; 64];
+    let (lo, hi) = private_channel_confidential::split(amount);
+    let (lo1, hi1) = cts::credit(keys, &zero, &zero, lo as i64, hi);
+    cts::deposit_event([0; 32], [4; 32], [5; 32], [6; 32], &zero, &zero, &lo1, &hi1)
+}
+
+/// An undecrypted deposit poisons its mint and is never handed to the operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn undecrypted_deposit_poisons_its_mint_and_is_never_fetched(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    storage
+        .insert_db_transactions_batch(&[
+            undecrypted_deposit("bad", vec![1, 2]),
+            make_db_transaction("good", TransactionType::Deposit),
+        ])
+        .await?;
+    assert_eq!(
+        storage.get_confidential_poisoned_mints().await?,
+        vec![CONF_MINT.to_string()]
+    );
+    let undecrypted = storage.get_confidential_undecrypted(CONF_MINT).await?;
+    assert_eq!(undecrypted.len(), 1);
+    assert_eq!(undecrypted[0].1, vec![1, 2]);
+    let fetched = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+        .await?;
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|t| t.signature.as_str())
+            .collect::<Vec<_>>(),
+        vec!["good"]
+    );
+    Ok(())
+}
+
+/// Recovery's fenced write fills amounts, clears flags and drops recovered zero deposits.
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_confidential_fills_amounts_and_clears_flags(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    cover_fixture_deposits(&storage).await?;
+    storage
+        .insert_db_transactions_batch(&[
+            undecrypted_deposit("dep", vec![1]),
+            undecrypted_deposit("zero", vec![2]),
+        ])
+        .await?;
+    let ids: Vec<i64> = storage
+        .get_confidential_undecrypted(CONF_MINT)
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let guard =
+        take_live_lock(&storage, LiveLockMode::Exclusive, "recover", Duration::ZERO).await?;
+    storage
+        .recover_confidential_fenced(
+            &guard,
+            vec![(ids[0], TokenAmount(77)), (ids[1], TokenAmount(0))],
+        )
+        .await?;
+    guard.stop_and_wait().await;
+    assert!(storage.get_confidential_poisoned_mints().await?.is_empty());
+    let deposits = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+        .await?;
+    assert_eq!(deposits.len(), 1);
+    assert_eq!(deposits[0].signature, "dep");
+    assert!(deposits[0].confidential && !deposits[0].confidential_undecrypted);
+    assert_eq!(deposits[0].amount, TokenAmount(77));
+    Ok(())
+}
+
+/// Every escrow account read reports this ElGamal key.
+struct ConfiguredUnder([u8; 32]);
+
+#[async_trait::async_trait]
+impl private_channel_indexer::indexer::confidential::EscrowKeySource for ConfiguredUnder {
+    async fn configured_key(
+        &self,
+        _: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<Option<[u8; 32]>, String> {
+        Ok(Some(self.0))
+    }
+}
+
+/// The whole recover command against Postgres: re-decrypt from the stored bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_recover_redecrypts_stored_deposits() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let keys = private_channel_confidential::test_support::keys();
+    storage
+        .insert_db_transactions_batch(&[undecrypted_deposit("dep", deposit_event(&keys, 4_242))])
+        .await?;
+    let report = private_channel_indexer::indexer::confidential::run_recover(
+        &storage,
+        &keys,
+        &ConfiguredUnder(keys.pubkey()),
+        &solana_sdk::pubkey::Pubkey::new_unique(),
+        CONF_MINT,
+        Duration::from_secs(1),
+    )
+    .await?;
+    assert_eq!((report.recovered, report.still_unreadable), (1, 0));
+    assert!(storage.get_confidential_poisoned_mints().await?.is_empty());
+    let rows = storage
+        .get_all_db_transactions(TransactionType::Deposit, 10)
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(rows[0].amount, TokenAmount(4_242));
+    Ok(())
+}
+
+/// Recovery takes the live lock exclusively, so it refuses while any worker holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_recover_refuses_while_a_worker_holds_the_live_lock(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let keys = private_channel_confidential::test_support::keys();
+    storage
+        .insert_db_transactions_batch(&[undecrypted_deposit("dep", deposit_event(&keys, 5))])
+        .await?;
+    let worker = take_live_lock(&storage, LiveLockMode::Shared, "indexer", Duration::ZERO).await?;
+    let refused = private_channel_indexer::indexer::confidential::run_recover(
+        &storage,
+        &keys,
+        &ConfiguredUnder(keys.pubkey()),
+        &solana_sdk::pubkey::Pubkey::new_unique(),
+        CONF_MINT,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(private_channel_indexer::error::IndexerError::Storage(
+                StorageError::LiveStateLockHeld { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        storage.get_confidential_poisoned_mints().await?,
+        vec![CONF_MINT.to_string()]
+    );
+    worker.stop_and_wait().await;
+    Ok(())
+}
+
+// ── Confidential sender: waits, read floor, parks, rebalance requests ────────
+
+/// A gated park's label is stored on a waiting row, listed for the next boot, and no
+/// longer listed once the row leaves the gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_park_labels_survive_a_restart_while_waiting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "conf_park",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    // A pending row is not waiting on any gate: nothing is stored.
+    storage
+        .set_confidential_park_label(id, "confidential_stale_proof")
+        .await?;
+    assert!(storage.get_confidential_park_labels().await?.is_empty());
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    storage
+        .set_confidential_park_label(id, "confidential_stale_proof")
+        .await?;
+    assert_eq!(
+        storage.get_confidential_park_labels().await?,
+        vec![(id, "confidential_stale_proof".to_string())]
+    );
+    sqlx::query("UPDATE transactions SET status = 'manual_review' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    assert!(storage.get_confidential_park_labels().await?.is_empty());
+    Ok(())
+}
+
+/// The landing slot only ever rises, and a fresh database has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_landing_slot_only_rises() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    assert_eq!(storage.confidential_landing_slot().await?, None);
+    storage.record_confidential_landing_slot(500).await?;
+    storage.record_confidential_landing_slot(400).await?;
+    assert_eq!(storage.confidential_landing_slot().await?, Some(500));
+    storage.record_confidential_landing_slot(501).await?;
+    assert_eq!(storage.confidential_landing_slot().await?, Some(501));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_wait_requeues_with_not_before_and_keeps_the_first_start(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "conf_wait",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    let lease = updated_at_of(&pool, id).await;
+    let first = Utc::now() - chrono::Duration::minutes(3);
+    let not_before = Utc::now() + chrono::Duration::minutes(5);
+
+    // A stale lease moves nothing.
+    assert!(
+        !storage
+            .requeue_confidential_wait(id, lease - chrono::Duration::seconds(1), not_before, first)
+            .await?
+    );
+    assert!(
+        storage
+            .requeue_confidential_wait(id, lease, not_before, first)
+            .await?
+    );
+    let (status, attempts): (String, i32) = sqlx::query_as(
+        "SELECT status::TEXT, recovery_requeue_attempts FROM transactions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!((status.as_str(), attempts), ("pending", 0));
+    // Waiting rows are skipped by the claim.
+    assert!(storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?
+        .is_empty());
+
+    // A second wait keeps the first start.
+    sqlx::query("UPDATE transactions SET status = 'processing', not_before = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let lease = updated_at_of(&pool, id).await;
+    assert!(
+        storage
+            .requeue_confidential_wait(id, lease, not_before, Utc::now())
+            .await?
+    );
+    let started: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT wait_started_at FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert!((started - first).num_milliseconds().abs() < 5);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_wait_refuses_a_journaled_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "conf_journaled",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    let lease = updated_at_of(&pool, id).await;
+    let lease = storage
+        .claim_and_persist_signature(id, lease, "sig-conf".to_string(), 10, Some(4_242))
+        .await?
+        .expect("claim");
+    assert!(
+        !storage
+            .requeue_confidential_wait(id, lease, Utc::now(), Utc::now())
+            .await?
+    );
+    assert_eq!(storage.max_release_journal_slot().await?, Some(4_242));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oldest_confidential_park_reads_confidential_withdrawals_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    assert_eq!(storage.oldest_confidential_park().await?, None);
+    let public = storage
+        .insert_db_transaction(&make_db_transaction(
+            "park_public",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    let confidential = storage
+        .insert_db_transaction(&make_db_transaction(
+            "park_conf",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    // The public park is older; only the confidential one counts.
+    for id in [public, confidential] {
+        sqlx::query(
+            "UPDATE transactions SET status = 'manual_review', confidential = (id = $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(confidential)
+        .execute(&pool)
+        .await?;
+    }
+    let oldest = storage.oldest_confidential_park().await?.expect("one park");
+    assert_eq!(oldest, updated_at_of(&pool, confidential).await);
+    assert!(oldest > updated_at_of(&pool, public).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebalance_requests_round_trip_and_transition_once(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::storage::confidential_sender::{
+        rebalance_status, RebalanceDirection,
+    };
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_rebalance_request("mint", RebalanceDirection::ToPublic, u64::MAX, 1 << 60)
+        .await?;
+    let pending = storage
+        .get_rebalance_requests(rebalance_status::PENDING)
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        (
+            pending[0].id,
+            pending[0].direction,
+            pending[0].amount,
+            pending[0].expected_available
+        ),
+        (id, RebalanceDirection::ToPublic, u64::MAX, 1 << 60)
+    );
+    assert!(
+        storage
+            .claim_rebalance_request(id, "sig", 1_200, 1_000)
+            .await?
+    );
+    // A second sender racing the same request loses.
+    assert!(
+        !storage
+            .claim_rebalance_request(id, "other", 1_300, 1_100)
+            .await?
+    );
+    // The attempt's blockhash validity is journaled with its signature.
+    let sent = storage
+        .get_rebalance_requests(rebalance_status::SENT)
+        .await?;
+    assert_eq!(
+        (
+            sent[0].signature.as_deref(),
+            sent[0].last_valid_block_height,
+            sent[0].blockhash_slot
+        ),
+        (Some("sig"), Some(1_200), Some(1_000))
+    );
+    assert!(
+        storage
+            .transition_rebalance_request(
+                id,
+                rebalance_status::SENT,
+                rebalance_status::COMPLETED,
+                None,
+                None
+            )
+            .await?
+    );
+    let done = storage
+        .get_rebalance_requests(rebalance_status::COMPLETED)
+        .await?;
+    assert_eq!(done[0].signature.as_deref(), Some("sig"));
     Ok(())
 }

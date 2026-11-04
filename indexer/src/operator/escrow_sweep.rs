@@ -12,9 +12,11 @@
 
 use crate::operator::utils::account_util::find_allowed_mint_pda;
 use crate::operator::utils::instruction_util::RetryPolicy;
+use crate::operator::utils::mint_util::{confidential_view, ConfidentialAccountView};
 use crate::operator::utils::rpc_util::{
     below_min_context_slot, is_min_context_slot_error, RpcClientWithRetry,
 };
+use private_channel_confidential::{AeBytes, Ciphertext};
 use private_channel_escrow_program_client::{AllowedMint, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use solana_account_decoder_client_types::{UiAccount, UiAccountData};
 use solana_client::rpc_request::RpcRequest;
@@ -25,7 +27,8 @@ use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
-use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022::extension::confidential_transfer::ConfidentialTransferAccount;
+use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
 use spl_token_2022::state::Account as Token2022Account;
 use spl_token_2022::state::Mint as Token2022Mint;
 use std::collections::HashMap;
@@ -93,8 +96,10 @@ impl std::fmt::Display for SweepFailure {
 /// point instead of against one that has drifted, so the two sides describe one instant.
 #[derive(Debug, Clone)]
 pub struct CustodySnapshot {
-    /// Per-mint custody; a mint absent from the map holds zero on-chain.
+    /// Per-mint public custody; a mint absent from the map holds zero on-chain.
     pub balances: HashMap<Pubkey, u64>,
+    /// Confidential part of each configured Token-2022 escrow ATA, read with `balances`.
+    pub confidential: HashMap<Pubkey, ConfidentialBalances>,
     /// Slot the whole snapshot is valid as of.
     pub slot: u64,
 }
@@ -102,12 +107,46 @@ pub struct CustodySnapshot {
 /// Escrow custody read from the instance ATAs, with the slot each mint's reading reflects.
 #[derive(Debug, Clone)]
 pub struct EscrowCustody {
-    /// Per-mint custody; a mint absent from the map holds zero on-chain.
+    /// Per-mint public custody; a mint absent from the map holds zero on-chain.
     pub balances: HashMap<Pubkey, u64>,
+    /// Confidential part of each configured Token-2022 escrow ATA, read with `balances`.
+    pub confidential: HashMap<Pubkey, ConfidentialBalances>,
     /// Slot each requested mint's balance was read at.
     pub slots: HashMap<Pubkey, u64>,
     /// Highest slot read, or the finalized slot when there are no mints.
     pub slot: u64,
+}
+
+/// The confidential part of a configured Token-2022 escrow ATA, from one account read: its
+/// ElGamal key, the pending and available ciphertexts, the AES copy of available and the
+/// credit counters that tell whether that copy is known to be stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfidentialBalances {
+    pub elgamal_pubkey: [u8; 32],
+    pub pending_lo: Ciphertext,
+    pub pending_hi: Ciphertext,
+    pub available: Ciphertext,
+    pub decryptable_available: AeBytes,
+    pub pending_credit_counter: u64,
+    /// Counter the last apply expected; differs from `actual_credit_counter` when a deposit
+    /// raced that apply, so the AES copy it wrote misses the deposit.
+    pub expected_credit_counter: u64,
+    pub actual_credit_counter: u64,
+}
+
+impl From<&ConfidentialAccountView> for ConfidentialBalances {
+    fn from(view: &ConfidentialAccountView) -> Self {
+        Self {
+            elgamal_pubkey: view.elgamal_pubkey,
+            pending_lo: view.pending_lo,
+            pending_hi: view.pending_hi,
+            available: view.available,
+            decryptable_available: view.decryptable_available,
+            pending_credit_counter: view.pending_credit_counter,
+            expected_credit_counter: view.expected_pending_credit_counter,
+            actual_credit_counter: view.actual_pending_credit_counter,
+        }
+    }
 }
 
 /// Attempts allowed to get both token-program sweeps to answer at the same slot. Set
@@ -144,7 +183,7 @@ pub async fn fetch_escrow_balances_by_mint(
     let floor = anchor.max(ledger_floor);
     let mut attempt = 1;
     loop {
-        let (mut balances, strays, low, high) =
+        let (mut custody, strays, low, high) =
             sweep_once(rpc_client, escrow_instance_id, floor).await?;
         if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
             attempt += 1;
@@ -173,7 +212,11 @@ pub async fn fetch_escrow_balances_by_mint(
         }
 
         let dropped =
-            retain_allowed_mints(rpc_client, escrow_instance_id, &mut balances, low).await?;
+            retain_allowed_mints(rpc_client, escrow_instance_id, &mut custody.balances, low)
+                .await?;
+        custody
+            .confidential
+            .retain(|mint, _| custody.balances.contains_key(mint));
         if !dropped.is_empty() {
             warn!(
                 count = dropped.len(),
@@ -183,7 +226,8 @@ pub async fn fetch_escrow_balances_by_mint(
         }
 
         return Ok(CustodySnapshot {
-            balances,
+            balances: custody.balances,
+            confidential: custody.confidential,
             slot: low,
         });
     }
@@ -245,6 +289,7 @@ pub async fn fetch_escrow_custody(
             .map_err(|e| read_failure(format!("Failed to read the finalized slot: {e}")))?;
         return Ok(EscrowCustody {
             balances: HashMap::new(),
+            confidential: HashMap::new(),
             slots: HashMap::new(),
             slot,
         });
@@ -255,12 +300,12 @@ pub async fn fetch_escrow_custody(
     let anchor = newest_block_anchor(rpc_client, "Solana")
         .await
         .map_err(|e| e.into_sweep_failure(0))?;
-    let (balances, slots) =
-        read_custody_once(rpc_client, escrow_instance_id, mints, anchor).await?;
-    let slot = slots.values().copied().max().unwrap_or_default();
+    let custody = read_custody_once(rpc_client, escrow_instance_id, mints, anchor).await?;
+    let slot = custody.slots.values().copied().max().unwrap_or_default();
     Ok(EscrowCustody {
-        balances,
-        slots,
+        balances: custody.balances,
+        confidential: custody.confidential,
+        slots: custody.slots,
         slot,
     })
 }
@@ -316,14 +361,21 @@ fn sweep_rpc_failure(e: &client_error::Error, floor: u64, what: String) -> Sweep
     }
 }
 
-/// One pass over every ATA. Returns the balances plus the slot each mint was read at, refusing
-/// any chunk answered below `anchor`.
+/// Public balances, confidential parts and the slot each mint was read at.
+#[derive(Default)]
+struct Custody {
+    balances: HashMap<Pubkey, u64>,
+    confidential: HashMap<Pubkey, ConfidentialBalances>,
+    slots: HashMap<Pubkey, u64>,
+}
+
+/// One pass over every ATA, refusing any chunk answered below `anchor`.
 async fn read_custody_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
     anchor: u64,
-) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), SweepFailure> {
+) -> Result<Custody, SweepFailure> {
     let keys: Vec<Pubkey> = mints
         .iter()
         .map(|(mint, token_program)| {
@@ -332,18 +384,20 @@ async fn read_custody_once(
         .collect();
     let accounts = read_accounts_chunked(rpc_client, &keys, anchor, "escrow ATAs").await?;
 
-    let mut balances = HashMap::new();
-    let mut slots = HashMap::new();
+    let mut custody = Custody::default();
     for ((mint, token_program), (account, slot)) in mints.iter().zip(accounts) {
-        slots.insert(*mint, slot);
+        custody.slots.insert(*mint, slot);
         // No account at the ATA means the escrow holds none of this mint.
         let Some(account) = account else { continue };
-        let amount =
+        let (amount, confidential) =
             decode_ata_amount(&account, mint, token_program).map_err(SweepFailure::Read)?;
-        balances.insert(*mint, amount);
+        custody.balances.insert(*mint, amount);
+        if let Some(confidential) = confidential {
+            custody.confidential.insert(*mint, confidential);
+        }
     }
 
-    Ok((balances, slots))
+    Ok(custody)
 }
 
 /// Read `keys` in chunks of `MAX_ACCOUNTS_PER_CALL`. Returns each key's account (None when
@@ -399,12 +453,31 @@ async fn read_accounts_chunked(
     Ok(accounts)
 }
 
-/// The balance of one escrow ATA, refusing anything that is not `mint`'s token account.
+/// One token account decoded from raw bytes: mint, public amount and, for a configured
+/// Token-2022 account, its confidential part. The startup sweep and the runtime read both
+/// use this, so they cannot disagree on custody.
+fn decode_token_account(
+    data: &[u8],
+    token_program: &Pubkey,
+) -> Result<(Pubkey, u64, Option<ConfidentialBalances>), String> {
+    if *token_program != spl_token_2022::id() {
+        let state = TokenAccount::unpack(data).map_err(|e| e.to_string())?;
+        return Ok((state.mint, state.amount, None));
+    }
+    let state = StateWithExtensions::<Token2022Account>::unpack(data).map_err(|e| e.to_string())?;
+    let confidential = state
+        .get_extension::<ConfidentialTransferAccount>()
+        .ok()
+        .map(|extension| ConfidentialBalances::from(&confidential_view(&state.base, extension)));
+    Ok((state.base.mint, state.base.amount, confidential))
+}
+
+/// The custody of one escrow ATA, refusing anything that is not `mint`'s token account.
 fn decode_ata_amount(
     account: &UiAccount,
     mint: &Pubkey,
     token_program: &Pubkey,
-) -> Result<u64, EscrowSweepError> {
+) -> Result<(u64, Option<ConfidentialBalances>), EscrowSweepError> {
     let fail = |why: &str| EscrowSweepError {
         reason: format!("Escrow ATA for mint {mint} {why}"),
     };
@@ -418,38 +491,36 @@ fn decode_ata_amount(
         .data
         .decode()
         .ok_or_else(|| fail("did not decode"))?;
-    let (account_mint, amount) = if *token_program == spl_token_2022::id() {
-        let state = StateWithExtensions::<Token2022Account>::unpack(&data)
-            .map_err(|e| fail(&format!("is not a token account: {e}")))?;
-        (state.base.mint, state.base.amount)
-    } else {
-        let state = TokenAccount::unpack(&data)
-            .map_err(|e| fail(&format!("is not a token account: {e}")))?;
-        (state.mint, state.amount)
-    };
+    let (account_mint, amount, confidential) = decode_token_account(&data, token_program)
+        .map_err(|e| fail(&format!("is not a token account: {e}")))?;
     if account_mint != *mint {
         return Err(fail(&format!("holds mint {account_mint}")));
     }
-    Ok(amount)
+    Ok((amount, confidential))
 }
 
 /// One pass over both token programs, each answered at or past `floor`. Returns each mint's
-/// ATA balance, the addresses of the other token accounts the instance owns, and the lowest
+/// ATA custody, the addresses of the other token accounts the instance owns, and the lowest
 /// and highest slot the two responses reported, which agree when the pass saw one instant.
 async fn sweep_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     floor: u64,
-) -> Result<(HashMap<Pubkey, u64>, Vec<String>, u64, u64), SweepFailure> {
-    let mut balances = HashMap::new();
+) -> Result<(Custody, Vec<String>, u64, u64), SweepFailure> {
+    let mut custody = Custody::default();
     let mut strays = Vec::new();
     let token_programs = [spl_token::id(), spl_token_2022::id()];
     let mut lowest_slot = u64::MAX;
     let mut highest_slot = 0u64;
 
     for token_program_id in token_programs {
-        // Sent raw because the client's helper has no `minContextSlot`; same filter and
-        // encoding as that helper.
+        // Sent raw because the client's helper has no `minContextSlot`. Token-2022 is read in
+        // base64 because jsonParsed renders the confidential ciphertexts as strings.
+        let encoding = if token_program_id == spl_token_2022::id() {
+            "base64"
+        } else {
+            "jsonParsed"
+        };
         let response = rpc_client
             .with_retry(
                 "get_token_accounts_by_owner",
@@ -462,7 +533,7 @@ async fn sweep_once(
                             serde_json::json!([
                                 escrow_instance_id.to_string(),
                                 {"programId": token_program_id.to_string()},
-                                {"encoding": "jsonParsed", "commitment": "finalized", "minContextSlot": floor}
+                                {"encoding": encoding, "commitment": "finalized", "minContextSlot": floor}
                             ]),
                         )
                         .await?;
@@ -488,22 +559,20 @@ async fn sweep_once(
         // The RPC may return accounts in binary (base64) or JSON-parsed form
         // depending on the requested encoding; handle both.
         for keyed_account in accounts {
-            let (mint, amount) = if let Some(decoded) = keyed_account.account.data.decode() {
-                if token_program_id == spl_token_2022::id() {
-                    let token_account = StateWithExtensions::<Token2022Account>::unpack(&decoded)
-                        .map_err(|e| EscrowSweepError {
-                        reason: format!("Failed to parse token-2022 account: {e}"),
-                    })?;
-                    (token_account.base.mint, token_account.base.amount)
-                } else {
-                    let token_account =
-                        TokenAccount::unpack(&decoded).map_err(|e| EscrowSweepError {
-                            reason: format!(
-                                "Failed to parse token account for program {token_program_id}: {e}"
-                            ),
-                        })?;
-                    (token_account.mint, token_account.amount)
-                }
+            let (mint, amount, confidential) = if let Some(decoded) =
+                keyed_account.account.data.decode()
+            {
+                decode_token_account(&decoded, &token_program_id).map_err(|e| EscrowSweepError {
+                    reason: format!(
+                        "Failed to parse token account for program {token_program_id}: {e}"
+                    ),
+                })?
+            } else if token_program_id == spl_token_2022::id() {
+                // Parsed JSON hides the ciphertexts, so it cannot stand for custody.
+                return Err(read_failure(format!(
+                    "Token-2022 account {} was not returned in base64",
+                    keyed_account.pubkey
+                )));
             } else if let UiAccountData::Json(parsed) = &keyed_account.account.data {
                 let info = parsed.parsed.get("info").ok_or_else(|| EscrowSweepError {
                     reason: "Missing 'info' in parsed token account".to_string(),
@@ -527,7 +596,7 @@ async fn sweep_once(
                 let amount = amount_str.parse::<u64>().map_err(|e| EscrowSweepError {
                     reason: format!("Invalid token amount '{amount_str}': {e}"),
                 })?;
-                (mint, amount)
+                (mint, amount, None)
             } else {
                 warn!(
                     token_program = %token_program_id,
@@ -547,11 +616,14 @@ async fn sweep_once(
                 strays.push(keyed_account.pubkey);
                 continue;
             }
-            balances.insert(mint, amount);
+            custody.balances.insert(mint, amount);
+            if let Some(confidential) = confidential {
+                custody.confidential.insert(mint, confidential);
+            }
         }
     }
 
-    Ok((balances, strays, lowest_slot, highest_slot))
+    Ok((custody, strays, lowest_slot, highest_slot))
 }
 
 /// Channel supply for `mint` and the context slot the node answered at. The node reads
@@ -1437,7 +1509,7 @@ pub(crate) mod tests {
     /// Wrap raw Token-2022 account data as `instance`'s Token-2022 ATA for `mint`, one base64
     /// `RpcKeyedAccount`, reporting the real length as `space` so the fixture stays
     /// self-consistent.
-    fn keyed_token2022_account(instance: Pubkey, mint: Pubkey, data: &[u8]) -> String {
+    pub(crate) fn keyed_token2022_account(instance: Pubkey, mint: Pubkey, data: &[u8]) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
         format!(
             r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":{space},"data":["{b64}","base64"]}}}}"#,
@@ -1599,7 +1671,7 @@ pub(crate) mod tests {
     }
 
     /// One `getMultipleAccounts` entry holding `data` under the program `owner`.
-    fn ui_account(owner: Pubkey, data: &[u8]) -> serde_json::Value {
+    pub(crate) fn ui_account(owner: Pubkey, data: &[u8]) -> serde_json::Value {
         serde_json::json!({
             "lamports": 2_039_280u64,
             "owner": owner.to_string(),
@@ -1657,7 +1729,7 @@ pub(crate) mod tests {
             .await;
     }
 
-    fn ata(instance: &Pubkey, mint: &Pubkey, program: &Pubkey) -> Pubkey {
+    pub(crate) fn ata(instance: &Pubkey, mint: &Pubkey, program: &Pubkey) -> Pubkey {
         spl_associated_token_account::get_associated_token_address_with_program_id(
             instance, mint, program,
         )
@@ -2277,9 +2349,10 @@ pub(crate) mod tests {
         );
         for p in params.iter() {
             assert_eq!(p[2]["minContextSlot"], 50, "{p}");
-            assert_eq!(p[2]["encoding"], "jsonParsed", "{p}");
             assert_eq!(p[2]["commitment"], "finalized", "{p}");
         }
+        assert_eq!(params[0][2]["encoding"], "jsonParsed");
+        assert_eq!(params[1][2]["encoding"], "base64", "Token-2022 is read raw");
     }
 
     /// Two answers below the floor agree with each other, but agreement is not freshness.
@@ -2379,5 +2452,197 @@ pub(crate) mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    // ── confidential custody decode ───────────────────────────────────
+
+    /// A configured escrow ATA's confidential part under `keys`: one pending credit per
+    /// `(amount, fee)`, `available` in the ElGamal balance, `aes` in its AES copy, and the
+    /// last apply's `(expected, actual)` credit counters.
+    pub(crate) fn confidential_balances(
+        keys: &private_channel_confidential::Keys,
+        pending: &[(u64, u64)],
+        available: u64,
+        aes: u64,
+        (expected, actual): (u64, u64),
+    ) -> ConfidentialBalances {
+        use private_channel_confidential::test_support::{encrypt, encrypt_aes, SimAccount};
+        let mut sim = SimAccount::new(keys);
+        for (amount, fee) in pending {
+            sim.credit(keys, *amount, *fee);
+        }
+        ConfidentialBalances {
+            elgamal_pubkey: keys.pubkey(),
+            pending_lo: sim.pending_lo,
+            pending_hi: sim.pending_hi,
+            available: encrypt(keys, available),
+            decryptable_available: encrypt_aes(keys, aes),
+            pending_credit_counter: pending.len() as u64,
+            expected_credit_counter: expected,
+            actual_credit_counter: actual,
+        }
+    }
+
+    /// Raw bytes of a configured Token-2022 escrow ATA: `public` plus the confidential extension.
+    pub(crate) fn account_with_confidential(
+        mint: Pubkey,
+        public: u64,
+        confidential: &ConfidentialBalances,
+    ) -> Vec<u8> {
+        use crate::operator::utils::mint_util::confidential_fixtures::{
+            account_with_confidential, AccountSpec,
+        };
+        account_with_confidential(&AccountSpec {
+            mint,
+            owner: Pubkey::new_unique(),
+            public,
+            frozen: false,
+            elgamal_pubkey: confidential.elgamal_pubkey,
+            pending_lo: confidential.pending_lo,
+            pending_hi: confidential.pending_hi,
+            available: confidential.available,
+            aes: confidential.decryptable_available,
+            approved: true,
+            allow_confidential_credits: true,
+            allow_non_confidential_credits: true,
+            pending_credit_counter: confidential.pending_credit_counter,
+            maximum_pending_credit_counter: 65_536,
+            expected_pending_credit_counter: confidential.expected_credit_counter,
+            actual_pending_credit_counter: confidential.actual_credit_counter,
+        })
+    }
+
+    /// A stale AES copy with differing counters, so every field is distinct and checked.
+    fn sample_confidential() -> ConfidentialBalances {
+        let keys = private_channel_confidential::test_support::keys();
+        confidential_balances(&keys, &[(70_000, 0), (5, 0)], 900, 800, (3, 4))
+    }
+
+    /// Token-2022 accounts are asked for in base64: jsonParsed renders the ciphertexts as
+    /// strings, so one raw decoder serves the sweep and the runtime read alike.
+    #[tokio::test]
+    async fn sweep_reads_token_2022_accounts_as_base64() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let confidential = sample_confidential();
+        mock_anchor(&mut server, 1).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(empty_body(1))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(spl_token_2022::id().to_string()),
+                mockito::Matcher::Regex(r#""encoding":"base64""#.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(result_body(
+                &[keyed_token2022_account(
+                    instance,
+                    mint,
+                    &account_with_confidential(mint, 900, &confidential),
+                )],
+                1,
+            ))
+            .create_async()
+            .await;
+        mock_all_mints_allowed(&mut server).await;
+
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.balances[&mint], 900, "public part only");
+        assert_eq!(snapshot.confidential[&mint], confidential);
+    }
+
+    /// A Token-2022 account in jsonParsed form cannot show its ciphertexts, so it is refused
+    /// rather than read as public-only custody.
+    #[tokio::test]
+    async fn sweep_refuses_a_json_parsed_token_2022_account() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ata =
+            get_associated_token_address_with_program_id(&instance, &mint, &spl_token_2022::id());
+        mock_sweep_token_2022(&mut server, &[json_parsed_account_at(ata, mint, 10)]).await;
+        mock_all_mints_allowed(&mut server).await;
+
+        let result = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0).await;
+
+        assert!(
+            matches!(result, Err(SweepFailure::Read(ref e)) if e.reason.contains("base64")),
+            "{result:?}"
+        );
+    }
+
+    /// An unconfigured Token-2022 account and an SPL account carry no confidential part.
+    #[tokio::test]
+    async fn unconfigured_accounts_carry_no_confidential_part() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_sweep_token_2022(
+            &mut server,
+            &[base64_token2022_account(instance, mint, 4_242)],
+        )
+        .await;
+        mock_all_mints_allowed(&mut server).await;
+
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), instance, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.balances[&mint], 4_242);
+        assert!(snapshot.confidential.is_empty());
+    }
+
+    /// The startup sweep and the runtime read decode one account to the same custody.
+    #[tokio::test]
+    async fn both_decoders_give_identical_custody() {
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let confidential = sample_confidential();
+        let data = account_with_confidential(mint, 1_234, &confidential);
+
+        let mut sweep = mockito::Server::new_async().await;
+        mock_sweep_token_2022(
+            &mut sweep,
+            &[keyed_token2022_account(instance, mint, &data)],
+        )
+        .await;
+        mock_all_mints_allowed(&mut sweep).await;
+        let swept = fetch_escrow_balances_by_mint(&client(&sweep.url()), instance, 0)
+            .await
+            .unwrap();
+
+        let mut runtime = mockito::Server::new_async().await;
+        mock_channel_clock(&mut runtime, 1, vec![1], Some(1)).await;
+        mock_multiple_accounts(
+            &mut runtime,
+            HashMap::from([(
+                ata(&instance, &mint, &spl_token_2022::id()),
+                ui_account(spl_token_2022::id(), &data),
+            )]),
+            vec![1],
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let read = fetch_escrow_custody(
+            &client(&runtime.url()),
+            instance,
+            &[(mint, spl_token_2022::id())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(swept.balances, read.balances);
+        assert_eq!(swept.confidential, read.confidential);
+        assert_eq!(read.confidential[&mint], confidential);
     }
 }

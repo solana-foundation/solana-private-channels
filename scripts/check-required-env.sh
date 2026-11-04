@@ -110,6 +110,18 @@ if [[ ${#shared[@]} -gt 0 ]]; then
   exit 1
 fi
 
+# Optional, but a set value must have the shape the services load, or they refuse to start.
+# The message names the variable only, never its value.
+confidential_keys="$(resolve_var ESCROW_CONFIDENTIAL_KEYS "$@")"
+if [[ -n "${confidential_keys//[[:space:]]/}" ]] \
+  && ! [[ "$confidential_keys" =~ ^[[:space:]]*\{.*\"elgamal_secret\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]+\".*\}[[:space:]]*$ \
+    && "$confidential_keys" =~ \"aes_key\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]+\" ]]; then
+  echo "FATAL: ESCROW_CONFIDENTIAL_KEYS is set but is not JSON with base64 elgamal_secret and aes_key." >&2
+  echo "Leave it blank until an escrow account is configured, or regenerate it with confidential_keygen." >&2
+  exit 1
+fi
+unset confidential_keys
+
 if [[ ${#placeheld[@]} -gt 0 ]]; then
   echo "FATAL: shipped placeholder still in use: ${placeheld[*]}" >&2
   echo "Anyone with the repository knows this value. Replace it, and rotate the" >&2

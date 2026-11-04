@@ -4,6 +4,7 @@ use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::MintStatusAtSlot;
 use crate::storage::Storage;
+use private_channel_confidential::{AeBytes, Ciphertext, ReleaseFee};
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::request::RpcError;
@@ -15,8 +16,12 @@ use spl_tlv_account_resolution::solana_program_error::ProgramError;
 use spl_tlv_account_resolution::state::ExtraAccountMetaList;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
-    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
+    confidential_transfer::{ConfidentialTransferAccount, ConfidentialTransferMint},
+    confidential_transfer_fee::ConfidentialTransferFeeConfig,
+    pausable::PausableConfig,
+    transfer_fee::TransferFeeConfig,
+    transfer_hook::TransferHook,
+    BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Account as Token2022AccountState;
 use spl_token_2022::state::AccountState;
@@ -597,6 +602,365 @@ impl MintCache {
             }),
         }
     }
+}
+
+/// A Token-2022 account's balances and confidential transfer state, decoded from raw bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfidentialAccountView {
+    pub public_amount: u64,
+    pub frozen: bool,
+    pub approved: bool,
+    pub elgamal_pubkey: [u8; 32],
+    pub pending_lo: Ciphertext,
+    pub pending_hi: Ciphertext,
+    pub available: Ciphertext,
+    pub decryptable_available: AeBytes,
+    pub allow_confidential_credits: bool,
+    pub allow_non_confidential_credits: bool,
+    pub pending_credit_counter: u64,
+    pub maximum_pending_credit_counter: u64,
+    pub expected_pending_credit_counter: u64,
+    pub actual_pending_credit_counter: u64,
+}
+
+impl ConfidentialAccountView {
+    /// An apply raced a deposit, so the AES copy misses that deposit.
+    pub fn aes_known_stale(&self) -> bool {
+        self.expected_pending_credit_counter != self.actual_pending_credit_counter
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending_credit_counter > 0
+    }
+
+    /// The pending credit counter is at or past `percent` of its cap.
+    pub fn counter_at_percent(&self, percent: u64) -> bool {
+        u128::from(self.pending_credit_counter) * 100
+            >= u128::from(self.maximum_pending_credit_counter) * u128::from(percent)
+    }
+}
+
+/// What a raw read found at a token account address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfidentialAccountRead {
+    Absent,
+    /// Not a Token-2022 account, or one that does not decode.
+    NotToken2022,
+    /// A Token-2022 account without the confidential extension.
+    NotConfigured {
+        public_amount: u64,
+        frozen: bool,
+    },
+    Configured(Box<ConfidentialAccountView>),
+}
+
+/// Decode a raw account as Token-2022 with its confidential extension.
+pub fn decode_confidential_account(account: Option<&Account>) -> ConfidentialAccountRead {
+    let Some(account) = account else {
+        return ConfidentialAccountRead::Absent;
+    };
+    if account.owner != TOKEN_2022_PROGRAM_ID {
+        return ConfidentialAccountRead::NotToken2022;
+    }
+    let Ok(state) = StateWithExtensions::<Token2022AccountState>::unpack(&account.data) else {
+        return ConfidentialAccountRead::NotToken2022;
+    };
+    let public_amount = state.base.amount;
+    let frozen = state.base.state == AccountState::Frozen;
+    let Ok(extension) = state.get_extension::<ConfidentialTransferAccount>() else {
+        return ConfidentialAccountRead::NotConfigured {
+            public_amount,
+            frozen,
+        };
+    };
+    ConfidentialAccountRead::Configured(Box::new(confidential_view(&state.base, extension)))
+}
+
+/// The one mapping from a Token-2022 account and its confidential extension to the view
+/// the sender and reconciliation read.
+pub fn confidential_view(
+    base: &Token2022AccountState,
+    extension: &ConfidentialTransferAccount,
+) -> ConfidentialAccountView {
+    ConfidentialAccountView {
+        public_amount: base.amount,
+        frozen: base.state == AccountState::Frozen,
+        approved: bool::from(extension.approved),
+        elgamal_pubkey: extension.elgamal_pubkey.0,
+        pending_lo: extension.pending_balance_lo.0,
+        pending_hi: extension.pending_balance_hi.0,
+        available: extension.available_balance.0,
+        decryptable_available: extension.decryptable_available_balance.0,
+        allow_confidential_credits: bool::from(extension.allow_confidential_credits),
+        allow_non_confidential_credits: bool::from(extension.allow_non_confidential_credits),
+        pending_credit_counter: u64::from(extension.pending_balance_credit_counter),
+        maximum_pending_credit_counter: u64::from(extension.maximum_pending_balance_credit_counter),
+        expected_pending_credit_counter: u64::from(
+            extension.expected_pending_balance_credit_counter,
+        ),
+        actual_pending_credit_counter: u64::from(extension.actual_pending_balance_credit_counter),
+    }
+}
+
+/// Whether a confidential release can credit this destination. Every refusal maps to
+/// a Token-2022 error the release would otherwise fail with after paying the fee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DestinationReadiness {
+    Ready { elgamal_pubkey: [u8; 32] },
+    NotReady(String),
+}
+
+pub fn destination_readiness(read: &ConfidentialAccountRead) -> DestinationReadiness {
+    let not_ready = |reason: &str| DestinationReadiness::NotReady(reason.to_string());
+    match read {
+        ConfidentialAccountRead::Absent => not_ready("destination account missing"),
+        ConfidentialAccountRead::NotToken2022 => {
+            not_ready("destination is not a Token-2022 account")
+        }
+        ConfidentialAccountRead::NotConfigured { .. } => {
+            not_ready("destination not configured for confidential transfers")
+        }
+        ConfidentialAccountRead::Configured(view) => {
+            if view.frozen {
+                not_ready("destination frozen")
+            } else if !view.approved {
+                not_ready("destination not approved")
+            } else if !view.allow_confidential_credits {
+                not_ready("destination confidential credits disabled")
+            } else if view.pending_credit_counter >= view.maximum_pending_credit_counter {
+                not_ready("destination pending credit counter full")
+            } else {
+                DestinationReadiness::Ready {
+                    elgamal_pubkey: view.elgamal_pubkey,
+                }
+            }
+        }
+    }
+}
+
+/// The mint's auditor and confidential fee, which a release's proofs must match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfidentialMintParams {
+    pub auditor: Option<[u8; 32]>,
+    pub fee: Option<ReleaseFee>,
+}
+
+/// Read the auditor and, for a fee mint, the fee in force at `epoch`.
+pub fn decode_confidential_mint(data: &[u8], epoch: u64) -> Option<ConfidentialMintParams> {
+    let state = StateWithExtensions::<Token2022MintState>::unpack(data).ok()?;
+    let mint = state.get_extension::<ConfidentialTransferMint>().ok()?;
+    let auditor = mint.auditor_elgamal_pubkey.get().map(|key| key.0);
+    let fee = match state.get_extension::<TransferFeeConfig>() {
+        Ok(config) => {
+            let withheld = state
+                .get_extension::<ConfidentialTransferFeeConfig>()
+                .ok()?;
+            let fee = config.get_epoch_fee(epoch);
+            Some(ReleaseFee {
+                basis_points: u16::from(fee.transfer_fee_basis_points),
+                maximum_fee: u64::from(fee.maximum_fee),
+                withdraw_withheld_pubkey: withheld.withdraw_withheld_authority_elgamal_pubkey.0,
+            })
+        }
+        Err(_) => None,
+    };
+    Some(ConfidentialMintParams { auditor, fee })
+}
+
+impl MintCache {
+    /// Raw read of a token account's confidential state, bound to `min_slot` at the
+    /// client's commitment. Returns the read and the slot it answered at.
+    pub async fn read_confidential_account(
+        &self,
+        ata: &Pubkey,
+        min_slot: u64,
+    ) -> Result<(ConfidentialAccountRead, u64), OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("read_confidential_account requires an RPC client".to_string())
+        })?;
+        let response = rpc
+            .get_account_with_context_min_slot(ata, rpc.rpc_client.commitment(), Some(min_slot))
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_account({ata}): {e}")))?;
+        Ok((
+            decode_confidential_account(response.value.as_ref()),
+            response.context.slot,
+        ))
+    }
+
+    /// The mint's auditor and fee for a release proof. `None` when the mint has no
+    /// confidential extension, which no configured escrow account can have.
+    pub async fn confidential_mint_params(
+        &self,
+        mint: &Pubkey,
+        min_slot: u64,
+    ) -> Result<Option<ConfidentialMintParams>, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("confidential_mint_params requires an RPC client".to_string())
+        })?;
+        let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
+        let epoch = rpc
+            .rpc_client
+            .get_epoch_info()
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_epoch_info: {e}")))?
+            .epoch;
+        Ok(decode_confidential_mint(&account.data, epoch))
+    }
+}
+
+/// Raw Token-2022 accounts with the confidential extensions, shared by the operator tests.
+#[cfg(test)]
+pub(crate) mod confidential_fixtures {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use private_channel_confidential::{test_support::SimAccount, Keys};
+    use spl_token_2022::extension::{BaseStateWithExtensionsMut, StateWithExtensionsMut};
+
+    /// Every field of an account's confidential state.
+    #[derive(Clone)]
+    pub struct AccountSpec {
+        pub mint: Pubkey,
+        pub owner: Pubkey,
+        pub public: u64,
+        pub frozen: bool,
+        pub elgamal_pubkey: [u8; 32],
+        pub pending_lo: Ciphertext,
+        pub pending_hi: Ciphertext,
+        pub available: Ciphertext,
+        pub aes: AeBytes,
+        pub approved: bool,
+        pub allow_confidential_credits: bool,
+        pub allow_non_confidential_credits: bool,
+        pub pending_credit_counter: u64,
+        pub maximum_pending_credit_counter: u64,
+        pub expected_pending_credit_counter: u64,
+        pub actual_pending_credit_counter: u64,
+    }
+
+    impl AccountSpec {
+        /// A configured, approved account holding `sim`'s balances, with the AES copy at
+        /// `aes_value` and matching counters.
+        pub fn healthy(keys: &Keys, sim: &SimAccount, public: u64, aes_value: u64) -> Self {
+            Self {
+                mint: Pubkey::new_unique(),
+                owner: Pubkey::new_unique(),
+                public,
+                frozen: false,
+                elgamal_pubkey: keys.pubkey(),
+                pending_lo: sim.pending_lo,
+                pending_hi: sim.pending_hi,
+                available: sim.available,
+                aes: keys.encrypt_aes(aes_value),
+                approved: true,
+                allow_confidential_credits: true,
+                allow_non_confidential_credits: true,
+                pending_credit_counter: 0,
+                maximum_pending_credit_counter: 65_536,
+                expected_pending_credit_counter: 0,
+                actual_pending_credit_counter: 0,
+            }
+        }
+    }
+
+    pub fn account_with_confidential(spec: &AccountSpec) -> Vec<u8> {
+        let len = ExtensionType::try_calculate_account_len::<Token2022AccountState>(&[
+            ExtensionType::ConfidentialTransferAccount,
+        ])
+        .unwrap();
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022AccountState>::unpack_uninitialized(&mut data)
+                .unwrap();
+        let ext = state
+            .init_extension::<ConfidentialTransferAccount>(true)
+            .unwrap();
+        ext.approved = spec.approved.into();
+        ext.elgamal_pubkey.0 = spec.elgamal_pubkey;
+        ext.pending_balance_lo.0 = spec.pending_lo;
+        ext.pending_balance_hi.0 = spec.pending_hi;
+        ext.available_balance.0 = spec.available;
+        ext.decryptable_available_balance.0 = spec.aes;
+        ext.allow_confidential_credits = spec.allow_confidential_credits.into();
+        ext.allow_non_confidential_credits = spec.allow_non_confidential_credits.into();
+        ext.pending_balance_credit_counter = spec.pending_credit_counter.into();
+        ext.maximum_pending_balance_credit_counter = spec.maximum_pending_credit_counter.into();
+        ext.expected_pending_balance_credit_counter = spec.expected_pending_credit_counter.into();
+        ext.actual_pending_balance_credit_counter = spec.actual_pending_credit_counter.into();
+        state.base = Token2022AccountState {
+            mint: spec.mint,
+            owner: spec.owner,
+            amount: spec.public,
+            state: if spec.frozen {
+                AccountState::Frozen
+            } else {
+                AccountState::Initialized
+            },
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        data
+    }
+
+    /// A Token-2022 mint with `ConfidentialTransferMint`, and the fee extensions when `fee` is set.
+    pub fn confidential_mint(auditor: Option<[u8; 32]>, fee: Option<ReleaseFee>) -> Vec<u8> {
+        use spl_token_2022::extension::transfer_fee::TransferFee;
+        let mut types = vec![ExtensionType::ConfidentialTransferMint];
+        if fee.is_some() {
+            types.push(ExtensionType::TransferFeeConfig);
+            types.push(ExtensionType::ConfidentialTransferFeeConfig);
+        }
+        let len = ExtensionType::try_calculate_account_len::<Token2022MintState>(&types).unwrap();
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022MintState>::unpack_uninitialized(&mut data).unwrap();
+        let ct = state
+            .init_extension::<ConfidentialTransferMint>(true)
+            .unwrap();
+        if let Some(auditor) = auditor {
+            let mut key = ConfidentialTransferAccount::default().elgamal_pubkey;
+            key.0 = auditor;
+            ct.auditor_elgamal_pubkey = key.into();
+        }
+        if let Some(fee) = fee {
+            let config = state.init_extension::<TransferFeeConfig>(true).unwrap();
+            let current = TransferFee {
+                epoch: 0.into(),
+                maximum_fee: fee.maximum_fee.into(),
+                transfer_fee_basis_points: fee.basis_points.into(),
+            };
+            config.older_transfer_fee = current;
+            config.newer_transfer_fee = current;
+            state
+                .init_extension::<ConfidentialTransferFeeConfig>(true)
+                .unwrap()
+                .withdraw_withheld_authority_elgamal_pubkey
+                .0 = fee.withdraw_withheld_pubkey;
+        }
+        state.base.decimals = 6;
+        state.base.is_initialized = true;
+        state.pack_base();
+        state.init_account_type().unwrap();
+        data
+    }
+
+    /// `getAccountInfo`'s JSON for `data` owned by `owner`, answered at `slot`.
+    pub fn rpc_account(owner: &Pubkey, data: &[u8], slot: u64) -> serde_json::Value {
+        serde_json::json!({
+            "context": {"slot": slot},
+            "value": {
+                "owner": owner.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(data), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
+    }
+
+    use spl_token_2022::extension::ExtensionType;
 }
 
 #[cfg(test)]
@@ -2171,5 +2535,174 @@ mod tests {
 
         assert!(!paused);
         bound_read.assert_async().await;
+    }
+
+    // ====================================================================
+    // Confidential account decode and destination readiness
+    // ====================================================================
+
+    use super::confidential_fixtures::{account_with_confidential, confidential_mint, AccountSpec};
+    use private_channel_confidential::test_support::{self as cts, SimAccount};
+
+    fn t22(data: Vec<u8>) -> Account {
+        Account {
+            lamports: 1,
+            data,
+            owner: TOKEN_2022_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    fn healthy() -> AccountSpec {
+        let keys = cts::keys();
+        AccountSpec::healthy(&keys, &SimAccount::new(&keys), 0, 0)
+    }
+
+    #[test]
+    fn decode_reads_every_confidential_field() {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        sim.credit(&keys, 70_000, 0);
+        let mut spec = AccountSpec::healthy(&keys, &sim, 123, 0);
+        spec.pending_credit_counter = 3;
+        spec.expected_pending_credit_counter = 2;
+        spec.actual_pending_credit_counter = 1;
+        let ConfidentialAccountRead::Configured(view) =
+            decode_confidential_account(Some(&t22(account_with_confidential(&spec))))
+        else {
+            panic!("configured account must decode");
+        };
+        assert_eq!(view.public_amount, 123);
+        assert_eq!(view.elgamal_pubkey, keys.pubkey());
+        assert_eq!(
+            keys.decrypt_pending(&view.pending_lo, &view.pending_hi),
+            Ok(70_000)
+        );
+        assert!(keys.opens_to(&view.available, 0));
+        assert_eq!(keys.decrypt_aes(&view.decryptable_available), Some(0));
+        assert!(view.has_pending());
+        assert!(view.aes_known_stale());
+        assert_eq!(view.maximum_pending_credit_counter, 65_536);
+    }
+
+    #[test]
+    fn decode_tells_absent_foreign_and_unconfigured_apart() {
+        assert_eq!(
+            decode_confidential_account(None),
+            ConfidentialAccountRead::Absent
+        );
+        let mut foreign = t22(account_with_confidential(&healthy()));
+        foreign.owner = TOKEN_PROGRAM_ID;
+        assert_eq!(
+            decode_confidential_account(Some(&foreign)),
+            ConfidentialAccountRead::NotToken2022
+        );
+        assert_eq!(
+            decode_confidential_account(Some(&t22(vec![1, 2, 3]))),
+            ConfidentialAccountRead::NotToken2022
+        );
+        let plain = t22(create_mock_token_account_data(9, true));
+        assert_eq!(
+            decode_confidential_account(Some(&plain)),
+            ConfidentialAccountRead::NotConfigured {
+                public_amount: 9,
+                frozen: true
+            }
+        );
+    }
+
+    #[test]
+    fn counter_threshold_is_a_share_of_the_cap() {
+        let mut spec = healthy();
+        spec.maximum_pending_credit_counter = 100;
+        spec.pending_credit_counter = 49;
+        let view = |spec: &AccountSpec| match decode_confidential_account(Some(&t22(
+            account_with_confidential(spec),
+        ))) {
+            ConfidentialAccountRead::Configured(view) => view,
+            other => panic!("{other:?}"),
+        };
+        assert!(!view(&spec).counter_at_percent(50));
+        spec.pending_credit_counter = 50;
+        assert!(view(&spec).counter_at_percent(50));
+    }
+
+    #[test]
+    fn destination_readiness_names_each_refusal() {
+        let ready = healthy();
+        assert_eq!(
+            destination_readiness(&decode_confidential_account(Some(&t22(
+                account_with_confidential(&ready)
+            )))),
+            DestinationReadiness::Ready {
+                elgamal_pubkey: ready.elgamal_pubkey
+            }
+        );
+        type Mutate = fn(&mut AccountSpec);
+        let cases: Vec<(Mutate, &str)> = vec![
+            ((|s: &mut AccountSpec| s.frozen = true), "frozen"),
+            ((|s: &mut AccountSpec| s.approved = false), "not approved"),
+            (
+                (|s: &mut AccountSpec| s.allow_confidential_credits = false),
+                "credits disabled",
+            ),
+            (
+                (|s: &mut AccountSpec| s.pending_credit_counter = s.maximum_pending_credit_counter),
+                "counter full",
+            ),
+        ];
+        for (mutate, expected) in cases {
+            let mut spec = healthy();
+            mutate(&mut spec);
+            let read = decode_confidential_account(Some(&t22(account_with_confidential(&spec))));
+            match destination_readiness(&read) {
+                DestinationReadiness::NotReady(reason) => {
+                    assert!(reason.contains(expected), "{reason} should name {expected}")
+                }
+                other => panic!("{expected}: {other:?}"),
+            }
+        }
+        for read in [
+            ConfidentialAccountRead::Absent,
+            ConfidentialAccountRead::NotToken2022,
+            ConfidentialAccountRead::NotConfigured {
+                public_amount: 0,
+                frozen: false,
+            },
+        ] {
+            assert!(matches!(
+                destination_readiness(&read),
+                DestinationReadiness::NotReady(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn confidential_mint_params_read_auditor_and_fee() {
+        let auditor = cts::other_keys().pubkey();
+        let fee = ReleaseFee {
+            basis_points: 50,
+            maximum_fee: 1_000,
+            withdraw_withheld_pubkey: cts::keys().pubkey(),
+        };
+        assert_eq!(
+            decode_confidential_mint(&confidential_mint(Some(auditor), Some(fee)), 7),
+            Some(ConfidentialMintParams {
+                auditor: Some(auditor),
+                fee: Some(fee)
+            })
+        );
+        assert_eq!(
+            decode_confidential_mint(&confidential_mint(None, None), 7),
+            Some(ConfidentialMintParams {
+                auditor: None,
+                fee: None
+            })
+        );
+        assert_eq!(
+            decode_confidential_mint(&create_mock_mint_account_data(6), 0),
+            None
+        );
     }
 }

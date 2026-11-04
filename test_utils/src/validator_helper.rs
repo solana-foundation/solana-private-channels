@@ -346,10 +346,49 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
 /// Start the solana-test-validator without the geyser plugin enabled.
 /// Returns the test validator instance and the mint keypair.
 pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
+    start_no_geyser_with(Vec::new()).await
+}
+
+/// Token-2022 as deployed on mainnet; the validator bundles an older release whose
+/// confidential transfers lack what the escrow's confidential instructions use.
+const TOKEN_2022_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../core/precompiles/spl_token_2022-11.1.0.so"
+);
+
+const TOKEN_2022_PROGRAM_ID: solana_sdk::pubkey::Pubkey =
+    solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+/// Program that forwards an instruction by CPI, for escrow instructions sent as inner ones.
+pub const CPI_FORWARDER_PROGRAM_ID: solana_sdk::pubkey::Pubkey =
+    solana_sdk::pubkey!("FZvL33G3brVb4Pv5wmqzQitbCzbjrxsYASHXsge3v2nk");
+
+const CPI_FORWARDER_PROGRAM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/programs/cpi_forwarder_fixture.so"
+);
+
+/// A validator for confidential transfers: Token-2022 11.1.0 replaces the bundled one, the
+/// ZK ElGamal proof program is on (every feature is active on a test validator), and the
+/// CPI forwarder is loaded.
+pub async fn start_test_validator_confidential() -> (TestValidator, Keypair) {
+    start_no_geyser_with(vec![
+        make_program_info(TOKEN_2022_PROGRAM_ID.to_bytes(), TOKEN_2022_PATH),
+        make_program_info(
+            CPI_FORWARDER_PROGRAM_ID.to_bytes(),
+            CPI_FORWARDER_PROGRAM_PATH,
+        ),
+    ])
+    .await
+}
+
+async fn start_no_geyser_with(
+    extra_programs: Vec<UpgradeableProgramInfo>,
+) -> (TestValidator, Keypair) {
     verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
     // Same port strategy as start_test_validator — see the comment there.
-    let (test_validator, mint_keypair) = start_with_port_retry(|| {
+    let (test_validator, mint_keypair) = start_with_port_retry(move || {
         let rpc_port = get_free_port();
         let gossip_port = 0u16;
 
@@ -381,17 +420,15 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
             HOOK_FIXTURE_PROGRAM_PATH,
         );
 
+        let mut programs = vec![escrow_program, withdraw_program, hook_fixture_program];
+        programs.extend(extra_programs.iter().cloned());
         let mut genesis = TestValidatorGenesis::default();
 
         genesis
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
-            .add_upgradeable_programs_with_path(&[
-                escrow_program,
-                withdraw_program,
-                hook_fixture_program,
-            ])
+            .add_upgradeable_programs_with_path(&programs)
             .start()
     })
     .await;

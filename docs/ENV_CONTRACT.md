@@ -87,6 +87,19 @@ Keys with compose-side defaults (e.g. `PRIVATE_CHANNEL_VERSION`, `STREAMER_PORT`
 are still documented in `.env.example` so the contract is complete, even though
 omitting them from an env file is harmless.
 
+`ESCROW_CONFIDENTIAL_KEYS` is an optional secret: the escrow instance's confidential
+transfer keys, `{"elgamal_secret":"<base64 32 bytes>","aes_key":"<base64 16 bytes>"}`,
+read by `indexer-solana`, `operator-solana` and `operator-private-channel` and by no
+other service. Every surface ships it blank, which the services read as not
+configured. It becomes required once any escrow account is configured for confidential
+transfers: then those services refuse to start without the key that account holds.
+Single-quote it in an env file so compose reads the JSON literally.
+`scripts/check-required-env.sh` refuses a set value that is not that JSON shape (the
+message never shows the value), and the deploy asserts the same of
+`escrow_confidential_keys` (`secrets.yml`, or `ESCROW_CONFIDENTIAL_KEYS` in Doppler),
+which `templates/env.j2` renders quoted, or blank when unset. Generate it with
+`confidential_keygen` (see [confidential_transfers.md](runbooks/confidential_transfers.md#setup-ceremony)).
+
 `PRIVATE_CHANNEL_COMPLIANCE_OWNER` is optional; the node reads a blank value as unset.
 `.env.example` documents it as a commented line, which the check does not count. Compose passes it through only when it is set, and
 `templates/env.j2` renders it only when `compliance_owner` is set.

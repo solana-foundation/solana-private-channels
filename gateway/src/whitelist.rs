@@ -13,7 +13,8 @@ use private_channel_escrow_program_client::{
     accounts::AllowedWallet, decode_instance, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_withdraw_program_client::{
-    instructions::WITHDRAW_FUNDS_DISCRIMINATOR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    instructions::{CONFIDENTIAL_WITHDRAW_FUNDS_DISCRIMINATOR, WITHDRAW_FUNDS_DISCRIMINATOR},
+    PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
 use serde_json::Value;
 use solana_pubkey::Pubkey;
@@ -296,8 +297,9 @@ pub fn wallet_not_allowed_body(wallet: &Pubkey) -> Bytes {
     )
 }
 
-/// The withdrawer, then the destination, of every top-level WithdrawFunds, without
-/// repeats: the order ReleaseFunds checks them in. Empty for anything the write node
+/// The withdrawer, then the destination, of every top-level WithdrawFunds or
+/// ConfidentialWithdrawFunds (same accounts and data), without repeats: the order
+/// ReleaseFunds checks them in. Empty for anything the write node
 /// refuses on its own: larger than a v1 transaction, or not decodable. No program the
 /// channel admits calls WithdrawFunds by CPI; one that did would skip this check.
 fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
@@ -323,9 +325,11 @@ fn withdraw_wallets(params: &Value) -> Vec<Pubkey> {
     let mut wallets = Vec::new();
     for instruction in transaction.message.instructions() {
         let program = keys.get(usize::from(instruction.program_id_index));
-        if program != Some(&PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID)
-            || instruction.data.first() != Some(&WITHDRAW_FUNDS_DISCRIMINATOR)
-        {
+        let is_withdrawal = matches!(
+            instruction.data.first(),
+            Some(&WITHDRAW_FUNDS_DISCRIMINATOR | &CONFIDENTIAL_WITHDRAW_FUNDS_DISCRIMINATOR)
+        );
+        if program != Some(&PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID) || !is_withdrawal {
             continue;
         }
         let Some(withdrawer) = instruction
@@ -409,7 +413,8 @@ mod tests {
     };
     use private_channel_withdraw_program_client::{
         instructions::{
-            WithdrawFundsBuilder, SET_WITHDRAW_CONFIG_DISCRIMINATOR, WITHDRAW_FUNDS_DISCRIMINATOR,
+            ConfidentialWithdrawFundsBuilder, WithdrawFundsBuilder,
+            SET_WITHDRAW_CONFIG_DISCRIMINATOR, WITHDRAW_FUNDS_DISCRIMINATOR,
         },
         PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     };
@@ -431,6 +436,25 @@ mod tests {
             .token_account(Pubkey::new_unique())
             .token_program(Pubkey::new_unique())
             .associated_token_program(Pubkey::new_unique())
+            .withdraw_config(Pubkey::new_unique())
+            .treasury_token_account(Pubkey::new_unique())
+            .amount(1_000);
+        if let Some(destination) = destination {
+            builder.destination(destination);
+        }
+        builder.instruction()
+    }
+
+    /// A ConfidentialWithdrawFunds by `withdrawer`, built with its own generated builder.
+    fn confidential_withdraw_funds(
+        withdrawer: &Pubkey,
+        destination: Option<Pubkey>,
+    ) -> Instruction {
+        let mut builder = ConfidentialWithdrawFundsBuilder::new();
+        builder
+            .user(*withdrawer)
+            .mint(Pubkey::new_unique())
+            .token_account(Pubkey::new_unique())
             .withdraw_config(Pubkey::new_unique())
             .treasury_token_account(Pubkey::new_unique())
             .amount(1_000);
@@ -533,6 +557,51 @@ mod tests {
             &[
                 withdraw_funds(&first_withdrawer.pubkey(), None),
                 withdraw_funds(&second_withdrawer.pubkey(), None),
+            ],
+            &[&first_withdrawer, &second_withdrawer],
+        );
+
+        assert_eq!(
+            withdraw_wallets(&params),
+            vec![first_withdrawer.pubkey(), second_withdrawer.pubkey()]
+        );
+    }
+
+    // The escrow releases a confidential withdrawal under the same whitelist rule.
+    #[test]
+    fn a_confidential_withdrawal_checks_the_withdrawer_then_the_destination() {
+        let withdrawer = Keypair::new();
+        let destination = Pubkey::new_unique();
+        let with_destination = send_params(
+            &[confidential_withdraw_funds(
+                &withdrawer.pubkey(),
+                Some(destination),
+            )],
+            &[&withdrawer],
+        );
+        let without_destination = send_params(
+            &[confidential_withdraw_funds(&withdrawer.pubkey(), None)],
+            &[&withdrawer],
+        );
+
+        assert_eq!(
+            withdraw_wallets(&with_destination),
+            vec![withdrawer.pubkey(), destination]
+        );
+        assert_eq!(
+            withdraw_wallets(&without_destination),
+            vec![withdrawer.pubkey()]
+        );
+    }
+
+    #[test]
+    fn public_and_confidential_withdrawals_in_one_transaction_are_both_checked() {
+        let first_withdrawer = Keypair::new();
+        let second_withdrawer = Keypair::new();
+        let params = send_params(
+            &[
+                withdraw_funds(&first_withdrawer.pubkey(), None),
+                confidential_withdraw_funds(&second_withdrawer.pubkey(), None),
             ],
             &[&first_withdrawer, &second_withdrawer],
         );

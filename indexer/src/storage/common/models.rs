@@ -123,6 +123,18 @@ pub struct DbTransaction {
     /// the finality window still lets the refund skip the bitmap gate. Rows that
     /// were never refused carry false (column DEFAULT).
     pub release_refused_on_chain: bool,
+    /// A confidential deposit, or a withdrawal to be released confidentially.
+    pub confidential: bool,
+    /// The sender leaves the row alone until this time. Set while a confidential
+    /// release waits for a balance it can prove.
+    pub not_before: Option<DateTime<Utc>>,
+    /// When the current wait began, kept across retries so the backoff can grow.
+    pub wait_started_at: Option<DateTime<Utc>>,
+    /// A confidential deposit our key could not decrypt. Its amount is 0 and it is never
+    /// minted; while one exists its mint is poisoned. Cleared by `confidential-recover`.
+    pub confidential_undecrypted: bool,
+    /// The deposit event exactly as emitted, kept on undecrypted rows for recovery.
+    pub confidential_raw: Option<Vec<u8>>,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -330,6 +342,8 @@ pub struct DbTransactionBuilder {
     trace_id: Option<String>,
     instruction_index: i32,
     inner_index: Option<i32>,
+    confidential: bool,
+    confidential_raw: Option<Vec<u8>>,
 }
 
 impl DbTransactionBuilder {
@@ -346,7 +360,20 @@ impl DbTransactionBuilder {
             trace_id: None,
             instruction_index: 0,
             inner_index: None,
+            confidential: false,
+            confidential_raw: None,
         }
+    }
+
+    /// A confidential deposit our key could not read; `raw` is its event for recovery.
+    pub fn undecrypted(mut self, raw: Vec<u8>) -> Self {
+        self.confidential_raw = Some(raw);
+        self
+    }
+
+    pub fn confidential(mut self, confidential: bool) -> Self {
+        self.confidential = confidential;
+        self
     }
 
     pub fn initiator(mut self, initiator: String) -> Self {
@@ -412,6 +439,11 @@ impl DbTransactionBuilder {
             inner_index: self.inner_index,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: self.confidential,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: self.confidential_raw.is_some(),
+            confidential_raw: self.confidential_raw,
         }
     }
 }

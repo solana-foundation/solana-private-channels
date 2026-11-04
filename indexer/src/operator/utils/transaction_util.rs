@@ -14,6 +14,8 @@ use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keychain::SolanaSigner;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::InstructionError;
+use solana_sdk::message::{v1, VersionedMessage};
+use solana_sdk::transaction::VersionedTransaction;
 use solana_sdk::{
     message::Message,
     pubkey::Pubkey,
@@ -315,7 +317,7 @@ pub async fn classify_failure(
 }
 
 /// The escrow error a custom code names, if the escrow raised it.
-fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> {
+pub(crate) fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> {
     match code {
         11 => Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
         12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
@@ -330,7 +332,7 @@ fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> 
 /// The program whose error failed the transaction: the runtime logs each failing frame
 /// innermost first. Program output is always prefixed `Program log:`, so it cannot pose
 /// as a runtime line. A truncated log may have lost the innermost frame, so it names none.
-fn failing_program(logs: &[String]) -> Option<Pubkey> {
+pub(crate) fn failing_program(logs: &[String]) -> Option<Pubkey> {
     if logs.iter().any(|line| line == "Log truncated") {
         return None;
     }
@@ -340,6 +342,145 @@ fn failing_program(logs: &[String]) -> Option<Pubkey> {
             return None;
         }
         program.parse().ok()
+    })
+}
+
+/// Why a v1 transaction could not be built. `TooLarge` and `TooManyAccounts` are
+/// permanent for the row; `Compile` is a malformed instruction set.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum V1BuildError {
+    #[error("v1 transaction is {bytes} bytes, above {}", v1::MAX_TRANSACTION_SIZE)]
+    TooLarge { bytes: usize },
+    #[error(
+        "v1 transaction names {accounts} accounts, above {}",
+        v1::MAX_ADDRESSES
+    )]
+    TooManyAccounts { accounts: usize },
+    #[error("v1 message did not compile: {0}")]
+    Compile(String),
+}
+
+/// v1's priority fee is a total in lamports: the per-unit price in micro-lamports times
+/// the unit limit, rounded up so the fee is never below the legacy equivalent.
+pub fn v1_priority_fee(compute_unit_price: u64, compute_unit_limit: u32) -> u64 {
+    let micro = u128::from(compute_unit_price) * u128::from(compute_unit_limit);
+    u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
+/// Compile `ix_with_signers` as a v1 message with explicit limits, since v1 reads a
+/// missing limit as 0. Sized against the v1 caps before anything is signed.
+pub fn compile_v1(
+    ix_with_signers: &InstructionWithSigners,
+    recent_blockhash: Hash,
+    loaded_accounts_data_size_limit: u32,
+) -> Result<v1::Message, V1BuildError> {
+    let compute_unit_limit = ix_with_signers
+        .compute_budget
+        .unwrap_or(crate::operator::confidential_constants::CU_CONFIDENTIAL_APPLY);
+    let mut config = v1::TransactionConfig::empty()
+        .with_compute_unit_limit(compute_unit_limit)
+        .with_loaded_accounts_data_size_limit(loaded_accounts_data_size_limit);
+    if let Some(price) = ix_with_signers.compute_unit_price {
+        config = config.with_priority_fee(v1_priority_fee(price, compute_unit_limit));
+    }
+    let message = v1::Message::try_compile_with_config(
+        &ix_with_signers.fee_payer,
+        &ix_with_signers.instructions,
+        recent_blockhash,
+        config,
+    )
+    .map_err(|e| V1BuildError::Compile(e.to_string()))?;
+    if message.account_keys.len() > usize::from(v1::MAX_ADDRESSES) {
+        return Err(V1BuildError::TooManyAccounts {
+            accounts: message.account_keys.len(),
+        });
+    }
+    let bytes = v1_wire_len(&message);
+    if bytes > v1::MAX_TRANSACTION_SIZE {
+        return Err(V1BuildError::TooLarge { bytes });
+    }
+    Ok(message)
+}
+
+/// Bytes a signed v1 transaction of `message` takes: the message, one signature per
+/// required signer and the short_vec count.
+pub fn v1_wire_len(message: &v1::Message) -> usize {
+    let signatures = usize::from(message.header.num_required_signatures);
+    let count_len = if signatures < 128 { 1 } else { 2 };
+    count_len
+        + signatures * SIGNATURE_BYTES
+        + VersionedMessage::V1(message.clone()).serialize().len()
+}
+
+/// Sign a v1 message with `sign_message`, which every keychain backend implements,
+/// placing each signature at its signer's account index.
+pub async fn sign_v1(
+    message: v1::Message,
+    signers: &[&'static solana_keychain::Signer],
+) -> Result<VersionedTransaction, TransactionError> {
+    let message = VersionedMessage::V1(message);
+    let bytes = message.serialize();
+    let required = usize::from(message.header().num_required_signatures);
+    let mut signatures = vec![Signature::default(); required];
+    for (index, key) in message.static_account_keys()[..required].iter().enumerate() {
+        let signer = signers
+            .iter()
+            .find(|signer| signer.pubkey() == *key)
+            .ok_or_else(|| {
+                TransactionError::Program(crate::error::ProgramError::InvalidBuilder {
+                    reason: format!("no signer for required key {key}"),
+                })
+            })?;
+        signatures[index] = signer
+            .sign_message(&bytes)
+            .await
+            .map_err(TransactionError::Signer)?;
+    }
+    Ok(VersionedTransaction {
+        signatures,
+        message,
+    })
+}
+
+/// A v1 transaction ready to journal and send: its signature, the blockhash's
+/// `last_valid_block_height` and the slot that blockhash was read at.
+pub struct SignedV1 {
+    pub transaction: VersionedTransaction,
+    pub signature: Signature,
+    pub last_valid_block_height: u64,
+    pub blockhash_slot: u64,
+}
+
+/// Either the transaction cannot exist (`Build`) or this attempt failed (`Transaction`).
+#[derive(Debug, thiserror::Error)]
+pub enum V1Error {
+    #[error(transparent)]
+    Build(#[from] V1BuildError),
+    #[error(transparent)]
+    Transaction(#[from] TransactionError),
+}
+
+/// `build_and_sign` for v1: compile with limits, size-check, sign.
+pub async fn build_and_sign_v1(
+    rpc_client: &RpcClientWithRetry,
+    ix_with_signers: &InstructionWithSigners,
+    loaded_accounts_data_size_limit: u32,
+) -> Result<SignedV1, V1Error> {
+    let (recent_blockhash, blockhash_slot, last_valid_block_height) = rpc_client
+        .get_latest_blockhash_with_commitment_and_context()
+        .await
+        .map_err(TransactionError::Rpc)?;
+    let message = compile_v1(
+        ix_with_signers,
+        recent_blockhash,
+        loaded_accounts_data_size_limit,
+    )?;
+    let transaction = sign_v1(message, &ix_with_signers.signers).await?;
+    Ok(SignedV1 {
+        signature: transaction.signatures[0],
+        transaction,
+        last_valid_block_height,
+        blockhash_slot,
     })
 }
 
@@ -1080,5 +1221,135 @@ mod tests {
             signature, transaction.signatures[0],
             "returned signature must be the transaction's first signature"
         );
+    }
+
+    // ====================================================================
+    // v1 transactions for confidential releases
+    // ====================================================================
+
+    fn memory_signer() -> &'static solana_keychain::Signer {
+        let keypair = solana_sdk::signature::Keypair::new();
+        Box::leak(Box::new(
+            solana_keychain::Signer::from_memory(&keypair.to_base58_string()).unwrap(),
+        ))
+    }
+
+    fn v1_input(
+        instructions: Vec<solana_sdk::instruction::Instruction>,
+        signers: Vec<&'static solana_keychain::Signer>,
+    ) -> InstructionWithSigners {
+        InstructionWithSigners {
+            instructions,
+            fee_payer: signers[0].pubkey(),
+            signers,
+            compute_unit_price: Some(1),
+            compute_budget: Some(1_400_000),
+        }
+    }
+
+    fn ix_with(
+        accounts: usize,
+        data: usize,
+        signer: Option<Pubkey>,
+    ) -> solana_sdk::instruction::Instruction {
+        let mut metas: Vec<_> = (0..accounts)
+            .map(|_| solana_sdk::instruction::AccountMeta::new(Pubkey::new_unique(), false))
+            .collect();
+        if let Some(signer) = signer {
+            metas.push(solana_sdk::instruction::AccountMeta::new_readonly(
+                signer, true,
+            ));
+        }
+        solana_sdk::instruction::Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &vec![7u8; data],
+            metas,
+        )
+    }
+
+    #[test]
+    fn v1_sets_both_limits_and_converts_the_priority_fee() {
+        let payer = memory_signer();
+        let input = v1_input(vec![ix_with(3, 10, None)], vec![payer]);
+        let message = compile_v1(&input, Hash::new_unique(), 4_000_000).unwrap();
+        assert_eq!(message.config.compute_unit_limit, Some(1_400_000));
+        assert_eq!(
+            message.config.loaded_accounts_data_size_limit,
+            Some(4_000_000)
+        );
+        // 1 micro-lamport per unit over 1.4M units is 1.4 lamports, rounded up.
+        assert_eq!(message.config.priority_fee, Some(2));
+        assert_eq!(v1_priority_fee(0, 1_400_000), 0);
+        assert_eq!(v1_priority_fee(1_000_000, 200_000), 200_000);
+        assert_eq!(v1_priority_fee(u64::MAX, u32::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn v1_without_a_price_has_no_priority_fee_and_a_default_limit() {
+        let payer = memory_signer();
+        let mut input = v1_input(vec![ix_with(1, 1, None)], vec![payer]);
+        input.compute_unit_price = None;
+        input.compute_budget = None;
+        let message = compile_v1(&input, Hash::new_unique(), 4_000_000).unwrap();
+        assert_eq!(message.config.priority_fee, None);
+        assert_eq!(
+            message.config.compute_unit_limit,
+            Some(crate::operator::confidential_constants::CU_CONFIDENTIAL_APPLY)
+        );
+    }
+
+    #[test]
+    fn v1_over_the_size_cap_is_too_large() {
+        let payer = memory_signer();
+        let input = v1_input(vec![ix_with(2, 4_000, None)], vec![payer]);
+        assert!(matches!(
+            compile_v1(&input, Hash::new_unique(), 4_000_000),
+            Err(V1BuildError::TooLarge { bytes }) if bytes > 4_096
+        ));
+        // Just under the cap still compiles.
+        let fits = v1_input(vec![ix_with(2, 3_000, None)], vec![payer]);
+        let message = compile_v1(&fits, Hash::new_unique(), 4_000_000).unwrap();
+        assert!(v1_wire_len(&message) <= 4_096);
+    }
+
+    #[test]
+    fn v1_over_the_account_cap_is_refused() {
+        let payer = memory_signer();
+        let input = v1_input(vec![ix_with(70, 1, None)], vec![payer]);
+        assert!(matches!(
+            compile_v1(&input, Hash::new_unique(), 4_000_000),
+            Err(V1BuildError::TooManyAccounts { accounts }) if accounts > 64
+        ));
+    }
+
+    #[tokio::test]
+    async fn v1_is_signed_by_every_required_signer_in_key_order() {
+        let payer = memory_signer();
+        let operator = memory_signer();
+        let input = v1_input(
+            vec![ix_with(2, 8, Some(operator.pubkey()))],
+            vec![payer, operator],
+        );
+        let message = compile_v1(&input, Hash::new_unique(), 4_000_000).unwrap();
+        let transaction = sign_v1(message, &input.signers).await.unwrap();
+        let bytes = transaction.message.serialize();
+        let keys = transaction.message.static_account_keys();
+        assert_eq!(transaction.signatures.len(), 2);
+        assert_eq!(keys[0], payer.pubkey());
+        for (signature, key) in transaction.signatures.iter().zip(keys) {
+            assert!(
+                signature.verify(key.as_ref(), &bytes),
+                "signature for {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_without_a_required_signer_is_an_error() {
+        let payer = memory_signer();
+        let missing = Pubkey::new_unique();
+        let input = v1_input(vec![ix_with(1, 1, Some(missing))], vec![payer]);
+        let message = compile_v1(&input, Hash::new_unique(), 4_000_000).unwrap();
+        assert!(sign_v1(message, &input.signers).await.is_err());
     }
 }

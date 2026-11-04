@@ -118,6 +118,7 @@ jobs:
               - '.github/actions/setup-solana/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'integration/**'
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
@@ -132,6 +133,7 @@ jobs:
               - '.github/actions/setup-solana/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'integration/**'
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
@@ -144,6 +146,7 @@ jobs:
               - '.github/actions/setup-environment/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'gateway/**'
               - 'auth/**'
               # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
@@ -281,11 +284,13 @@ jobs:
             -p private-channel-escrow-program \
             -p tests-private-channel-escrow-program \
             -p transfer-hook-fixture \
+            -p cpi-forwarder-fixture \
             -p private-channel-withdraw-program \
             -p tests-private-channel-withdraw-program \
             -p private-channel-core \
             -p private-channel-gateway \
             -p private-channel-indexer \
+            -p private-channel-confidential \
             -p private-channel-integration \
             -p test_utils \
             -p devnet-scripts \

@@ -9,6 +9,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
+use private_channel_confidential::Keys;
+use private_channel_indexer::operator::utils::mint_util::{
+    decode_confidential_account, ConfidentialAccountRead,
+};
 use serde_json::{json, Value};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
@@ -16,6 +20,10 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::{convert::Infallible, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::{net::TcpListener, task::JoinHandle};
+
+const TOKEN_2022_ID: Pubkey = solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("ATokenGPvbd2nbmAXpTqXmzpo9NWp9xSHvpGsQYQkTH");
 
 /// A running shim. Dropping it stops the server.
 pub struct ChannelShim {
@@ -32,17 +40,31 @@ const TOKEN_PROGRAMS: [&str; 2] = [
 impl ChannelShim {
     /// Start a shim in front of `upstream_url` on a free local port.
     pub async fn start(upstream_url: &str) -> Self {
-        Self::start_with(upstream_url, None).await
+        Self::start_with(upstream_url, None, None).await
     }
 
     /// Like `start`, but every mint account it serves reports a supply equal to what escrow
     /// `instance` holds of that mint. A harness that plays the channel on the same validator
     /// needs this: every token outside custody would otherwise read as unbacked channel supply.
     pub async fn start_mirroring_custody(upstream_url: &str, instance: Pubkey) -> Self {
-        Self::start_with(upstream_url, Some(instance)).await
+        Self::start_with(upstream_url, Some(instance), None).await
     }
 
-    async fn start_with(upstream_url: &str, custody_of: Option<Pubkey>) -> Self {
+    /// Like `start_mirroring_custody`, with each escrow account's confidential balance
+    /// (pending plus the verified available) counted too, decrypted with the instance `keys`.
+    pub async fn start_mirroring_confidential_custody(
+        upstream_url: &str,
+        instance: Pubkey,
+        keys: Arc<Keys>,
+    ) -> Self {
+        Self::start_with(upstream_url, Some(instance), Some(keys)).await
+    }
+
+    async fn start_with(
+        upstream_url: &str,
+        custody_of: Option<Pubkey>,
+        keys: Option<Arc<Keys>>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("channel shim: bind 127.0.0.1:0");
@@ -55,6 +77,7 @@ impl ChannelShim {
             ),
             http: Client::builder(TokioExecutor::new()).build_http(),
             custody_of,
+            keys,
         });
         let task = tokio::spawn(async move {
             loop {
@@ -93,6 +116,7 @@ struct Upstream {
     rpc: RpcClient,
     http: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
     custody_of: Option<Pubkey>,
+    keys: Option<Arc<Keys>>,
 }
 
 impl Upstream {
@@ -160,6 +184,38 @@ impl Upstream {
 
     /// What `instance` holds of `mint` across its token accounts, 0 when it holds none.
     async fn custody_balance(&self, instance: &Pubkey, mint: &str) -> u64 {
+        let public = self.public_custody(instance, mint).await;
+        public + self.confidential_custody(instance, mint).await
+    }
+
+    /// Pending plus available of the escrow's confidential balance; 0 without keys, when
+    /// unconfigured, or when the AES copy does not open (a stale copy is held anyway).
+    async fn confidential_custody(&self, instance: &Pubkey, mint: &str) -> u64 {
+        let (Some(keys), Ok(mint)) = (self.keys.as_ref(), Pubkey::from_str(mint)) else {
+            return 0;
+        };
+        let ata = Pubkey::find_program_address(
+            &[instance.as_ref(), TOKEN_2022_ID.as_ref(), mint.as_ref()],
+            &ASSOCIATED_TOKEN_PROGRAM_ID,
+        )
+        .0;
+        let account = self.rpc.get_account(&ata).await.ok();
+        let ConfidentialAccountRead::Configured(view) =
+            decode_confidential_account(account.as_ref())
+        else {
+            return 0;
+        };
+        let pending = keys
+            .decrypt_pending(&view.pending_lo, &view.pending_hi)
+            .unwrap_or(0);
+        let available = keys
+            .decrypt_aes(&view.decryptable_available)
+            .filter(|x| keys.opens_to(&view.available, *x))
+            .unwrap_or(0);
+        pending + available
+    }
+
+    async fn public_custody(&self, instance: &Pubkey, mint: &str) -> u64 {
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
             "params": [instance.to_string(), {"mint": mint}, {"encoding": "jsonParsed"}]

@@ -174,6 +174,35 @@ enum Mode {
     /// 2 on an error and 3 when the ledger cannot be compared yet: the escrow indexer has
     /// not reached the custody slot, or a resync is rebuilding it.
     Reconcile,
+    /// Re-decrypt a poisoned mint's undecrypted confidential deposits with the current
+    /// ESCROW_CONFIDENTIAL_KEYS and clear their flags. Takes the live-state lock
+    /// exclusively, so stop the indexer and operators first. Refuses during a resync.
+    ConfidentialRecover {
+        /// Mint whose undecrypted deposits to recover.
+        #[arg(long)]
+        mint: String,
+    },
+    /// Ask the withdraw operator to move escrow funds between the public and the
+    /// confidential balance. Records a request against the available balance verified
+    /// now; the operator runs it and refuses it if that balance moved meanwhile.
+    Rebalance {
+        /// Mint whose escrow account to rebalance.
+        #[arg(long)]
+        mint: String,
+        /// Move this many base units from confidential to public.
+        #[arg(
+            long,
+            conflicts_with = "to_confidential",
+            required_unless_present = "to_confidential"
+        )]
+        to_public: Option<u64>,
+        /// Move this many base units from public to confidential.
+        #[arg(long)]
+        to_confidential: Option<u64>,
+        /// Solana RPC that serves the escrow account.
+        #[arg(long)]
+        rpc_url: String,
+    },
 }
 
 /// `reconcile` exit codes.
@@ -265,7 +294,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Exits here so a setup failure reports as an error, not as the mismatch code a
         // returned error would produce.
         Mode::Reconcile => std::process::exit(run_reconcile(figment, args.verbose).await),
+        Mode::ConfidentialRecover { mint } => {
+            run_confidential_recover(figment, args.verbose, &mint).await
+        }
+        Mode::Rebalance {
+            mint,
+            to_public,
+            to_confidential,
+            rpc_url,
+        } => run_rebalance(figment, &mint, to_public, to_confidential, rpc_url).await,
     }
+}
+
+/// Record one rebalance request for the withdraw operator to run.
+async fn run_rebalance(
+    figment: Figment,
+    mint: &str,
+    to_public: Option<u64>,
+    to_confidential: Option<u64>,
+    rpc_url: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::storage::confidential_sender::RebalanceDirection;
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    let common: CommonSection = figment.extract_inner("common")?;
+    let storage: StorageSection = figment.extract_inner("storage")?;
+    let instance: solana_sdk::pubkey::Pubkey = common
+        .escrow_instance_id
+        .ok_or("rebalance needs common.escrow_instance_id")?
+        .parse()?;
+    let keys = private_channel_confidential::Keys::from_env()?
+        .ok_or("rebalance needs ESCROW_CONFIDENTIAL_KEYS")?;
+    let (direction, amount) = match (to_public, to_confidential) {
+        (Some(amount), None) => (RebalanceDirection::ToPublic, amount),
+        (None, Some(amount)) => (RebalanceDirection::ToConfidential, amount),
+        _ => return Err("pass exactly one of --to-public or --to-confidential".into()),
+    };
+    let mint: solana_sdk::pubkey::Pubkey = mint.parse()?;
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
+    let storage_instance = match storage.storage_type {
+        StorageType::Postgres => private_channel_indexer::storage::Storage::Postgres(
+            private_channel_indexer::storage::PostgresDb::new(&PostgresConfig {
+                database_url,
+                max_connections: storage.max_connections,
+            })
+            .await?,
+        ),
+    };
+    storage_instance.init_schema().await?;
+    let rpc = private_channel_indexer::operator::RpcClientWithRetry::with_retry_config(
+        rpc_url,
+        Default::default(),
+        solana_commitment_config::CommitmentConfig::confirmed(),
+    );
+    let id = private_channel_indexer::operator::sender::confidential::request_rebalance(
+        &storage_instance,
+        &rpc,
+        &keys,
+        &instance,
+        &mint,
+        direction,
+        amount,
+    )
+    .await?;
+    println!("rebalance request {id} recorded");
+    Ok(())
+}
+
+/// Recover one poisoned mint's undecrypted deposits, then report what changed.
+async fn run_confidential_recover(
+    figment: Figment,
+    verbose: bool,
+    mint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(if verbose {
+            "info,private_channel_indexer=debug"
+        } else {
+            "info"
+        })
+        .init();
+    let common: CommonSection = figment.extract_inner("common")?;
+    let storage: StorageSection = figment.extract_inner("storage")?;
+    if common.program_type != ProgramType::Escrow {
+        return Err("confidential-recover requires the escrow indexer config".into());
+    }
+    let keys = private_channel_indexer::indexer::confidential::load_keys()?.ok_or(
+        "confidential-recover needs ESCROW_CONFIDENTIAL_KEYS set to the escrow instance's keys",
+    )?;
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
+    let storage_instance = match storage.storage_type {
+        StorageType::Postgres => private_channel_indexer::storage::Storage::Postgres(
+            private_channel_indexer::storage::PostgresDb::new(&PostgresConfig {
+                database_url,
+                max_connections: storage.max_connections,
+            })
+            .await?,
+        ),
+    };
+    storage_instance.init_schema().await?;
+    let instance = parse_escrow_instance_id(common.escrow_instance_id.clone())?
+        .ok_or("confidential-recover needs common.escrow_instance_id")?;
+    // rpc_url is Solana for the escrow indexer, where the escrow accounts live.
+    let source = private_channel_indexer::indexer::confidential::RpcEscrowKeySource {
+        rpc: std::sync::Arc::new(
+            private_channel_indexer::operator::utils::RpcClientWithRetry::with_retry_config(
+                common.rpc_url.clone(),
+                private_channel_indexer::operator::utils::RetryConfig::default(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            ),
+        ),
+    };
+    let report = private_channel_indexer::indexer::confidential::run_recover(
+        &storage_instance,
+        &keys,
+        &source,
+        &instance,
+        mint,
+        private_channel_indexer::storage::common::storage::live_lock::LIVE_LOCK_HEARTBEAT_INTERVAL,
+    )
+    .await?;
+    println!(
+        "recovered {} deposit(s), {} still unreadable",
+        report.recovered, report.still_unreadable
+    );
+    if report.still_unreadable > 0 {
+        return Err(format!("mint {mint} is still poisoned").into());
+    }
+    Ok(())
 }
 
 /// Run one reconciliation and return its exit code.
@@ -306,6 +463,8 @@ async fn reconcile_once(
     if common.program_type != ProgramType::Escrow {
         return Err("reconcile requires the escrow indexer config (program_type = escrow)".into());
     }
+    // A malformed key fails before any read; configured mints need it to count their custody.
+    let confidential_keys = private_channel_indexer::indexer::confidential::load_keys()?;
 
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
@@ -346,6 +505,7 @@ async fn reconcile_once(
         &common_config.rpc_url,
         common_config.source_rpc_url.as_deref(),
         &instance_pda,
+        confidential_keys.as_deref(),
     )
     .await)
 }
@@ -704,6 +864,12 @@ async fn run_resync(
         .map_err(|e| format!("Signer configuration error: {}", e))?;
     // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
     validate_resync_config(&storage, &indexer)?;
+    // The escrow rebuild decrypts confidential events; the withdraw rebuild never does.
+    let confidential_keys = if common.program_type == ProgramType::Escrow {
+        private_channel_indexer::indexer::confidential::load_keys()?
+    } else {
+        None
+    };
 
     // Get DATABASE_URL from environment
     let database_url =
@@ -764,7 +930,8 @@ async fn run_resync(
         common.program_type,
         backfill_config_base,
         escrow_instance_id,
-    );
+    )
+    .with_confidential_keys(confidential_keys);
 
     // Reconcile-on-rebuild is mandatory: each already-serviced deposit or remint must be
     // rebuilt in its terminal state rather than as a fresh pending row the operator would

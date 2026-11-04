@@ -291,6 +291,7 @@ fn spawn_reconciliation(
             rpc,
             channel_rpc,
             instance,
+            None,
             Some(health),
             cancel,
             private_channel_indexer::operator::solvency_fence::SolvencyFence::closed(),
@@ -511,6 +512,7 @@ async fn startup_comparison_at_threshold_zero(
         Some(channel_rpc_url),
         &instance,
         &snapshot,
+        None,
     )
     .await
 }
@@ -537,6 +539,7 @@ async fn startup_comparison_over_a_lagging_ledger(
         Some(channel_rpc_url),
         &instance,
         &snapshot,
+        None,
     )
     .await
 }

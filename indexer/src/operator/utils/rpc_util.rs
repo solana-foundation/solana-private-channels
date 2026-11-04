@@ -445,6 +445,26 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Send a signed v1 transaction base64, with preflight at confirmed so the simulation
+    /// sees the state the confidential proofs were built from.
+    pub async fn send_versioned_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::VersionedTransaction,
+        retry_policy: RetryPolicy,
+    ) -> Result<solana_sdk::signature::Signature, Box<client_error::Error>> {
+        let config = solana_rpc_client_api::config::RpcSendTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            preflight_commitment: Some(solana_commitment_config::CommitmentLevel::Confirmed),
+            ..Default::default()
+        };
+        self.with_retry("send_versioned_transaction", retry_policy, || async {
+            self.rpc_client
+                .send_transaction_with_config(transaction, config)
+                .await
+        })
+        .await
+    }
+
     /// Get account data with retry
     pub async fn get_account_data(
         &self,

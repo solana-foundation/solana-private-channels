@@ -223,6 +223,70 @@ pub const BAIL_REASONS: [&str; 10] = [
     BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN,
 ];
 
+// Confidential withdrawals: park labels, and the sender's applies and AES repairs.
+pub const BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED: &str = "confidential_mint_not_configured";
+pub const BAIL_REASON_CONFIDENTIAL_MINT_POISONED: &str = "confidential_mint_poisoned";
+pub const BAIL_REASON_DESTINATION_NOT_READY: &str = "destination_not_ready";
+pub const BAIL_REASON_CONFIDENTIAL_BALANCE_LOW: &str = "confidential_balance_low";
+pub const BAIL_REASON_CONFIDENTIAL_STALE_PROOF: &str = "confidential_stale_proof";
+pub const BAIL_REASON_CONFIDENTIAL_TX_TOO_LARGE: &str = "confidential_tx_too_large";
+/// A public release on a confidential-configured mint whose public balance is short.
+pub const BAIL_REASON_PUBLIC_BALANCE_LOW: &str = "public_balance_low";
+
+pub const CONFIDENTIAL_BAIL_REASONS: [&str; 7] = [
+    BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+    BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+    BAIL_REASON_DESTINATION_NOT_READY,
+    BAIL_REASON_CONFIDENTIAL_BALANCE_LOW,
+    BAIL_REASON_CONFIDENTIAL_STALE_PROOF,
+    BAIL_REASON_CONFIDENTIAL_TX_TOO_LARGE,
+    BAIL_REASON_PUBLIC_BALANCE_LOW,
+];
+
+gauge_vec!(
+    OPERATOR_CONFIDENTIAL_PENDING_COUNTER,
+    "private_channel_operator_confidential_pending_credit_counter_ratio",
+    "Escrow pending credit counter as a share of its cap, from the sender's last read",
+    &["mint"]
+);
+
+counter_vec!(
+    OPERATOR_CONFIDENTIAL_APPLIES,
+    "private_channel_operator_confidential_applies_total",
+    "ApplyPendingBalance sent by the sender, by what triggered it",
+    &["mint", "trigger"]
+);
+
+// 1 from the first repair that ran out of its back-to-back budget until a repair lands.
+gauge_vec!(
+    OPERATOR_CONFIDENTIAL_AES_REPAIR_DEFERRED,
+    "private_channel_operator_confidential_aes_repair_deferred",
+    "1 while a mint's stale AES copy is waiting on a backed-off repair",
+    &["mint"]
+);
+
+counter_vec!(
+    OPERATOR_CONFIDENTIAL_WAITS,
+    "private_channel_operator_confidential_waits_total",
+    "Confidential releases sent back to Pending because no balance candidate verified",
+    &["mint"]
+);
+
+// A park holds its nonce, and an unreleased nonce holds rotation for the instance.
+gauge_vec!(
+    OPERATOR_CONFIDENTIAL_OLDEST_PARK_SECONDS,
+    "private_channel_operator_confidential_oldest_park_seconds",
+    "Age of the oldest parked confidential withdrawal (0 when none)",
+    &["program_type"]
+);
+
+gauge_vec!(
+    OPERATOR_BITMAP_GENERATION_USED_RATIO,
+    "private_channel_operator_bitmap_generation_used_ratio",
+    "Share of the current bitmap generation's nonces already issued",
+    &["program_type"]
+);
+
 // Supervision: a critical task inside the operator exited.  The supervisor
 // aborts the process immediately when this increments; the counter exists
 // so dashboards can alert even if the restart is fast.
@@ -378,6 +442,45 @@ counter_vec!(
     &["chain", "outcome"]
 );
 
+// A poisoned mint has a confidential deposit our key could not decrypt, or an escrow
+// account configured with another key. It stays held until `indexer confidential-recover`.
+gauge_vec!(
+    CONFIDENTIAL_MINT_POISONED,
+    "private_channel_confidential_mint_poisoned",
+    "1 while a mint has a confidential deposit the key could not decrypt or a foreign key",
+    &["mint"]
+);
+
+counter_vec!(
+    CONFIDENTIAL_DECRYPT_FAILURES,
+    "private_channel_confidential_decrypt_failures_total",
+    "Confidential events the indexer could not decrypt or whose key did not match",
+    &["kind"]
+);
+
+// Confidential custody in escrow reconciliation, read from the escrow account. Held mints are
+// alert-only; a mismatch on a healthy mint counts as a dark input.
+gauge_vec!(
+    RECONCILIATION_CONFIDENTIAL_MISMATCH,
+    "private_channel_reconciliation_confidential_mismatch",
+    "1 while a mint's confidential custody cannot be proven from its escrow account",
+    &["mint"]
+);
+
+gauge_vec!(
+    RECONCILIATION_CONFIDENTIAL_LAGGING,
+    "private_channel_reconciliation_confidential_lagging",
+    "1 while a mint's confidential custody is held, by reason (stale_aes, pending_too_large, poisoned, key_mismatch)",
+    &["mint", "reason"]
+);
+
+gauge_vec!(
+    RECONCILIATION_CONFIDENTIAL_HOLD_AGE,
+    "private_channel_reconciliation_confidential_hold_age_seconds",
+    "Seconds a configured mint has been left out of reconciliation, by reason (0 when not held for it)",
+    &["mint", "reason"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -489,6 +592,9 @@ pub fn init_labels(program_type: &str) {
     for reason in &BAIL_REASONS {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
     }
+    for reason in &CONFIDENTIAL_BAIL_REASONS {
+        OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
+    }
 
     for outcome in &[
         "completed",
@@ -576,6 +682,17 @@ pub fn init_labels(program_type: &str) {
 
 pub fn init() {
     private_channel_metrics::init_metrics!(
+        OPERATOR_CONFIDENTIAL_PENDING_COUNTER,
+        OPERATOR_CONFIDENTIAL_APPLIES,
+        OPERATOR_CONFIDENTIAL_AES_REPAIR_DEFERRED,
+        OPERATOR_CONFIDENTIAL_WAITS,
+        OPERATOR_CONFIDENTIAL_OLDEST_PARK_SECONDS,
+        OPERATOR_BITMAP_GENERATION_USED_RATIO,
+        CONFIDENTIAL_MINT_POISONED,
+        CONFIDENTIAL_DECRYPT_FAILURES,
+        RECONCILIATION_CONFIDENTIAL_MISMATCH,
+        RECONCILIATION_CONFIDENTIAL_LAGGING,
+        RECONCILIATION_CONFIDENTIAL_HOLD_AGE,
         INDEXER_SLOTS_PROCESSED,
         INDEXER_TRANSACTIONS_SAVED,
         INDEXER_MINTS_SAVED,

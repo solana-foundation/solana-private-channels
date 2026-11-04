@@ -42,12 +42,14 @@ use crate::{
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
+use crate::indexer::confidential;
 
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 
 #[cfg(feature = "datasource-yellowstone")]
 use crate::indexer::datasource::yellowstone::YellowstoneSource;
+use private_channel_confidential::Keys;
 use private_channel_metrics::HealthState;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -262,6 +264,7 @@ async fn reconcile_escrow(
     config: &ReconciliationConfig,
     common_config: &PrivateChannelIndexerConfig,
     storage: &Arc<Storage>,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
     let Some(instance_id) = common_config.escrow_instance_id else {
         return Ok(());
@@ -276,6 +279,7 @@ async fn reconcile_escrow(
         // only for the supply invariant; None skips it.
         common_config.source_rpc_url.as_deref(),
         &instance_id,
+        confidential_keys,
     )
     .await
 }
@@ -287,6 +291,7 @@ async fn reconcile_escrow_against(
     common_config: &PrivateChannelIndexerConfig,
     storage: &Arc<Storage>,
     snapshot: &CustodySnapshot,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
     let Some(instance_id) = common_config.escrow_instance_id else {
         return Ok(());
@@ -300,6 +305,7 @@ async fn reconcile_escrow_against(
         common_config.source_rpc_url.as_deref(),
         &instance_id,
         snapshot,
+        confidential_keys,
     )
     .await
 }
@@ -412,8 +418,10 @@ fn spawn_transaction_processor(
     instruction_rx: mpsc::Receiver<ProcessorMessage>,
     escrow_instance_id: Option<Pubkey>,
     health: Option<Arc<HealthState>>,
+    confidential_keys: Option<Arc<Keys>>,
 ) -> tokio::task::JoinHandle<Result<(), IndexerError>> {
-    let mut transaction_processor = TransactionProcessor::new(storage, checkpoint_tx);
+    let mut transaction_processor =
+        TransactionProcessor::new(storage, checkpoint_tx).with_confidential_keys(confidential_keys);
     // Wire the escrow instance scope. Config validation guarantees Some for the
     // Escrow program; None here means the Withdraw program, where no instance
     // scoping applies.
@@ -440,6 +448,7 @@ async fn run_backfill_only(
     escrow_instance_id: Option<Pubkey>,
     configured_start_slot: Option<u64>,
     live_lock_lost: CancellationToken,
+    confidential_keys: Option<Arc<Keys>>,
 ) -> Result<(), IndexerError> {
     // Resolve first and fail closed: with no live stream there is no ungated fallback.
     let range = backfill_service.resolve_range().await?;
@@ -484,6 +493,7 @@ async fn run_backfill_only(
         instruction_rx,
         escrow_instance_id,
         None,
+        confidential_keys,
     );
     info!("TransactionProcessor task spawned");
 
@@ -632,6 +642,33 @@ pub async fn run(
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
 
+    // Confidential keys: optional until an escrow account is configured, then required and
+    // checked against the configured accounts. The withdraw indexer never decrypts.
+    let confidential_keys = match (common_config.program_type, common_config.escrow_instance_id) {
+        (ProgramType::Escrow, Some(instance)) => {
+            let keys = confidential::load_keys()?;
+            // rpc_url is Solana for the escrow indexer, where the escrow accounts live.
+            let source = confidential::RpcEscrowKeySource {
+                rpc: Arc::new(
+                    crate::operator::utils::RpcClientWithRetry::with_retry_config(
+                        common_config.rpc_url.clone(),
+                        crate::operator::utils::RetryConfig::default(),
+                        solana_commitment_config::CommitmentConfig::confirmed(),
+                    ),
+                ),
+            };
+            under_live_lock(
+                &live_lock_lost,
+                confidential::check_keys_at_boot(&storage, keys.as_deref(), &source, &instance),
+            )
+            .await
+            .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
+            keys
+        }
+        // A missing instance is refused just below.
+        _ => None,
+    };
+
     // The withdraw indexer DB must never be ahead of the channel. Checked once, before any
     // block is read. A restore done while it runs is not caught: every service must be stopped.
     if common_config.program_type == ProgramType::Withdraw {
@@ -699,7 +736,12 @@ pub async fn run(
         // is right now and the comparison is as meaningful here as anywhere.
         under_live_lock(
             &live_lock_lost,
-            reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage),
+            reconcile_escrow(
+                &indexer_config.reconciliation,
+                &common_config,
+                &storage,
+                confidential_keys.as_deref(),
+            ),
         )
         .await?;
     }
@@ -725,6 +767,7 @@ pub async fn run(
                 common_config.escrow_instance_id,
                 indexer_config.backfill.start_slot,
                 live_lock_lost.clone(),
+                confidential_keys.clone(),
             )
             .await;
         }
@@ -750,6 +793,7 @@ pub async fn run(
         instruction_rx,
         common_config.escrow_instance_id,
         health.clone(),
+        confidential_keys.clone(),
     );
 
     // First slot the live RPC source must request, captured from the backfill range so
@@ -921,6 +965,7 @@ pub async fn run(
                                 &common_config,
                                 &storage,
                                 &snapshot,
+                                confidential_keys.as_deref(),
                             )
                             .await
                             {
@@ -2187,6 +2232,7 @@ mod tests {
                 None,
                 Some(5000),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2233,6 +2279,7 @@ mod tests {
                 None,
                 Some(5000),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2259,6 +2306,7 @@ mod tests {
                 None,
                 Some(101),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2285,6 +2333,7 @@ mod tests {
                 None,
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2320,6 +2369,7 @@ mod tests {
                     None,
                     None,
                     CancellationToken::new(),
+                    None,
                 ),
             )
             .await;
@@ -2351,6 +2401,7 @@ mod tests {
                 instance,
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2397,6 +2448,7 @@ mod tests {
                 None,
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2426,6 +2478,7 @@ mod tests {
                 None,
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -2455,8 +2508,16 @@ mod tests {
             lost.cancel();
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None, lost).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                None,
+                lost,
+                None,
+            )
+            .await;
 
             assert!(
                 matches!(
@@ -2495,6 +2556,7 @@ mod tests {
                 None,
                 None,
                 CancellationToken::new(),
+                None,
             )
             .await;
 

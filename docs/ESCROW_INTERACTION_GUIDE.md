@@ -35,7 +35,8 @@ pnpm add private-channel-escrow-program @solana/kit
 8. [Whitelist](#whitelist) - Restrict who can deposit and who can withdraw (AddOrUpdateAllowedWallet, RemoveAllowedWallet, SetWhitelistEnabled)
 9. [Channel Seize Authority](#channel-seize-authority) - The permanent delegate on channel mints, the compliance wallet, and rotating the delegate
 10. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
-11. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
+11. [Confidential deposits](#confidential-deposits) - Deposit a hidden amount, and the admin setup it needs
+12. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
 ## CreateInstance
 
@@ -396,6 +397,18 @@ const depositIx = await getDepositInstructionAsync({
 **Use Case**: Third-party deposits (e.g., CEX depositing on behalf of end users OR user's depositing to CEX managed-wallet)
 
 Check out the [Architecture Overview](./ARCHITECTURE.md) for more details on how deposits are processed on Solana Private Channels.
+
+## Confidential deposits
+
+On a Token-2022 mint with confidential transfers, a deposit can hide its amount on Solana. The channel still mints it publicly, net of any transfer fee.
+
+**Admin setup, once.** Generate the instance keys (`confidential_keygen`), set them as `ESCROW_CONFIDENTIAL_KEYS` for `indexer-solana` and both operators and restart them, then per mint: `BlockMint` its deposits, run `ConfigureConfidentialAccount` (`configure_confidential`), confirm the indexer logged the instance's ElGamal key for the mint, and `AllowMint` again. The keys can never be rotated once an account is configured, and losing them strands the confidential balance. Details: [confidential_transfers.md](runbooks/confidential_transfers.md#setup-ceremony).
+
+**User side.** The user needs a Token-2022 account for the mint configured for confidential transfers under their own keys, with enough in its available balance. They build the transfer proofs against the escrow account's ElGamal key (read it from the escrow account's `ConfidentialTransferAccount`), the mint's auditor key and, on fee mints, the current fee, and send `ConfidentialDeposit` with the proofs either inline after it in one v1 transaction, or in context accounts verified earlier (offset 0). Account order, proof order and the fields are in [ESCROW_PROGRAM.md](ESCROW_PROGRAM.md#confidentialdeposit). Whitelisting and the recipient work as for `Deposit`; there is no minimum deposit, since the amount is hidden.
+
+`scripts/devnet/src/bin/confidential_deposit.rs` does all of it from the command line: it configures the user's account if needed, moves public tokens into the confidential balance when short, applies, and sends the deposit with inline proofs. It does not support transfer-hook mints.
+
+A confidential deposit made with proofs built for a different escrow key fails on-chain; one indexed under a key the indexer does not hold poisons the mint until an operator recovers it, so no deposit is ever lost, only delayed.
 
 ## PDA Reference
 
