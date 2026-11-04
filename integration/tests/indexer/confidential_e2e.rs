@@ -661,6 +661,19 @@ async fn test_36_crash_points_recover_exactly() -> TestResult {
     // The escrow indexer dies with a deposit not yet indexed.
     stack.stop_service(Service::EscrowIndexer).await;
     let unindexed = env.deposit_confidential(&bob, mint, 70_000, false).await?;
+    // Boot reads custody finalized at or past the confirmed checkpoint and gives up after a
+    // few seconds, so let finalization catch up first.
+    let checkpoint = helpers::db::get_checkpoint_slot(&env.pool, "escrow")
+        .await?
+        .unwrap_or(0);
+    wait_until("finalization to pass the indexer checkpoint", || async {
+        let finalized = env
+            .client
+            .get_slot_with_commitment(CommitmentConfig::finalized())
+            .await?;
+        Ok((finalized >= checkpoint).then_some(()))
+    })
+    .await?;
     stack.start_service(Service::EscrowIndexer).await;
     wait_credited(&env, &unindexed).await?;
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")

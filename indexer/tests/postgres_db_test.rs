@@ -6561,3 +6561,132 @@ async fn an_unsettled_confidential_release_is_found_except_the_asking_one(
     );
     Ok(())
 }
+
+/// A confidential sender that lost its lock must not claim a rebalance, journal an apply,
+/// or make any other sender write, since a replacement may be writing the same mint.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_sender_writes_fail_once_the_lock_is_lost(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::storage::confidential_sender::{
+        attempt_status, rebalance_status, OperatorAttempt, RebalanceDirection,
+    };
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    let operator = CancellationToken::new();
+    let attempt = OperatorAttempt {
+        id: 0,
+        mint: CONF_MINT.to_string(),
+        kind: "background".into(),
+        signature: "journaled".into(),
+        last_valid_block_height: 1_200,
+        blockhash_slot: 1_000,
+        prior_available: Some(1),
+        applied_pending: Some(2),
+        status: attempt_status::SENT.into(),
+        landed_slot: None,
+        created_at: Utc::now(),
+    };
+
+    let pending = storage
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 5, 10)
+        .await?;
+    let sent = storage
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 5, 10)
+        .await?;
+    assert!(
+        storage
+            .claim_rebalance_request(sent, "s", 1_200, 1_000)
+            .await?
+    );
+    let outstanding = storage.journal_operator_attempt(&attempt).await?;
+    let release = storage
+        .insert_db_transaction(&make_db_transaction(
+            "conf-fence",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    let lease = updated_at_of(&pool, release).await;
+
+    let key = sender_lock_key(ProgramType::Escrow);
+    let _guard = storage
+        .try_acquire_sender_lock(key, "escrow", operator.clone(), Duration::from_secs(3600))
+        .await?
+        .expect("the lock must be free");
+    terminate_advisory_lock_holder(&url, key).await;
+
+    let claim = storage
+        .claim_rebalance_request(pending, "late", 1_300, 1_100)
+        .await;
+    assert!(
+        claim.is_err(),
+        "claim on a lost lock must fail, got {claim:?}"
+    );
+    assert!(
+        operator.is_cancelled(),
+        "an unprovable fenced write must cancel the operator"
+    );
+    let journal = storage
+        .journal_operator_attempt(&OperatorAttempt {
+            signature: "late".into(),
+            ..attempt
+        })
+        .await;
+    assert!(
+        journal.is_err(),
+        "journal on a lost lock must fail, got {journal:?}"
+    );
+    assert!(storage
+        .transition_rebalance_request(
+            sent,
+            rebalance_status::SENT,
+            rebalance_status::COMPLETED,
+            None,
+            None
+        )
+        .await
+        .is_err());
+    assert!(storage
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 1, 1)
+        .await
+        .is_err());
+    assert!(storage
+        .settle_operator_attempt(outstanding, Some(500))
+        .await
+        .is_err());
+    assert!(storage
+        .set_confidential_park_label(release, "confidential_stale_proof")
+        .await
+        .is_err());
+    assert!(storage.record_confidential_landing_slot(900).await.is_err());
+    assert!(storage
+        .requeue_confidential_wait(release, lease, Utc::now(), Utc::now())
+        .await
+        .is_err());
+
+    // Nothing applied: reads go through the pool, which is still healthy.
+    let requests: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, status FROM rebalance_requests ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        requests,
+        vec![(pending, "pending".into()), (sent, "sent".into())]
+    );
+    let attempts: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, status FROM confidential_operator_attempts")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(attempts, vec![(outstanding, "sent".into())]);
+    let (status, label): (String, Option<String>) = sqlx::query_as(
+        "SELECT status::text, confidential_park_label FROM transactions WHERE id = $1",
+    )
+    .bind(release)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!((status.as_str(), label), ("processing", None));
+    assert_eq!(storage.confidential_landing_slot().await?, None);
+    Ok(())
+}

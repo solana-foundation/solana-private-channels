@@ -4106,26 +4106,32 @@ impl PostgresDb {
         wait_started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, sqlx::Error> {
         // Same lease and journal guard as `requeue_unclaimed`; the attempt counter is untouched.
-        let result = sqlx::query(
-            r#"
-            UPDATE transactions
-            SET status = 'pending',
-                not_before = $3,
-                wait_started_at = COALESCE(wait_started_at, $4)
-            WHERE id = $1
-              AND status = 'processing'
-              AND updated_at = $2
-              AND NOT EXISTS (
-                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
-              )
-            "#,
-        )
-        .bind(transaction_id)
-        .bind(lease)
-        .bind(not_before)
-        .bind(wait_started_at)
-        .execute(&self.pool)
-        .await?;
+        let result = self
+            .run_sender_owned(move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"
+                        UPDATE transactions
+                        SET status = 'pending',
+                            not_before = $3,
+                            wait_started_at = COALESCE(wait_started_at, $4)
+                        WHERE id = $1
+                          AND status = 'processing'
+                          AND updated_at = $2
+                          AND NOT EXISTS (
+                              SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+                          )
+                        "#,
+                    )
+                    .bind(transaction_id)
+                    .bind(lease)
+                    .bind(not_before)
+                    .bind(wait_started_at)
+                    .execute(conn)
+                    .await
+                })
+            })
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -4145,13 +4151,19 @@ impl PostgresDb {
         transaction_id: i64,
         label: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE transactions SET confidential_park_label = $2 \
-             WHERE id = $1 AND status IN ('processing', 'pending_remint')",
-        )
-        .bind(transaction_id)
-        .bind(label)
-        .execute(&self.pool)
+        let label = label.to_string();
+        self.run_sender_owned(move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE transactions SET confidential_park_label = $2 \
+                     WHERE id = $1 AND status IN ('processing', 'pending_remint')",
+                )
+                .bind(transaction_id)
+                .bind(label)
+                .execute(conn)
+                .await
+            })
+        })
         .await?;
         Ok(())
     }
@@ -4172,14 +4184,20 @@ impl PostgresDb {
         &self,
         slot: u64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO confidential_sender_state (id, last_landing_slot) VALUES (TRUE, $1) \
-             ON CONFLICT (id) DO UPDATE SET \
-               last_landing_slot = GREATEST(confidential_sender_state.last_landing_slot, $1), \
-               updated_at = NOW()",
-        )
-        .bind(i64::try_from(slot).unwrap_or(i64::MAX))
-        .execute(&self.pool)
+        let slot = i64::try_from(slot).unwrap_or(i64::MAX);
+        self.run_sender_owned(move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO confidential_sender_state (id, last_landing_slot) VALUES (TRUE, $1) \
+                     ON CONFLICT (id) DO UPDATE SET \
+                       last_landing_slot = GREATEST(confidential_sender_state.last_landing_slot, $1), \
+                       updated_at = NOW()",
+                )
+                .bind(slot)
+                .execute(conn)
+                .await
+            })
+        })
         .await?;
         Ok(())
     }
@@ -4207,18 +4225,24 @@ impl PostgresDb {
         amount: u64,
         expected_available: u64,
     ) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(
-            r#"
-            INSERT INTO rebalance_requests (mint, direction, amount, expected_available)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            "#,
-        )
-        .bind(mint)
-        .bind(direction.as_str())
-        .bind(TokenAmount(amount))
-        .bind(TokenAmount(expected_available))
-        .fetch_one(&self.pool)
+        let mint = mint.to_string();
+        self.run_sender_owned(move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    r#"
+                    INSERT INTO rebalance_requests (mint, direction, amount, expected_available)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    "#,
+                )
+                .bind(mint)
+                .bind(direction.as_str())
+                .bind(TokenAmount(amount))
+                .bind(TokenAmount(expected_available))
+                .fetch_one(conn)
+                .await
+            })
+        })
         .await
     }
 
@@ -4300,23 +4324,31 @@ impl PostgresDb {
         last_valid_block_height: u64,
         blockhash_slot: u64,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE rebalance_requests
-            SET status = 'sent',
-                signature = $2,
-                last_valid_block_height = $3,
-                blockhash_slot = $4,
-                updated_at = NOW()
-            WHERE id = $1 AND status = 'pending'
-            "#,
-        )
-        .bind(id)
-        .bind(signature)
-        .bind(i64::try_from(last_valid_block_height).unwrap_or(i64::MAX))
-        .bind(i64::try_from(blockhash_slot).unwrap_or(i64::MAX))
-        .execute(&self.pool)
-        .await?;
+        // On the lock's session, so a sender that lost its lock cannot claim and then broadcast.
+        let signature = signature.to_string();
+        let result = self
+            .run_sender_owned(move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"
+                        UPDATE rebalance_requests
+                        SET status = 'sent',
+                            signature = $2,
+                            last_valid_block_height = $3,
+                            blockhash_slot = $4,
+                            updated_at = NOW()
+                        WHERE id = $1 AND status = 'pending'
+                        "#,
+                    )
+                    .bind(id)
+                    .bind(signature)
+                    .bind(i64::try_from(last_valid_block_height).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(blockhash_slot).unwrap_or(i64::MAX))
+                    .execute(conn)
+                    .await
+                })
+            })
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -4328,23 +4360,30 @@ impl PostgresDb {
         signature: Option<String>,
         error: Option<String>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE rebalance_requests
-            SET status = $3,
-                signature = COALESCE($4, signature),
-                error = COALESCE($5, error),
-                updated_at = NOW()
-            WHERE id = $1 AND status = $2
-            "#,
-        )
-        .bind(id)
-        .bind(from)
-        .bind(to)
-        .bind(signature)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
+        let (from, to) = (from.to_string(), to.to_string());
+        let result = self
+            .run_sender_owned(move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"
+                        UPDATE rebalance_requests
+                        SET status = $3,
+                            signature = COALESCE($4, signature),
+                            error = COALESCE($5, error),
+                            updated_at = NOW()
+                        WHERE id = $1 AND status = $2
+                        "#,
+                    )
+                    .bind(id)
+                    .bind(from)
+                    .bind(to)
+                    .bind(signature)
+                    .bind(error)
+                    .execute(conn)
+                    .await
+                })
+            })
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 }
@@ -4391,23 +4430,30 @@ impl PostgresDb {
         &self,
         attempt: &crate::storage::common::storage::confidential_sender::OperatorAttempt,
     ) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(
-            r#"
-            INSERT INTO confidential_operator_attempts
-                (mint, kind, signature, last_valid_block_height, blockhash_slot,
-                 prior_available, applied_pending)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id
-            "#,
-        )
-        .bind(&attempt.mint)
-        .bind(&attempt.kind)
-        .bind(&attempt.signature)
-        .bind(i64::try_from(attempt.last_valid_block_height).unwrap_or(i64::MAX))
-        .bind(i64::try_from(attempt.blockhash_slot).unwrap_or(i64::MAX))
-        .bind(attempt.prior_available.map(TokenAmount))
-        .bind(attempt.applied_pending.map(TokenAmount))
-        .fetch_one(&self.pool)
+        // On the lock's session, so a sender that lost its lock cannot journal and then broadcast.
+        let attempt = attempt.clone();
+        self.run_sender_owned(move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    r#"
+                    INSERT INTO confidential_operator_attempts
+                        (mint, kind, signature, last_valid_block_height, blockhash_slot,
+                         prior_available, applied_pending)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id
+                    "#,
+                )
+                .bind(&attempt.mint)
+                .bind(&attempt.kind)
+                .bind(&attempt.signature)
+                .bind(i64::try_from(attempt.last_valid_block_height).unwrap_or(i64::MAX))
+                .bind(i64::try_from(attempt.blockhash_slot).unwrap_or(i64::MAX))
+                .bind(attempt.prior_available.map(TokenAmount))
+                .bind(attempt.applied_pending.map(TokenAmount))
+                .fetch_one(conn)
+                .await
+            })
+        })
         .await
     }
 
@@ -4433,16 +4479,23 @@ impl PostgresDb {
         id: i64,
         landed_slot: Option<u64>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE confidential_operator_attempts \
-             SET status = CASE WHEN $2::BIGINT IS NULL THEN 'dead' ELSE 'landed' END, \
-                 landed_slot = $2, updated_at = NOW() \
-             WHERE id = $1 AND status = 'sent'",
-        )
-        .bind(id)
-        .bind(landed_slot.map(|slot| i64::try_from(slot).unwrap_or(i64::MAX)))
-        .execute(&self.pool)
-        .await?;
+        let landed_slot = landed_slot.map(|slot| i64::try_from(slot).unwrap_or(i64::MAX));
+        let result = self
+            .run_sender_owned(move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "UPDATE confidential_operator_attempts \
+                         SET status = CASE WHEN $2::BIGINT IS NULL THEN 'dead' ELSE 'landed' END, \
+                             landed_slot = $2, updated_at = NOW() \
+                         WHERE id = $1 AND status = 'sent'",
+                    )
+                    .bind(id)
+                    .bind(landed_slot)
+                    .execute(conn)
+                    .await
+                })
+            })
+            .await?;
         Ok(result.rows_affected() == 1)
     }
 
