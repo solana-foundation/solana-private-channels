@@ -18,7 +18,8 @@ use crate::operator::utils::instruction_util::{
     TransactionBuilder, TransactionKind,
 };
 use crate::operator::utils::mint_util::{
-    decode_confidential_account, ConfidentialAccountRead, ConfidentialAccountView,
+    decode_confidential_account, destination_readiness, read_confidential_mint_params,
+    ConfidentialAccountRead, ConfidentialAccountView, ConfidentialMintParams, DestinationReadiness,
 };
 use crate::operator::utils::transaction_util::{
     build_and_sign, build_and_sign_v1, escrow_error_for_code, failing_program, send_signed,
@@ -31,7 +32,8 @@ use crate::operator::{
 };
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::confidential_sender::{
-    rebalance_status, RebalanceDirection, RebalanceRequest,
+    attempt_status, rebalance_status, OperatorAttempt, PendingInputs, RebalanceDirection,
+    RebalanceRequest,
 };
 use crate::storage::Storage;
 use chrono::{DateTime, Utc};
@@ -71,6 +73,8 @@ pub struct MintBook {
 pub struct LastApply {
     pub prior_available: u64,
     pub signature: Signature,
+    /// The pending the apply was built with, verified against the account it read.
+    pub applied_pending: Option<u64>,
 }
 
 /// The confidential half of the withdraw sender.
@@ -91,6 +95,8 @@ pub struct ConfidentialSender {
     pub requests: HashMap<u64, ConfidentialReleaseRequest>,
     /// Mint of each confidential release by nonce; only those still in flight count.
     pub release_mints: HashMap<u64, Pubkey>,
+    /// Releases confirmed by this process whose row update may not be written yet.
+    pub settled_releases: std::collections::HashSet<i64>,
     pub last_background_check: Option<Instant>,
 }
 
@@ -107,6 +113,7 @@ impl ConfidentialSender {
             parks: HashMap::new(),
             requests: HashMap::new(),
             release_mints: HashMap::new(),
+            settled_releases: std::collections::HashSet::new(),
             last_background_check: None,
         }
     }
@@ -187,8 +194,9 @@ pub fn verify_available(
     .or_else(|| stale_aes_gap(keys, view).map(|value| (value, CandidateSource::StaleAesGap)))
 }
 
-/// Our last apply, as candidate (d) needs it: the available before it and what it applied.
-pub type ApplyEvent = (u64, Ciphertext, Ciphertext);
+/// Our last apply, as candidate (d) needs it: the available before it, what its event says
+/// it applied, and the pending we verified before sending it.
+pub type ApplyEvent = (u64, Ciphertext, Ciphertext, Option<u64>);
 
 /// `verify_available` with the discrete logs on a blocking thread. (a) and (b) need none, so
 /// (d) and the gap are only searched when neither opens.
@@ -203,7 +211,9 @@ pub async fn verify_available_off_executor(
     }
     let view = view.clone();
     tokio::task::spawn_blocking(move || {
-        let d = apply.and_then(|(prior, lo, hi)| candidate_from_apply(&keys, prior, &lo, &hi));
+        let d = apply.and_then(|(prior, lo, hi, verified)| {
+            candidate_from_apply(&keys, prior, &lo, &hi, verified)
+        });
         verify_available(&keys, &view, None, d)
     })
     .await
@@ -255,15 +265,62 @@ pub async fn background_apply_due_off_executor(
     .flatten()
 }
 
-/// Candidate (d): the available before our apply plus the pending it actually applied.
+/// Candidate (d): the available before our apply plus the pending it actually applied. When
+/// the event's pending is past the search, the pending we verified before sending stands in;
+/// the opening check on available still decides.
 pub fn candidate_from_apply(
     keys: &Keys,
     prior_available: u64,
     applied_lo: &Ciphertext,
     applied_hi: &Ciphertext,
+    verified_pending: Option<u64>,
 ) -> Option<u64> {
-    let applied = keys.decrypt_pending(applied_lo, applied_hi).ok()?;
+    let applied = match keys.decrypt_pending(applied_lo, applied_hi) {
+        Ok(applied) => applied,
+        Err(PendingError::HiTooLarge) => verified_pending?,
+        Err(_) => return None,
+    };
     prior_available.checked_add(applied)
+}
+
+/// Deposits in the last apply's own slot whose order against it is tried both ways.
+const MAX_SAME_SLOT_DEPOSITS: usize = 10;
+
+/// The pending `lo + 2^16 * hi` opens to, out of the indexed deposits and moves since the
+/// last apply that landed at `boundary`. Deposits in that same slot may have landed before
+/// or after it, so each split of them is tried. `None` when nothing opens.
+pub fn indexed_pending(
+    keys: &Keys,
+    lo: &Ciphertext,
+    hi: &Ciphertext,
+    inputs: &PendingInputs,
+    boundary: Option<u64>,
+) -> Option<u64> {
+    let mut certain = inputs
+        .moves
+        .iter()
+        .try_fold(0u64, |sum, amount| sum.checked_add(*amount))?;
+    let mut same_slot = Vec::new();
+    for (slot, amount) in &inputs.deposits {
+        let amount = (*amount)?;
+        if Some(*slot) == boundary {
+            same_slot.push(amount);
+        } else {
+            certain = certain.checked_add(amount)?;
+        }
+    }
+    if same_slot.len() > MAX_SAME_SLOT_DEPOSITS {
+        return None;
+    }
+    (0u32..1 << same_slot.len()).find_map(|split| {
+        let candidate = same_slot
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| split & (1 << i) != 0)
+            .try_fold(certain, |sum, (_, amount)| sum.checked_add(*amount))?;
+        keys.pending_opens_to(lo, hi, candidate)
+            .then_some(candidate)
+    })
 }
 
 // A stale copy misses exactly the deposits that raced the apply, so the gap between the
@@ -769,7 +826,7 @@ async fn verified_available(
     }
     let last_apply = match book.and_then(|book| book.last_apply) {
         Some(apply) => match applied_pending_of(rpc, &apply.signature).await {
-            Ok((lo, hi)) => Some((apply.prior_available, lo, hi)),
+            Ok((lo, hi)) => Some((apply.prior_available, lo, hi, apply.applied_pending)),
             Err(e) => {
                 warn!(%mint, "Candidate (d) unavailable: {e}");
                 None
@@ -836,33 +893,274 @@ async fn confirm(
     Ok(Confirmation::Timeout)
 }
 
-/// Send an operator-only transaction (legacy; no proofs) and wait for it.
-async fn send_operator_legacy(
+/// Journal an apply or repair (legacy; no proofs), then send it and wait. One whose
+/// outcome is unknown stays journaled and blocks its mint until it settles.
+async fn send_journaled_apply(
     state: &SenderState,
-    instructions: Vec<solana_sdk::instruction::Instruction>,
+    mint: &Pubkey,
+    trigger: ApplyTrigger,
+    prior_available: u64,
+    applied_pending: u64,
+    instruction: solana_sdk::instruction::Instruction,
 ) -> Result<(Signature, u64), String> {
     let ix = InstructionWithSigners {
-        instructions,
+        instructions: vec![instruction],
         fee_payer: TransactionBuilder::release_signers()[0].pubkey(),
         signers: TransactionBuilder::release_signers(),
         compute_unit_price: Some(1),
         compute_budget: Some(CU_CONFIDENTIAL_APPLY),
     };
-    let (transaction, signature, _, _) = build_and_sign(&state.rpc_client, ix)
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
+        build_and_sign(&state.rpc_client, ix)
+            .await
+            .map_err(|e| e.to_string())?;
+    let id = state
+        .storage
+        .journal_operator_attempt(&OperatorAttempt {
+            id: 0,
+            mint: mint.to_string(),
+            kind: trigger.label().to_string(),
+            signature: signature.to_string(),
+            last_valid_block_height,
+            blockhash_slot,
+            prior_available: Some(prior_available),
+            applied_pending: Some(applied_pending),
+            status: attempt_status::SENT.to_string(),
+            landed_slot: None,
+            created_at: Utc::now(),
+        })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("apply journal: {e}"))?;
     send_signed(&state.rpc_client, &transaction, RetryPolicy::Idempotent)
         .await
-        .map_err(|e| e.to_string())?;
-    match confirm(
+        .map_err(|e| format!("{signature}: send: {e}; journaled, settles before the next write"))?;
+    let landed = match confirm(
         &state.rpc_client,
         &signature,
         state.confirmation_poll_interval_ms,
     )
     .await?
     {
-        Confirmation::Confirmed { slot } => Ok((signature, slot)),
-        other => Err(format!("{signature}: {other:?}")),
+        Confirmation::Confirmed { slot } => Some(slot),
+        // Failed on-chain: it changed nothing, so it no longer blocks the mint.
+        Confirmation::Failed { .. } => None,
+        Confirmation::Timeout => {
+            return Err(format!(
+                "{signature}: not confirmed; journaled, settles before the next write"
+            ))
+        }
+    };
+    // Best effort: left `sent`, the next write settles it from history instead.
+    if let Err(e) = state.storage.settle_operator_attempt(id, landed).await {
+        warn!(%signature, "Could not settle the journaled apply: {e}");
+    }
+    match landed {
+        Some(slot) => Ok((signature, slot)),
+        None => Err(format!("{signature}: failed on-chain")),
+    }
+}
+
+/// Which kind of confidential write is about to go out on a mint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Write {
+    Release,
+    Rebalance,
+    /// An apply or repair; `release` is the release that asked for it, if any.
+    Apply {
+        release: Option<i64>,
+    },
+}
+
+/// Why a write on `mint` must wait, if it must. An apply or repair that could still land
+/// would otherwise overwrite the AES copy after the write; an apply also waits for any
+/// rebalance or other release of the mint, since one landing after it leaves its AES stale.
+pub async fn write_blocked(
+    state: &mut SenderState,
+    mint: &Pubkey,
+    write: Write,
+) -> Result<Option<String>, String> {
+    let open = settle_operator_attempts(state, Some(mint)).await?;
+    if open > 0 {
+        return Ok(Some(format!(
+            "an apply on {mint} may still land; waiting until it lands or expires"
+        )));
+    }
+    let Write::Apply { release } = write else {
+        return Ok(None);
+    };
+    let mint_str = mint.to_string();
+    let sent = |requests: Vec<RebalanceRequest>| {
+        requests
+            .into_iter()
+            .filter(|request| request.mint == mint_str)
+            .collect::<Vec<_>>()
+    };
+    let rebalances = state
+        .storage
+        .get_rebalance_requests(rebalance_status::SENT)
+        .await
+        .map_err(|e| format!("rebalance requests: {e}"))?;
+    for request in sent(rebalances) {
+        settle_sent_rebalance(state, &request).await;
+    }
+    let rebalances = state
+        .storage
+        .get_rebalance_requests(rebalance_status::SENT)
+        .await
+        .map_err(|e| format!("rebalance requests: {e}"))?;
+    if !sent(rebalances).is_empty() {
+        return Ok(Some(format!("a rebalance on {mint} may still land")));
+    }
+    let settled = state
+        .confidential
+        .as_ref()
+        .map(|conf| conf.settled_releases.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let except: Vec<i64> = settled.into_iter().chain(release).collect();
+    if state
+        .storage
+        .confidential_release_unsettled(&mint_str, &except)
+        .await
+        .map_err(|e| format!("release journal: {e}"))?
+    {
+        return Ok(Some(format!(
+            "another confidential release of {mint} may still land"
+        )));
+    }
+    Ok(None)
+}
+
+/// Settle journaled applies and repairs, of one mint or all (at boot): landed ones raise the
+/// read floor and become candidate (d), expired ones are dropped. Returns how many are
+/// still undecided.
+pub async fn settle_operator_attempts(
+    state: &mut SenderState,
+    mint: Option<&Pubkey>,
+) -> Result<usize, String> {
+    let mint = mint.map(Pubkey::to_string);
+    let attempts = state
+        .storage
+        .outstanding_operator_attempts(mint.as_deref())
+        .await
+        .map_err(|e| format!("apply journal: {e}"))?;
+    let mut open = 0;
+    for attempt in attempts {
+        if !settle_attempt(state, &attempt).await {
+            open += 1;
+        }
+    }
+    Ok(open)
+}
+
+/// Settle one attempt by the rule releases use; false while it could still land.
+async fn settle_attempt(state: &mut SenderState, attempt: &OperatorAttempt) -> bool {
+    use super::remint::{classify_signatures, FinalityRpc, SigFinality};
+    let Ok(signature) = Signature::from_str(&attempt.signature) else {
+        warn!(
+            id = attempt.id,
+            "Journaled apply has no valid signature; resolve it by hand"
+        );
+        return false;
+    };
+    let pending = PendingSig {
+        signature,
+        last_valid_block_height: attempt.last_valid_block_height,
+        blockhash_slot: Some(attempt.blockhash_slot),
+    };
+    let finality = FinalityRpc::solana(&state.rpc_client, state.fallback_rpc_client.as_deref());
+    let landed_slot = match classify_signatures(&finality, &[pending]).await {
+        SigFinality::Landed(_) => match landing_slot(&state.rpc_client, &signature).await {
+            Ok(slot) => Some(slot),
+            Err(e) => {
+                warn!(%signature, "Landed apply has no readable slot yet: {e}");
+                return false;
+            }
+        },
+        SigFinality::Dead => None,
+        SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
+            info!(%signature, mint = attempt.mint, "Apply still undecided: {reason}");
+            return false;
+        }
+    };
+    if let Err(e) = state
+        .storage
+        .settle_operator_attempt(attempt.id, landed_slot)
+        .await
+    {
+        warn!(%signature, "Could not settle the journaled apply: {e}");
+        return false;
+    }
+    let (Some(slot), Ok(mint)) = (landed_slot, Pubkey::from_str(&attempt.mint)) else {
+        info!(%signature, mint = attempt.mint, "Journaled apply expired without landing");
+        return true;
+    };
+    warn!(%signature, %mint, slot, "Journaled apply landed late");
+    record_landing(state, slot).await;
+    if let Some(conf) = state.confidential.as_mut() {
+        let book = conf.books.entry(mint).or_default();
+        book.local = None;
+        book.last_apply = attempt.prior_available.map(|prior_available| LastApply {
+            prior_available,
+            signature,
+            applied_pending: attempt.applied_pending,
+        });
+    }
+    true
+}
+
+async fn landing_slot(rpc: &RpcClientWithRetry, signature: &Signature) -> Result<u64, String> {
+    rpc.get_signature_statuses_with_history(&[*signature])
+        .await
+        .map_err(|e| e.to_string())?
+        .value
+        .first()
+        .and_then(|status| status.as_ref())
+        .map(|status| status.slot)
+        .ok_or_else(|| "no status".to_string())
+}
+
+/// Pending past the bounded search: take what the indexer recorded since the mint's last
+/// landed apply, and use it only if the combined pending ciphertext opens to it. Otherwise
+/// wait (the indexer may be behind) and alert; never apply a guessed value.
+async fn pending_from_indexed(
+    state: &SenderState,
+    mint: &Pubkey,
+    view: &ConfidentialAccountView,
+) -> Result<u64, String> {
+    let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
+    let mint_label = mint.to_string();
+    let last = state
+        .storage
+        .last_landed_operator_attempt(&mint_label)
+        .await
+        .map_err(|e| format!("apply journal: {e}"))?;
+    let inputs = state
+        .storage
+        .confidential_pending_inputs(&mint_label, last.as_ref())
+        .await
+        .map_err(|e| format!("indexed deposits: {e}"))?;
+    let boundary = last.and_then(|attempt| attempt.landed_slot);
+    let (keys, lo, hi) = (conf.keys.clone(), view.pending_lo, view.pending_hi);
+    let found =
+        tokio::task::spawn_blocking(move || indexed_pending(&keys, &lo, &hi, &inputs, boundary))
+            .await
+            .ok()
+            .flatten();
+    let unverified =
+        metrics::OPERATOR_CONFIDENTIAL_PENDING_UNVERIFIED.with_label_values(&[&mint_label]);
+    match found {
+        Some(pending) => {
+            unverified.set(0.0);
+            info!(%mint, pending, "Pending past the search verified from the indexed deposits");
+            Ok(pending)
+        }
+        None => {
+            unverified.set(1.0);
+            error!(%mint, "Pending is past the search and the indexed deposits do not open it; waiting");
+            Err(format!(
+                "pending of {mint} is past the search and the indexed deposits do not open it"
+            ))
+        }
     }
 }
 
@@ -890,7 +1188,11 @@ async fn apply_once(
     state: &mut SenderState,
     mint: &Pubkey,
     trigger: ApplyTrigger,
+    release: Option<i64>,
 ) -> Result<(), String> {
+    if let Some(reason) = write_blocked(state, mint, Write::Apply { release }).await? {
+        return Err(reason);
+    }
     let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
     let (view, _) = read_ours(&state.rpc_client, conf, mint)
         .await?
@@ -898,9 +1200,12 @@ async fn apply_once(
     let (verified, _) = verified_available(&state.rpc_client, conf, mint, &view)
         .await
         .ok_or("no candidate opens the available balance")?;
-    let pending = pending_off_executor(conf.keys.clone(), &view)
-        .await
-        .map_err(|e| format!("pending: {e}"))?;
+    let pending = match pending_off_executor(conf.keys.clone(), &view).await {
+        Ok(pending) => pending,
+        Err(PendingError::HiTooLarge) => pending_from_indexed(state, mint, &view).await?,
+        Err(e) => return Err(format!("pending: {e}")),
+    };
+    let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
     let aes = conf.keys.encrypt_aes(
         verified
             .checked_add(pending)
@@ -909,7 +1214,8 @@ async fn apply_once(
     let ix =
         apply_pending_balance_instruction(&conf.accounts(mint), view.pending_credit_counter, aes);
 
-    let (signature, slot) = send_operator_legacy(state, vec![ix]).await?;
+    let (signature, slot) =
+        send_journaled_apply(state, mint, trigger, verified, pending, ix).await?;
     metrics::OPERATOR_CONFIDENTIAL_APPLIES
         .with_label_values(&[&mint.to_string(), trigger.label()])
         .inc();
@@ -921,6 +1227,7 @@ async fn apply_once(
     book.last_apply = Some(LastApply {
         prior_available: verified,
         signature,
+        applied_pending: Some(pending),
     });
     info!(%mint, %signature, trigger = trigger.label(), "Applied pending balance");
     Ok(())
@@ -931,6 +1238,7 @@ pub async fn apply_and_repair(
     state: &mut SenderState,
     mint: &Pubkey,
     trigger: ApplyTrigger,
+    release: Option<i64>,
 ) -> Result<(), String> {
     if trigger != ApplyTrigger::Repair {
         if let Some(conf) = state.confidential.as_mut() {
@@ -939,7 +1247,7 @@ pub async fn apply_and_repair(
     }
     let mut trigger = trigger;
     loop {
-        apply_once(state, mint, trigger).await?;
+        apply_once(state, mint, trigger, release).await?;
         let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
         let Some((view, _)) = read_ours(&state.rpc_client, conf, mint).await? else {
             return Ok(());
@@ -980,6 +1288,8 @@ enum Prepared {
         verified: u64,
     },
     Wait(String),
+    /// An earlier write on the mint could still land.
+    Blocked(String),
     Park(&'static str, String),
 }
 
@@ -988,6 +1298,9 @@ async fn prepare_release(
     request: &ConfidentialReleaseRequest,
 ) -> Result<Prepared, String> {
     let mint = request.mint;
+    if let Some(reason) = write_blocked(state, &mint, Write::Release).await? {
+        return Ok(Prepared::Blocked(reason));
+    }
     let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
     let Some((view, _)) = read_ours(&state.rpc_client, conf, &mint).await? else {
         return Ok(Prepared::Park(
@@ -999,7 +1312,14 @@ async fn prepare_release(
 
     let mut view = view;
     if release_needs_apply(verified.map(|(v, _)| v), request.amount, &view) {
-        apply_and_repair(state, &mint, ApplyTrigger::Release).await?;
+        let release = Some(request.transaction_id);
+        if let Err(e) = apply_and_repair(state, &mint, ApplyTrigger::Release, release).await {
+            // An apply that may still land, or a write it must wait for, is a wait.
+            return match write_blocked(state, &mint, Write::Apply { release }).await? {
+                Some(reason) => Ok(Prepared::Blocked(format!("{e}; {reason}"))),
+                None => Err(e),
+            };
+        }
         let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
         let Some((fresh, _)) = read_ours(&state.rpc_client, conf, &mint).await? else {
             return Err("escrow account unreadable after the apply".into());
@@ -1024,13 +1344,18 @@ async fn prepare_release(
     }
 
     let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
+    let (destination_elgamal, mint_params) =
+        match release_inputs(&state.rpc_client, conf, request).await? {
+            Ok(inputs) => inputs,
+            Err(park) => return Ok(park),
+        };
     let proofs = match conf.keys.prove_release(
         &view.available,
         available,
         request.amount,
-        &request.destination_elgamal,
-        request.mint_params.auditor.as_ref(),
-        request.mint_params.fee.as_ref(),
+        &destination_elgamal,
+        mint_params.auditor.as_ref(),
+        mint_params.fee.as_ref(),
     ) {
         Ok(proofs) => proofs,
         Err(ProofError::InvalidInput) => {
@@ -1046,6 +1371,35 @@ async fn prepare_release(
         instructions: request.instructions(&proofs),
         verified: available,
     })
+}
+
+/// The destination's key and the mint's auditor and fee, read for every proof build: a key
+/// rotation or a fee epoch change between attempts must not leave a rebuild on old values.
+async fn release_inputs(
+    rpc: &RpcClientWithRetry,
+    conf: &ConfidentialSender,
+    request: &ConfidentialReleaseRequest,
+) -> Result<Result<([u8; 32], ConfidentialMintParams), Prepared>, String> {
+    let (destination, _) = read_escrow(rpc, &request.destination, conf.min_context_slot).await?;
+    let destination_elgamal = match destination_readiness(&destination) {
+        DestinationReadiness::Ready { elgamal_pubkey } => elgamal_pubkey,
+        DestinationReadiness::NotReady(reason) => {
+            return Ok(Err(Prepared::Park(
+                metrics::BAIL_REASON_DESTINATION_NOT_READY,
+                format!("destination {}: {reason}", request.destination),
+            )))
+        }
+    };
+    let mint_params = read_confidential_mint_params(rpc, &request.mint, conf.min_context_slot)
+        .await
+        .map_err(|e| format!("mint read: {e}"))?;
+    let Some(mint_params) = mint_params else {
+        return Ok(Err(Prepared::Park(
+            metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+            format!("mint {} does not decode as confidential", request.mint),
+        )));
+    };
+    Ok(Ok((destination_elgamal, mint_params)))
 }
 
 fn release_ctx(request: &ConfidentialReleaseRequest) -> TransactionContext {
@@ -1266,6 +1620,41 @@ async fn wait_or_park(
     }
 }
 
+/// The mint is blocked by an earlier write: before any attempt the row waits in `Pending`;
+/// after one it is left `Processing` for recovery, since the block lifts on its own.
+async fn wait_or_leave(
+    state: &mut SenderState,
+    request: &ConfidentialReleaseRequest,
+    reason: &str,
+) {
+    let nonce = request.nonce;
+    match journaled(state, request.transaction_id).await {
+        Ok(false) => {
+            let Some(lease) = state.release_leases.get(&nonce).copied() else {
+                return;
+            };
+            let (not_before, started) = next_wait(Utc::now(), request.wait_started_at);
+            match state
+                .storage
+                .requeue_confidential_wait(request.transaction_id, lease, not_before, started)
+                .await
+            {
+                Ok(true) => info!(nonce, %not_before, "Confidential release waits: {reason}"),
+                Ok(false) => warn!(nonce, "Release no longer ours to requeue; leaving it"),
+                Err(e) => warn!(
+                    nonce,
+                    "Could not requeue the waiting release; recovery will: {e}"
+                ),
+            }
+            forget_release(state, nonce);
+        }
+        Ok(true) | Err(_) => {
+            warn!(nonce, "Leaving the release to recovery: {reason}");
+            leave_to_recovery(state, nonce);
+        }
+    }
+}
+
 // Recovery owns the row now; a kept retry count would end its next run at max retries.
 fn leave_to_recovery(state: &mut SenderState, nonce: u64) {
     state.in_flight_withdrawals.remove(&nonce);
@@ -1342,6 +1731,10 @@ pub async fn submit_release(
                 }) => prepared = Some((instructions, verified)),
                 Ok(Prepared::Wait(reason)) => {
                     wait_or_park(state, &ctx, &request, storage_tx, &reason).await;
+                    return;
+                }
+                Ok(Prepared::Blocked(reason)) => {
+                    wait_or_leave(state, &request, &reason).await;
                     return;
                 }
                 Ok(Prepared::Park(label, reason)) => {
@@ -1472,6 +1865,7 @@ pub async fn submit_release(
                 .await
                 {
                     Ok(Confirmation::Confirmed { slot }) => {
+                        mark_settled(state, request.transaction_id);
                         settle_local(state, &request.mint, verified, request.amount, slot).await;
                         handle_success(state, &ctx, signed.signature, storage_tx).await;
                         forget_release(state, nonce);
@@ -1536,6 +1930,7 @@ pub async fn submit_release(
             }
             ConfidentialFailure::Escrow(PrivateChannelEscrowProgramError::NonceAlreadyUsed) => {
                 if handle_nonce_already_used(state, &ctx, signed.signature, storage_tx).await {
+                    mark_settled(state, request.transaction_id);
                     settle_local(
                         state,
                         &request.mint,
@@ -1570,6 +1965,19 @@ pub async fn submit_release(
                 return;
             }
         }
+    }
+}
+
+/// Ids kept for releases settled here; a row update lands within moments, so older ids go.
+const SETTLED_RELEASES_KEPT: usize = 4_096;
+
+/// The release's row update is on its way; until it lands the row must not count as unsettled.
+fn mark_settled(state: &mut SenderState, transaction_id: i64) {
+    if let Some(conf) = state.confidential.as_mut() {
+        if conf.settled_releases.len() >= SETTLED_RELEASES_KEPT {
+            conf.settled_releases.clear();
+        }
+        conf.settled_releases.insert(transaction_id);
     }
 }
 
@@ -1733,7 +2141,7 @@ async fn check_mint(
     .await
     {
         info!(%mint, ?reason, "Background check applies pending");
-        return apply_and_repair(state, mint, ApplyTrigger::Background).await;
+        return apply_and_repair(state, mint, ApplyTrigger::Background, None).await;
     }
     if halted || blocked || release_in_flight || !aes_is_stale(&conf.keys, &view) {
         return Ok(());
@@ -1745,7 +2153,7 @@ async fn check_mint(
         .map(|book| book.repair.clone())
         .unwrap_or_default();
     if repair.deferred_until.is_none() || repair.deferred_repair_due(Instant::now()) {
-        return apply_and_repair(state, mint, ApplyTrigger::Repair).await;
+        return apply_and_repair(state, mint, ApplyTrigger::Repair, None).await;
     }
     Ok(())
 }
@@ -1914,6 +2322,10 @@ pub async fn execute_rebalance(
     request: &RebalanceRequest,
 ) -> Result<(), String> {
     let mint = Pubkey::from_str(&request.mint).map_err(|e| format!("mint: {e}"))?;
+    if let Some(reason) = write_blocked(state, &mint, Write::Rebalance).await? {
+        info!(id = request.id, "Rebalance waits: {reason}");
+        return Ok(());
+    }
     let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
     let Some((view, _)) = read_ours(&state.rpc_client, conf, &mint).await? else {
         return refuse(state, request, "escrow account not configured with our key").await;
@@ -2104,9 +2516,8 @@ mod tests {
         sender_state_with_storage_and_role,
     };
     use crate::operator::utils::mint_util::confidential_fixtures::{
-        account_with_confidential, rpc_account, AccountSpec,
+        account_with_confidential, confidential_mint, rpc_account, AccountSpec,
     };
-    use crate::operator::utils::mint_util::ConfidentialMintParams;
     use crate::storage::common::models::StoredSig;
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_confidential::test_support::{self as cts, SimAccount};
@@ -2181,7 +2592,7 @@ mod tests {
         let mut spec = AccountSpec::healthy(&keys, &sim, 0, 60_500);
         spec.expected_pending_credit_counter = 1;
         spec.actual_pending_credit_counter = 2;
-        let d = candidate_from_apply(&keys, 500, &applied_lo, &applied_hi);
+        let d = candidate_from_apply(&keys, 500, &applied_lo, &applied_hi, None);
         assert_eq!(d, Some(70_500));
         assert_eq!(
             verify_available(&keys, &view_of(&spec), None, d),
@@ -2196,7 +2607,7 @@ mod tests {
         let lo = cts::encrypt(&keys, 5);
         let hi = cts::encrypt(&keys, 1 << 33);
         assert_eq!(
-            candidate_from_apply(&keys, 7, &lo, &hi),
+            candidate_from_apply(&keys, 7, &lo, &hi, None),
             Some(7 + 5 + (1u64 << 49))
         );
     }
@@ -2267,7 +2678,7 @@ mod tests {
         sim.apply();
         sim.credit(&keys, 60_000, 0);
         sim.credit(&keys, 10_000, 0);
-        let applied = (500, sim.pending_lo, sim.pending_hi);
+        let applied = (500, sim.pending_lo, sim.pending_hi, None);
         sim.apply();
         let mut raced = AccountSpec::healthy(&keys, &sim, 0, 60_500);
         raced.expected_pending_credit_counter = 1;
@@ -2282,7 +2693,9 @@ mod tests {
         ];
         for (spec, local, apply) in cases {
             let view = view_of(&spec);
-            let d = apply.and_then(|(prior, lo, hi)| candidate_from_apply(&keys, prior, &lo, &hi));
+            let d = apply.and_then(|(prior, lo, hi, verified)| {
+                candidate_from_apply(&keys, prior, &lo, &hi, verified)
+            });
             assert_eq!(
                 verify_available_off_executor(shared.clone(), &view, local, apply).await,
                 verify_available(&keys, &view, local, d)
@@ -2347,11 +2760,7 @@ mod tests {
             mint,
             instance_ata: Pubkey::new_unique(),
             amount: 100,
-            destination_elgamal: cts::other_keys().pubkey(),
-            mint_params: ConfidentialMintParams {
-                auditor: None,
-                fee: None,
-            },
+            destination: Pubkey::new_unique(),
             hook_extras: Vec::new(),
             wait_started_at: None,
         }
@@ -2733,6 +3142,8 @@ mod tests {
         let mock = MockStorage::new();
         push_processing_row(&mock, 1);
         let (mut state, mut server, _) = sender_reading(&spec, 10, mock.clone()).await;
+        let mint = Pubkey::new_unique();
+        answer_mint(&mut server, &mint, confidential_mint(None, None), 0).await;
         let rpc =
             |method: &str| mockito::Matcher::PartialJson(serde_json::json!({ "method": method }));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2809,7 +3220,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         submit_release(
             &mut state,
-            full_request(1, Pubkey::new_unique(), lease),
+            full_request(1, mint, lease),
             &tx,
             AttemptCause::First,
             true,
@@ -3743,5 +4154,712 @@ mod tests {
             !conf.release_mints.contains_key(&1),
             "settled entries are dropped"
         );
+    }
+
+    // ---- every proof build reads the destination key, auditor and fee fresh ----------
+
+    /// What a release's proofs are bound to besides the balance, as the chain shows it.
+    #[derive(Clone, Copy)]
+    struct ProofWorld {
+        destination: [u8; 32],
+        auditor: [u8; 32],
+        /// Maximum fee of the older (epoch 0) and newer (epoch 5) fee settings.
+        fees: (u64, u64),
+        epoch: u64,
+    }
+
+    /// An ElGamal pubkey derived from a fixed seed; a top byte of zero keeps it canonical.
+    fn seeded_key(seed: u8) -> [u8; 32] {
+        let mut secret = [seed; 32];
+        secret[31] = 0;
+        Keys::from_bytes(&secret, &[seed; 16]).unwrap().pubkey()
+    }
+
+    fn fee_with_max(maximum_fee: u64) -> private_channel_confidential::ReleaseFee {
+        private_channel_confidential::ReleaseFee {
+            basis_points: 100,
+            maximum_fee,
+            withdraw_withheld_pubkey: seeded_key(9),
+        }
+    }
+
+    /// A fee mint whose newer fee takes over at epoch 5.
+    fn mint_for(world: &ProofWorld) -> Vec<u8> {
+        use spl_token_2022::extension::transfer_fee::{TransferFee, TransferFeeConfig};
+        use spl_token_2022::extension::{BaseStateWithExtensionsMut, StateWithExtensionsMut};
+        let mut data = confidential_mint(Some(world.auditor), Some(fee_with_max(world.fees.0)));
+        let mut state =
+            StateWithExtensionsMut::<spl_token_2022::state::Mint>::unpack(&mut data).unwrap();
+        state
+            .get_extension_mut::<TransferFeeConfig>()
+            .unwrap()
+            .newer_transfer_fee = TransferFee {
+            epoch: 5.into(),
+            maximum_fee: world.fees.1.into(),
+            transfer_fee_basis_points: 100.into(),
+        };
+        data
+    }
+
+    async fn answer(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        result: serde_json::Value,
+    ) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJson(serde_json::json!({"method": "getAccountInfo"})),
+                mockito::Matcher::Regex(address.to_string()),
+            ]))
+            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": result}).to_string())
+            .create_async()
+            .await;
+    }
+
+    /// The mint account and the current epoch, as a proof build reads them.
+    async fn answer_mint(
+        server: &mut mockito::ServerGuard,
+        mint: &Pubkey,
+        data: Vec<u8>,
+        epoch: u64,
+    ) {
+        answer(server, mint, rpc_account(&spl_token_2022::ID, &data, 10)).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getEpochInfo"}),
+            ))
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {
+                    "absoluteSlot": 10, "blockHeight": 10, "epoch": epoch,
+                    "slotIndex": 0, "slotsInEpoch": 432_000, "transactionCount": null
+                }})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+    }
+
+    /// Prepare the same release under `before`, then under `after` as a rebuild would, and
+    /// return each build's proof instruction bytes.
+    async fn proofs_before_and_after(before: ProofWorld, after: ProofWorld) -> [Vec<u8>; 2] {
+        let (_, escrow_spec) = escrow(5_000, 5_000);
+        let mint = Pubkey::new_unique();
+        let request = full_request(1, mint, Utc::now());
+        let mut built = Vec::new();
+        for world in [before, after] {
+            let mut server = mockito::Server::new_async().await;
+            let mut state = sender_state_with_storage_and_role(
+                &server.url(),
+                MockStorage::new(),
+                ProgramType::Withdraw,
+            );
+            let instance = Pubkey::new_unique();
+            state.confidential = Some(Box::new(ConfidentialSender::new(
+                Arc::new(cts::keys()),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                instance,
+            )));
+            let escrow_data = account_with_confidential(&escrow_spec);
+            let escrow = rpc_account(&spl_token_2022::ID, &escrow_data, 10);
+            answer(&mut server, &escrow_ata(&instance, &mint), escrow).await;
+            let mut destination = escrow_spec.clone();
+            destination.elgamal_pubkey = world.destination;
+            let destination = account_with_confidential(&destination);
+            let destination = rpc_account(&spl_token_2022::ID, &destination, 10);
+            answer(&mut server, &request.destination, destination).await;
+            answer_mint(&mut server, &mint, mint_for(&world), world.epoch).await;
+            let Ok(Prepared::Ready { instructions, .. }) =
+                prepare_release(&mut state, &request).await
+            else {
+                panic!("the release must prepare");
+            };
+            built.push(
+                instructions[1..]
+                    .iter()
+                    .flat_map(|ix| ix.data.clone())
+                    .collect::<Vec<u8>>(),
+            );
+        }
+        built.try_into().unwrap()
+    }
+
+    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn world() -> ProofWorld {
+        ProofWorld {
+            destination: seeded_key(1),
+            auditor: seeded_key(2),
+            fees: (111_111_111, 222_222_222),
+            epoch: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_after_the_fee_epoch_changes_proves_the_new_fee() {
+        let before = world();
+        let after = ProofWorld { epoch: 5, ..before };
+        let [first, second] = proofs_before_and_after(before, after).await;
+        assert!(holds(&first, &111_111_111u64.to_le_bytes()));
+        assert!(holds(&second, &222_222_222u64.to_le_bytes()));
+        assert!(!holds(&second, &111_111_111u64.to_le_bytes()));
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_after_an_auditor_rotation_proves_for_the_new_auditor() {
+        let before = world();
+        let after = ProofWorld {
+            auditor: seeded_key(3),
+            ..before
+        };
+        let [first, second] = proofs_before_and_after(before, after).await;
+        assert!(holds(&first, &seeded_key(2)));
+        assert!(holds(&second, &seeded_key(3)));
+        assert!(!holds(&second, &seeded_key(2)));
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_after_the_destination_key_changes_proves_for_the_new_key() {
+        let before = world();
+        let after = ProofWorld {
+            destination: seeded_key(4),
+            ..before
+        };
+        let [first, second] = proofs_before_and_after(before, after).await;
+        assert!(holds(&first, &seeded_key(1)));
+        assert!(holds(&second, &seeded_key(4)));
+        assert!(!holds(&second, &seeded_key(1)));
+    }
+
+    // ---- every apply and repair is journaled and blocks its mint until settled ---------
+
+    /// How the node treats an apply's broadcast.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Broadcast {
+        SendFails,
+        NeverConfirms,
+    }
+
+    /// An escrow with 5,000 available (AES copy current) and 700 pending, under a node that
+    /// answers sends as `broadcast`, knows no status, and is at block height 50. Returns
+    /// the sender, the node, the mint and a count of sends.
+    async fn apply_chain(
+        mock: MockStorage,
+        broadcast: Broadcast,
+    ) -> (
+        SenderState,
+        mockito::ServerGuard,
+        Pubkey,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        sim.credit(&keys, 5_000, 0);
+        sim.apply();
+        sim.credit(&keys, 700, 0);
+        let mut spec = AccountSpec::healthy(&keys, &sim, 0, 5_000);
+        spec.pending_credit_counter = 1;
+        apply_chain_with(&spec, mock, broadcast).await
+    }
+
+    /// `apply_chain` with the escrow account `spec`.
+    async fn apply_chain_with(
+        spec: &AccountSpec,
+        mock: MockStorage,
+        broadcast: Broadcast,
+    ) -> (
+        SenderState,
+        mockito::ServerGuard,
+        Pubkey,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        ensure_test_signer();
+        let (state, mut server, _) = sender_reading(spec, 10, mock).await;
+        let rpc =
+            |method: &str| mockito::Matcher::PartialJson(serde_json::json!({ "method": method }));
+        for (method, result) in [
+            (
+                "getLatestBlockhash",
+                serde_json::json!({"context": {"slot": 11}, "value": {
+                    "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                    "lastValidBlockHeight": 100
+                }}),
+            ),
+            (
+                "getVersion",
+                serde_json::json!({"solana-core": "2.2.0", "feature-set": 1}),
+            ),
+            (
+                "getSignatureStatuses",
+                serde_json::json!({"context": {"slot": 50}, "value": [null]}),
+            ),
+            ("getBlockHeight", serde_json::json!(50)),
+            ("getFirstAvailableBlock", serde_json::json!(0)),
+        ] {
+            server
+                .mock("POST", "/")
+                .match_body(rpc(method))
+                .with_body(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string(),
+                )
+                .create_async()
+                .await;
+        }
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = sends.clone();
+        server
+            .mock("POST", "/")
+            .match_body(rpc("sendTransaction"))
+            .with_status(if broadcast == Broadcast::SendFails {
+                503
+            } else {
+                200
+            })
+            .with_body_from_request(move |request| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().unwrap()).unwrap();
+                let wire = base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    body["params"][0].as_str().unwrap(),
+                )
+                .unwrap();
+                let signature = Signature::try_from(&wire[1..65]).unwrap();
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": signature.to_string()})
+                    .to_string()
+                    .into()
+            })
+            .create_async()
+            .await;
+        (state, server, Pubkey::new_unique(), sends)
+    }
+
+    /// The attempt is now found finalized at slot 60.
+    async fn land_late(server: &mut mockito::ServerGuard) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSignatureStatuses"}),
+            ))
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 300}, "value": [landed("finalized")]
+                }})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+    }
+
+    /// The chain moved past the attempt's last valid block height.
+    async fn expire(server: &mut mockito::ServerGuard) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getBlockHeight"}),
+            ))
+            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": 300}).to_string())
+            .create_async()
+            .await;
+    }
+
+    fn attempts_of(mock: &MockStorage) -> Vec<OperatorAttempt> {
+        mock.confidential_sender.lock().unwrap().attempts.clone()
+    }
+
+    /// Nothing may be written on the mint while the attempt could still land.
+    async fn assert_mint_blocked(state: &mut SenderState, mint: &Pubkey, mock: &MockStorage) {
+        let journaled = attempts_of(mock).len();
+        assert!(apply_once(state, mint, ApplyTrigger::Background, None)
+            .await
+            .is_err());
+        assert_eq!(attempts_of(mock).len(), journaled, "no second apply");
+        let request = full_request(1, *mint, Utc::now());
+        assert!(matches!(
+            prepare_release(state, &request).await,
+            Ok(Prepared::Blocked(_))
+        ));
+        for write in [
+            Write::Release,
+            Write::Rebalance,
+            Write::Apply { release: None },
+        ] {
+            assert!(write_blocked(state, mint, write).await.unwrap().is_some());
+        }
+    }
+
+    fn assert_landed_late(state: &SenderState, mint: &Pubkey, mock: &MockStorage) {
+        let attempt = &attempts_of(mock)[0];
+        assert_eq!(attempt.status, attempt_status::LANDED);
+        assert_eq!(attempt.landed_slot, Some(60));
+        let conf = state.confidential.as_ref().unwrap();
+        let book = &conf.books[mint];
+        assert_eq!(
+            book.local, None,
+            "available moved by what the apply applied"
+        );
+        let last = book.last_apply.unwrap();
+        assert_eq!(last.prior_available, 5_000);
+        assert_eq!(last.signature.to_string(), attempt.signature);
+        assert!(conf.min_context_slot >= 60);
+    }
+
+    #[tokio::test]
+    async fn an_apply_whose_send_failed_blocks_its_mint_until_it_lands_late() {
+        let mock = MockStorage::new();
+        let (mut state, mut server, mint, sends) =
+            apply_chain(mock.clone(), Broadcast::SendFails).await;
+        assert!(
+            apply_once(&mut state, &mint, ApplyTrigger::Background, None)
+                .await
+                .is_err()
+        );
+        let attempts = attempts_of(&mock);
+        assert_eq!(attempts.len(), 1, "journaled before the broadcast");
+        assert_eq!(attempts[0].status, attempt_status::SENT);
+        assert_eq!(attempts[0].applied_pending, Some(700));
+        assert_mint_blocked(&mut state, &mint, &mock).await;
+
+        land_late(&mut server).await;
+        assert!(write_blocked(&mut state, &mint, Write::Release)
+            .await
+            .unwrap()
+            .is_none());
+        assert_landed_late(&state, &mint, &mock);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_apply_that_never_confirmed_blocks_its_mint_until_it_lands_late() {
+        let mock = MockStorage::new();
+        let (mut state, mut server, mint, sends) =
+            apply_chain(mock.clone(), Broadcast::NeverConfirms).await;
+        assert!(
+            apply_once(&mut state, &mint, ApplyTrigger::Background, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts_of(&mock)[0].status, attempt_status::SENT);
+        assert_mint_blocked(&mut state, &mint, &mock).await;
+
+        land_late(&mut server).await;
+        assert!(
+            write_blocked(&mut state, &mint, Write::Apply { release: None })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_landed_late(&state, &mint, &mock);
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the AES copy is written once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_apply_absent_from_history_clears_the_block() {
+        let mock = MockStorage::new();
+        let (mut state, mut server, mint, _) =
+            apply_chain(mock.clone(), Broadcast::SendFails).await;
+        assert!(
+            apply_once(&mut state, &mint, ApplyTrigger::Background, None)
+                .await
+                .is_err()
+        );
+        assert!(write_blocked(&mut state, &mint, Write::Release)
+            .await
+            .unwrap()
+            .is_some());
+        expire(&mut server).await;
+        assert!(write_blocked(&mut state, &mint, Write::Release)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(attempts_of(&mock)[0].status, attempt_status::DEAD);
+        let book = state.confidential.as_ref().unwrap().books.get(&mint);
+        assert!(book.is_none_or(|book| book.last_apply.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_restart_settles_an_outstanding_apply_before_any_write() {
+        let mock = MockStorage::new();
+        let (_, _, mint, _) = apply_chain(mock.clone(), Broadcast::SendFails).await;
+        // Left `sent` by the previous incarnation.
+        Storage::Mock(mock.clone())
+            .journal_operator_attempt(&OperatorAttempt {
+                id: 0,
+                mint: mint.to_string(),
+                kind: ApplyTrigger::Background.label().into(),
+                signature: Signature::new_unique().to_string(),
+                last_valid_block_height: 100,
+                blockhash_slot: 11,
+                prior_available: Some(5_000),
+                applied_pending: Some(700),
+                status: attempt_status::SENT.into(),
+                landed_slot: None,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let (mut state, mut server, _, sends) =
+            apply_chain(mock.clone(), Broadcast::SendFails).await;
+        assert_eq!(settle_operator_attempts(&mut state, None).await.unwrap(), 1);
+        assert_mint_blocked(&mut state, &mint, &mock).await;
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        land_late(&mut server).await;
+        assert_eq!(settle_operator_attempts(&mut state, None).await.unwrap(), 0);
+        assert_landed_late(&state, &mint, &mock);
+    }
+
+    #[tokio::test]
+    async fn an_apply_also_waits_for_a_sent_rebalance_and_other_releases_of_its_mint() {
+        let mock = MockStorage::new();
+        let (mut state, _server, mint, _) = apply_chain(mock.clone(), Broadcast::SendFails).await;
+        let storage = Storage::Mock(mock.clone());
+        let id = storage
+            .insert_rebalance_request(&mint.to_string(), RebalanceDirection::ToPublic, 5, 10)
+            .await
+            .unwrap();
+        storage
+            .claim_rebalance_request(id, &Signature::new_unique().to_string(), 100, 11)
+            .await
+            .unwrap();
+        let apply = Write::Apply { release: None };
+        assert!(write_blocked(&mut state, &mint, apply)
+            .await
+            .unwrap()
+            .is_some());
+        // Proofs bind a release to the balance it read, so only the apply must wait.
+        assert!(write_blocked(&mut state, &mint, Write::Release)
+            .await
+            .unwrap()
+            .is_none());
+        storage
+            .transition_rebalance_request(
+                id,
+                rebalance_status::SENT,
+                rebalance_status::FAILED,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(write_blocked(&mut state, &mint, apply)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A release of the mint whose journaled attempt is not settled yet.
+        push_processing_row(&mock, 9);
+        {
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            let row = rows.iter_mut().find(|row| row.id == 9).unwrap();
+            row.mint = mint.to_string();
+            row.confidential = true;
+        }
+        journal_one(&mock, 9);
+        assert!(write_blocked(&mut state, &mint, apply)
+            .await
+            .unwrap()
+            .is_some());
+        let own = Write::Apply { release: Some(9) };
+        assert!(
+            write_blocked(&mut state, &mint, own)
+                .await
+                .unwrap()
+                .is_none(),
+            "the release asking for the apply does not block itself"
+        );
+        // Confirmed here while its row update is still on the way: settled, not in limbo.
+        let conf = state.confidential.as_mut().unwrap();
+        conf.settled_releases.insert(9);
+        assert!(write_blocked(&mut state, &mint, apply)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // ---- a pending past the search is applied from the indexed deposits --------------
+
+    const MAX: u64 = private_channel_confidential::MAX_CONFIDENTIAL_AMOUNT;
+
+    /// 257 maximum deposits: the high part of pending is past the 40-bit search.
+    fn huge_pending(keys: &Keys) -> SimAccount {
+        let mut sim = SimAccount::new(keys);
+        for _ in 0..257 {
+            sim.credit(keys, MAX, 0);
+        }
+        sim
+    }
+
+    fn inputs(deposits: &[(u64, u64)], moves: &[u64]) -> PendingInputs {
+        PendingInputs {
+            deposits: deposits.iter().map(|(slot, a)| (*slot, Some(*a))).collect(),
+            moves: moves.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_indexed_pending_is_used_only_when_the_ciphertext_opens_to_it() {
+        let keys = cts::keys();
+        let sim = huge_pending(&keys);
+        let (lo, hi) = (sim.pending_lo, sim.pending_hi);
+        let rows: Vec<(u64, u64)> = (0..257).map(|i| (20 + i, MAX)).collect();
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &inputs(&rows, &[]), Some(10)),
+            Some(257 * MAX)
+        );
+        // A wrong sum is refused.
+        let mut wrong = rows.clone();
+        wrong[3].1 -= 1;
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &inputs(&wrong, &[]), Some(10)),
+            None
+        );
+        // The indexer is one deposit behind.
+        let behind = &rows[..256];
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &inputs(behind, &[]), Some(10)),
+            None
+        );
+        // A deposit the key could not decrypt leaves no candidate.
+        let mut undecrypted = inputs(&rows, &[]);
+        undecrypted.deposits[0].1 = None;
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &undecrypted, Some(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_indexed_pending_counts_moves_and_sorts_out_the_applys_own_slot() {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        // 111 landed in the apply's slot before it, so it was applied; 222 after it.
+        for amount in [222, 333, 50] {
+            sim.credit(&keys, amount, 0);
+        }
+        let (lo, hi) = (sim.pending_lo, sim.pending_hi);
+        let rows = [(10, 111), (10, 222), (11, 333)];
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &inputs(&rows, &[50]), Some(10)),
+            Some(605)
+        );
+        assert_eq!(
+            indexed_pending(&keys, &lo, &hi, &inputs(&rows, &[]), Some(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_d_after_an_apply_past_the_search_uses_the_verified_pending() {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        sim.credit(&keys, 5_000, 0);
+        sim.apply();
+        for _ in 0..257 {
+            sim.credit(&keys, MAX, 0);
+        }
+        let (lo, hi) = (sim.pending_lo, sim.pending_hi);
+        sim.apply();
+        // The AES copy is wrong, so only (d) can explain the balance.
+        let spec = AccountSpec::healthy(&keys, &sim, 0, 1);
+        let d = candidate_from_apply(&keys, 5_000, &lo, &hi, Some(257 * MAX));
+        assert_eq!(d, Some(5_000 + 257 * MAX));
+        assert_eq!(
+            verify_available(&keys, &view_of(&spec), None, d),
+            Some((5_000 + 257 * MAX, CandidateSource::LastApply))
+        );
+    }
+
+    fn unverified(mint: &Pubkey) -> f64 {
+        metrics::OPERATOR_CONFIDENTIAL_PENDING_UNVERIFIED
+            .with_label_values(&[&mint.to_string()])
+            .get()
+    }
+
+    /// 257 maximum deposits arrive while the operator is down; once the indexer has them
+    /// all, the apply goes out with exactly their sum.
+    #[tokio::test]
+    async fn a_pending_past_the_search_waits_for_the_indexer_then_applies() {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        sim.credit(&keys, 5_000, 0);
+        sim.apply();
+        for _ in 0..257 {
+            sim.credit(&keys, MAX, 0);
+        }
+        let mut spec = AccountSpec::healthy(&keys, &sim, 0, 5_000);
+        spec.pending_credit_counter = 257;
+        let mock = MockStorage::new();
+        let (mut state, mut server, mint, sends) =
+            apply_chain_with(&spec, mock.clone(), Broadcast::NeverConfirms).await;
+        // The last apply before the deposits landed at slot 10.
+        mock.confidential_sender
+            .lock()
+            .unwrap()
+            .attempts
+            .push(OperatorAttempt {
+                id: 1,
+                mint: mint.to_string(),
+                kind: "background".into(),
+                signature: Signature::new_unique().to_string(),
+                last_valid_block_height: 100,
+                blockhash_slot: 9,
+                prior_available: Some(0),
+                applied_pending: Some(5_000),
+                status: attempt_status::LANDED.into(),
+                landed_slot: Some(10),
+                created_at: Utc::now(),
+            });
+        let deposit = |slot: u64| {
+            crate::storage::common::models::DbTransactionBuilder::new(
+                Signature::new_unique().to_string(),
+                slot,
+                mint.to_string(),
+                MAX,
+            )
+            .confidential(true)
+            .initiator("user".into())
+            .recipient("user".into())
+            .transaction_type(crate::storage::common::models::TransactionType::Deposit)
+            .build()
+        };
+        for slot in 11..267 {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .push(deposit(slot));
+        }
+
+        // One deposit not indexed yet: nothing is sent and the mint alerts.
+        assert!(
+            apply_once(&mut state, &mint, ApplyTrigger::Background, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts_of(&mock).len(), 1);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(unverified(&mint), 1.0);
+
+        mock.pending_transactions.lock().unwrap().push(deposit(267));
+        land_late(&mut server).await;
+        apply_once(&mut state, &mint, ApplyTrigger::Background, None)
+            .await
+            .unwrap();
+        let sent = &attempts_of(&mock)[1];
+        assert_eq!(sent.applied_pending, Some(257 * MAX));
+        assert_eq!(sent.prior_available, Some(5_000));
+        assert_eq!(unverified(&mint), 0.0);
+        let book = &state.confidential.as_ref().unwrap().books[&mint];
+        assert_eq!(book.last_apply.unwrap().applied_pending, Some(257 * MAX));
     }
 }

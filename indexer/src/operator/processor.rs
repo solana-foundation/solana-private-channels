@@ -14,8 +14,7 @@ use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
 };
 use crate::operator::utils::mint_util::{
-    destination_readiness, ConfidentialAccountRead, ConfidentialMintParams, DestinationReadiness,
-    HookExtras, MintCache,
+    destination_readiness, ConfidentialAccountRead, DestinationReadiness, HookExtras, MintCache,
 };
 use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
@@ -793,8 +792,7 @@ fn build_confidential_release(
             mint,
             instance_ata,
             amount: transaction.amount.value(),
-            destination_elgamal: ready.destination_elgamal,
-            mint_params: ready.mint_params,
+            destination: ready.destination,
             hook_extras: Vec::new(),
             wait_started_at: transaction.wait_started_at,
         },
@@ -1104,10 +1102,10 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
-/// What a confidential release needs from its pre-flight reads.
+/// What a confidential release needs from its pre-flight. The destination's key and the
+/// mint's auditor and fee are not kept: the sender reads them for every proof build.
 struct ConfidentialReady {
-    destination_elgamal: [u8; 32],
-    mint_params: ConfidentialMintParams,
+    destination: Pubkey,
 }
 
 /// Pre-flights only a confidential release has. Every bail is a release that could
@@ -1183,26 +1181,23 @@ async fn confidential_preflights(
         .mint_cache
         .read_confidential_account(&recipient_ata, gate_slot)
         .await?;
-    let destination_elgamal = match destination_readiness(&destination) {
-        DestinationReadiness::Ready { elgamal_pubkey } => elgamal_pubkey,
-        DestinationReadiness::NotReady(reason) => {
-            return Ok(Err(BailReason::new(
-                metrics::BAIL_REASON_DESTINATION_NOT_READY,
-                format!("destination {recipient_ata}: {reason}"),
-            )))
-        }
-    };
+    if let DestinationReadiness::NotReady(reason) = destination_readiness(&destination) {
+        return Ok(Err(BailReason::new(
+            metrics::BAIL_REASON_DESTINATION_NOT_READY,
+            format!("destination {recipient_ata}: {reason}"),
+        )));
+    }
 
-    let Some(mint_params) = processor_state
+    if processor_state
         .mint_cache
         .confidential_mint_params(&mint, gate_slot)
         .await?
-    else {
+        .is_none()
+    {
         return not_configured("the mint does not decode as confidential");
-    };
+    }
     Ok(Ok(ConfidentialReady {
-        destination_elgamal,
-        mint_params,
+        destination: recipient_ata,
     }))
 }
 
@@ -6756,11 +6751,7 @@ mod tests {
             let Some(TransactionBuilder::ConfidentialReleaseFunds(request)) = builder else {
                 panic!("a confidential row must become a confidential release");
             };
-            assert_eq!(request.destination_elgamal, cts::other_keys().pubkey());
-            assert_eq!(
-                request.mint_params.auditor,
-                Some(cts::other_keys().pubkey())
-            );
+            assert_ne!(request.destination, Pubkey::default());
             assert_eq!(request.amount, 1000);
             assert!(request.remint_info.is_some());
 
@@ -6773,7 +6764,7 @@ mod tests {
                     &available,
                     5_000,
                     1000,
-                    &request.destination_elgamal,
+                    &cts::other_keys().pubkey(),
                     None,
                     None,
                 )

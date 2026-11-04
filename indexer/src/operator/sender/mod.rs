@@ -324,6 +324,12 @@ pub async fn run_sender(
                 confidential::seed_min_context_slot(&mut conf, &state.storage).await;
                 confidential::seed_parks(&mut conf, &state.storage).await;
                 state.confidential = Some(Box::new(conf));
+                // Undecided ones keep blocking their mint; every write settles them first.
+                match confidential::settle_operator_attempts(&mut state, None).await {
+                    Ok(0) => {}
+                    Ok(open) => warn!(open, "Journaled confidential applies still undecided"),
+                    Err(e) => warn!("Could not settle journaled confidential applies: {e}"),
+                }
             }
             Ok(None) => {}
             Err(e) => return Err(OperatorError::RpcError(format!("confidential keys: {e}"))),

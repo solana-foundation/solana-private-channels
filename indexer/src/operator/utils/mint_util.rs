@@ -798,15 +798,24 @@ impl MintCache {
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError("confidential_mint_params requires an RPC client".to_string())
         })?;
-        let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
-        let epoch = rpc
-            .rpc_client
-            .get_epoch_info()
-            .await
-            .map_err(|e| OperatorError::RpcError(format!("get_epoch_info: {e}")))?
-            .epoch;
-        Ok(decode_confidential_mint(&account.data, epoch))
+        read_confidential_mint_params(rpc, mint, min_slot).await
     }
+}
+
+/// The mint's auditor and the fee in force at the current epoch, read no older than `min_slot`.
+pub async fn read_confidential_mint_params(
+    rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+    min_slot: u64,
+) -> Result<Option<ConfidentialMintParams>, OperatorError> {
+    let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
+    let epoch = rpc
+        .rpc_client
+        .get_epoch_info()
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("get_epoch_info: {e}")))?
+        .epoch;
+    Ok(decode_confidential_mint(&account.data, epoch))
 }
 
 /// Raw Token-2022 accounts with the confidential extensions, shared by the operator tests.

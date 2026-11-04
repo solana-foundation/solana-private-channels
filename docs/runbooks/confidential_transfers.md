@@ -264,6 +264,25 @@ release, `MoveToPublic` or apply also fixes the copy. Sustained deposits on the
 mint cause it; it clears when they pause. If it persists for an hour, check that
 `operator-private-channel` is running and its signer has SOL.
 
+### Pending not verified
+
+`private_channel_operator_confidential_pending_unverified{mint}`: the escrow's pending
+balance is too large to decrypt (past the 40-bit search), so the sender takes the sum of
+the indexed confidential deposits and moves to confidential since the mint's last apply,
+and applies only if the pending ciphertext opens to exactly that sum. It does not, so
+nothing is applied. Check that `indexer-solana` is running and caught up; the gauge
+clears on the next background check once it is. If the indexer is current, look for an
+undecrypted deposit on the mint ([confidential_mint_poisoned](#confidential_mint_poisoned)).
+
+### Apply undecided
+
+Every apply and AES repair is journaled in `confidential_operator_attempts` before it is
+sent. While one is `sent` (its outcome unknown) no release, apply, repair or rebalance
+goes out on that mint; releases wait in `pending`. It settles on its own: `landed` once
+found finalized, `dead` once its blockhash expired and history shows it absent (about
+two minutes). The sender settles them at boot too. One stuck `sent` for long means the
+RPC cannot answer status or history; check it.
+
 ### Pending credit counter high
 
 The escrow's pending credit counter is near its cap of 65,536. The sender applies at

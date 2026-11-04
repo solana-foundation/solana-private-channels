@@ -1,5 +1,5 @@
 //! Storage the withdraw sender needs for confidential releases: balance waits, the
-//! read-freshness seed, and rebalance requests.
+//! read-freshness seed, rebalance requests and the apply journal.
 
 use crate::error::StorageError;
 use crate::storage::common::storage::Storage;
@@ -53,6 +53,41 @@ pub struct RebalanceRequest {
     pub blockhash_slot: Option<u64>,
 }
 
+/// Lifecycle of a journaled apply or repair. `sent` is written before broadcast and
+/// blocks every later confidential write on its mint until it lands or is proven dead.
+pub mod attempt_status {
+    pub const SENT: &str = "sent";
+    pub const LANDED: &str = "landed";
+    pub const DEAD: &str = "dead";
+}
+
+/// One journaled `ApplyPendingBalance` (an apply or an AES repair) on an escrow account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorAttempt {
+    pub id: i64,
+    pub mint: String,
+    pub kind: String,
+    pub signature: String,
+    pub last_valid_block_height: u64,
+    pub blockhash_slot: u64,
+    /// The verified available and pending the attempt was built on, so a late landing
+    /// still yields candidate (d).
+    pub prior_available: Option<u64>,
+    pub applied_pending: Option<u64>,
+    pub status: String,
+    pub landed_slot: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What the escrow's pending balance should hold since the last landed apply: confidential
+/// deposits from its slot on (`None` amount when undecrypted), and moves to confidential
+/// completed after it was journaled.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingInputs {
+    pub deposits: Vec<(u64, Option<u64>)>,
+    pub moves: Vec<u64>,
+}
+
 /// In-memory mirror of the tables these calls touch, for `MockStorage`.
 #[cfg(any(test, feature = "test-mock-storage"))]
 #[derive(Clone, Debug, Default)]
@@ -60,6 +95,9 @@ pub struct ConfidentialSenderMock {
     pub rebalance_requests: Vec<RebalanceRequest>,
     pub park_labels: std::collections::HashMap<i64, String>,
     pub landing_slot: Option<u64>,
+    pub attempts: Vec<OperatorAttempt>,
+    /// `updated_at` of each rebalance request, by id, for the moves read.
+    pub rebalance_updated_at: std::collections::HashMap<i64, DateTime<Utc>>,
 }
 
 impl Storage {
@@ -225,6 +263,94 @@ impl Storage {
                 mock.transition_rebalance_request(id, from, to, signature, error)
                     .await
             }
+        }
+    }
+
+    /// Journal an apply or repair before it is broadcast.
+    pub async fn journal_operator_attempt(
+        &self,
+        attempt: &OperatorAttempt,
+    ) -> Result<i64, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db.journal_operator_attempt_internal(attempt).await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.journal_operator_attempt(attempt).await,
+        }
+    }
+
+    /// Attempts still `sent`, for one mint or all.
+    pub async fn outstanding_operator_attempts(
+        &self,
+        mint: Option<&str>,
+    ) -> Result<Vec<OperatorAttempt>, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db.outstanding_operator_attempts_internal(mint).await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.outstanding_operator_attempts(mint).await,
+        }
+    }
+
+    /// CAS an attempt from `sent` to `landed` at `landed_slot`, or to `dead` when `None`.
+    pub async fn settle_operator_attempt(
+        &self,
+        id: i64,
+        landed_slot: Option<u64>,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Storage::Postgres(db) => {
+                Ok(db.settle_operator_attempt_internal(id, landed_slot).await?)
+            }
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.settle_operator_attempt(id, landed_slot).await,
+        }
+    }
+
+    /// The mint's most recent landed apply or repair.
+    pub async fn last_landed_operator_attempt(
+        &self,
+        mint: &str,
+    ) -> Result<Option<OperatorAttempt>, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db.last_landed_operator_attempt_internal(mint).await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.last_landed_operator_attempt(mint).await,
+        }
+    }
+
+    /// Deposits and moves that fed the mint's pending balance since `after`, the last
+    /// landed apply (`None` when it never had one).
+    pub async fn confidential_pending_inputs(
+        &self,
+        mint: &str,
+        after: Option<&OperatorAttempt>,
+    ) -> Result<PendingInputs, StorageError> {
+        let from_slot = after.and_then(|a| a.landed_slot).unwrap_or(0);
+        let since = after.map(|a| a.created_at);
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .confidential_pending_inputs_internal(mint, from_slot, since)
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => {
+                mock.confidential_pending_inputs(mint, from_slot, since)
+                    .await
+            }
+        }
+    }
+
+    /// Whether a confidential release of `mint`, other than those in `except`, has a journaled
+    /// attempt that is not settled yet, so it could still land and move the available balance.
+    pub async fn confidential_release_unsettled(
+        &self,
+        mint: &str,
+        except: &[i64],
+    ) -> Result<bool, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .confidential_release_unsettled_internal(mint, except)
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.confidential_release_unsettled(mint, except).await,
         }
     }
 }

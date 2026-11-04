@@ -1433,6 +1433,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: confidential-pending-unverified
+        title: "Escrow pending too large to verify"
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the pending balance of mint {{ $labels.mint }} is past the decryption search and the indexed confidential deposits do not add up to it, so no apply is sent. Usually the escrow indexer is behind. Runbook: docs/runbooks/confidential_transfers.md, section Pending not verified."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_operator_confidential_pending_unverified)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
       - uid: confidential-pending-counter-high
         title: "Escrow pending credit counter stays high"
         condition: C

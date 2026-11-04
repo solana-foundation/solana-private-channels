@@ -339,9 +339,9 @@ pub struct ConfidentialReleaseRequest {
     pub mint: Pubkey,
     pub instance_ata: Pubkey,
     pub amount: u64,
-    /// The destination's ElGamal key, read at the pre-flight.
-    pub destination_elgamal: [u8; 32],
-    pub mint_params: crate::operator::utils::mint_util::ConfidentialMintParams,
+    /// The user's token account the release credits. Its key and the mint's auditor and
+    /// fee are read again for every proof build, since any of them can change.
+    pub destination: Pubkey,
     /// Transfer-hook accounts, resolved for an amount of `u64::MAX`.
     pub hook_extras: Vec<AccountMeta>,
     /// Set while the row waits for a verifiable balance, so its backoff keeps doubling.

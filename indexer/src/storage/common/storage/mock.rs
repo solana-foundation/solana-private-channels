@@ -2349,6 +2349,160 @@ impl MockStorage {
         request.status = to.to_string();
         request.signature = signature.or(request.signature.take());
         request.error = error.or(request.error.take());
+        state.rebalance_updated_at.insert(id, Utc::now());
         Ok(true)
+    }
+
+    pub async fn journal_operator_attempt(
+        &self,
+        attempt: &crate::storage::common::storage::confidential_sender::OperatorAttempt,
+    ) -> Result<i64, StorageError> {
+        use crate::storage::common::storage::confidential_sender::attempt_status;
+        self.check_should_fail("journal_operator_attempt")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        let id = state.attempts.len() as i64 + 1;
+        state.attempts.push(
+            crate::storage::common::storage::confidential_sender::OperatorAttempt {
+                id,
+                status: attempt_status::SENT.to_string(),
+                landed_slot: None,
+                created_at: Utc::now(),
+                ..attempt.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    pub async fn outstanding_operator_attempts(
+        &self,
+        mint: Option<&str>,
+    ) -> Result<
+        Vec<crate::storage::common::storage::confidential_sender::OperatorAttempt>,
+        StorageError,
+    > {
+        use crate::storage::common::storage::confidential_sender::attempt_status;
+        self.check_should_fail("outstanding_operator_attempts")?;
+        Ok(self
+            .confidential_sender
+            .lock()
+            .unwrap()
+            .attempts
+            .iter()
+            .filter(|a| a.status == attempt_status::SENT && mint.is_none_or(|m| a.mint == m))
+            .cloned()
+            .collect())
+    }
+
+    pub async fn settle_operator_attempt(
+        &self,
+        id: i64,
+        landed_slot: Option<u64>,
+    ) -> Result<bool, StorageError> {
+        use crate::storage::common::storage::confidential_sender::attempt_status;
+        self.check_should_fail("settle_operator_attempt")?;
+        let mut state = self.confidential_sender.lock().unwrap();
+        let Some(attempt) = state
+            .attempts
+            .iter_mut()
+            .find(|a| a.id == id && a.status == attempt_status::SENT)
+        else {
+            return Ok(false);
+        };
+        attempt.status = match landed_slot {
+            Some(_) => attempt_status::LANDED,
+            None => attempt_status::DEAD,
+        }
+        .to_string();
+        attempt.landed_slot = landed_slot;
+        Ok(true)
+    }
+
+    pub async fn last_landed_operator_attempt(
+        &self,
+        mint: &str,
+    ) -> Result<
+        Option<crate::storage::common::storage::confidential_sender::OperatorAttempt>,
+        StorageError,
+    > {
+        use crate::storage::common::storage::confidential_sender::attempt_status;
+        self.check_should_fail("last_landed_operator_attempt")?;
+        Ok(self
+            .confidential_sender
+            .lock()
+            .unwrap()
+            .attempts
+            .iter()
+            .filter(|a| a.mint == mint && a.status == attempt_status::LANDED)
+            .max_by_key(|a| (a.landed_slot, a.id))
+            .cloned())
+    }
+
+    pub async fn confidential_pending_inputs(
+        &self,
+        mint: &str,
+        from_slot: u64,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<crate::storage::common::storage::confidential_sender::PendingInputs, StorageError>
+    {
+        use crate::storage::common::storage::confidential_sender::{
+            rebalance_status, PendingInputs, RebalanceDirection,
+        };
+        self.check_should_fail("confidential_pending_inputs")?;
+        let deposits = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.mint == mint
+                    && t.confidential
+                    && t.transaction_type == TransactionType::Deposit
+                    && u64::try_from(t.slot).is_ok_and(|slot| slot >= from_slot)
+            })
+            .map(|t| {
+                (
+                    u64::try_from(t.slot).unwrap_or(0),
+                    (!t.confidential_undecrypted).then(|| t.amount.value()),
+                )
+            })
+            .collect();
+        let state = self.confidential_sender.lock().unwrap();
+        let moves = state
+            .rebalance_requests
+            .iter()
+            .filter(|r| {
+                r.mint == mint
+                    && r.direction == RebalanceDirection::ToConfidential
+                    && r.status == rebalance_status::COMPLETED
+                    && since.is_none_or(|since| {
+                        state
+                            .rebalance_updated_at
+                            .get(&r.id)
+                            .is_some_and(|at| *at > since)
+                    })
+            })
+            .map(|r| r.amount)
+            .collect();
+        Ok(PendingInputs { deposits, moves })
+    }
+
+    pub async fn confidential_release_unsettled(
+        &self,
+        mint: &str,
+        except: &[i64],
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("confidential_release_unsettled")?;
+        let journals = self.release_signatures.lock().unwrap();
+        Ok(self.pending_transactions.lock().unwrap().iter().any(|t| {
+            t.mint == mint
+                && t.confidential
+                && t.transaction_type == TransactionType::Withdrawal
+                && matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::PendingRemint
+                )
+                && !except.contains(&t.id)
+                && journals.get(&t.id).is_some_and(|sigs| !sigs.is_empty())
+        }))
     }
 }

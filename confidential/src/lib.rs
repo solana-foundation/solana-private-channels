@@ -218,6 +218,19 @@ impl Keys {
         u64::try_from(lo + (i128::from(hi) << LO_BITS)).map_err(|_| PendingError::Invalid)
     }
 
+    /// True when the pending balance `lo + 2^16 * hi` is exactly `value`: the opening check
+    /// on the combined ciphertext, for a pending too large to search.
+    pub fn pending_opens_to(&self, lo: &Ciphertext, hi: &Ciphertext, value: u64) -> bool {
+        let (Some(lo), Some(hi)) = (
+            ElGamalCiphertext::from_bytes(lo),
+            ElGamalCiphertext::from_bytes(hi),
+        ) else {
+            return false;
+        };
+        let combined = lo + hi * Scalar::from(1u64 << LO_BITS);
+        self.opens_to(&combined.to_bytes(), value)
+    }
+
     /// The available balance from its AES copy. Confirm it with [`Keys::opens_to`] before use.
     pub fn decrypt_aes(&self, aes: &AeBytes) -> Option<u64> {
         self.aes.decrypt(&AeCiphertext::from_bytes(aes)?)
@@ -673,5 +686,25 @@ mod tests {
         let rate = deposits.len() as f64 / start.elapsed().as_secs_f64();
         println!("decrypt_deposit: {rate:.1} deposits/s");
         assert!(rate >= 20.0, "{rate:.1} deposits/s");
+    }
+
+    #[test]
+    fn a_pending_past_the_search_opens_only_to_its_exact_sum() {
+        let keys = keys();
+        let mut sim = SimAccount::new(&keys);
+        // 257 maximum deposits put the high part past the 40-bit search.
+        for _ in 0..257 {
+            sim.credit(&keys, MAX_CONFIDENTIAL_AMOUNT, 0);
+        }
+        let sum = 257 * MAX_CONFIDENTIAL_AMOUNT;
+        assert!(keys.pending_opens_to(&sim.pending_lo, &sim.pending_hi, sum));
+        assert!(!keys.pending_opens_to(&sim.pending_lo, &sim.pending_hi, sum - 1));
+        assert!(!keys.pending_opens_to(&sim.pending_lo, &sim.pending_hi, sum + 1));
+        assert!(!other_keys().pending_opens_to(&sim.pending_lo, &sim.pending_hi, sum));
+
+        // A fee mint's lo can sum negative; the combined value is still the net credit.
+        let mut fee = SimAccount::new(&keys);
+        fee.credit(&keys, 70_000, 5_000);
+        assert!(keys.pending_opens_to(&fee.pending_lo, &fee.pending_hi, 65_000));
     }
 }

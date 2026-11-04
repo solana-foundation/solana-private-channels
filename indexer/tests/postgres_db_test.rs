@@ -6419,3 +6419,145 @@ async fn rebalance_requests_round_trip_and_transition_once(
     assert_eq!(done[0].signature.as_deref(), Some("sig"));
     Ok(())
 }
+
+// ── Confidential sender: the apply journal and the indexed pending inputs ────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_attempts_journal_settle_and_feed_the_pending_inputs(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::storage::confidential_sender::{
+        attempt_status, rebalance_status, OperatorAttempt, RebalanceDirection,
+    };
+    let (pool, storage, _pg) = start_postgres().await?;
+    let attempt = |signature: &str| OperatorAttempt {
+        id: 0,
+        mint: CONF_MINT.to_string(),
+        kind: "background".into(),
+        signature: signature.into(),
+        last_valid_block_height: 1_200,
+        blockhash_slot: 1_000,
+        prior_available: Some(u64::MAX),
+        applied_pending: Some(1 << 60),
+        status: attempt_status::SENT.into(),
+        landed_slot: None,
+        created_at: Utc::now(),
+    };
+    let first = storage.journal_operator_attempt(&attempt("a")).await?;
+    let second = storage.journal_operator_attempt(&attempt("b")).await?;
+    let open = storage
+        .outstanding_operator_attempts(Some(CONF_MINT))
+        .await?;
+    assert_eq!(open.len(), 2);
+    assert_eq!(
+        (open[0].prior_available, open[0].applied_pending),
+        (Some(u64::MAX), Some(1 << 60))
+    );
+    assert!(storage
+        .outstanding_operator_attempts(Some("other"))
+        .await?
+        .is_empty());
+    assert_eq!(storage.outstanding_operator_attempts(None).await?.len(), 2);
+
+    // Settled once: landed with its slot, or dead.
+    assert!(storage.settle_operator_attempt(first, Some(500)).await?);
+    assert!(!storage.settle_operator_attempt(first, None).await?);
+    assert!(storage.settle_operator_attempt(second, None).await?);
+    assert!(storage
+        .outstanding_operator_attempts(None)
+        .await?
+        .is_empty());
+    let last = storage
+        .last_landed_operator_attempt(CONF_MINT)
+        .await?
+        .expect("landed");
+    assert_eq!((last.id, last.landed_slot), (first, Some(500)));
+
+    // Deposits from the apply's slot on, undecrypted ones without an amount.
+    for (sig, slot, amount) in [("d1", 499, 7), ("d2", 500, 8), ("d3", 501, 9)] {
+        let mut row = make_db_transaction(sig, TransactionType::Deposit);
+        row.mint = CONF_MINT.to_string();
+        row.slot = slot;
+        row.amount = TokenAmount(amount);
+        row.confidential = true;
+        storage.insert_db_transaction(&row).await?;
+    }
+    storage
+        .insert_db_transaction(&undecrypted_deposit("d4", vec![1]))
+        .await?;
+    sqlx::query("UPDATE transactions SET slot = 502 WHERE signature = 'd4'")
+        .execute(&pool)
+        .await?;
+    // A move completed after the apply was journaled counts; one completed before does not.
+    let before = storage
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 3, 0)
+        .await?;
+    sqlx::query("UPDATE rebalance_requests SET status = 'completed', updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+        .bind(before)
+        .execute(&pool)
+        .await?;
+    let after = storage
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 4, 0)
+        .await?;
+    storage
+        .transition_rebalance_request(
+            after,
+            rebalance_status::PENDING,
+            rebalance_status::COMPLETED,
+            None,
+            None,
+        )
+        .await?;
+    let inputs = storage
+        .confidential_pending_inputs(CONF_MINT, Some(&last))
+        .await?;
+    assert_eq!(
+        inputs.deposits,
+        vec![(500, Some(8)), (501, Some(9)), (502, None)]
+    );
+    assert_eq!(inputs.moves, vec![4]);
+    // With no apply yet, everything counts.
+    let all = storage.confidential_pending_inputs(CONF_MINT, None).await?;
+    assert_eq!(all.deposits.len(), 4);
+    assert_eq!(all.moves, vec![3, 4]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsettled_confidential_release_is_found_except_the_asking_one(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut row = make_db_transaction("rel", TransactionType::Withdrawal);
+    row.mint = CONF_MINT.to_string();
+    row.confidential = true;
+    row.status = TransactionStatus::Processing;
+    let id = storage.insert_db_transaction(&row).await?;
+    assert!(
+        !storage
+            .confidential_release_unsettled(CONF_MINT, &[])
+            .await?
+    );
+    storage
+        .insert_release_signature(id, "sig".to_string(), 100, None)
+        .await?;
+    assert!(
+        storage
+            .confidential_release_unsettled(CONF_MINT, &[])
+            .await?
+    );
+    assert!(
+        !storage
+            .confidential_release_unsettled(CONF_MINT, &[id])
+            .await?
+    );
+    assert!(!storage.confidential_release_unsettled("other", &[]).await?);
+    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    assert!(
+        !storage
+            .confidential_release_unsettled(CONF_MINT, &[])
+            .await?
+    );
+    Ok(())
+}

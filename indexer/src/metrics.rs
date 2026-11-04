@@ -265,6 +265,15 @@ gauge_vec!(
     &["mint"]
 );
 
+// 1 while an apply waits because pending is past the search and the indexed deposits do not
+// open it (the indexer is behind, or a deposit is undecrypted).
+gauge_vec!(
+    OPERATOR_CONFIDENTIAL_PENDING_UNVERIFIED,
+    "private_channel_operator_confidential_pending_unverified",
+    "1 while a mint's pending is too large to decrypt and the indexed deposits do not verify it",
+    &["mint"]
+);
+
 counter_vec!(
     OPERATOR_CONFIDENTIAL_WAITS,
     "private_channel_operator_confidential_waits_total",
@@ -685,6 +694,7 @@ pub fn init() {
         OPERATOR_CONFIDENTIAL_PENDING_COUNTER,
         OPERATOR_CONFIDENTIAL_APPLIES,
         OPERATOR_CONFIDENTIAL_AES_REPAIR_DEFERRED,
+        OPERATOR_CONFIDENTIAL_PENDING_UNVERIFIED,
         OPERATOR_CONFIDENTIAL_WAITS,
         OPERATOR_CONFIDENTIAL_OLDEST_PARK_SECONDS,
         OPERATOR_BITMAP_GENERATION_USED_RATIO,
