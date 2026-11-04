@@ -470,17 +470,53 @@ pub async fn build_and_sign_v1(
         .get_latest_blockhash_with_commitment_and_context()
         .await
         .map_err(TransactionError::Rpc)?;
+    resign_v1(
+        ix_with_signers,
+        loaded_accounts_data_size_limit,
+        &SignedV1Blockhash {
+            recent_blockhash,
+            last_valid_block_height,
+            blockhash_slot,
+        },
+    )
+    .await
+}
+
+/// The blockhash a v1 transaction was signed with, so a rebuild can reuse it.
+#[derive(Clone, Copy, Debug)]
+pub struct SignedV1Blockhash {
+    pub recent_blockhash: solana_sdk::hash::Hash,
+    pub last_valid_block_height: u64,
+    pub blockhash_slot: u64,
+}
+
+impl SignedV1 {
+    pub fn blockhash(&self) -> SignedV1Blockhash {
+        SignedV1Blockhash {
+            recent_blockhash: *self.transaction.message.recent_blockhash(),
+            last_valid_block_height: self.last_valid_block_height,
+            blockhash_slot: self.blockhash_slot,
+        }
+    }
+}
+
+/// `build_and_sign_v1` against a blockhash already read.
+pub async fn resign_v1(
+    ix_with_signers: &InstructionWithSigners,
+    loaded_accounts_data_size_limit: u32,
+    blockhash: &SignedV1Blockhash,
+) -> Result<SignedV1, V1Error> {
     let message = compile_v1(
         ix_with_signers,
-        recent_blockhash,
+        blockhash.recent_blockhash,
         loaded_accounts_data_size_limit,
     )?;
     let transaction = sign_v1(message, &ix_with_signers.signers).await?;
     Ok(SignedV1 {
         signature: transaction.signatures[0],
         transaction,
-        last_valid_block_height,
-        blockhash_slot,
+        last_valid_block_height: blockhash.last_valid_block_height,
+        blockhash_slot: blockhash.blockhash_slot,
     })
 }
 

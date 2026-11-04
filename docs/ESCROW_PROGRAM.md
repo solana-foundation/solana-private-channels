@@ -372,6 +372,8 @@ Deposits a hidden amount from the user's available confidential balance into the
 
 Each deposit, even of zero, takes one of the pending balance's 65,536 credits until the operator applies it, and the hidden amount can't be refused, so dust deposits can use them up between applies. Deposits and `MoveToConfidential` then fail until the next apply, and nothing is lost. The event carries the credit counter so the operator can apply early.
 
+Dust also costs the escrow indexer: it decrypts each confidential deposit with two or three 32-bit discrete-log searches (about 20 deposits a second), and a slot checkpoints only once all of its deposits are decrypted. With no confidential minimum, 1-unit deposits sent faster than that, for the price of transaction fees, delay every deposit behind them, public ones included, until the flood stops. A resync decrypts the whole history twice under the exclusive live-state lock, so every service stays down longer. No funds are at risk; the indexer lag alert (`indexer-lag-10s`) fires on the backlog. See [confidential_transfers.md](runbooks/confidential_transfers.md#dust-deposits).
+
 Each proof offset is the proof instruction's position relative to this one, or 0 for a proof in a context account. The fee offsets are read only for mints with a transfer fee. After the fixed accounts come one context account per zero offset, in Token-2022's order (equality, ciphertext validity, fee sigma, fee ciphertext validity, range), then the mint's transfer-hook extras, resolved with an amount of `u64::MAX`.
 
 Discriminator: `13`

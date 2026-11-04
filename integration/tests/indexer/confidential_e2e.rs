@@ -750,7 +750,7 @@ async fn test_37_releases_continue_with_the_indexer_stopped() -> TestResult {
 /// park, and the other confidential mint and public deposits are unaffected. Recovery
 /// refuses the mint, so nothing is ever credited from it.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_38_wrong_key_poisons_one_mint_and_recovers() -> TestResult {
+async fn test_38_wrong_key_poisons_one_mint_and_recovery_is_refused() -> TestResult {
     use private_channel_indexer::operator::confidential_custody::ConfidentialHold;
     let env = Env::start("conf_38").await?;
     let good = env.mint(MintSpec::default()).await?;

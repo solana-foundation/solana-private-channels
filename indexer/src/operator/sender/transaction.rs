@@ -931,6 +931,7 @@ pub(super) fn handle_confirmation_result<'a>(
                             ctx.deposit_claim_lease,
                             TransactionStatus::ManualReview,
                             &reason,
+                            None,
                         )
                         .await;
                         // A verdict that did not apply, or may not have, leaves the
@@ -1470,6 +1471,7 @@ pub(super) async fn send_manual_review(
         incarnation_lease(state, ctx),
         TransactionStatus::ManualReview,
         reason,
+        None,
     )
     .await;
 }
@@ -2635,6 +2637,7 @@ pub(super) async fn send_fatal_error(
         lease,
         TransactionStatus::Failed,
         error_msg,
+        None,
     )
     .await;
 }
@@ -2663,6 +2666,7 @@ pub(super) async fn send_fenced_outcome(
     lease: Option<DateTime<Utc>>,
     status: TransactionStatus,
     reason: &str,
+    park_label: Option<&str>,
 ) -> FencedWrite {
     let outcome = match lease {
         None => FencedWrite::Applied,
@@ -2686,7 +2690,7 @@ pub(super) async fn send_fenced_outcome(
                 transaction_id,
                 status,
                 reason,
-                || storage.try_quarantine_processing(transaction_id, lease, None, None),
+                || storage.try_quarantine_processing(transaction_id, lease, None, None, park_label),
             )
             .await
         }

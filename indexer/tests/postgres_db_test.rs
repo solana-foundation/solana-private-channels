@@ -3402,7 +3402,13 @@ async fn quarantine_cas_writes_signatures_and_coalesces_none(
     .await?;
     let captured = updated_at_of(&pool, with_sigs).await;
     let quarantined = storage
-        .try_quarantine_processing(with_sigs, captured, Some(sigs.clone()), Some(vec![777i64]))
+        .try_quarantine_processing(
+            with_sigs,
+            captured,
+            Some(sigs.clone()),
+            Some(vec![777i64]),
+            None,
+        )
         .await?;
     assert!(quarantined, "fresh CAS must succeed");
     assert_eq!(status_of(&pool, with_sigs).await, "manual_review");
@@ -3439,7 +3445,7 @@ async fn quarantine_cas_writes_signatures_and_coalesces_none(
     let captured = updated_at_of(&pool, preloaded).await;
     assert!(
         storage
-            .try_quarantine_processing(preloaded, captured, None, None)
+            .try_quarantine_processing(preloaded, captured, None, None, None)
             .await?
     );
     let (kept_sigs, kept_heights) = remint_columns_of(&pool, preloaded).await?;
@@ -3462,7 +3468,8 @@ async fn quarantine_cas_writes_signatures_and_coalesces_none(
                 stale_row,
                 stale,
                 Some(vec!["sig-race".to_string()]),
-                Some(vec![1])
+                Some(vec![1]),
+                None
             )
             .await?
     );
@@ -6015,6 +6022,117 @@ async fn fetch_skips_rows_until_not_before() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// The backlog /health sees counts only rows the fetch can take now; undecryptable
+/// deposits are counted apart and waiting releases not at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_backlog_counts_only_rows_the_fetch_can_take(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::storage::count_pending_transactions::PendingBacklog;
+    let (pool, storage, _pg) = start_postgres().await?;
+    let waiting = storage
+        .insert_db_transaction(&make_db_transaction("wait", TransactionType::Withdrawal))
+        .await?;
+    storage
+        .insert_db_transaction(&make_db_transaction("ready", TransactionType::Withdrawal))
+        .await?;
+    sqlx::query("UPDATE transactions SET not_before = NOW() + INTERVAL '1 hour' WHERE id = $1")
+        .bind(waiting)
+        .execute(&pool)
+        .await?;
+    storage
+        .insert_db_transactions_batch(&[
+            undecrypted_deposit("bad", vec![1, 2]),
+            make_db_transaction("good", TransactionType::Deposit),
+        ])
+        .await?;
+    let one_each = PendingBacklog {
+        claimable: 1,
+        undecrypted: 0,
+    };
+    assert_eq!(
+        storage
+            .count_pending_transactions(TransactionType::Withdrawal)
+            .await?,
+        one_each
+    );
+    assert_eq!(
+        storage
+            .count_pending_transactions(TransactionType::Deposit)
+            .await?,
+        PendingBacklog {
+            claimable: 1,
+            undecrypted: 1
+        }
+    );
+    Ok(())
+}
+
+/// The poisoned-mint lookup runs on every confidential withdrawal and reconciliation tick,
+/// so a partial index on the flagged rows serves it instead of a full table scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_poisoned_mint_lookup_uses_its_partial_index() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    // A second init must be a no-op for the index too.
+    storage.init_schema().await?;
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *conn)
+        .await?;
+    let plan: Vec<(String,)> = sqlx::query_as(
+        "EXPLAIN SELECT DISTINCT mint FROM transactions WHERE confidential_undecrypted ORDER BY mint",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let plan = plan
+        .into_iter()
+        .map(|(line,)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("idx_transactions_confidential_undecrypted_mint"),
+        "{plan}"
+    );
+    Ok(())
+}
+
+/// A park keeps its label on a confidential row, in the same write that parks it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_confidential_park_keeps_its_label_on_the_row() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut confidential = make_db_transaction("conf", TransactionType::Withdrawal);
+    confidential.confidential = true;
+    let conf = storage.insert_db_transaction(&confidential).await?;
+    let public = storage
+        .insert_db_transaction(&make_db_transaction("pub", TransactionType::Withdrawal))
+        .await?;
+    for row in storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?
+    {
+        assert!(
+            storage
+                .try_quarantine_processing(row.id, row.updated_at, None, None, Some("label_x"))
+                .await?
+        );
+    }
+    let label = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT confidential_park_label FROM transactions WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    assert_eq!(label(conf).await?.as_deref(), Some("label_x"));
+    assert_eq!(label(public).await?, None);
+    Ok(())
+}
+
 // A real pubkey: recovery reads the mint's escrow account.
 const CONF_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
 
@@ -6093,6 +6211,7 @@ async fn recover_confidential_fills_amounts_and_clears_flags(
     storage
         .recover_confidential_fenced(
             &guard,
+            CONF_MINT,
             vec![(ids[0], TokenAmount(77)), (ids[1], TokenAmount(0))],
         )
         .await?;
@@ -6364,7 +6483,13 @@ async fn rebalance_requests_round_trip_and_transition_once(
     };
     let (_pool, storage, _pg) = start_postgres().await?;
     let id = storage
-        .insert_rebalance_request("mint", RebalanceDirection::ToPublic, u64::MAX, 1 << 60)
+        .insert_rebalance_request(
+            "mint",
+            RebalanceDirection::ToPublic,
+            u64::MAX,
+            1 << 60,
+            None,
+        )
         .await?;
     let pending = storage
         .get_rebalance_requests(rebalance_status::PENDING)
@@ -6379,6 +6504,22 @@ async fn rebalance_requests_round_trip_and_transition_once(
         ),
         (id, RebalanceDirection::ToPublic, u64::MAX, 1 << 60)
     );
+    assert_eq!(pending[0].expected_public, None);
+    // A move to confidential keeps the public balance it was made against.
+    let to_confidential = storage
+        .insert_rebalance_request(
+            "mint",
+            RebalanceDirection::ToConfidential,
+            5,
+            0,
+            Some(u64::MAX),
+        )
+        .await?;
+    let stored = storage
+        .get_rebalance_requests(rebalance_status::PENDING)
+        .await?;
+    assert_eq!(stored[1].id, to_confidential);
+    assert_eq!(stored[1].expected_public, Some(u64::MAX));
     assert!(
         storage
             .claim_rebalance_request(id, "sig", 1_200, 1_000)
@@ -6489,14 +6630,14 @@ async fn operator_attempts_journal_settle_and_feed_the_pending_inputs(
         .await?;
     // A move completed after the apply was journaled counts; one completed before does not.
     let before = storage
-        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 3, 0)
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 3, 0, None)
         .await?;
     sqlx::query("UPDATE rebalance_requests SET status = 'completed', updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
         .bind(before)
         .execute(&pool)
         .await?;
     let after = storage
-        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 4, 0)
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 4, 0, None)
         .await?;
     storage
         .transition_rebalance_request(
@@ -6588,10 +6729,10 @@ async fn confidential_sender_writes_fail_once_the_lock_is_lost(
     };
 
     let pending = storage
-        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 5, 10)
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 5, 10, None)
         .await?;
     let sent = storage
-        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 5, 10)
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToConfidential, 5, 10, None)
         .await?;
     assert!(
         storage
@@ -6649,7 +6790,7 @@ async fn confidential_sender_writes_fail_once_the_lock_is_lost(
         .await
         .is_err());
     assert!(storage
-        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 1, 1)
+        .insert_rebalance_request(CONF_MINT, RebalanceDirection::ToPublic, 1, 1, None)
         .await
         .is_err());
     assert!(storage
@@ -6661,6 +6802,10 @@ async fn confidential_sender_writes_fail_once_the_lock_is_lost(
         .await
         .is_err());
     assert!(storage.record_confidential_landing_slot(900).await.is_err());
+    assert!(storage
+        .record_confidential_mint_state(CONF_MINT, 5, 900)
+        .await
+        .is_err());
     assert!(storage
         .requeue_confidential_wait(release, lease, Utc::now(), Utc::now())
         .await
@@ -6688,5 +6833,43 @@ async fn confidential_sender_writes_fail_once_the_lock_is_lost(
     .await?;
     assert_eq!((status.as_str(), label), ("processing", None));
     assert_eq!(storage.confidential_landing_slot().await?, None);
+    assert!(storage.confidential_mint_states().await?.is_empty());
+    Ok(())
+}
+
+/// The sender keeps the last verified available per mint; confidential-recover clears its
+/// mint and an escrow resync clears every mint.
+#[tokio::test(flavor = "multi_thread")]
+async fn confidential_mint_state_is_kept_and_cleared_by_recovery_and_resync(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage
+        .record_confidential_mint_state(CONF_MINT, 7, 100)
+        .await?;
+    storage
+        .record_confidential_mint_state(CONF_MINT, u64::MAX, 120)
+        .await?;
+    storage
+        .record_confidential_mint_state("other", 3, 90)
+        .await?;
+    assert_eq!(
+        storage.confidential_mint_states().await?,
+        vec![(CONF_MINT.to_string(), u64::MAX), ("other".to_string(), 3)]
+    );
+
+    let guard =
+        take_live_lock(&storage, LiveLockMode::Exclusive, "recover", Duration::ZERO).await?;
+    storage
+        .recover_confidential_fenced(&guard, CONF_MINT, Vec::new())
+        .await?;
+    assert_eq!(
+        storage.confidential_mint_states().await?,
+        vec![("other".to_string(), 3)]
+    );
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    guard.stop_and_wait().await;
+    assert!(storage.confidential_mint_states().await?.is_empty());
     Ok(())
 }

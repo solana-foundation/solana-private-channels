@@ -445,16 +445,18 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Send a signed v1 transaction base64, with preflight at confirmed so the simulation
-    /// sees the state the confidential proofs were built from.
+    /// Send a signed v1 transaction base64, with preflight at confirmed and no older than
+    /// `min_context_slot`, so the simulation sees the state the confidential proofs were built from.
     pub async fn send_versioned_transaction(
         &self,
         transaction: &solana_sdk::transaction::VersionedTransaction,
         retry_policy: RetryPolicy,
+        min_context_slot: Option<u64>,
     ) -> Result<solana_sdk::signature::Signature, Box<client_error::Error>> {
         let config = solana_rpc_client_api::config::RpcSendTransactionConfig {
             encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
             preflight_commitment: Some(solana_commitment_config::CommitmentLevel::Confirmed),
+            min_context_slot,
             ..Default::default()
         };
         self.with_retry("send_versioned_transaction", retry_policy, || async {
@@ -462,6 +464,34 @@ impl RpcClientWithRetry {
                 .send_transaction_with_config(transaction, config)
                 .await
         })
+        .await
+    }
+
+    /// Simulate a signed v1 transaction at confirmed, no older than `min_context_slot`.
+    pub async fn simulate_versioned_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::VersionedTransaction,
+        min_context_slot: Option<u64>,
+    ) -> Result<
+        solana_rpc_client_api::response::RpcSimulateTransactionResult,
+        Box<client_error::Error>,
+    > {
+        let config = solana_rpc_client_api::config::RpcSimulateTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot,
+            ..Default::default()
+        };
+        self.with_retry(
+            "simulate_versioned_transaction",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .simulate_transaction_with_config(transaction, config.clone())
+                    .await
+                    .map(|response| response.value)
+            },
+        )
         .await
     }
 

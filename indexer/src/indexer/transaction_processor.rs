@@ -3692,9 +3692,10 @@ mod confidential_tests {
             && l.contains(crate::indexer::confidential::CONFIGURED_UNDER_INSTANCE_KEY)));
     }
 
-    /// The live indexer and a resync rebuild, both keyed, write the same rows.
+    /// Two keyed processors fed the same confidential slot write the same rows. The live versus
+    /// resync comparison is e2e test 39, `e2e_escrow_resync_rebuilds_confidential_rows_identically`.
     #[tokio::test]
-    async fn rebuild_writes_identical_confidential_rows() {
+    async fn two_keyed_processors_write_identical_confidential_rows() {
         let keys = cts::keys();
         // Built once: ciphertexts are randomized, and a rebuild reads the same bytes.
         let slot = vec![

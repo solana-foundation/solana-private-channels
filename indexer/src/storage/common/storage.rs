@@ -336,9 +336,10 @@ impl Storage {
     pub async fn recover_confidential_fenced(
         &self,
         lock: &live_lock::LiveLockGuard,
+        mint: &str,
         recovered: Vec<(i64, crate::storage::common::amount::TokenAmount)>,
     ) -> Result<(), StorageError> {
-        confidential_deposits::recover_confidential_fenced(self, lock, recovered).await
+        confidential_deposits::recover_confidential_fenced(self, lock, mint, recovered).await
     }
 
     /// The release recorded for `nonce`, if the indexer has seen one.
@@ -473,7 +474,7 @@ impl Storage {
     pub async fn count_pending_transactions(
         &self,
         transaction_type: TransactionType,
-    ) -> Result<i64, StorageError> {
+    ) -> Result<count_pending_transactions::PendingBacklog, StorageError> {
         count_pending_transactions::count_pending_transactions(self, transaction_type).await
     }
 
@@ -810,13 +811,14 @@ impl Storage {
 
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
     /// The optional signature arrays are recorded on the row in the same write;
-    /// `None` leaves both columns untouched.
+    /// `None` leaves both columns untouched. `park_label` is kept on a confidential row.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         remint_signatures: Option<Vec<String>>,
         remint_last_valid_block_heights: Option<Vec<i64>>,
+        park_label: Option<&str>,
     ) -> Result<bool, StorageError> {
         try_quarantine_processing::try_quarantine_processing(
             self,
@@ -824,6 +826,7 @@ impl Storage {
             expected_updated_at,
             remint_signatures,
             remint_last_valid_block_heights,
+            park_label,
         )
         .await
     }
@@ -1495,14 +1498,14 @@ mod tests {
             .count_pending_transactions(TransactionType::Deposit)
             .await
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count.claimable, 3);
 
         // Count withdrawals only
         let count = storage
             .count_pending_transactions(TransactionType::Withdrawal)
             .await
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count.claimable, 1);
     }
 
     #[tokio::test]

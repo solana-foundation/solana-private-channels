@@ -948,17 +948,20 @@ impl MockStorage {
     pub async fn count_pending_transactions(
         &self,
         transaction_type: TransactionType,
-    ) -> Result<i64, StorageError> {
-        let count = self
-            .pending_transactions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|t| {
-                t.transaction_type == transaction_type && t.status == TransactionStatus::Pending
-            })
-            .count();
-        Ok(count as i64)
+    ) -> Result<super::count_pending_transactions::PendingBacklog, StorageError> {
+        let pending = self.pending_transactions.lock().unwrap();
+        let rows = pending.iter().filter(|t| {
+            t.transaction_type == transaction_type && t.status == TransactionStatus::Pending
+        });
+        let mut backlog = super::count_pending_transactions::PendingBacklog::default();
+        for row in rows {
+            if row.confidential_undecrypted {
+                backlog.undecrypted += 1;
+            } else if row.not_before.is_none_or(|at| at <= Utc::now()) {
+                backlog.claimable += 1;
+            }
+        }
+        Ok(backlog)
     }
 
     pub fn get_completed_withdrawal_nonces(
@@ -1741,6 +1744,7 @@ impl MockStorage {
         expected_updated_at: DateTime<Utc>,
         remint_signatures: Option<Vec<String>>,
         remint_last_valid_block_heights: Option<Vec<i64>>,
+        park_label: Option<&str>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_quarantine_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -1755,6 +1759,13 @@ impl MockStorage {
                 }
                 if remint_last_valid_block_heights.is_some() {
                     txn.remint_last_valid_block_heights = remint_last_valid_block_heights;
+                }
+                if let Some(label) = park_label.filter(|_| txn.confidential) {
+                    self.confidential_sender
+                        .lock()
+                        .unwrap()
+                        .park_labels
+                        .insert(transaction_id, label.to_string());
                 }
                 let now = Utc::now();
                 txn.processed_at = Some(now);
@@ -2192,13 +2203,21 @@ impl MockStorage {
         label: &str,
     ) -> Result<(), StorageError> {
         self.check_should_fail("set_confidential_park_label")?;
-        let waiting = self.pending_transactions.lock().unwrap().iter().any(|t| {
-            t.id == transaction_id
-                && matches!(
-                    t.status,
-                    TransactionStatus::Processing | TransactionStatus::PendingRemint
-                )
-        });
+        // The row's updated_at trigger fires on this write as on any other.
+        let waiting = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| {
+                t.id == transaction_id
+                    && matches!(
+                        t.status,
+                        TransactionStatus::Processing | TransactionStatus::PendingRemint
+                    )
+            })
+            .map(|t| t.updated_at = Utc::now())
+            .is_some();
         if waiting {
             self.confidential_sender
                 .lock()
@@ -2264,6 +2283,7 @@ impl MockStorage {
         direction: crate::storage::common::storage::confidential_sender::RebalanceDirection,
         amount: u64,
         expected_available: u64,
+        expected_public: Option<u64>,
     ) -> Result<i64, StorageError> {
         use crate::storage::common::storage::confidential_sender::{
             rebalance_status, RebalanceRequest,
@@ -2277,6 +2297,7 @@ impl MockStorage {
             direction,
             amount,
             expected_available,
+            expected_public,
             status: rebalance_status::PENDING.to_string(),
             signature: None,
             error: None,

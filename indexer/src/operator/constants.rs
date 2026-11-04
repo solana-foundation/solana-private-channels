@@ -55,9 +55,11 @@ pub mod confidential_constants {
     pub const WAIT_BACKOFF_CAP: Duration = Duration::from_secs(300);
     /// A confidential park older than this alerts (mirrored in the alert rules).
     pub const PARK_AGE_ALERT: Duration = Duration::from_secs(3600);
-    /// Compute for a release with inline proofs. A fee and hook mint release, the costliest
-    /// path, measured about 496,000 on Token-2022 11.1.0; this leaves a 20% margin.
+    /// Compute for a `MoveToPublic` with inline proofs; it calls no hook.
     pub const CU_CONFIDENTIAL_RELEASE: u32 = 600_000;
+    /// A release is simulated at the transaction maximum, then sent with what it used plus a
+    /// fifth, since an issuer's hook may cost any amount.
+    pub const CU_CONFIDENTIAL_RELEASE_MAX: u32 = 1_400_000;
     /// Compute for an apply, a repair or a move between balances.
     pub const CU_CONFIDENTIAL_APPLY: u32 = 200_000;
     /// v1 reads a missing limit as 0; Token-2022 alone loads about 1.3 MB.

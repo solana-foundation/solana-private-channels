@@ -168,6 +168,13 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_UNDECRYPTED_DEPOSITS_HELD,
+    "private_channel_operator_undecrypted_deposits_held",
+    "Pending confidential deposits the key could not decrypt, held out of the backlog until recovery",
+    &["program_type"]
+);
+
+gauge_vec!(
     OPERATOR_PENDING_REMINTS,
     "private_channel_operator_pending_remints",
     "Deferred remints in the withdraw sender after its last tick, including backlog rows not loaded yet",
@@ -230,16 +237,23 @@ pub const BAIL_REASON_DESTINATION_NOT_READY: &str = "destination_not_ready";
 pub const BAIL_REASON_CONFIDENTIAL_BALANCE_LOW: &str = "confidential_balance_low";
 pub const BAIL_REASON_CONFIDENTIAL_STALE_PROOF: &str = "confidential_stale_proof";
 pub const BAIL_REASON_CONFIDENTIAL_TX_TOO_LARGE: &str = "confidential_tx_too_large";
+/// Token-2022 refused a release because the escrow's own account is frozen or unapproved.
+pub const BAIL_REASON_CONFIDENTIAL_ESCROW_ACCOUNT_NOT_READY: &str =
+    "confidential_escrow_account_not_ready";
+/// A confidential release ran out of compute, in the escrow or in the mint's hook.
+pub const BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED: &str = "confidential_compute_exceeded";
 /// A public release on a confidential-configured mint whose public balance is short.
 pub const BAIL_REASON_PUBLIC_BALANCE_LOW: &str = "public_balance_low";
 
-pub const CONFIDENTIAL_BAIL_REASONS: [&str; 7] = [
+pub const CONFIDENTIAL_BAIL_REASONS: [&str; 9] = [
     BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
     BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
     BAIL_REASON_DESTINATION_NOT_READY,
     BAIL_REASON_CONFIDENTIAL_BALANCE_LOW,
     BAIL_REASON_CONFIDENTIAL_STALE_PROOF,
     BAIL_REASON_CONFIDENTIAL_TX_TOO_LARGE,
+    BAIL_REASON_CONFIDENTIAL_ESCROW_ACCOUNT_NOT_READY,
+    BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED,
     BAIL_REASON_PUBLIC_BALANCE_LOW,
 ];
 
@@ -583,6 +597,7 @@ pub fn init_labels(program_type: &str) {
     }
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
+    OPERATOR_UNDECRYPTED_DEPOSITS_HELD.with_label_values(&[program_type]);
     // FEEPAYER_BALANCE_LAMPORTS is seeded by the withdraw operator's monitor, the only
     // writer; seeding it here would pin every other process at a 0 SOL balance.
 
@@ -722,6 +737,7 @@ pub fn init() {
         OPERATOR_TRANSACTION_ERRORS,
         OPERATOR_MINTS_SENT,
         OPERATOR_BACKLOG_DEPTH,
+        OPERATOR_UNDECRYPTED_DEPOSITS_HELD,
         FEEPAYER_BALANCE_LAMPORTS,
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,

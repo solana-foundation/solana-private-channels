@@ -20,7 +20,9 @@ How it works, in short:
   on-chain ciphertext. No event history is involved.
 - The withdraw operator's sender is the only process that changes the escrow's
   confidential balance: releases, applies, AES repairs and rebalances all run in it,
-  one at a time.
+  one at a time. After each of its transactions lands it keeps the available balance it
+  verified in `confidential_mint_state`, so a restart still has a value the opening check
+  can confirm; `confidential-recover` and an escrow resync clear it.
 - Every park goes through the journal and finality gate, so a parked row never
   hides a release that later lands. A park is not a refund: the user's channel
   tokens were burned when the row was created.
@@ -59,8 +61,19 @@ indexer and both operators refuse to start without the key that account holds.
 
 ## Park labels
 
-A parked confidential withdrawal is a `manual_review` row whose `error_message`
-contains the label. Run the remint journal check from
+A parked confidential withdrawal is a `manual_review` row whose
+`confidential_park_label` column holds the label, for pre-flight parks and parks after a
+send alike. The alert webhook's `error_message` starts with it too; the database has no
+`error_message` column.
+
+```sql
+SELECT id, withdrawal_nonce, mint, confidential_park_label, updated_at
+  FROM transactions
+ WHERE confidential AND status = 'manual_review'
+ ORDER BY updated_at;
+```
+
+Run the remint journal check from
 [withdrawal_manual_review.md](withdrawal_manual_review.md#triage---dispatch-by-error_message)
 first, then [`_verify_onchain_release.md`](_verify_onchain_release.md): continue
 only on `NOT_LANDED` with an empty or all-dead journal.
@@ -74,6 +87,8 @@ only on `NOT_LANDED` with an empty or all-dead journal.
 | `public_balance_low` | [Public balance low](#public_balance_low) |
 | `confidential_stale_proof` | [Stale proof](#confidential_stale_proof) |
 | `confidential_tx_too_large` | [Transaction too large](#confidential_tx_too_large) |
+| `confidential_escrow_account_not_ready` | [Escrow account not ready](#confidential_escrow_account_not_ready) |
+| `confidential_compute_exceeded` | [Compute exceeded](#confidential_compute_exceeded) |
 | `hook_unresolvable` (on a confidential row) | [Hook refuses `u64::MAX`](#hook_unresolvable-on-a-confidential-row) |
 
 Every label has three possible ends:
@@ -143,14 +158,16 @@ nothing is minted for its undecrypted deposits.
      confidential balance. [Escalate](_escalation.md) (Tier 1) and stop here.
 2. Load the right key (`ESCROW_CONFIDENTIAL_KEYS`, the instance key), restart the
    services.
-3. Stop `indexer-solana` (recover takes the live-state lock and refuses during a
-   resync), then run `indexer confidential-recover --mint <mint>`. It first checks
+3. Stop every indexer and operator on the database (`indexer-solana`,
+   `indexer-private-channel`, `operator-solana` and `operator-private-channel`): each
+   holds the live-state lock shared, and recover takes it exclusively and refuses during
+   a resync. Then run `indexer confidential-recover --mint <mint>`. It first checks
    the mint's escrow account is configured under the loaded key and refuses
    otherwise; then it re-decrypts every flagged row from its raw bytes in one
    database transaction and clears the flags; it exits non-zero if any row still
    does not decrypt. Rerunning is safe.
-4. Start `indexer-solana`. The recovered deposits are minted on the channel, the
-   gauge drops to 0 and reconciliation counts the mint again.
+4. Start the indexers and operators again. The recovered deposits are minted on the
+   channel, the gauge drops to 0 and reconciliation counts the mint again.
 5. Re-arm the parked withdrawals.
 
 **Resync.** An escrow resync decrypts with the instance key only, so it requires
@@ -165,7 +182,9 @@ The mint stays held after the resync exactly as before it. See
 The user's Token-2022 account on Solana cannot take a confidential release: it is
 missing, not configured for confidential transfers, not approved, has confidential
 credits off, its pending credit counter is full, or it is frozen (pre-flight, escrow
-25 to 29, or Token-2022 17, 24, 25 or 39 on-chain).
+25 to 29, or Token-2022 25 or 39 on-chain). The escrow checks these states itself before
+it calls Token-2022, so a Token-2022 17 or 24 is about the escrow's own account; see
+[Escrow account not ready](#confidential_escrow_account_not_ready).
 
 - The user fixes their account (create and configure it, apply their pending
   balance, ask the issuer to approve or thaw it), then re-arm. `confidential_withdraw`
@@ -178,10 +197,12 @@ The escrow's verified available balance is below the amount even after applying
 pending. Public funds of the mint may cover it.
 
 1. Move public funds into the confidential balance with a rebalance request:
-   `indexer rebalance --mint <mint> --to-confidential <amount>`. The sender
-   executes it, journaled like a release, and refuses it if the available balance
-   it verifies differs from the request's `expected_available`. Rerunning after a
-   crash never moves funds twice. A request left `sent` becomes `completed` once its
+   `indexer rebalance --mint <mint> --to-confidential <amount>`. The request records
+   the escrow's public balance in `expected_public`; the sender executes it, journaled
+   like a release, and refuses it if the public balance differs (a `--to-public`
+   request is guarded the same way by the available balance, `expected_available`).
+   Running the same command twice therefore moves the amount once: the second request
+   is refused once the first has landed. A request left `sent` becomes `completed` once its
    transaction finalizes, and `failed` only after its blockhash expired and the
    signature is absent from history; until then it stays `sent`.
 2. Re-arm the row. Or release publicly if the public balance covers it.
@@ -212,10 +233,38 @@ available balance, or the RPC keeps serving an old account.
 The release does not fit one v1 transaction (4,096 bytes or 64 accounts), usually
 a fee mint with many hook accounts. It will never fit. Release publicly.
 
+### confidential_escrow_account_not_ready
+
+Token-2022 refused the release with 17 (account frozen) or 24 (not approved). The
+escrow refuses a frozen or unapproved destination itself before calling Token-2022, so
+these can only be about the escrow's own token account for the mint. Nothing moved.
+
+1. Check the escrow account: `solana account <escrow-ata>` (state and the confidential
+   extension's `approved`). A freeze or an unapproved account is the issuer's action.
+2. Ask the issuer to thaw it, or to approve it with the mint's confidential authority.
+   Background applies and repairs on a frozen escrow account are held until it is
+   thawed (the operator logs `Escrow account is frozen` once).
+3. Re-arm. If the issuer will not, [escalate](_escalation.md) (Tier 1): no withdrawal of
+   the mint, public or confidential, can be paid from a frozen escrow account.
+
+### confidential_compute_exceeded
+
+The release ran out of compute, in the simulation or on-chain, in the escrow or in the
+mint's transfer hook. The sender simulates every release at 1,400,000 compute units,
+the transaction maximum, and sends it with what it used plus a fifth, so this means the
+release does not fit one transaction at all, usually because the issuer's hook is too
+expensive. A resend cannot pass it.
+
+- Release publicly: rebalance to public if needed, then clear `confidential` and
+  re-arm. A public release runs the hook with the real amount and may cost less.
+- If the hook was changed since, re-arm once to try again.
+
 ### hook_unresolvable (on a confidential row)
 
 Token-2022 calls the hook with `u64::MAX` on confidential transfers, and this
-mint's hook refuses it or its extra accounts cannot be resolved for it.
+mint's hook refuses it or its extra accounts cannot be resolved for it. A hook that
+runs out of compute parks [`confidential_compute_exceeded`](#confidential_compute_exceeded)
+instead.
 Release publicly: rebalance to public if needed, then clear `confidential` and
 re-arm.
 
@@ -223,10 +272,14 @@ re-arm.
 
 ### Confidential mint poisoned
 
-`private_channel_confidential_mint_poisoned{mint} == 1`. See
-[confidential_mint_poisoned](#confidential_mint_poisoned).
-`private_channel_confidential_decrypt_failures_total{kind}` rising is the same
-cause, seen per event.
+Rule `confidential-mint-poisoned`: `private_channel_confidential_mint_poisoned{mint} == 1`.
+See [confidential_mint_poisoned](#confidential_mint_poisoned). Two rules report the same
+cause from other angles: `confidential-decrypt-failures`
+(`private_channel_confidential_decrypt_failures_total{kind}` rose in the last 10 minutes,
+per event) and `confidential-undecrypted-deposits-held`
+(`private_channel_operator_undecrypted_deposits_held`, the escrow operator's count of
+pending deposits it cannot mint). Held deposits are not counted as backlog, so they do
+not turn the operator's `/health` red.
 
 ### Reconciliation confidential mismatch
 
@@ -287,7 +340,9 @@ RPC cannot answer status or history; check it.
 
 The escrow's pending credit counter is near its cap of 65,536. The sender applies at
 half the cap, so a high value means it is not applying: check that
-`operator-private-channel` is up and not halted, and that the mint is not blocked.
+`operator-private-channel` is up and not halted, that the mint is not blocked, and that
+the escrow account is not frozen (Token-2022 refuses an apply on a frozen account, so
+the sender holds them until it is thawed).
 At the cap, new confidential deposits fail for users (nothing is lost).
 
 ### Confidential park age
@@ -308,3 +363,13 @@ balance for a long time. It is back in `pending` with a growing `not_before`, so
 other rows keep flowing. Usually a stale AES copy the repair has not fixed yet; see
 [AES repair deferred](#aes-repair-deferred). If the copy is fine, check the RPC the
 operator reads from is not behind.
+
+### Dust deposits
+
+Not an alert of its own. Confidential deposits have no minimum, and the escrow indexer
+decrypts each one with two or three 32-bit discrete-log searches (about 20 a second); a
+slot checkpoints only once all of its deposits are decrypted. 1-unit deposits sent
+faster than that delay every deposit behind them, public ones included, and the indexer
+lag alert (`indexer-lag-10s`) fires. No funds are at risk and the backlog drains once
+the flood stops. Do not resync to clear it: a resync decrypts the whole history twice
+while holding the exclusive live-state lock, so every service stays down longer.

@@ -970,7 +970,7 @@ async fn route_outcome(
             };
             // Noisy by design — page on uncertainty, never silently demote.
             match storage
-                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights)
+                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights, None)
                 .await
             {
                 Ok(true) => {

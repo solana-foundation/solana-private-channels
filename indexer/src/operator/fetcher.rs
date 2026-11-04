@@ -36,6 +36,8 @@ pub async fn run_fetcher(
     let mut holding = false;
     // Set while the solvency fence holds the poll, so the wait is logged once.
     let mut fenced = false;
+    // Undecryptable deposits last logged, so a change in the count is logged once.
+    let mut undecrypted_held = 0;
 
     loop {
         // Check for cancellation
@@ -46,10 +48,21 @@ pub async fn run_fetcher(
 
         // Measured before the halt gate so /health can still report a stalled backlog.
         let backlog = match storage.count_pending_transactions(transaction_type).await {
-            Ok(count) => {
+            Ok(counts) => {
+                let count = counts.claimable;
                 metrics::OPERATOR_BACKLOG_DEPTH
                     .with_label_values(&[program_type.as_label()])
                     .set(count as f64);
+                metrics::OPERATOR_UNDECRYPTED_DEPOSITS_HELD
+                    .with_label_values(&[program_type.as_label()])
+                    .set(counts.undecrypted as f64);
+                if counts.undecrypted > 0 && counts.undecrypted != undecrypted_held {
+                    warn!(
+                        held = counts.undecrypted,
+                        "Confidential deposits the key could not decrypt are held until confidential-recover"
+                    );
+                }
+                undecrypted_held = counts.undecrypted;
                 if let Some(h) = &health {
                     h.set_pending(count as u64);
                     // An empty backlog is caught up, so idle time never counts against the next row.
@@ -521,6 +534,58 @@ mod tests {
 
         token.cancel();
         assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// Rows the fetch cannot take now are not backlog: an undecryptable deposit is held until
+    /// recovery and counted on its own gauge, and a release waiting out its retry delay is idle.
+    #[tokio::test]
+    async fn rows_the_fetch_skips_do_not_count_as_a_stalled_backlog() {
+        use private_channel_metrics::HealthOutcome;
+        for (program, transaction_type) in [
+            (ProgramType::Escrow, TransactionType::Deposit),
+            (ProgramType::Withdraw, TransactionType::Withdrawal),
+        ] {
+            let mock = covered_mock();
+            let mut txn = make_test_transaction("sig_skipped");
+            txn.transaction_type = transaction_type;
+            txn.confidential = true;
+            if transaction_type == TransactionType::Deposit {
+                txn.confidential_undecrypted = true;
+                txn.confidential_raw = Some(vec![1]);
+            } else {
+                txn.not_before = Some(Utc::now() + chrono::Duration::seconds(300));
+            }
+            mock.pending_transactions.lock().unwrap().push(txn);
+            let health = fast_stall_health();
+            let storage = Arc::new(Storage::Mock(mock.clone()));
+            let (tx, mut rx) = mpsc::channel(10);
+            let token = CancellationToken::new();
+            let handle = tokio::spawn(run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                program,
+                token.clone(),
+                Some(health.clone()),
+                SolvencyFence::open_from_start(),
+            ));
+
+            let got = tokio::time::timeout(Duration::from_millis(2_500), rx.recv()).await;
+            assert!(got.is_err(), "the skipped row is not forwarded");
+            assert_eq!(health.check(), HealthOutcome::Healthy, "{program:?}");
+            // The gauges are process-global and other fetcher tests write them, so the
+            // split itself is checked on the count.
+            let counts = mock
+                .count_pending_transactions(transaction_type)
+                .await
+                .unwrap();
+            assert_eq!(counts.claimable, 0, "{program:?}");
+            let held = i64::from(transaction_type == TransactionType::Deposit);
+            assert_eq!(counts.undecrypted, held, "{program:?}");
+
+            token.cancel();
+            assert!(handle.await.unwrap().is_ok());
+        }
     }
 
     /// An idle stretch is not a stall: a deposit that arrives after it starts a fresh window.

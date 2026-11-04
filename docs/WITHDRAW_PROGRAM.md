@@ -61,7 +61,7 @@ The instruction emits a `WithdrawFundsEvent` via program log:
 
 The destination's Token-2022 account on Solana must exist, be configured for confidential transfers, be approved when the mint requires it, accept confidential credits, have room in its pending credit counter and not be frozen, or the operator parks the withdrawal (`destination_not_ready`). It is not a refund: the burn already happened, and an operator resolves the park by re-arming it, releasing it publicly or reminting. `scripts/devnet/src/bin/confidential_withdraw.rs` checks the destination first when `SOLANA_RPC_URL` is set.
 
-The withdraw indexer allow-lists discriminators 0, 1 and 2 and fails the slot on any other, so an indexer older than this instruction stops rather than skip a burn. Roll indexers out before the program.
+Roll the withdraw indexer out before the program. The 0.1.0 indexer parses any unknown discriminator as nothing and moves on, so it would silently skip a `ConfidentialWithdrawFunds` and the user's burn would never be released. From this release the indexer allow-lists discriminators 0, 1 and 2 and fails the slot on any other, so a later instruction stops it instead.
 
 Discriminator: `2`
 

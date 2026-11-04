@@ -1148,7 +1148,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} has been left out of reconciliation for 5 minutes (reason {{ $labels.reason }}). A stale AES copy should be repaired by the sender within seconds and large pending applied by it; check the escrow operator is running and not halted. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
+          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} has been left out of reconciliation for 5 minutes (reason {{ $labels.reason }}). A stale AES copy should be repaired by the withdraw sender within seconds and large pending applied by it; applies and repairs run in operator-private-channel, so check it is running and not halted. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
         labels:
           severity: warning
         data:
@@ -1601,4 +1601,112 @@ groups:
                 - evaluator:
                     type: gt
                     params: [10]
+              refId: C
+
+  # Confidential deposits the instance key cannot read: the mint is poisoned until recovery.
+  - orgId: 1
+    name: confidential-key-alerts
+    folder: Solana Private Channels Alerts
+    interval: 30s
+    rules:
+      - uid: confidential-mint-poisoned
+        title: "Confidential mint poisoned"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.job }}: mint {{ $labels.mint }} has a confidential deposit the instance key could not decrypt, or its escrow account is configured with another key. Its deposits stay pending and its confidential withdrawals park until confidential-recover clears it. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_confidential_mint_poisoned)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-decrypt-failures
+        title: "Confidential events failed to decrypt"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.job }}: {{ $values.A }} confidential events (kind {{ $labels.kind }}) could not be decrypted or named another key in the last 10 minutes. Check ESCROW_CONFIDENTIAL_KEYS against the configured escrow accounts. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by (job, kind) (increase(private_channel_confidential_decrypt_failures_total[10m]))
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-undecrypted-deposits-held
+        title: "Undecryptable confidential deposits held"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: {{ $values.A }} pending confidential deposits could not be decrypted and are held out of the backlog until confidential-recover. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job) (private_channel_operator_undecrypted_deposits_held)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
               refId: C

@@ -256,10 +256,10 @@ pub async fn recover_mint(
         recovered.push((id, TokenAmount(amount)));
     }
     report.recovered = recovered.len();
-    if !recovered.is_empty() {
-        lock.ensure_held().await?;
-        storage.recover_confidential_fenced(lock, recovered).await?;
-    }
+    lock.ensure_held().await?;
+    storage
+        .recover_confidential_fenced(lock, mint, recovered)
+        .await?;
     let poisoned = storage
         .get_confidential_poisoned_mints()
         .await?

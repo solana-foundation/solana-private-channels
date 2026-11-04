@@ -183,8 +183,8 @@ enum Mode {
         mint: String,
     },
     /// Ask the withdraw operator to move escrow funds between the public and the
-    /// confidential balance. Records a request against the available balance verified
-    /// now; the operator runs it and refuses it if that balance moved meanwhile.
+    /// confidential balance. Records a request against the balance it spends, read now
+    /// (available to public, public to confidential); the operator refuses it if that moved.
     Rebalance {
         /// Mint whose escrow account to rebalance.
         #[arg(long)]

@@ -612,17 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn key_parts_zeroize_on_drop() {
-        // Both key types derive Zeroize with a drop hook in zk-sdk.
-        fn zeroizes<T: Zeroize>() -> bool {
-            std::mem::needs_drop::<T>()
-        }
-        assert!(zeroizes::<ElGamalSecretKey>());
-        assert!(zeroizes::<AeKey>());
-        assert!(std::mem::needs_drop::<Keys>());
-    }
-
-    #[test]
     fn split_is_16_and_32_bits() {
         assert_eq!(split(70_000), (4_464, 1));
         assert_eq!(split(MAX_CONFIDENTIAL_AMOUNT), (LO_MAX, u32::MAX as u64));

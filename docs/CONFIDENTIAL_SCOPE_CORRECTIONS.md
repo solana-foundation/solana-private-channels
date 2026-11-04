@@ -12,18 +12,19 @@ are right.
 - **Scope:** an optional trailing `confidential` byte on `WithdrawFunds`, relying on the program
   and indexer ignoring trailing bytes.
   **Shipped:** a new instruction, `ConfidentialWithdrawFunds` (discriminator 2), with the same
-  accounts and data as `WithdrawFunds` and an amount cap of 2^48 - 1. The withdraw indexer
-  allow-lists 0, 1 and 2 and fails the slot on anything else, so an indexer that does not know an
-  instruction stops instead of skipping a burn. Indexers roll out before the program.
+  accounts and data as `WithdrawFunds` and an amount cap of 2^48 - 1. Indexers roll out before
+  the program: the 0.1.0 withdraw indexer parses an unknown discriminator as nothing, so it would
+  silently skip a `ConfidentialWithdrawFunds` and drop the user's burn. From this release the
+  indexer allow-lists 0, 1 and 2 and fails the slot on anything else.
 
 ## Keys
 
 - **Scope:** the escrow operator needs the key only for reconciliation, the withdraw operator for
   applies and proofs.
   **Shipped:** `ESCROW_CONFIDENTIAL_KEYS` is loaded by the escrow indexer (run, resync,
-  reconcile, confidential-recover) and both operators. At boot the escrow indexer compares it
-  with every configured escrow account's key and refuses to start if any account is configured
-  and the key is missing or matches none. A configure event under another key poisons that mint
+  reconcile, confidential-recover) and both operators. At boot the escrow indexer, both
+  operators and a resync compare it with every configured escrow account's key and refuse to
+  start if any account is configured and the key is missing or matches none. A configure event under another key poisons that mint
   at index time. The secret is optional until an account is configured, and
   `check-required-env.sh` and the deploy refuse a malformed value.
 
@@ -36,9 +37,10 @@ are right.
   deposits and other mints keep flowing. `indexer confidential-recover --mint` re-decrypts the
   rows from their raw bytes under the live-state lock, in one database transaction.
 - **Scope:** one new column, `transactions.confidential`.
-  **Shipped:** `confidential`, `confidential_undecrypted`, `confidential_raw`, and `not_before`
-  and `wait_started_at` for confidential rows waiting on a verified balance, plus a
-  `rebalance_requests` table.
+  **Shipped:** `confidential`, `confidential_undecrypted`, `confidential_raw`, `not_before`
+  and `wait_started_at` for confidential rows waiting on a verified balance, and
+  `confidential_park_label`, plus the tables `rebalance_requests`, `confidential_sender_state`,
+  `confidential_operator_attempts` and `confidential_mint_state`.
 - **Scope:** the escrow indexer records observed releases with the decrypted amount.
   **Shipped:** the observed release is written even when the mint is poisoned or the amount does
   not decrypt (amount NULL), so the remint double-pay guard always sees it.
@@ -48,8 +50,10 @@ are right.
 - **Scope:** an AES copy that fails the opening check is unreadable custody (a dark tick); this
   was an open point.
   **Shipped:** Token-2022's expected and actual pending credit counters tell the two cases
-  apart. When they differ, a deposit raced an apply and the copy is known stale: the mint is
-  *lagging* (held, alert only) and the withdraw sender repairs the copy within seconds. When they
+  apart. When they differ, a deposit raced an apply and the copy is known stale: the gap between
+  the copy and the ciphertext is the raced deposits, which reconciliation decrypts in the same
+  bounded search as pending and counts exactly. Only when that gap does not decrypt is the mint
+  *lagging* (held, alert only) until the withdraw sender repairs the copy. When the counters
   match, the copy is really wrong: a dark tick, three in a row halt. A pending high part beyond the
   bounded search is also lagging. Held mints are never counted as zero.
 - **Scope:** pending "stays small because the operator applies it regularly".
@@ -68,7 +72,8 @@ are right.
 - **Scope:** the withdraw operator applies on a timer whenever pending is not empty.
   **Shipped:** every 60 s the sender only *reads* each configured escrow account; it applies when
   the pending credit counter reaches half its cap or pending reaches 2^47, and before a release
-  whose verified available balance is short. It never applies while halted or for a blocked mint.
+  whose verified available balance is short. It never applies while halted, for a blocked mint,
+  or while the escrow account is frozen.
 
 ## Releases
 
@@ -81,8 +86,12 @@ are right.
 - **Scope:** a stale proof is "not a failure", rebuild and retry; paused mint, frozen account and
   hook refusal take the permanent-failure path to a remint.
   **Shipped:** Token-2022 26, 27, 32 and 33, and escrow 30, 31 and 33, rebuild on a budget of
-  five, then park `confidential_stale_proof`; Token-2022 17, 24, 25 and 39, and escrow 25 to 29,
-  park `destination_not_ready`; escrow 22 parks `confidential_mint_not_configured`. Errors are classified by origin from the logs, since escrow
+  five, then park `confidential_stale_proof`; Token-2022 25 and 39, and escrow 25 to 29, park
+  `destination_not_ready`; Token-2022 17 and 24 can only be about the escrow's own account,
+  since the escrow checks the destination first, and park `confidential_escrow_account_not_ready`;
+  running out of compute parks `confidential_compute_exceeded`; escrow 22 parks
+  `confidential_mint_not_configured`. A custom error whose program cannot be read from the log is
+  retried, never refunded. Errors are classified by origin from the logs, since escrow
   and Token-2022 codes collide. Every park after a send goes through the journal and finality
   gate, so a late-landing attempt is seen before any remint. A timeout resend reuses its proofs.
 - **Scope:** "transfer-hook mints: supported, for deposits and releases".
@@ -97,17 +106,19 @@ are right.
 
 - **Scope:** a human runs a rebalance CLI that signs `MoveToConfidential` and `MoveToPublic`.
   **Shipped:** `indexer rebalance --mint M --to-public N | --to-confidential N` inserts a request
-  row with the expected available balance; the withdraw sender executes it, journaled like a
-  release, and refuses it if the balance it verifies differs. No second signer process, and a
-  rerun after a crash moves nothing twice.
+  row with the balance that direction spends: the available balance for `--to-public`, the
+  public balance (`expected_public`) for `--to-confidential`. The withdraw sender executes it,
+  journaled like a release, and refuses it if that balance differs. No second signer process,
+  and running the same request twice moves the amount once.
 
 ## Open points the scope listed, now settled
 
 - AES mismatch: lagging or dark tick by the credit counters, as above.
 - Reading the confidential fields: decoded from the raw (base64) account bytes on both the startup
   and runtime paths; jsonParsed renders ciphertexts as strings.
-- Remote signers and v1: confidential releases, rebalances, applies and repairs are v1 messages
-  signed per signer with `sign_message`, on all four keychain backends.
+- Remote signers and v1: confidential releases and `MoveToPublic` rebalances are v1 messages
+  signed per signer with `sign_message`, on all four keychain backends. Applies, repairs and
+  `MoveToConfidential` carry no proofs and stay legacy transactions.
 - Who signs rebalances: the operator, through the sender.
 - Minimum deposit for confidential deposits: still not enforced.
 

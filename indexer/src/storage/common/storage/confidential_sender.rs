@@ -45,6 +45,8 @@ pub struct RebalanceRequest {
     pub direction: RebalanceDirection,
     pub amount: u64,
     pub expected_available: u64,
+    /// The public balance a move to confidential was made against; it spends only that.
+    pub expected_public: Option<u64>,
     pub status: String,
     pub signature: Option<String>,
     pub error: Option<String>,
@@ -95,6 +97,8 @@ pub struct ConfidentialSenderMock {
     pub rebalance_requests: Vec<RebalanceRequest>,
     pub park_labels: std::collections::HashMap<i64, String>,
     pub landing_slot: Option<u64>,
+    /// `confidential_mint_state`: the last verified available per mint, with its slot.
+    pub mint_states: std::collections::BTreeMap<String, (u64, u64)>,
     pub attempts: Vec<OperatorAttempt>,
     /// `updated_at` of each rebalance request, by id, for the moves read.
     pub rebalance_updated_at: std::collections::HashMap<i64, DateTime<Utc>>,
@@ -173,6 +177,44 @@ impl Storage {
         }
     }
 
+    /// Keep the available a landed sender transaction left on `mint`, verified at `slot`.
+    pub async fn record_confidential_mint_state(
+        &self,
+        mint: &str,
+        verified_available: u64,
+        slot: u64,
+    ) -> Result<(), StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .record_confidential_mint_state_internal(mint, verified_available, slot)
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => {
+                let mut state = mock.confidential_sender.lock().unwrap();
+                state
+                    .mint_states
+                    .insert(mint.to_string(), (verified_available, slot));
+                Ok(())
+            }
+        }
+    }
+
+    /// Every kept `(mint, verified available)`, to seed candidate (a) at boot.
+    pub async fn confidential_mint_states(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db.confidential_mint_states_internal().await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => Ok(mock
+                .confidential_sender
+                .lock()
+                .unwrap()
+                .mint_states
+                .iter()
+                .map(|(mint, (available, _))| (mint.clone(), *available))
+                .collect()),
+        }
+    }
+
     pub async fn confidential_landing_slot(&self) -> Result<Option<u64>, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db.confidential_landing_slot_internal().await?),
@@ -196,15 +238,28 @@ impl Storage {
         direction: RebalanceDirection,
         amount: u64,
         expected_available: u64,
+        expected_public: Option<u64>,
     ) -> Result<i64, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db
-                .insert_rebalance_request_internal(mint, direction, amount, expected_available)
+                .insert_rebalance_request_internal(
+                    mint,
+                    direction,
+                    amount,
+                    expected_available,
+                    expected_public,
+                )
                 .await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
             Storage::Mock(mock) => {
-                mock.insert_rebalance_request(mint, direction, amount, expected_available)
-                    .await
+                mock.insert_rebalance_request(
+                    mint,
+                    direction,
+                    amount,
+                    expected_available,
+                    expected_public,
+                )
+                .await
             }
         }
     }

@@ -260,14 +260,15 @@ ORDER BY mint, slot, signature;
 How each state ends. None of them is resolved by reconciliation itself.
 
 - **stale_aes**: should clear within seconds once the sender's repair lands. If it
-  lasts, check the escrow operator is running and not halted, and look for
+  lasts, check `operator-private-channel` (the withdraw operator, whose sender runs every
+  apply and repair) is running and not halted, and look for
   `confidential_aes_repair_deferred{mint}`; any later apply, release or
   `MoveToPublic` also rewrites the copy.
 - **pending_too_large**: the sender applies pending once it reaches 2^47 base
-  units. If it lasts, check the escrow operator is running, not halted, and the
+  units. If it lasts, check `operator-private-channel` is running, not halted, and the
   mint is not blocked.
 - **poisoned**: the key that encrypted these rows is not the loaded one. Set
-  `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop the indexer and operators,
+  `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop every indexer and operator on the database,
   run `indexer confidential-recover --mint <mint>`, then restart. The mint is
   counted again once no deposit is flagged `confidential_undecrypted`.
 - **key_mismatch**: the escrow account was configured with another key. Load the

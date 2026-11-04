@@ -126,7 +126,7 @@ have prefixes.
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
-| `confidential_mint_not_configured`, `confidential_mint_poisoned`, `destination_not_ready`, `confidential_balance_low`, `public_balance_low`, `confidential_stale_proof`, `confidential_tx_too_large`, or `hook_unresolvable` on a row with `confidential = true` | [Confidential park labels](confidential_transfers.md#park-labels) | no | confidential pre-flights, sender (journal-gated) |
+| `confidential_mint_not_configured`, `confidential_mint_poisoned`, `destination_not_ready`, `confidential_balance_low`, `public_balance_low`, `confidential_stale_proof`, `confidential_tx_too_large`, `confidential_escrow_account_not_ready`, `confidential_compute_exceeded`, or `hook_unresolvable` on a row with `confidential = true` (also in the row's `confidential_park_label`) | [Confidential park labels](confidential_transfers.md#park-labels) | no | confidential pre-flights, sender (journal-gated) |
 
 ## An unresolved row holds the bitmap rotation
 

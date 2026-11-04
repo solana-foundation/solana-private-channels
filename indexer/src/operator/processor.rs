@@ -195,6 +195,26 @@ async fn quarantine_single(
     transaction: &DbTransaction,
     error_message: String,
 ) -> bool {
+    quarantine_labelled(
+        storage,
+        storage_tx,
+        pt_label,
+        transaction,
+        error_message,
+        None,
+    )
+    .await
+}
+
+/// `quarantine_single`, keeping `park_label` on a confidential row.
+async fn quarantine_labelled(
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+    error_message: String,
+    park_label: Option<&str>,
+) -> bool {
     let outcome = fenced_terminal_write(
         storage,
         pt_label,
@@ -202,7 +222,15 @@ async fn quarantine_single(
         transaction.id,
         TransactionStatus::ManualReview,
         &error_message,
-        || storage.try_quarantine_processing(transaction.id, transaction.updated_at, None, None),
+        || {
+            storage.try_quarantine_processing(
+                transaction.id,
+                transaction.updated_at,
+                None,
+                None,
+                park_label,
+            )
+        },
     )
     .await;
     if outcome == FencedWrite::Stale {
@@ -243,7 +271,16 @@ async fn park_row(
 ) {
     // The label leads the alert so it maps straight to its runbook entry.
     let message = format!("{}: {}", bail.label, bail.message);
-    if quarantine_single(storage, storage_tx, pt_label, transaction, message).await {
+    if quarantine_labelled(
+        storage,
+        storage_tx,
+        pt_label,
+        transaction,
+        message,
+        Some(bail.label),
+    )
+    .await
+    {
         metrics::OPERATOR_TRANSACTION_QUARANTINED
             .with_label_values(&[pt_label, bail.label])
             .inc();
@@ -6646,8 +6683,19 @@ mod tests {
                 Option<TransactionStatusUpdate>,
                 Option<TransactionBuilder>,
             ) {
+                self.run_on(Arc::new(Storage::Mock(MockStorage::new())))
+                    .await
+            }
+
+            async fn run_on(
+                self,
+                storage: Arc<Storage>,
+            ) -> (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ) {
                 let mint = Pubkey::new_unique();
-                let storage = Arc::new(Storage::Mock(MockStorage::new()));
                 insert_token_2022_mint_row(&storage, &mint);
                 let (mut ps, mut server) = processor_state_for(
                     &storage,
@@ -6810,6 +6858,23 @@ mod tests {
             assert_parked(
                 foreign.run().await,
                 metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            );
+        }
+
+        /// A pre-flight park keeps its label on the row, where the runbook reads it.
+        #[tokio::test]
+        async fn a_confidential_preflight_park_keeps_its_label() {
+            let mock = MockStorage::new();
+            let mut poisoned = Case::healthy();
+            poisoned.poisoned = true;
+            assert_parked(
+                poisoned.run_on(Arc::new(Storage::Mock(mock.clone()))).await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            );
+            let labels = mock.confidential_sender.lock().unwrap().park_labels.clone();
+            assert_eq!(
+                labels.get(&9).map(String::as_str),
+                Some(metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED)
             );
         }
 
