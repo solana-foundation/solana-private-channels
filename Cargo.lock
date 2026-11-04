@@ -12709,6 +12709,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-zk-sdk"
+version = "7.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cd8535d2f40d43a1d47af2849e1c86706a597a2ad84207441f51a50f09d8fd"
+dependencies = [
+ "aes-gcm-siv",
+ "base64 0.22.1",
+ "bincode",
+ "bytemuck",
+ "curve25519-dalek 4.1.3",
+ "hkdf",
+ "itertools 0.14.0",
+ "merlin",
+ "rand 0.8.8",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "solana-address 2.6.1",
+ "solana-derivation-path 3.0.0",
+ "solana-seed-derivable 3.0.0",
+ "solana-seed-phrase 3.0.0",
+ "solana-signature 3.4.1",
+ "solana-signer 3.0.1",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk-pod",
+ "subtle",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "solana-zk-sdk-pod"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13377,6 +13410,19 @@ checksum = "f63a2b41095945dc15274b924b21ccae9b3ec9dc2fdd43dbc08de8c33bbcd915"
 dependencies = [
  "curve25519-dalek 4.1.3",
  "solana-zk-sdk 4.0.0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "spl-token-confidential-transfer-proof-generation"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03d81c8000b53c6a398a2173d5009e2b7248a450e152b4e4d03dfe423ffafa9c"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
+ "solana-zk-sdk-pod",
  "thiserror 2.0.20",
 ]
 
@@ -14158,6 +14204,7 @@ dependencies = [
 name = "tests-private-channel-escrow-program"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "const-crypto",
  "litesvm",
  "private-channel-escrow-program-client",
@@ -14168,11 +14215,16 @@ dependencies = [
  "solana-sdk",
  "solana-sdk-ids 3.1.0",
  "solana-system-interface 3.2.0",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
  "spl-associated-token-account",
  "spl-memo 7.0.0",
  "spl-tlv-account-resolution 0.11.1",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-token-2022-interface 3.1.1",
+ "spl-token-confidential-transfer-proof-extraction 0.6.1",
+ "spl-token-confidential-transfer-proof-generation 0.6.1",
  "spl-token-metadata-interface 1.0.1",
  "spl-transfer-hook-interface 2.1.0",
 ]

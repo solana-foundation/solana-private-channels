@@ -38,6 +38,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
 | P3 | Escrow program MUST require an authorized operator to release funds AND that the withdrawal's nonce is unconsumed in the current bitmap generation | MUST | Done | #9, #10, #29 |
 | P4 | Escrow program MUST NOT allow the spl-token native mint | MUST | Done | - |
+| P5 | A configured escrow account MUST take confidential credits only inside `ConfidentialDeposit` and `MoveToConfidential`, so every confidential deposit passes the deposit gates and emits its event | MUST | Done | - |
 
 ## Indexer
 

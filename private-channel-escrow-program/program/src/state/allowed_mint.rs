@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use codama::CodamaAccount;
 use pinocchio::account::AccountView;
 use pinocchio::{error::ProgramError, Address};
+use spl_token_2022::extension::ExtensionType;
 
 /// Seeds: [b"allowed_mint", instance_pda, mint_pubkey]
 ///
@@ -176,6 +177,11 @@ impl AllowedMint {
             || self.token_program != *token_program
             || (self.extensions ^ profile.extensions) & !ISSUER_ADDABLE_EXTENSIONS != 0
             || (profile.has_freeze_authority && !self.has_freeze_authority)
+    }
+
+    /// Whether the mint carried `extension` when it was allowed.
+    pub fn has_extension(&self, extension: ExtensionType) -> bool {
+        self.extensions & (1 << extension as u64) != 0
     }
 
     pub fn validate_pda(

@@ -89,6 +89,7 @@ fuzz:
 	@echo "Running fuzz harnesses for escrow program..."
 	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_escrow
 	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_rotate_bitmap
+	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_confidential
 
 # Run unit tests with coverage
 unit-coverage:

@@ -29,6 +29,12 @@ pub enum PrivateChannelEscrowInstructionDiscriminators {
     AddOrUpdateAllowedWallet = 9,
     RemoveAllowedWallet = 10,
     SetWhitelistEnabled = 11,
+    ConfigureConfidentialAccount = 12,
+    ConfidentialDeposit = 13,
+    ConfidentialReleaseFunds = 14,
+    ApplyPendingBalance = 15,
+    MoveToConfidential = 16,
+    MoveToPublic = 17,
     EmitEvent = 228,
 }
 
@@ -49,6 +55,12 @@ impl TryFrom<u8> for PrivateChannelEscrowInstructionDiscriminators {
             9 => Ok(Self::AddOrUpdateAllowedWallet),
             10 => Ok(Self::RemoveAllowedWallet),
             11 => Ok(Self::SetWhitelistEnabled),
+            12 => Ok(Self::ConfigureConfidentialAccount),
+            13 => Ok(Self::ConfidentialDeposit),
+            14 => Ok(Self::ConfidentialReleaseFunds),
+            15 => Ok(Self::ApplyPendingBalance),
+            16 => Ok(Self::MoveToConfidential),
+            17 => Ok(Self::MoveToPublic),
             228 => Ok(Self::EmitEvent),
             _ => Err(()),
         }
@@ -71,11 +83,13 @@ pub trait AccountSerialize: Discriminator {
 mod tests {
     use super::*;
 
-    // All 13 defined instruction discriminators must parse successfully.
+    // All 19 defined instruction discriminators must parse successfully.
     // If a variant is added or removed, this test will catch the gap.
     #[test]
     fn test_instruction_discriminator_all_valid_values() {
-        for byte in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 228] {
+        for byte in [
+            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 228,
+        ] {
             assert!(
                 PrivateChannelEscrowInstructionDiscriminators::try_from(byte).is_ok(),
                 "byte {byte} should be a valid discriminator"
@@ -87,7 +101,7 @@ mod tests {
     // The entrypoint relies on this to reject malformed instructions before dispatch.
     #[test]
     fn test_instruction_discriminator_invalid_values() {
-        for byte in [12u8, 13, 100, 227, 229, 255] {
+        for byte in [18u8, 19, 100, 227, 229, 255] {
             assert!(
                 PrivateChannelEscrowInstructionDiscriminators::try_from(byte).is_err(),
                 "byte {byte} should not map to a valid discriminator"

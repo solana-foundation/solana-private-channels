@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**70 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **154 integration tests** (end-to-end behavior).
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **228 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -164,7 +164,7 @@ The whitelist tests below turn on only the deposit flag.
 - `test_deposit_whitelist_empty_wrong_account_rejected` — an empty account at the wrong address in a listed wallet's slot is InvalidAllowedWalletPda, not WalletNotAllowed
 - `test_deposit_whitelist_empty_wrong_recipient_account_rejected` — the same in the recipient slot, which is checked after the user's
 
-### ReleaseFunds (38 integration tests)
+### ReleaseFunds (39 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_from_a_0_1_0_instance_succeeds` — a 0.1.0 instance reads with the whitelist off and releases
@@ -184,6 +184,7 @@ The whitelist tests below turn on only the deposit flag.
 - `test_double_spend_bitmap_rejects_used_nonce` — replay within a generation rejected by the bit alone
 - `test_double_spend_sequential_releases_then_replay` — three neighbouring nonces in one byte, then a replay of the first
 - `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
+- `test_release_funds_to_instance_rejected` — InvalidRecipient; otherwise a self-transfer that spends the nonce and moves nothing
 - `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
 - `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
 - `test_release_funds_token_2022_transfer_hook_forwards_extras` — the hook runs once on the way out of escrow and the nonce is consumed
@@ -222,7 +223,98 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### Unit Tests (60 tests across processor and program modules)
+### ConfigureConfidentialAccount (10 integration tests)
+
+- `test_configure_confidential_account_success` — escrow account carries the instance key, approved, confidential credits off and public credits on
+- `test_configure_confidential_account_fee_mint` — a fee mint's escrow account also gets `ConfidentialTransferFeeAmount`
+- `test_configure_confidential_account_manual_approval_mint_leaves_account_unapproved`
+- `test_configure_confidential_account_rejects_non_admin`
+- `test_configure_confidential_account_rejects_spl_token_program`
+- `test_configure_confidential_account_rejects_mint_without_extension` — UnsupportedConfidentialMint
+- `test_configure_confidential_account_rejects_fee_mint_without_confidential_fee_config` — a pre-v0.9 mint, written by hand
+- `test_configure_confidential_account_rejects_confidential_mint_burn` — no public balance to release a public withdrawal from
+- `test_configure_confidential_account_rejects_recreated_mint` — MintProfileChanged, so a ConfidentialMintBurn added after AllowMint can't slip through
+- `test_configure_confidential_account_twice_fails` — the key cannot change
+
+### ConfidentialDeposit (17 integration tests)
+
+- `test_confidential_deposit_inline_proofs` — the event's pending difference decrypts to the amount; credits are off again after
+- `test_confidential_deposit_context_account_proofs`
+- `test_confidential_deposit_onto_a_non_empty_pending_balance` — the second of two unapplied deposits reports only its own amount; the events carry credit counters 1 and 2
+- `test_confidential_deposit_with_recipient`
+- `test_confidential_deposit_direct_transfer_to_escrow_refused` — a confidential transfer outside the escrow finds credits off
+- `test_confidential_deposit_unconfigured_escrow_rejected`
+- `test_confidential_deposit_blocked_mint_rejected`
+- `test_confidential_deposit_whitelist_unlisted_user_rejected`
+- `test_confidential_deposit_whitelist_unlisted_recipient_rejected` — a listed user does not vouch for the recipient
+- `test_confidential_deposit_whitelist_unlisted_user_with_listed_recipient_rejected` — a listed recipient does not vouch for the user
+- `test_confidential_deposit_transfer_hook_forwards_extras`
+- `test_confidential_deposit_rejects_signer_bearing_hook_extra` — a hook naming the payer as a signer cannot drain it
+- `test_confidential_deposit_transfer_fee_net_amount` — net of the fee, with a negative low part
+- `test_confidential_deposit_paused_mint_rejected` — Token-2022's MintPaused
+- `test_confidential_deposit_frozen_user_account_rejected` — Token-2022's AccountFrozen
+- `test_confidential_deposit_frozen_escrow_account_rejected` — Token-2022's AccountFrozen, though the escrow turned its credits on
+- `test_confidential_deposit_cpi_guard_rejected` — Token-2022's CpiGuardTransferBlocked: the escrow spends from the user's account inside a CPI
+
+### ConfidentialReleaseFunds (35 integration tests)
+
+- `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
+- `test_confidential_release_funds_context_account_proofs`
+- `test_confidential_release_funds_nonce_replay_rejected` — fresh proofs, same nonce
+- `test_confidential_release_funds_stale_proof_rejected` — StaleConfidentialBalance: an apply in between turns the proofs stale
+- `test_confidential_release_funds_destination_credits_disabled_rejected` — RecipientCreditsDisabled
+- `test_confidential_release_funds_destination_not_configured_rejected` — RecipientNotConfidential
+- `test_confidential_release_funds_destination_missing_rejected` — RecipientNotConfidential for an account never created
+- `test_confidential_release_funds_destination_not_approved_rejected` — RecipientNotApproved, manual-approval mint
+- `test_confidential_release_funds_destination_pending_full_rejected` — the release taking the last pending slot lands, the next is RecipientPendingFull
+- `test_confidential_release_funds_destination_frozen_rejected` — RecipientFrozen
+- `test_confidential_release_funds_frozen_escrow_account_rejected` — Token-2022's AccountFrozen, which on a release now means the escrow's account
+- `test_confidential_release_funds_destination_cpi_guard_accepted` — CpiGuard doesn't block incoming credits
+- `test_confidential_release_funds_destination_key_changed_rejected` — RecipientKeyChanged
+- `test_confidential_release_funds_resent_after_destination_change_reports_nonce_used` — the landed release sent again as is, with stale proofs and a destination refusing credits: every check runs after the nonce
+- `test_confidential_release_funds_resent_after_account_closed_reports_nonce_used` — the user ATA check runs after the nonce too
+- `test_confidential_release_funds_auditor_rotated_rejected` — StaleAuditorKey
+- `test_confidential_release_funds_auditor_removed_rejected` — StaleAuditorKey: Token-2022 then expects the zero key
+- `test_confidential_release_funds_paused_mint_rejected` — MintPaused
+- `test_confidential_release_funds_mint_without_auditor` — proofs naming the zero key land
+- `test_confidential_release_funds_misplaced_validity_proof_rejected` — the range proof at the validity offset is refused, not read
+- `test_confidential_release_funds_foreign_validity_context_rejected` — a validity context the ZK program doesn't own
+- `test_confidential_release_funds_uninitialized_validity_context_rejected` — a full-size zeroed context is refused by its proof type, not read as zero keys
+- `test_confidential_release_funds_short_validity_context_rejected` — a context shorter than its header is an error, not a panic
+- `test_confidential_release_funds_validity_proof_for_another_program_rejected` — a copy of the validity proof addressed to another program
+- `test_confidential_release_funds_memo_required_destination`
+- `test_confidential_release_funds_not_operator_rejected`
+- `test_confidential_release_funds_to_instance_rejected` — InvalidRecipient instead of Token-2022's credits-disabled error
+- `test_confidential_release_funds_blocked_withdrawals_rejected`
+- `test_confidential_release_funds_whitelist_requires_withdrawer_and_user` — listing only one of the two is refused
+- `test_confidential_release_funds_transfer_hook_forwards_extras`
+- `test_confidential_release_funds_hook_refusing_u64_max_settled_publicly` — the hook blocks the confidential release; `MoveToPublic` then `ReleaseFunds` settle the same nonce
+- `test_confidential_release_funds_transfer_fee` — the escrow pays the whole amount, the user receives it net of the fee
+- `test_confidential_release_funds_mixed_proofs` — equality inline, validity in the first context account: the event amount is read from it by position
+- `test_confidential_release_funds_transfer_fee_hook_context_account_proofs` — the most accounts: fee, five context accounts and the 32 hook accounts the escrow allows, the most its CPI can carry (41 of the 42 it allows)
+- `test_confidential_release_funds_transfer_fee_hook_inline_proofs` — fee, a 3-account hook and five inline proofs: 3,844 of 4,096 bytes, room for about 7 more hook accounts
+
+### ApplyPendingBalance (6 integration tests)
+
+- `test_apply_pending_balance_success` — available and its AES copy hold the applied amount
+- `test_apply_pending_balance_late_credit_recovered_by_release` — applied anyway; the event carries the full applied pending and its credit count while the AES copy lags, and a release proved from that count writes a correct copy
+- `test_apply_pending_balance_not_operator_rejected`
+- `test_apply_pending_balance_unconfigured_escrow_rejected`
+- `test_apply_pending_balance_counts_deposits_and_moves` — three deposits and a move: the deposit events' amounts plus the move add up to the applied amount, the apply counts 4, and the deposit counters read 1, 3, 4
+- `test_apply_pending_balance_clears_a_full_credit_counter` — at 65,536 credits a deposit is refused by Token-2022 and moves nothing; apply resets the counter and the next deposit lands
+
+### MoveToConfidential (2 integration tests)
+
+- `test_move_to_confidential_success` — public balance to pending; credits off again after
+- `test_move_to_confidential_not_operator_rejected`
+
+### MoveToPublic (3 integration tests)
+
+- `test_move_to_public_inline_proofs`
+- `test_move_to_public_context_account_proofs`
+- `test_move_to_public_not_operator_rejected`
+
+### Unit Tests (95 tests across processor and program modules)
 
 **Instruction data parsing** (processor modules):
 
@@ -234,6 +326,13 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)
 - `set_whitelist_enabled`: 1 test (non-canonical flag byte rejected in either position)
 - `add_or_update_allowed_wallet`: 1 test (non-canonical flag byte rejected in either position)
+- `configure_confidential_account`: 3 tests (valid data, zero proof offset rejected, too short)
+- `confidential_deposit`: 3 tests (with/without recipient, non-canonical recipient tag)
+- `confidential_release_funds`: 2 tests (valid data, too short)
+- `apply_pending_balance`: 2 tests (valid data, too short)
+- `move_to_confidential`: 2 tests (zero amount rejected before the accounts, too short)
+- `move_to_public`: 2 tests (valid data, zero amount rejected before the accounts)
+- `shared/confidential_utils`: 4 tests (transfer fields parse, too short, Token-2022 proof order with and without a fee, context account count)
 
 **Withdrawal bitmap logic** (`state/withdrawal_bitmap.rs`):
 
@@ -245,7 +344,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
 - `allowed_wallet`: 1 test (wrong discriminator rejected, so no other escrow account passes as a whitelist entry)
 - `instance`: 7 tests (constructor, serialization roundtrip with length check and opposite whitelist flags, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, a 0.1.0 instance reads with the whitelist off, a cut-short instance rejected)
-- `discriminator`: 2 tests (all 13 valid instruction discriminator bytes accepted, unmapped bytes rejected)
+- `discriminator`: 2 tests (all 19 valid instruction discriminator bytes accepted, unmapped bytes rejected)
 
 **Error ABI stability** (`error.rs`):
 
@@ -253,7 +352,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 
 **Event encoding** (`events.rs`):
 
-- 11 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap, AddOrUpdateAllowedWallet, SetWhitelistEnabled) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix. RemoveAllowedWallet shares the operator events' layout and is asserted emitted by the integration tests
+- 17 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap, AddOrUpdateAllowedWallet, SetWhitelistEnabled, and the six confidential ones) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix. RemoveAllowedWallet shares the operator events' layout and is asserted emitted by the integration tests
 
 ## Documented Gaps
 

@@ -3,8 +3,10 @@ use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, 
 use crate::{
     processor::{
         process_add_operator, process_add_or_update_allowed_wallet, process_allow_mint,
-        process_block_mint, process_create_instance, process_deposit,
-        process_emit_event::process_emit_event, process_release_funds,
+        process_apply_pending_balance, process_block_mint, process_confidential_deposit,
+        process_confidential_release_funds, process_configure_confidential_account,
+        process_create_instance, process_deposit, process_emit_event::process_emit_event,
+        process_move_to_confidential, process_move_to_public, process_release_funds,
         process_remove_allowed_wallet, process_remove_operator, process_rotate_bitmap,
         process_set_new_admin, process_set_whitelist_enabled,
     },
@@ -61,6 +63,24 @@ pub fn process_instruction(
         }
         PrivateChannelEscrowInstructionDiscriminators::SetWhitelistEnabled => {
             process_set_whitelist_enabled(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::ConfigureConfidentialAccount => {
+            process_configure_confidential_account(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::ConfidentialDeposit => {
+            process_confidential_deposit(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::ConfidentialReleaseFunds => {
+            process_confidential_release_funds(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::ApplyPendingBalance => {
+            process_apply_pending_balance(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::MoveToConfidential => {
+            process_move_to_confidential(program_id, accounts, instruction_data)
+        }
+        PrivateChannelEscrowInstructionDiscriminators::MoveToPublic => {
+            process_move_to_public(program_id, accounts, instruction_data)
         }
         PrivateChannelEscrowInstructionDiscriminators::EmitEvent => {
             process_emit_event(program_id, accounts)

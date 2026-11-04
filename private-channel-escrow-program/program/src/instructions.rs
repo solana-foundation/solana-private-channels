@@ -370,6 +370,294 @@ pub enum PrivateChannelEscrowProgramInstruction {
         whitelist_withdrawals: bool,
     } = 11,
 
+    /// Turn on confidential transfers for the escrow account of an allowed mint
+    /// (admin-only). Confidential credits stay off outside the escrow's own
+    /// instructions. Put the `VerifyPubkeyValidity` proof of the instance ElGamal
+    /// key in the same transaction.
+    #[codama(account(
+        name = "payer",
+        docs = "Pays for the larger escrow account",
+        signer,
+        writable
+    ))]
+    #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]
+    #[codama(account(name = "mint", docs = "Token mint of the escrow account"))]
+    #[codama(account(name = "allowed_mint", docs = "AllowedMint PDA of the mint"))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "system_program", docs = "System program"))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "instructions_sysvar",
+        docs = "Instructions sysvar, holding the key's proof"
+    ))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    ConfigureConfidentialAccount {
+        /// Zero, encrypted under the instance AES key
+        decryptable_zero_balance: [u8; 36],
+        /// Position of the `VerifyPubkeyValidity` instruction relative to this one, never 0
+        proof_instruction_offset: i8,
+    } = 12,
+
+    /// Deposit a hidden amount from the user's confidential balance into the escrow
+    /// (permissionless). The indexer decrypts the amount from the event.
+    ///
+    /// Each proof offset is the proof instruction's position relative to this
+    /// one, or 0 for a context account. Append one context account per zero
+    /// offset, in Token-2022's proof order, then the mint's transfer-hook extras.
+    /// Codama drops trailing accounts, so they are not in the generated list.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "user", docs = "User depositing tokens", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]
+    #[codama(account(name = "mint", docs = "Token mint being deposited"))]
+    #[codama(account(
+        name = "allowed_mint",
+        docs = "AllowedMint PDA to validate mint is allowed"
+    ))]
+    #[codama(account(
+        name = "user_ata",
+        docs = "User's Associated Token Account for this mint",
+        writable
+    ))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "instructions_sysvar",
+        docs = "Instructions sysvar, read when a proof is an instruction"
+    ))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    #[codama(account(
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while deposits are whitelisted"
+    ))]
+    #[codama(account(
+        name = "recipient_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of the recipient, or of user when none is given; read only while deposits are whitelisted"
+    ))]
+    ConfidentialDeposit {
+        /// User's available balance after the deposit, encrypted under their AES key
+        new_source_decryptable_available_balance: [u8; 36],
+        /// Low bits of the amount, encrypted under the mint's auditor key
+        auditor_ciphertext_lo: [u8; 64],
+        /// High bits of the amount, encrypted under the mint's auditor key
+        auditor_ciphertext_hi: [u8; 64],
+        equality_proof_instruction_offset: i8,
+        ciphertext_validity_proof_instruction_offset: i8,
+        range_proof_instruction_offset: i8,
+        /// Read only for mints with a transfer fee
+        fee_sigma_proof_instruction_offset: i8,
+        /// Read only for mints with a transfer fee
+        fee_ciphertext_validity_proof_instruction_offset: i8,
+        /// Optional recipient for PrivateChannel tracking, is the wallet address, not the ATA (if None, defaults to user)
+        recipient: Option<Pubkey>,
+    } = 13,
+
+    /// Release a hidden amount from the escrow to the user's confidential balance
+    /// (operator-only).
+    ///
+    /// Proof offsets and trailing accounts as in ConfidentialDeposit.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "operator", docs = "Operator releasing the funds", signer))]
+    #[codama(account(
+        name = "instance",
+        docs = "Instance PDA to validate and sign the transfer"
+    ))]
+    #[codama(account(
+        name = "withdrawal_bitmap",
+        docs = "Withdrawal bitmap PDA to consume the nonce",
+        writable
+    ))]
+    #[codama(account(
+        name = "operator_pda",
+        docs = "Operator PDA to validate operator permissions"
+    ))]
+    #[codama(account(name = "mint", docs = "Token mint being released"))]
+    #[codama(account(
+        name = "allowed_mint",
+        docs = "AllowedMint PDA to validate mint is allowed"
+    ))]
+    #[codama(account(
+        name = "user_ata",
+        docs = "User's Associated Token Account for this mint",
+        writable
+    ))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "instructions_sysvar",
+        docs = "Instructions sysvar, read when a proof is an instruction"
+    ))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used when user_ata requires a memo"
+    ))]
+    #[codama(account(
+        name = "user_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of user; read only while withdrawals are whitelisted"
+    ))]
+    #[codama(account(
+        name = "withdrawer_allowed_wallet_pda",
+        docs = "AllowedWallet PDA of withdrawer; read only while withdrawals are whitelisted"
+    ))]
+    ConfidentialReleaseFunds {
+        /// User receiving the funds (wallet address, not the ATA)
+        user: Pubkey,
+        /// Transaction nonce to consume from the withdrawal bitmap
+        transaction_nonce: u64,
+        /// Wallet whose channel burn this release settles; may differ from user
+        withdrawer: Pubkey,
+        /// Escrow's available balance ciphertext the proofs were built against
+        expected_available_balance: [u8; 64],
+        /// Escrow's available balance after the release, encrypted under the instance AES key
+        new_source_decryptable_available_balance: [u8; 36],
+        /// Low bits of the amount, encrypted under the mint's auditor key
+        auditor_ciphertext_lo: [u8; 64],
+        /// High bits of the amount, encrypted under the mint's auditor key
+        auditor_ciphertext_hi: [u8; 64],
+        equality_proof_instruction_offset: i8,
+        ciphertext_validity_proof_instruction_offset: i8,
+        range_proof_instruction_offset: i8,
+        /// Read only for mints with a transfer fee
+        fee_sigma_proof_instruction_offset: i8,
+        /// Read only for mints with a transfer fee
+        fee_ciphertext_validity_proof_instruction_offset: i8,
+    } = 14,
+
+    /// Move the escrow's pending balance into its available balance
+    /// (operator-only). A credit that arrived after the operator read the account
+    /// is applied too but missing from the AES balance; the event carries the
+    /// pending balance actually applied, so the operator counts available itself.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "operator", docs = "Operator applying the balance", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]
+    #[codama(account(
+        name = "operator_pda",
+        docs = "Operator PDA to validate operator permissions"
+    ))]
+    #[codama(account(name = "mint", docs = "Token mint of the escrow account"))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    ApplyPendingBalance {
+        /// Pending credits the operator saw
+        expected_credit_counter: u64,
+        /// Available balance after the apply, encrypted under the instance AES key
+        new_decryptable_available_balance: [u8; 36],
+    } = 15,
+
+    /// Move escrow funds from the public to the confidential balance
+    /// (operator-only). The amount is public.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "operator", docs = "Operator moving the funds", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]
+    #[codama(account(
+        name = "operator_pda",
+        docs = "Operator PDA to validate operator permissions"
+    ))]
+    #[codama(account(name = "mint", docs = "Token mint of the escrow account"))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    MoveToConfidential {
+        /// Amount to move
+        amount: u64,
+    } = 16,
+
+    /// Move escrow funds from the confidential to the public balance
+    /// (operator-only). The amount is public.
+    ///
+    /// Append one context account per zero proof offset, equality first.
+    #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
+    #[codama(account(name = "operator", docs = "Operator moving the funds", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA, owner of the escrow account"))]
+    #[codama(account(
+        name = "operator_pda",
+        docs = "Operator PDA to validate operator permissions"
+    ))]
+    #[codama(account(name = "mint", docs = "Token mint of the escrow account"))]
+    #[codama(account(
+        name = "instance_ata",
+        docs = "Instance's Associated Token Account (escrow) for this mint",
+        writable
+    ))]
+    #[codama(account(name = "token_program", docs = "Token-2022 program"))]
+    #[codama(account(
+        name = "instructions_sysvar",
+        docs = "Instructions sysvar, read when a proof is an instruction"
+    ))]
+    #[codama(account(
+        name = "event_authority",
+        docs = "Event authority PDA for emitting events"
+    ))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
+    MoveToPublic {
+        /// Amount to move
+        amount: u64,
+        /// Available balance after the move, encrypted under the instance AES key
+        new_decryptable_available_balance: [u8; 36],
+        equality_proof_instruction_offset: i8,
+        range_proof_instruction_offset: i8,
+    } = 17,
+
     /// Invoked via CPI from another program to log event via instruction data.
     #[codama(account(
         name = "event_authority",
