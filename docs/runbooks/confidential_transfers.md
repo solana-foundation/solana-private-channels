@@ -35,14 +35,22 @@ Once per instance:
 
 1. Generate the keys offline:
    `cargo run -p devnet-scripts --bin confidential_keygen -- ./escrow-confidential.json`.
-   It writes a new owner-only file and prints the ElGamal pubkey. Back the file up
-   like `Instance.admin`: losing it strands every confidential balance of the
-   instance for good.
+   It writes a new owner-only file and prints the line
+   `ESCROW_CONFIDENTIAL_PUBKEY=<base64 ElGamal pubkey>`. Record that line with the
+   instance's records (it is not secret). Back the file up like `Instance.admin`:
+   losing it strands every confidential balance of the instance for good.
 2. Set the file's content, single-quoted, as `ESCROW_CONFIDENTIAL_KEYS` in the
    stack's `.env` (Ansible: `escrow_confidential_keys` in `secrets.yml`, Doppler:
    `ESCROW_CONFIDENTIAL_KEYS`). `scripts/check-required-env.sh` and the deploy
    refuse a value that is not JSON with `elgamal_secret` and `aes_key`.
-3. Restart `indexer-solana`, `operator-solana` and `operator-private-channel`.
+3. Set the printed line as is: `ESCROW_CONFIDENTIAL_PUBKEY` in the same `.env`
+   (Ansible: `escrow_confidential_pubkey`, Doppler: `ESCROW_CONFIDENTIAL_PUBKEY`),
+   before the first configure. From then on `indexer-solana`, both operators and
+   `resync` refuse to start unless `ESCROW_CONFIDENTIAL_KEYS` holds the matching keys,
+   even on an empty database, where the per-mint check has no mint to read. The env
+   check and the deploy refuse a pubkey that is not base64 of 32 bytes, or one set
+   without the keys.
+4. Restart `indexer-solana`, `operator-solana` and `operator-private-channel`.
 
 Once per mint:
 
@@ -58,8 +66,10 @@ Once per mint:
    approve the escrow account.
 5. `allow_mint` again to reopen deposits.
 
-Never remove `ESCROW_CONFIDENTIAL_KEYS` once any escrow account is configured: the
-indexer and both operators refuse to start without the key that account holds.
+Never remove `ESCROW_CONFIDENTIAL_KEYS` or `ESCROW_CONFIDENTIAL_PUBKEY` once any escrow
+account is configured: the indexer and both operators refuse to start without the key
+that account holds, and without the pin a fresh database (a new host, or a resync into
+an empty one) has no mint to check, so a missing key would only show as poisoned deposits.
 
 ## Park labels
 

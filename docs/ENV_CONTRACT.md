@@ -100,6 +100,17 @@ message never shows the value), and the deploy asserts the same of
 which `templates/env.j2` renders quoted, or blank when unset. Generate it with
 `confidential_keygen` (see [confidential_transfers.md](runbooks/confidential_transfers.md#setup-ceremony)).
 
+`ESCROW_CONFIDENTIAL_PUBKEY` is optional and not secret: the instance's ElGamal pubkey,
+base64, exactly as the `ESCROW_CONFIDENTIAL_PUBKEY=` line `confidential_keygen` prints.
+It reaches the same three services and ships blank everywhere. When set,
+`indexer-solana`, both operators and `resync` refuse to start unless
+`ESCROW_CONFIDENTIAL_KEYS` is set and its pubkey equals it, whatever the database holds;
+the per-mint check against the escrow accounts the database knows still runs. Errors
+name the variables only. `scripts/check-required-env.sh` and the deploy (with
+`escrow_confidential_pubkey`, or `ESCROW_CONFIDENTIAL_PUBKEY` in Doppler) refuse a value
+that is not base64 of 32 bytes, or one set while the keys are blank; `templates/env.j2`
+renders it as is, or blank when unset.
+
 `PRIVATE_CHANNEL_COMPLIANCE_OWNER` is optional; the node reads a blank value as unset.
 `.env.example` documents it as a commented line, which the check does not count. Compose passes it through only when it is set, and
 `templates/env.j2` renders it only when `compliance_owner` is set.

@@ -120,7 +120,22 @@ if [[ -n "${confidential_keys//[[:space:]]/}" ]] \
   echo "Leave it blank until an escrow account is configured, or regenerate it with confidential_keygen." >&2
   exit 1
 fi
-unset confidential_keys
+
+# The pinned pubkey is base64 of 32 bytes, and pins nothing without the keys it names.
+confidential_pubkey="$(resolve_var ESCROW_CONFIDENTIAL_PUBKEY "$@")"
+if [[ -n "${confidential_pubkey//[[:space:]]/}" ]]; then
+  if ! [[ "$confidential_pubkey" =~ ^[[:space:]]*[A-Za-z0-9+/]{43}=[[:space:]]*$ ]]; then
+    echo "FATAL: ESCROW_CONFIDENTIAL_PUBKEY is set but is not a base64 ElGamal pubkey." >&2
+    echo "Copy the ESCROW_CONFIDENTIAL_PUBKEY line confidential_keygen printed." >&2
+    exit 1
+  fi
+  if [[ -z "${confidential_keys//[[:space:]]/}" ]]; then
+    echo "FATAL: ESCROW_CONFIDENTIAL_PUBKEY is set but ESCROW_CONFIDENTIAL_KEYS is blank." >&2
+    echo "The services refuse to start without the matching keys." >&2
+    exit 1
+  fi
+fi
+unset confidential_keys confidential_pubkey
 
 if [[ ${#placeheld[@]} -gt 0 ]]; then
   echo "FATAL: shipped placeholder still in use: ${placeheld[*]}" >&2

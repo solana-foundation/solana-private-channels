@@ -872,10 +872,13 @@ async fn run_resync(
     // Resync builds its backfill config without `IndexerConfig::validate`, so check here.
     validate_resync_config(&storage, &indexer)?;
     // The escrow rebuild decrypts confidential events; the withdraw rebuild never does.
-    let confidential_keys = if common.program_type == ProgramType::Escrow {
-        private_channel_indexer::indexer::confidential::load_keys()?
+    let (confidential_keys, pinned_pubkey) = if common.program_type == ProgramType::Escrow {
+        (
+            private_channel_indexer::indexer::confidential::load_keys()?,
+            private_channel_indexer::indexer::confidential::load_pinned_pubkey()?,
+        )
     } else {
-        None
+        (None, None)
     };
 
     // Get DATABASE_URL from environment
@@ -938,7 +941,8 @@ async fn run_resync(
         backfill_config_base,
         escrow_instance_id,
     )
-    .with_confidential_keys(confidential_keys);
+    .with_confidential_keys(confidential_keys)
+    .with_pinned_pubkey(pinned_pubkey);
 
     // Reconcile-on-rebuild is mandatory: each already-serviced deposit or remint must be
     // rebuilt in its terminal state rather than as a fresh pending row the operator would

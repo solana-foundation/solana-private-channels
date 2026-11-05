@@ -647,6 +647,7 @@ pub async fn run(
     let confidential_keys = match (common_config.program_type, common_config.escrow_instance_id) {
         (ProgramType::Escrow, Some(instance)) => {
             let keys = confidential::load_keys()?;
+            let pinned = confidential::load_pinned_pubkey()?;
             // rpc_url is Solana for the escrow indexer, where the escrow accounts live.
             let source = confidential::RpcEscrowKeySource {
                 rpc: Arc::new(
@@ -659,7 +660,13 @@ pub async fn run(
             };
             under_live_lock(
                 &live_lock_lost,
-                confidential::check_keys_at_boot(&storage, keys.as_deref(), &source, &instance),
+                confidential::check_keys_at_boot(
+                    &storage,
+                    keys.as_deref(),
+                    pinned,
+                    &source,
+                    &instance,
+                ),
             )
             .await
             .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;

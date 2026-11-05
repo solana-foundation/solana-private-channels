@@ -25,11 +25,12 @@ use tracing::{error, info, warn};
 /// Metric label for the live-state lock this role holds.
 const OPERATOR_LOCK_ROLE: &str = "operator";
 
-/// The escrow indexer's boot key check, for both operators: once any escrow account is
-/// configured, `keys` must be set and match one of them.
+/// The escrow indexer's boot key check, for both operators: `keys` must match `pinned` when
+/// set, and once any escrow account is configured, be set and match one of them.
 pub(crate) async fn check_confidential_keys(
     storage: &Storage,
     keys: Option<&private_channel_confidential::Keys>,
+    pinned: Option<[u8; 32]>,
     solana_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance: &solana_sdk::pubkey::Pubkey,
 ) -> Result<(), OperatorError> {
@@ -37,7 +38,7 @@ pub(crate) async fn check_confidential_keys(
     let source = RpcEscrowKeySource {
         rpc: solana_rpc.clone(),
     };
-    check_keys_at_boot(storage, keys, &source, escrow_instance)
+    check_keys_at_boot(storage, keys, pinned, &source, escrow_instance)
         .await
         .map_err(|e| OperatorError::InvalidConfig(e.to_string()))
 }
@@ -198,11 +199,14 @@ pub async fn run(
     // A missing or foreign key refuses here, not later as a reconciliation halt or parks.
     let confidential_keys = crate::indexer::confidential::load_keys()
         .map_err(|e| OperatorError::InvalidConfig(e.to_string()))?;
+    let pinned = crate::indexer::confidential::load_pinned_pubkey()
+        .map_err(|e| OperatorError::InvalidConfig(e.to_string()))?;
     under_live_lock(
         &live_lock_lost,
         check_confidential_keys(
             &storage,
             confidential_keys.as_deref(),
+            pinned,
             solana_rpc,
             &escrow_instance,
         ),
@@ -2650,7 +2654,7 @@ mod tests {
             configured_escrow(Some(cts::keys().pubkey()), &instance).await;
 
         for keys in [None, Some(cts::other_keys())] {
-            let err = check_confidential_keys(&storage, keys.as_ref(), &rpc, &instance)
+            let err = check_confidential_keys(&storage, keys.as_ref(), None, &rpc, &instance)
                 .await
                 .expect_err("a missing or foreign key refuses to boot");
             assert!(matches!(err, OperatorError::InvalidConfig(_)), "{err}");
@@ -2660,7 +2664,7 @@ mod tests {
                 "the error names the variable: {err}"
             );
         }
-        check_confidential_keys(&storage, Some(&cts::keys()), &rpc, &instance)
+        check_confidential_keys(&storage, Some(&cts::keys()), None, &rpc, &instance)
             .await
             .expect("the instance key boots");
     }
@@ -2669,8 +2673,31 @@ mod tests {
     async fn operators_boot_without_a_key_until_an_escrow_account_is_configured() {
         let instance = solana_sdk::pubkey::Pubkey::new_unique();
         let (storage, rpc, _server) = configured_escrow(None, &instance).await;
-        check_confidential_keys(&storage, None, &rpc, &instance)
+        check_confidential_keys(&storage, None, None, &rpc, &instance)
             .await
             .expect("nothing configured, nothing required");
+    }
+
+    /// On a database that knows no mint, the pinned pubkey still requires its key.
+    #[tokio::test]
+    async fn operators_on_an_empty_database_require_the_pinned_key() {
+        use private_channel_confidential::{test_support as cts, PUBKEY_ENV};
+        let instance = solana_sdk::pubkey::Pubkey::new_unique();
+        let storage = Storage::Mock(MockStorage::new());
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://127.0.0.1:1".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        ));
+        let pinned = Some(cts::keys().pubkey());
+        for keys in [None, Some(cts::other_keys())] {
+            let err = check_confidential_keys(&storage, keys.as_ref(), pinned, &rpc, &instance)
+                .await
+                .expect_err("a missing or foreign key refuses under a pin");
+            assert!(err.to_string().contains(PUBKEY_ENV), "{err}");
+        }
+        check_confidential_keys(&storage, Some(&cts::keys()), pinned, &rpc, &instance)
+            .await
+            .expect("the pinned key boots");
     }
 }

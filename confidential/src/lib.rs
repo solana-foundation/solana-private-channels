@@ -9,7 +9,7 @@ use serde::Deserialize;
 use solana_zk_sdk::encryption::{
     auth_encryption::{AeCiphertext, AeKey},
     discrete_log::DiscreteLog,
-    elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalSecretKey},
+    elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
 };
 use std::num::NonZeroUsize;
 use zeroize::{Zeroize, Zeroizing};
@@ -22,6 +22,10 @@ pub use proofs::{MoveToPublicProofs, ProofError, ReleaseFee, ReleaseProofs};
 
 /// Environment variable holding the instance keys as base64 JSON.
 pub const KEYS_ENV: &str = "ESCROW_CONFIDENTIAL_KEYS";
+
+/// Environment variable pinning the instance's ElGamal pubkey, base64 as `confidential_keygen`
+/// prints it. Not secret.
+pub const PUBKEY_ENV: &str = "ESCROW_CONFIDENTIAL_PUBKEY";
 
 /// An ElGamal ciphertext as Token-2022 and the escrow events store it.
 pub type Ciphertext = [u8; 64];
@@ -52,6 +56,10 @@ pub enum KeysError {
     ElGamalInvalid,
     #[error("{KEYS_ENV} aes_key must be {AES_KEY_LEN} bytes")]
     AesLength,
+    #[error("{PUBKEY_ENV} is not valid UTF-8")]
+    PubkeyNotUnicode,
+    #[error("{PUBKEY_ENV} is not a base64 32-byte ElGamal public key")]
+    PubkeyMalformed,
 }
 
 /// Why a pending balance could not be decrypted.
@@ -77,6 +85,26 @@ impl Drop for KeysJson {
         self.elgamal_secret.zeroize();
         self.aes_key.zeroize();
     }
+}
+
+/// Load [`PUBKEY_ENV`]. Unset or blank is `None`.
+pub fn pinned_pubkey_from_env() -> Result<Option<[u8; 32]>, KeysError> {
+    match std::env::var(PUBKEY_ENV) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => parse_pubkey(&value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(KeysError::PubkeyNotUnicode),
+    }
+}
+
+/// Parse a base64 ElGamal pubkey, the form [`PUBKEY_ENV`] takes.
+pub fn parse_pubkey(value: &str) -> Result<[u8; 32], KeysError> {
+    let bytes = BASE64
+        .decode(value.trim().as_bytes())
+        .map_err(|_| KeysError::PubkeyMalformed)?;
+    let pubkey: [u8; 32] = bytes.try_into().map_err(|_| KeysError::PubkeyMalformed)?;
+    ElGamalPubkey::try_from(&pubkey[..]).map_err(|_| KeysError::PubkeyMalformed)?;
+    Ok(pubkey)
 }
 
 /// The escrow instance's ElGamal and AES keys. Both parts zeroize themselves on drop, clones
@@ -325,6 +353,17 @@ pub fn split(amount: u64) -> (u64, u64) {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn a_pinned_pubkey_parses_as_keygen_prints_it() {
+        let pubkey = keys().pubkey();
+        assert_eq!(parse_pubkey(&BASE64.encode(pubkey)).unwrap(), pubkey);
+        for bad in ["not-base64!", "AAAA", &BASE64.encode([0u8; 33])] {
+            let err = parse_pubkey(bad).unwrap_err();
+            assert_eq!(err, KeysError::PubkeyMalformed);
+            assert!(!err.to_string().contains(bad), "{err}");
+        }
+    }
 
     const EDGES: [u64; 5] = [0, 1, LO_MAX, 1 << 16, MAX_CONFIDENTIAL_AMOUNT];
 

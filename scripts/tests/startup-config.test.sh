@@ -186,11 +186,13 @@ test_compose_release_fixes() {
 # operators, ship blank in every preset and stay optional until an account is configured.
 CONFIDENTIAL_KEYS='{"elgamal_secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","aes_key":"AAAAAAAAAAAAAAAAAAAAAA=="}'
 CONFIDENTIAL_SERVICES="indexer-solana operator-solana operator-private-channel"
+CONFIDENTIAL_PUBKEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 
 test_confidential_keys_wiring() {
   local start=$failures
   for f in .env.example .env.local .env.devnet; do
     grep -qx 'ESCROW_CONFIDENTIAL_KEYS=' "$f" || fail "$f must ship ESCROW_CONFIDENTIAL_KEYS blank"
+    grep -qx 'ESCROW_CONFIDENTIAL_PUBKEY=' "$f" || fail "$f must ship ESCROW_CONFIDENTIAL_PUBKEY blank"
   done
   # Optional: blank passes, a well-formed value passes, a malformed one is refused by name only.
   local i=0 var
@@ -214,13 +216,27 @@ test_confidential_keys_wiring() {
     grep -q 'ESCROW_CONFIDENTIAL_KEYS' "$TMP/bad-keys.err" || fail "refusal does not name ESCROW_CONFIDENTIAL_KEYS"
     grep -q 'secret-material' "$TMP/bad-keys.err" && fail "refusal leaks the ESCROW_CONFIDENTIAL_KEYS value"
   fi
+  # The pinned pubkey: base64 of 32 bytes, and only together with the keys.
+  printf 'ESCROW_CONFIDENTIAL_PUBKEY=%s\n' "$CONFIDENTIAL_PUBKEY" >"$TMP/pubkey.env"
+  env -u ESCROW_CONFIDENTIAL_KEYS -u ESCROW_CONFIDENTIAL_PUBKEY ./scripts/check-required-env.sh .env.example \
+    "$TMP/secrets.env" "$TMP/good-keys.env" "$TMP/pubkey.env" >/dev/null 2>&1 \
+    || fail "check-required-env.sh refused a pinned pubkey with its keys"
+  env -u ESCROW_CONFIDENTIAL_KEYS -u ESCROW_CONFIDENTIAL_PUBKEY ./scripts/check-required-env.sh .env.example \
+    "$TMP/secrets.env" "$TMP/pubkey.env" >/dev/null 2>"$TMP/pin-alone.err" \
+    && fail "check-required-env.sh accepted ESCROW_CONFIDENTIAL_PUBKEY without the keys"
+  grep -q 'ESCROW_CONFIDENTIAL_KEYS is blank' "$TMP/pin-alone.err" || fail "pin without keys refusal does not say why"
+  printf 'ESCROW_CONFIDENTIAL_PUBKEY=not-a-pubkey\n' >"$TMP/bad-pubkey.env"
+  env -u ESCROW_CONFIDENTIAL_KEYS -u ESCROW_CONFIDENTIAL_PUBKEY ./scripts/check-required-env.sh .env.example \
+    "$TMP/secrets.env" "$TMP/good-keys.env" "$TMP/bad-pubkey.env" >/dev/null 2>"$TMP/bad-pubkey.err" \
+    && fail "check-required-env.sh accepted a malformed ESCROW_CONFIDENTIAL_PUBKEY"
+  grep -q 'ESCROW_CONFIDENTIAL_PUBKEY' "$TMP/bad-pubkey.err" || fail "refusal does not name ESCROW_CONFIDENTIAL_PUBKEY"
   if ! docker compose version >/dev/null 2>&1 || ! command -v jq >/dev/null; then
     skip "confidential keys compose wiring (docker compose or jq missing)"
     pass "$start" "confidential keys wiring"
     return
   fi
-  printf "COMMON_ESCROW_INSTANCE_ID=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz\nESCROW_CONFIDENTIAL_KEYS='%s'\n" \
-    "$CONFIDENTIAL_KEYS" >"$TMP/keys.env"
+  printf "COMMON_ESCROW_INSTANCE_ID=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz\nESCROW_CONFIDENTIAL_KEYS='%s'\nESCROW_CONFIDENTIAL_PUBKEY=%s\n" \
+    "$CONFIDENTIAL_KEYS" "$CONFIDENTIAL_PUBKEY" >"$TMP/keys.env"
   local name json svc got
   for name in local devnet; do
     if [[ $name == local ]]; then
@@ -233,6 +249,8 @@ test_confidential_keys_wiring() {
     for svc in $CONFIDENTIAL_SERVICES; do
       got="$(jq -r --arg s "$svc" '.services[$s].environment.ESCROW_CONFIDENTIAL_KEYS' <<<"$json")"
       [[ "$got" == "$CONFIDENTIAL_KEYS" ]] || fail "$name $svc does not get ESCROW_CONFIDENTIAL_KEYS verbatim (got '$got')"
+      got="$(jq -r --arg s "$svc" '.services[$s].environment.ESCROW_CONFIDENTIAL_PUBKEY' <<<"$json")"
+      [[ "$got" == "$CONFIDENTIAL_PUBKEY" ]] || fail "$name $svc does not get ESCROW_CONFIDENTIAL_PUBKEY (got '$got')"
     done
     # The secret goes nowhere else.
     got="$(jq -r '[.services | to_entries[] | select(.value.environment.ESCROW_CONFIDENTIAL_KEYS != null) | .key] | sort | join(" ")' <<<"$json")"

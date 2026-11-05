@@ -37,6 +37,7 @@ INSTANCE=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz
 PLACEHOLDER=11111111111111111111111111111111
 WORKERS="indexer-solana operator-solana operator-private-channel"
 CONFIDENTIAL_KEYS='{"elgamal_secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","aes_key":"AAAAAAAAAAAAAAAAAAAAAA=="}'
+CONFIDENTIAL_PUBKEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 
 failures=0
 fail() {
@@ -146,6 +147,14 @@ test_preflight_cases() {
   grep -q 'secret-material' "$TMP/malformed_confidential_keys.log" && fail "malformed_confidential_keys: value leaked"
   expect_services confidential_keys_accepted no "${common[@]}" \
     -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
+  # The pinned pubkey needs its keys and the base64 shape.
+  expect_refused confidential_pubkey_without_keys "escrow_confidential_pubkey must be" "${common[@]}" \
+    -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY
+  expect_refused malformed_confidential_pubkey "escrow_confidential_pubkey must be" "${common[@]}" \
+    -e escrow_confidential_pubkey=not-a-pubkey \
+    -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
+  expect_services confidential_pubkey_accepted no "${common[@]}" -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY \
+    -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
 
   expect_services localnet_no_instance no "${common[@]}"
   local kept=(-e reset_state=false -e validator_reset=false)
@@ -210,7 +219,8 @@ test_env_render() {
   render "$TMP/both.env" -e escrow_instance_id=$INSTANCE -e escrow_instance_id_pda=$PLACEHOLDER
   render "$TMP/hook.env" -e notify_webhook=https://hooks.invalid/x
   # JSON extra vars, so the quotes inside the value survive.
-  render "$TMP/keys.env" -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
+  render "$TMP/keys.env" -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}" \
+    -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY
 
   [[ "$(instance_line "$TMP/none.env")" == "COMMON_ESCROW_INSTANCE_ID=" ]] || fail "unset instance must render blank"
   [[ "$(instance_line "$TMP/var.env")" == "COMMON_ESCROW_INSTANCE_ID=$INSTANCE" ]] || fail "escrow_instance_id not rendered"
@@ -226,6 +236,8 @@ test_env_render() {
   # Single-quoted so compose reads the JSON literally; blank when unset.
   grep -qx "ESCROW_CONFIDENTIAL_KEYS='$CONFIDENTIAL_KEYS'" "$TMP/keys.env" || fail "escrow_confidential_keys not rendered quoted"
   grep -qx "ESCROW_CONFIDENTIAL_KEYS=" "$TMP/none.env" || fail "unset escrow_confidential_keys must render blank"
+  grep -qx "ESCROW_CONFIDENTIAL_PUBKEY=$CONFIDENTIAL_PUBKEY" "$TMP/keys.env" || fail "escrow_confidential_pubkey not rendered"
+  grep -qx "ESCROW_CONFIDENTIAL_PUBKEY=" "$TMP/none.env" || fail "unset escrow_confidential_pubkey must render blank"
   # Both runtime webhooks follow notify_webhook, and fall back to the no-op together.
   grep -qx 'RECONCILIATION_WEBHOOK_URL=https://hooks.invalid/x' "$TMP/hook.env" || fail "reconciliation webhook not rendered from notify_webhook"
   grep -qx 'RECONCILIATION_WEBHOOK_URL=http://localhost:9/no-op' "$TMP/none.env" || fail "reconciliation webhook must fall back to the no-op"

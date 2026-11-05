@@ -161,8 +161,9 @@ Setup, once per instance, then once per mint (see
 ```bash
 # Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json.
 cargo run --bin confidential_keygen -- ./keypairs/escrow-confidential.json
-# Put its content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS and restart
-# indexer-solana and both operators. Then, with the mint's deposits blocked:
+# Put its content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS, and the
+# ESCROW_CONFIDENTIAL_PUBKEY=... line it prints as is, then restart indexer-solana
+# and both operators. Then, with the mint's deposits blocked:
 cargo run --bin configure_confidential -- \
   https://api.devnet.solana.com \
   ./keypairs/escrow-admin.json \

@@ -1,7 +1,8 @@
 //! Generate confidential keys: the escrow instance's `ESCROW_CONFIDENTIAL_KEYS`, or a
 //! user's keys for `confidential_deposit`. The secret goes to a new owner-only file.
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use devnet_scripts::confidential::{generate_keys_json, parse_keys, write_keys_file};
+use devnet_scripts::confidential::{
+    generate_keys_json, parse_keys, pinned_pubkey_line, write_keys_file,
+};
 use std::{env, error::Error, path::Path};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -13,7 +14,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!(
             "For the escrow instance, set its content, single-quoted, as ESCROW_CONFIDENTIAL_KEYS"
         );
-        eprintln!("(secrets.yml: escrow_confidential_keys). One key per instance; never rotate it");
+        eprintln!(
+            "(secrets.yml: escrow_confidential_keys), and the printed ESCROW_CONFIDENTIAL_PUBKEY"
+        );
+        eprintln!("line as is (escrow_confidential_pubkey). One key per instance; never rotate it");
         eprintln!("while an escrow account is configured.");
         std::process::exit(1);
     }
@@ -22,6 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_keys_file(path, &json)?;
     let keys = parse_keys(&json)?;
     println!("Wrote {}", path.display());
-    println!("ElGamal pubkey: {}", BASE64.encode(keys.keys.pubkey()));
+    // Public: for the escrow instance, record it and set this line before the first configure.
+    println!("{}", pinned_pubkey_line(&keys.keys));
     Ok(())
 }

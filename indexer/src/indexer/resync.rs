@@ -191,6 +191,8 @@ pub struct ResyncService {
     index_catch_up_budget: Duration,
     // Decrypts confidential events in both passes; `None` leaves deposits undecrypted.
     confidential_keys: Option<Arc<Keys>>,
+    // The instance's pinned ElGamal pubkey; when set the key check needs the matching key.
+    pinned_pubkey: Option<[u8; 32]>,
     // Where the startup key check reads the escrow accounts; `None` uses the backfill RPC.
     escrow_key_source: Option<Arc<dyn crate::indexer::confidential::EscrowKeySource>>,
 }
@@ -215,12 +217,18 @@ impl ResyncService {
             stale_holder_grace: STALE_HOLDER_GRACE,
             index_catch_up_budget: INDEX_CATCH_UP_BUDGET,
             confidential_keys: None,
+            pinned_pubkey: None,
             escrow_key_source: None,
         }
     }
 
     pub fn with_confidential_keys(mut self, keys: Option<Arc<Keys>>) -> Self {
         self.confidential_keys = keys;
+        self
+    }
+
+    pub fn with_pinned_pubkey(mut self, pinned: Option<[u8; 32]>) -> Self {
+        self.pinned_pubkey = pinned;
         self
     }
 
@@ -728,6 +736,7 @@ impl ResyncService {
             crate::indexer::confidential::check_keys_at_boot(
                 &self.storage,
                 self.confidential_keys.as_deref(),
+                self.pinned_pubkey,
                 source.as_ref(),
                 &instance,
             )
@@ -1152,6 +1161,57 @@ mod tests {
             other => panic!("a resync without the escrow key must refuse, got: {other:?}"),
         }
         assert_eq!(mock.get_unfinished_resync().unwrap(), None, "nothing wiped");
+    }
+
+    /// A resync into an empty database knows no mint, so only the pinned pubkey can refuse
+    /// a missing or foreign key there, before anything is wiped.
+    #[tokio::test]
+    async fn run_into_an_empty_database_requires_the_pinned_key() {
+        use private_channel_confidential::test_support as cts;
+        let keys = cts::keys();
+        let pinned = Some(keys.pubkey());
+        let cases = [
+            (None, pinned, true),
+            (Some(cts::other_keys()), pinned, true),
+            (Some(keys.clone()), pinned, false),
+            (None, None, false),
+        ];
+        for (loaded, pinned, refuses) in cases {
+            let mock = MockStorage::new();
+            let backfill_config = BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                batch_size: 50,
+                max_gap_slots: 500,
+                start_slot: None,
+            };
+            let service = ResyncService::new(
+                Arc::new(Storage::Mock(mock.clone())),
+                Arc::new(RpcPoller::new(
+                    "http://127.0.0.1:1".to_string(),
+                    UiTransactionEncoding::Json,
+                    CommitmentLevel::Finalized,
+                )),
+                ProgramType::Escrow,
+                backfill_config,
+                Some(Pubkey::new_unique()),
+            )
+            .with_stale_holder_grace(Duration::ZERO)
+            .with_escrow_key_source(no_escrow_accounts())
+            .with_confidential_keys(loaded.map(Arc::new))
+            .with_pinned_pubkey(pinned);
+            // Past the key check the run reads the unreachable RPC and fails there instead.
+            let result = service.run(100).await;
+            let refused = matches!(&result, Err(IndexerError::ConfidentialKeys { reason })
+                if reason.contains(private_channel_confidential::PUBKEY_ENV));
+            assert_eq!(refused, refuses, "{result:?}");
+            assert!(
+                result.is_err(),
+                "the unreachable RPC never lets a resync finish"
+            );
+            assert_eq!(mock.get_unfinished_resync().unwrap(), None, "nothing wiped");
+        }
     }
 
     // ── withdrawal bitmap pre-flight ─────────────────────────────────

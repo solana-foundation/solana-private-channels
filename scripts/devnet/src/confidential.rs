@@ -60,6 +60,15 @@ pub fn generate_keys_json() -> Zeroizing<String> {
         .to_json()
 }
 
+/// `ESCROW_CONFIDENTIAL_PUBKEY=<base64>`, the line to set for the instance's keys.
+pub fn pinned_pubkey_line(keys: &Keys) -> String {
+    format!(
+        "{}={}",
+        private_channel_confidential::PUBKEY_ENV,
+        BASE64.encode(keys.pubkey())
+    )
+}
+
 /// Parse key JSON. Errors never include the value.
 pub fn parse_keys(json: &str) -> Result<ConfidentialKeyPair> {
     let keys = Keys::from_json(json.trim()).map_err(|e| e.to_string())?;
@@ -392,6 +401,18 @@ mod tests {
         let parsed = parse_keys(&json).expect("tools read keygen output");
         assert_eq!(parsed.elgamal.pubkey().to_bytes(), shared.pubkey());
         assert_ne!(*generate_keys_json(), *json, "each run makes new keys");
+    }
+
+    #[test]
+    fn the_printed_pubkey_line_is_what_the_services_load() {
+        let keys = test_support::keys();
+        let line = pinned_pubkey_line(&keys);
+        let (name, value) = line.split_once('=').unwrap();
+        assert_eq!(name, private_channel_confidential::PUBKEY_ENV);
+        assert_eq!(
+            private_channel_confidential::parse_pubkey(value).unwrap(),
+            keys.pubkey()
+        );
     }
 
     #[test]

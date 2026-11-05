@@ -39,6 +39,15 @@ pub fn load_keys() -> Result<Option<Arc<Keys>>, IndexerError> {
     Ok(keys.map(Arc::new))
 }
 
+/// Load `ESCROW_CONFIDENTIAL_PUBKEY`, the instance's pinned ElGamal pubkey. Unset is `None`.
+pub fn load_pinned_pubkey() -> Result<Option<[u8; 32]>, IndexerError> {
+    private_channel_confidential::pinned_pubkey_from_env().map_err(|e| {
+        IndexerError::ConfidentialKeys {
+            reason: e.to_string(),
+        }
+    })
+}
+
 /// Reads the ElGamal key an escrow token account is configured with.
 #[async_trait::async_trait]
 pub trait EscrowKeySource: Send + Sync {
@@ -181,16 +190,31 @@ pub fn report_poisoned(mint: &str) {
         .set(1.0);
 }
 
-/// Boot check: once any escrow account is configured the key is required and must match at
-/// least one of them. A mint configured with another key is reported poisoned.
+/// Boot check: a pinned pubkey requires the matching key, whatever the database holds. Once
+/// any escrow account is configured the key is required and must match at least one of them.
+/// A mint configured with another key is reported poisoned.
 pub async fn check_keys_at_boot(
     storage: &Storage,
     keys: Option<&Keys>,
+    pinned: Option<[u8; 32]>,
     source: &dyn EscrowKeySource,
     instance: &Pubkey,
 ) -> Result<(), IndexerError> {
     for mint in storage.get_confidential_poisoned_mints().await? {
         report_poisoned(&mint);
+    }
+    if let Some(pinned) = pinned {
+        use private_channel_confidential::{KEYS_ENV, PUBKEY_ENV};
+        let Some(keys) = keys else {
+            return Err(IndexerError::ConfidentialKeys {
+                reason: format!("{PUBKEY_ENV} is set; set {KEYS_ENV} to the matching keys"),
+            });
+        };
+        if keys.pubkey() != pinned {
+            return Err(IndexerError::ConfidentialKeys {
+                reason: format!("{KEYS_ENV} does not match {PUBKEY_ENV}"),
+            });
+        }
     }
     // The instance's mints as the database knows them, listed or seen only in history; the
     // chain then says which the admin allowed. Fail closed on a key we cannot compare.
@@ -481,7 +505,7 @@ mod tests {
     async fn boot_check_needs_no_key_until_a_mint_is_configured() {
         let (storage, mock) = storage_with(vec![]);
         with_token_2022_mints(&mock, &[MINT]);
-        check_keys_at_boot(&storage, None, &accounts(&[]), &instance())
+        check_keys_at_boot(&storage, None, None, &accounts(&[]), &instance())
             .await
             .unwrap();
     }
@@ -493,12 +517,47 @@ mod tests {
         let keys = cts::keys();
         let source = accounts(&[(MINT, keys.pubkey())]);
         let (storage, _mock) = storage_with(vec![undecrypted(1, deposit_raw(&keys, 5))]);
-        let err = check_keys_at_boot(&storage, None, &source, &instance())
+        let err = check_keys_at_boot(&storage, None, None, &source, &instance())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("configured"), "{err}");
+    }
+
+    /// A database that knows no mint cannot name the configured accounts, so the pinned
+    /// pubkey alone decides: no key or another key refuses, the matching key starts.
+    #[tokio::test]
+    async fn a_pinned_pubkey_requires_its_key_even_on_an_empty_database() {
+        let keys = cts::keys();
+        let source = accounts(&[(MINT, keys.pubkey())]);
+        let pinned = Some(keys.pubkey());
         let (empty, _) = storage_with(vec![]);
-        check_keys_at_boot(&empty, None, &source, &instance())
+        let err = check_keys_at_boot(&empty, None, pinned, &source, &instance())
+            .await
+            .unwrap_err();
+        let reason = err.to_string();
+        assert!(
+            reason.contains(private_channel_confidential::PUBKEY_ENV),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(private_channel_confidential::KEYS_ENV),
+            "{reason}"
+        );
+        let err = check_keys_at_boot(
+            &empty,
+            Some(&cts::other_keys()),
+            pinned,
+            &source,
+            &instance(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        check_keys_at_boot(&empty, Some(&keys), pinned, &source, &instance())
+            .await
+            .unwrap();
+        // Unpinned, an empty database has no mint to check and passes as before.
+        check_keys_at_boot(&empty, None, None, &source, &instance())
             .await
             .unwrap();
     }
@@ -655,14 +714,22 @@ mod tests {
         let (storage, mock) = storage_with(vec![]);
         with_token_2022_mints(&mock, &[MINT]);
         let source = accounts(&[(MINT, cts::keys().pubkey())]);
-        assert!(check_keys_at_boot(&storage, None, &source, &instance())
-            .await
-            .is_err());
-        let err = check_keys_at_boot(&storage, Some(&cts::other_keys()), &source, &instance())
-            .await
-            .unwrap_err();
+        assert!(
+            check_keys_at_boot(&storage, None, None, &source, &instance())
+                .await
+                .is_err()
+        );
+        let err = check_keys_at_boot(
+            &storage,
+            Some(&cts::other_keys()),
+            None,
+            &source,
+            &instance(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("matches none"), "{err}");
-        check_keys_at_boot(&storage, Some(&cts::keys()), &source, &instance())
+        check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
             .await
             .unwrap();
     }
@@ -676,7 +743,7 @@ mod tests {
             (MINT, cts::keys().pubkey()),
             (foreign_mint, cts::other_keys().pubkey()),
         ]);
-        check_keys_at_boot(&storage, Some(&cts::keys()), &source, &instance())
+        check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
             .await
             .unwrap();
         assert_eq!(
