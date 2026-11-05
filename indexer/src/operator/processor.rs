@@ -1,11 +1,14 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
+use crate::operator::confidential_custody::{judge_confidential_custody, ConfidentialCustody};
+use crate::operator::escrow_sweep::ConfidentialBalances;
 use crate::operator::instruction_util::ConfidentialReleaseRequest;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawConfigSetup,
     WithdrawalRemintInfo,
 };
+use crate::operator::reconciliation::ledger_liability;
 use crate::operator::recovery::{
     check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
 };
@@ -14,7 +17,8 @@ use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
 };
 use crate::operator::utils::mint_util::{
-    destination_readiness, ConfidentialAccountRead, DestinationReadiness, HookExtras, MintCache,
+    destination_readiness, ConfidentialAccountRead, ConfidentialAccountView, DestinationReadiness,
+    HookExtras, MintCache,
 };
 use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
@@ -1101,22 +1105,16 @@ async fn check_withdrawal_preflights_inner(
 
         // Custody can sit in the confidential balance, so the public one may be short.
         let amount = transaction.amount.value();
-        let (escrow, _) = processor_state
+        let (escrow, slot) = processor_state
             .mint_cache
             .read_confidential_account(&instance_ata, gate_slot)
             .await?;
         if let ConfidentialAccountRead::Configured(view) = escrow {
             if view.public_amount < amount {
-                return Ok(Some(BailReason::new(
-                    metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
-                    format!(
-                        "escrow public balance {} below release {amount} for mint {mint}; rebalance to public",
-                        view.public_amount
-                    ),
-                )));
+                return short_public_balance(processor_state, &mint, &view, amount, slot)
+                    .await
+                    .map(Some);
             }
-            // Custody also sits in the confidential balance, so a short public one is not
-            // a drain; the check above already covered it.
             return Ok(None);
         }
     }
@@ -1137,6 +1135,65 @@ async fn check_withdrawal_preflights_inner(
     }
 
     Ok(None)
+}
+
+/// A short public balance on a configured mint is routine only while the whole custody
+/// still covers what the ledger owes. Otherwise, or when the confidential part cannot be
+/// counted, funds may have left the escrow, so the row parks as a drain.
+async fn short_public_balance(
+    processor_state: &ProcessorState,
+    mint: &Pubkey,
+    view: &ConfidentialAccountView,
+    amount: u64,
+    slot: u64,
+) -> Result<BailReason, OperatorError> {
+    let public = view.public_amount;
+    let storage = processor_state.mint_cache.storage();
+    let custody = judge_confidential_custody(
+        storage,
+        processor_state.confidential_keys.as_deref(),
+        mint,
+        public,
+        &ConfidentialBalances::from(view),
+    )
+    .await
+    .map_err(OperatorError::Storage)?;
+    let mint_address = mint.to_string();
+    let owed = storage
+        .get_mint_balances_for_unpinned_reconciliation(slot)
+        .await
+        .map_err(OperatorError::Storage)?
+        .iter()
+        .find(|row| row.mint_address == mint_address)
+        .map_or(0, ledger_liability);
+    let drained = |why: String| {
+        BailReason::new(
+            metrics::BAIL_REASON_ESCROW_DRAINED,
+            format!(
+                "insufficient escrow balance: public {public} below release {amount} for mint {mint} and {why}; \
+                 possible drain, do not re-arm"
+            ),
+        )
+    };
+    Ok(match custody {
+        ConfidentialCustody::Counted(total) if total >= owed => BailReason::new(
+            metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            format!(
+                "escrow public balance {public} below release {amount} for mint {mint}; \
+                 custody {total} covers liabilities {owed}; rebalance to public"
+            ),
+        ),
+        ConfidentialCustody::Counted(total) => {
+            drained(format!("custody {total} below liabilities {owed}"))
+        }
+        ConfidentialCustody::Held(hold) => drained(format!(
+            "its confidential custody is held ({})",
+            hold.label()
+        )),
+        ConfidentialCustody::Mismatch(reason) => {
+            drained(format!("its confidential custody is not proven: {reason}"))
+        }
+    })
 }
 
 /// What a confidential release needs from its pre-flight. The destination's key and the
@@ -6615,6 +6672,7 @@ mod tests {
         use crate::operator::utils::mint_util::confidential_fixtures::{
             account_with_confidential, confidential_mint, AccountSpec,
         };
+        use crate::storage::common::models::MintDbBalance;
         use private_channel_confidential::test_support::{self as cts, SimAccount};
 
         const CT_BIT: u64 = 1 << EXTENSION_BIT_CONFIDENTIAL_TRANSFER;
@@ -6661,6 +6719,8 @@ mod tests {
             destination: Option<Vec<u8>>,
             poisoned: bool,
             confidential: bool,
+            /// Ledger liabilities of the mint (deposits minus released withdrawals).
+            owed: u64,
         }
 
         impl Case {
@@ -6673,6 +6733,7 @@ mod tests {
                     destination: Some(account_with_confidential(&destination)),
                     poisoned: false,
                     confidential: true,
+                    owed: 0,
                 }
             }
 
@@ -6736,6 +6797,14 @@ mod tests {
                     &spl_token_2022::id(),
                     confidential_mint(Some(cts::other_keys().pubkey()), None),
                 ));
+                if let Storage::Mock(ref mock) = *storage {
+                    mock.mint_balances.lock().unwrap().push(MintDbBalance {
+                        mint_address: mint.to_string(),
+                        token_program: spl_token_2022::id().to_string(),
+                        total_deposits: bigdecimal::BigDecimal::from(self.owed),
+                        total_withdrawals: bigdecimal::BigDecimal::from(0u64),
+                    });
+                }
                 if self.poisoned {
                     let mut poison = withdrawal_for(&mint, 6);
                     poison.id = 77;
@@ -6772,6 +6841,7 @@ mod tests {
                 metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED => "mint",
                 metrics::BAIL_REASON_DESTINATION_NOT_READY => "destination",
                 metrics::BAIL_REASON_PUBLIC_BALANCE_LOW => "escrow public balance",
+                metrics::BAIL_REASON_ESCROW_DRAINED => "do not re-arm",
                 other => panic!("no message for {other}"),
             };
             let message = update.error_message.unwrap_or_default();
@@ -6978,6 +7048,53 @@ mod tests {
                 update.and_then(|u| u.error_message)
             );
             assert!(matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))));
+        }
+
+        /// A public release of `owed` liabilities against an escrow with 999 public and
+        /// 10,000 confidential, under `keys`.
+        async fn short_public_release(
+            owed: u64,
+            foreign_key: bool,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = owed;
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            if foreign_key {
+                escrow.elgamal_pubkey = cts::other_keys().pubkey();
+            }
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run().await
+        }
+
+        /// The reviewer's case: the delegate drained the public balance, so custody no longer
+        /// covers the liabilities. That is a drain, not a balance to move to public.
+        #[tokio::test]
+        async fn a_drained_public_balance_on_a_configured_mint_parks_as_a_drain() {
+            assert_parked(
+                short_public_release(50_000, false).await,
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+            );
+            // Custody exactly covers the liabilities: the funds are only in confidential.
+            assert_parked(
+                short_public_release(10_999, false).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// Confidential custody that cannot be counted cannot rule a drain out.
+        #[tokio::test]
+        async fn a_short_public_balance_with_held_confidential_custody_parks_as_a_drain() {
+            let result = short_public_release(0, true).await;
+            let message = result.1.as_ref().and_then(|u| u.error_message.clone());
+            assert_parked(result, metrics::BAIL_REASON_ESCROW_DRAINED);
+            assert!(message.unwrap().contains("key_mismatch"));
         }
 
         /// A Token-2022 account with no extensions and an empty public balance.

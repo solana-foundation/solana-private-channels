@@ -90,6 +90,7 @@ only on `NOT_LANDED` with an empty or all-dead journal.
 | `confidential_balance_low` | [Confidential balance low](#confidential_balance_low) |
 | `public_balance_low` | [Public balance low](#public_balance_low) |
 | `confidential_stale_proof` | [Stale proof](#confidential_stale_proof) |
+| `confidential_transient_failure` | [Transient failure](#confidential_transient_failure) |
 | `confidential_tx_too_large` | [Transaction too large](#confidential_tx_too_large) |
 | `confidential_escrow_account_not_ready` | [Escrow account not ready](#confidential_escrow_account_not_ready) |
 | `confidential_compute_exceeded` | [Compute exceeded](#confidential_compute_exceeded) |
@@ -216,23 +217,48 @@ pending. Public funds of the mint may cover it.
 ### public_balance_low
 
 A public release on a confidential-configured mint has more than the escrow's
-public balance to pay, because funds sit in the confidential balance.
+public balance to pay, and the whole custody (public plus the verified confidential
+balance) still covers what the ledger owes, so the funds sit in the confidential balance.
+A short public balance whose custody does not cover the ledger, or whose confidential part
+cannot be counted, parks `escrow_drained` instead (`insufficient escrow balance:`), see
+[withdrawal_manual_review.md](withdrawal_manual_review.md#triage---dispatch-by-error_message).
 
-1. `indexer rebalance --mint <mint> --to-public <amount> --id <id>`.
-2. Re-arm the row.
+1. Rule out a drain first: the mint's permanent delegate (if any) can move public funds
+   but not confidential ones. Check `private_channel_reconciliation_confidential_mismatch{mint}`
+   and the reconciliation alerts for the mint; if either fires, or the public balance fell
+   without a release or rebalance to explain it, do not rebalance or re-arm, and
+   [escalate](_escalation.md).
+2. `indexer rebalance --mint <mint> --to-public <amount> --id <id>`.
+3. Re-arm the row.
 
 ### confidential_stale_proof
 
 The escrow (30, 31 or 33) or Token-2022 (26, 27, 32 or 33) refused the release's
-proofs on every rebuild of the stale-proof budget, or no candidate available balance opened against the account
-after a journaled attempt. Something other than the sender changed the escrow's
-available balance, or the RPC keeps serving an old account.
+proofs on every rebuild of the stale-proof budget. Something other than the sender
+changed the escrow's available balance, or the RPC keeps serving an old account.
 
 1. Check `operator-private-channel` logs for the mint around the row's
    `updated_at`, and that only one withdraw operator runs against the database.
 2. Check `private_channel_reconciliation_confidential_mismatch{mint}`. If it is 1,
    follow the reconciliation runbook first; do not re-arm.
 3. Otherwise re-arm. The sender reads the account again and rebuilds.
+
+### confidential_transient_failure
+
+A release with an earlier journaled attempt could not send its next attempt for 30
+minutes: every try failed before broadcast (the escrow account or mint could not be read,
+no candidate available balance opened, a blockhash fetch or signing failed, the
+simulation could not answer, or the RPC kept answering "minimum context slot not
+reached"). The sender held the row `processing` and retried with backoff the whole time,
+spending no proof rebuild or retry; the journal gate then proved no attempt landed. Nothing
+refused the release on chain.
+
+1. Check `operator-private-channel` logs for the nonce: `Confidential release held in the
+   sender` gives each failure.
+2. Fix the cause: usually the Solana RPC (down, rate limited, or a load balancer with a
+   node far behind), or the signer. If no candidate opened, see
+   [Confidential release waiting](#confidential-release-waiting).
+3. Re-arm.
 
 ### confidential_tx_too_large
 
@@ -309,12 +335,15 @@ failing, see [AES repair deferred](#aes-repair-deferred).
 The mint is held with `reason` `poisoned` (see
 [confidential_mint_poisoned](#confidential_mint_poisoned)) or `key_mismatch` (the
 escrow account is under a key that is not `ESCROW_CONFIDENTIAL_KEYS`). Fires at once;
-nothing clears it automatically.
+nothing clears it automatically. A `key_mismatch` mint is still compared on its public
+balance, which must cover its liabilities, and halts like any mint when it does not.
 
 ### Confidential hold age
 
 A mint has been held for any reason for over an hour. Its custody is not checked
-while held. Find the reason on the lagging gauge and follow its entry.
+while held, except under `key_mismatch`, where no confidential deposit is ever credited
+and the mint is still reconciled on its public balance alone. Find the reason on the
+lagging gauge and follow its entry.
 
 ### AES repair deferred
 

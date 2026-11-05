@@ -234,7 +234,7 @@ read as zero custody.
 | stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | no | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
 | pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | no | unapplied pending is past the bounded search; the sender's next apply clears it |
 | poisoned | `..._lagging{reason="poisoned"}` = 1 | no | a confidential deposit could not be decrypted |
-| key_mismatch | `..._lagging{reason="key_mismatch"}` = 1 | no | the account's ElGamal key is not ours |
+| key_mismatch | `..._lagging{reason="key_mismatch"}` = 1 | no | the account's ElGamal key is not ours; still compared on its public balance |
 | mismatch | `private_channel_reconciliation_confidential_mismatch{mint}` = 1 | yes | AES copy does not open with matching counters, pending lo does not decrypt, the total overflows, or no key is loaded |
 
 Every held state also exports
@@ -244,8 +244,11 @@ A mismatch is an [inputs-dark](#inputs-dark-halt) tick with the reason
 `confidential custody not proven for ...`; three in a row halt as an outage. The
 held states are alert only, so a racing deposit or a failure contained to one mint
 never halts the others. While a mint is held its value is unchecked, so treat a
-hold-age alert as urgent. Startup and manual runs use the same rules: a held mint
-is left out of the comparison, a mismatch stops the run, and a manual
+hold-age alert as urgent. A `key_mismatch` mint is the exception: no confidential
+deposit is ever credited under a foreign key, so its custody is its public balance and
+it is compared, and can halt, like any mint. Startup and manual runs use the same rules: a
+held mint is left out of the comparison (a `key_mismatch` mint is compared on its public
+balance and not reported as held), a mismatch stops the run, and a manual
 `indexer reconcile` exits non-zero naming every held mint and its reason.
 
 Deposits that could not be decrypted (each poisons its mint):
@@ -273,7 +276,9 @@ How each state ends. None of them is resolved by reconciliation itself.
   counted again once no deposit is flagged `confidential_undecrypted`.
 - **key_mismatch**: the escrow account was configured with another key. Load the
   right key; if it is lost the confidential custody of this mint is stuck for good,
-  so escalate.
+  so escalate. Its public side stays reconciled meanwhile. If confidential deposits of
+  this mint were ever credited under an earlier key, its liabilities exceed the public
+  balance and the mint halts: that needs the earlier key back.
 - **mismatch**: read the reason the operator logged. If no key was loaded, load it
   and restart the escrow operator. Otherwise the account disagrees with its own AES
   copy while no race is recorded: do not clear the resulting halt until it is

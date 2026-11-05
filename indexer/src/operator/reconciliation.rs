@@ -315,7 +315,7 @@ fn evaluate_liability_shortfall(
 
 /// A ledger row's liabilities (deposits minus released withdrawals) as u64.
 /// Negative means missing deposit history and reads as 0 (surplus); above u64::MAX fails closed.
-fn ledger_liability(row: &MintDbBalance) -> u64 {
+pub(crate) fn ledger_liability(row: &MintDbBalance) -> u64 {
     let net = &row.total_deposits - &row.total_withdrawals;
     match net_to_u64(&net) {
         NetBalance::Exact(v) => v,
@@ -632,13 +632,19 @@ async fn check_invariants(
     .map_err(OperatorError::Storage)?;
     report_confidential_holds(&resolved, breach_counters);
     // An unresolved mint's custody was never read, and a held or mismatched confidential mint's
-    // is not known, so both arms skip them rather than count 0. The counters are rebuilt from
+    // is not known (a foreign-key mint's is its public balance), so both arms skip them rather than count 0. The counters are rebuilt from
     // the set each tick, so their streaks are carried over by hand: no verdict, no reset.
     let skipped: Vec<Pubkey> = universe
         .unresolved
         .iter()
         .copied()
-        .chain(resolved.held.iter().map(|(mint, _)| *mint))
+        .chain(
+            resolved
+                .held
+                .iter()
+                .filter(|(_, hold)| !hold.reconciled_on_public())
+                .map(|(mint, _)| *mint),
+        )
         .chain(resolved.mismatched.iter().map(|(mint, _)| *mint))
         .collect();
     let held: Vec<(Pubkey, Option<u32>, Option<u32>)> = skipped
@@ -728,6 +734,14 @@ fn report_confidential_holds(resolved: &ResolvedCustody, counters: &mut BreachCo
         let age = now.duration_since(since).as_secs_f64();
         if hold.is_transient() {
             warn!(mint = %mint, reason = hold.label(), held_secs = age, "Confidential custody lagging; this mint is not reconciled until the sender catches up");
+        } else if hold.reconciled_on_public() {
+            error!(
+                reconciliation_alert = true,
+                mint = %mint,
+                reason = hold.label(),
+                held_secs = age,
+                "Confidential custody held; this mint is reconciled on its public balance only"
+            );
         } else {
             error!(
                 reconciliation_alert = true,
@@ -4830,6 +4844,32 @@ mod tests {
         assert_eq!((dark, halted), (0, false));
         assert_eq!(counters.held_since[&mint].0, "poisoned");
         assert!(!counters.supply.contains_key(&mint));
+    }
+
+    /// A mint under a foreign key is still compared on its public balance: exact supply
+    /// passes with the hold reported, and a drained public balance halts like any mint.
+    #[tokio::test]
+    async fn a_foreign_key_mint_is_reconciled_on_its_public_balance() {
+        use crate::operator::confidential_custody::tests::healthy;
+        let keys = private_channel_confidential::test_support::keys();
+        let mut foreign = healthy(&keys);
+        foreign.elgamal_pubkey = private_channel_confidential::test_support::other_keys().pubkey();
+
+        let (env, mint) = confidential_env(900, &foreign, 900).await;
+        let mut counters = BreachCounters::default();
+        assert_eq!(
+            run_confidential_ticks(&env, &mut counters, 1).await,
+            (0, false)
+        );
+        assert_eq!(counters.held_since[&mint].0, "key_mismatch");
+        assert_eq!(counters.supply.get(&mint).copied().unwrap_or(0), 0);
+
+        // The delegate drained 100 from the public balance the channel still owes.
+        let (env, mint) = confidential_env(800, &foreign, 900).await;
+        let mut counters = BreachCounters::default();
+        let (_, halted) = run_confidential_ticks(&env, &mut counters, HALT_CONFIRM_TICKS + 1).await;
+        assert!(halted, "{counters:?}");
+        assert!(counters.supply.get(&mint).copied().unwrap_or(0) >= HALT_CONFIRM_TICKS);
     }
 
     /// The age gauge reports how long the current hold has lasted, restarts when the reason

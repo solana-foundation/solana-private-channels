@@ -1,4 +1,5 @@
 use crate::error::{AccountError, OperatorError};
+use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::is_min_context_slot_error;
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::RpcClientWithRetry;
@@ -770,6 +771,10 @@ pub fn decode_confidential_mint(data: &[u8], epoch: u64) -> Option<ConfidentialM
 impl MintCache {
     /// Raw read of a token account's confidential state, bound to `min_slot` at the
     /// client's commitment. Returns the read and the slot it answered at.
+    pub fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
     pub async fn read_confidential_account(
         &self,
         ata: &Pubkey,
@@ -810,8 +815,9 @@ pub async fn read_confidential_mint_params(
 ) -> Result<Option<ConfidentialMintParams>, OperatorError> {
     let account = read_target_mint_account(rpc, mint, Some(min_slot)).await?;
     let epoch = rpc
-        .rpc_client
-        .get_epoch_info()
+        .with_retry("get_epoch_info", RetryPolicy::Idempotent, || async {
+            rpc.rpc_client.get_epoch_info().await
+        })
         .await
         .map_err(|e| OperatorError::RpcError(format!("get_epoch_info: {e}")))?
         .epoch;
@@ -1561,6 +1567,56 @@ mod tests {
             })
             .create_async()
             .await;
+    }
+
+    /// One failed `getEpochInfo` is retried like every other read of the release path.
+    #[tokio::test]
+    async fn confidential_mint_params_retry_a_failed_epoch_read() {
+        use confidential_fixtures::{confidential_mint, rpc_account};
+        let mut server = mockito::Server::new_async().await;
+        let account = rpc_account(&spl_token_2022::ID, &confidential_mint(None, None), 20);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getAccountInfo"}),
+            ))
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": account}).to_string(),
+            )
+            .create_async()
+            .await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getEpochInfo"}),
+            ))
+            .with_body_from_request(move |_| {
+                let body = if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                        "error": {"code": -32005, "message": "Node is behind"}})
+                } else {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                        "absoluteSlot": 20, "blockHeight": 20, "epoch": 3,
+                        "slotIndex": 20, "slotsInEpoch": 432000, "transactionCount": 0}})
+                };
+                body.to_string().into_bytes()
+            })
+            .create_async()
+            .await;
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let params = read_confidential_mint_params(&rpc, &Pubkey::new_unique(), 10).await;
+        assert!(params.is_ok(), "{params:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn fast_cache(url: String) -> MintCache {

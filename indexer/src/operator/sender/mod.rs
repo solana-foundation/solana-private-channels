@@ -440,6 +440,8 @@ pub async fn run_sender(
 
                 drain_rotation_retry_queue(&mut state, &storage_tx).await;
 
+                confidential::retry_held(&mut state, &storage_tx).await;
+
                 // Paced inside to once a minute; the first pass also repairs after a crash.
                 confidential::background_check(&mut state, &storage_tx).await;
             }

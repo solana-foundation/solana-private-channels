@@ -41,6 +41,12 @@ impl ConfidentialHold {
         }
     }
 
+    /// Still compared on the public balance alone: under a foreign key no confidential
+    /// deposit is ever credited, so the liabilities must fit in the public balance.
+    pub fn reconciled_on_public(&self) -> bool {
+        matches!(self, Self::KeyMismatch)
+    }
+
     /// Lag the sender clears on its own, as opposed to a hold that needs an operator.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::StaleAes | Self::PendingTooLarge)
@@ -67,10 +73,21 @@ pub async fn resolve_confidential_custody(
     public: u64,
     balances: &ConfidentialBalances,
 ) -> Result<ConfidentialCustody, StorageError> {
-    let poisoned = poisoned_mints(storage).await?.contains(&mint.to_string());
-    let verdict = judge_off_executor(poisoned, keys, public, balances).await;
+    let verdict = judge_confidential_custody(storage, keys, mint, public, balances).await?;
     publish(mint, &verdict);
     Ok(verdict)
+}
+
+/// `resolve_confidential_custody` without touching the reconciliation gauges.
+pub async fn judge_confidential_custody(
+    storage: &Storage,
+    keys: Option<&Keys>,
+    mint: &Pubkey,
+    public: u64,
+    balances: &ConfidentialBalances,
+) -> Result<ConfidentialCustody, StorageError> {
+    let poisoned = poisoned_mints(storage).await?.contains(&mint.to_string());
+    Ok(judge_off_executor(poisoned, keys, public, balances).await)
 }
 
 async fn poisoned_mints(storage: &Storage) -> Result<HashSet<String>, StorageError> {
@@ -89,15 +106,17 @@ fn judge(
     balances: &ConfidentialBalances,
 ) -> ConfidentialCustody {
     use ConfidentialCustody::{Counted, Held, Mismatch};
+    // First: under a foreign key every confidential deposit is undecryptable, so a poisoned
+    // flag there follows from the key and the mint is still reconciled on its public side.
+    if keys.is_some_and(|keys| keys.pubkey() != balances.elgamal_pubkey) {
+        return Held(ConfidentialHold::KeyMismatch);
+    }
     if poisoned {
         return Held(ConfidentialHold::Poisoned);
     }
     let Some(keys) = keys else {
         return Mismatch("no confidential key loaded for a configured escrow account".into());
     };
-    if keys.pubkey() != balances.elgamal_pubkey {
-        return Held(ConfidentialHold::KeyMismatch);
-    }
     // Checked before the pending search so a current copy costs no discrete log.
     let copy = keys.decrypt_aes(&balances.decryptable_available);
     let available = match copy.filter(|x| keys.opens_to(&balances.available, *x)) {
@@ -169,7 +188,8 @@ fn publish(mint: &Pubkey, verdict: &ConfidentialCustody) {
 }
 
 /// Custody with every configured mint judged: counted mints carry their full custody, the
-/// rest are listed apart and must be left out of every comparison.
+/// rest are listed apart and must be left out of every comparison, except a hold that is
+/// `reconciled_on_public`, which keeps its public balance in the map.
 #[derive(Debug, Default)]
 pub struct ResolvedCustody {
     pub balances: HashMap<Pubkey, u64>,
@@ -202,7 +222,11 @@ pub async fn resolve_custody(
                 resolved.balances.insert(*mint, custody);
             }
             ConfidentialCustody::Held(hold) => {
-                resolved.balances.remove(mint);
+                if hold.reconciled_on_public() {
+                    resolved.balances.insert(*mint, public);
+                } else {
+                    resolved.balances.remove(mint);
+                }
                 resolved.held.push((*mint, hold));
             }
             ConfidentialCustody::Mismatch(reason) => {
@@ -430,6 +454,31 @@ pub(crate) mod tests {
         assert_eq!(resolved.held, vec![(held, ConfidentialHold::Poisoned)]);
         assert_eq!(resolved.mismatched.len(), 1);
         assert_eq!(resolved.mismatched[0].0, bad);
+    }
+
+    /// A mint under a foreign key never credits a confidential deposit, so it stays in the
+    /// custody map on its public balance alone, poisoned or not, and is still reported held.
+    #[tokio::test]
+    async fn resolve_custody_keeps_a_foreign_key_mint_on_its_public_balance() {
+        let keys = keys();
+        let mut foreign = healthy(&keys);
+        foreign.elgamal_pubkey = other_keys().pubkey();
+        for poisoned in [false, true] {
+            let mint = Pubkey::new_unique();
+            let poisoned_mints = if poisoned { vec![mint] } else { vec![] };
+            let storage = storage(&poisoned_mints);
+            let resolved = resolve_custody(
+                &storage,
+                Some(&keys),
+                &HashMap::from([(mint, 7)]),
+                &HashMap::from([(mint, foreign)]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved.balances, HashMap::from([(mint, 7)]));
+            assert_eq!(resolved.held, vec![(mint, ConfidentialHold::KeyMismatch)]);
+            assert!(ConfidentialHold::KeyMismatch.reconciled_on_public());
+        }
     }
 
     /// Judging on a blocking thread gives exactly the inline verdicts, and the executor keeps

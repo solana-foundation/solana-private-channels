@@ -82,7 +82,9 @@ are right.
   on-chain ciphertext, from an account read at confirmed commitment at or past its own last
   transaction: its own running count, the AES copy, or its last apply's event. If none opens, a
   row that has never been sent waits in `pending` with a backoff, without spending retries; one
-  that was sent parks `confidential_stale_proof` through the journal gate.
+  that was sent stays `processing` in the sender and retries with backoff, like any other
+  error before its next attempt goes out, and after 30 minutes parks
+  `confidential_transient_failure` through the journal gate.
 - **Scope:** a stale proof is "not a failure", rebuild and retry; paused mint, frozen account and
   hook refusal take the permanent-failure path to a remint.
   **Shipped:** Token-2022 26, 27, 32 and 33, and escrow 30, 31 and 33, rebuild on a budget of
@@ -98,13 +100,16 @@ are right.
   resend reuses its proofs. Each release is simulated before it is journaled: a refusal there
   on a row that never broadcast is refunded at once with no signature to wait on, while a row
   with an earlier attempt still goes through the gate; a simulation that cannot answer (node
-  behind, unknown blockhash) sends the row back to `Pending` with its backoff.
+  behind, unknown blockhash) sends a never-sent row back to `Pending` with its backoff and
+  holds a sent one in the sender.
 - **Scope:** "transfer-hook mints: supported, for deposits and releases".
   **Shipped with a limit:** Token-2022 calls the hook with `u64::MAX`; a hook that refuses it, or
   whose extras cannot be resolved for it, parks `hook_unresolvable`, and the withdrawal settles
   publicly. A release over 4,096 bytes or 64 accounts parks `confidential_tx_too_large`.
 - **Scope:** the public-balance check on "confidential-capable" mints.
-  **Shipped:** on confidential-*configured* mints (`public_balance_low`). The public pre-flights
+  **Shipped:** on confidential-*configured* mints (`public_balance_low`), only while public plus
+  verified confidential custody covers the mint's liabilities; otherwise, or when the
+  confidential part is held, the row parks `escrow_drained`. The public pre-flights
   `destination_refuses_credits` and `escrow_drained` skip confidential rows.
 
 ## Rebalancing

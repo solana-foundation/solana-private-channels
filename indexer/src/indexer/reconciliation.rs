@@ -430,7 +430,8 @@ struct ConfidentialCheck<'a> {
 }
 
 /// Judge every configured mint in `snapshot` by the runtime's rules. A mismatch stops the run,
-/// since that mint's custody is unknown; held mints are left out with a warning.
+/// since that mint's custody is unknown; held mints are left out with a warning, except a
+/// foreign-key mint, which is compared on its public balance.
 async fn judge_confidential_custody<'a>(
     storage: &'a Storage,
     keys: Option<&'a Keys>,
@@ -453,17 +454,21 @@ async fn judge_confidential_custody<'a>(
         .into());
     }
     for (mint, hold) in &resolved.held {
-        warn!(
-            mint = %mint,
-            reason = hold.label(),
-            "Confidential custody held; this mint is left out of the comparison"
-        );
+        if hold.reconciled_on_public() {
+            warn!(mint = %mint, reason = hold.label(), "Confidential custody held; this mint is compared on its public balance");
+        } else {
+            warn!(mint = %mint, reason = hold.label(), "Confidential custody held; this mint is left out of the comparison");
+        }
     }
     Ok(ConfidentialCheck {
         storage,
         keys,
         balances: resolved.balances,
-        held: resolved.held,
+        held: resolved
+            .held
+            .into_iter()
+            .filter(|(_, hold)| !hold.reconciled_on_public())
+            .collect(),
     })
 }
 
@@ -493,6 +498,7 @@ async fn reread_custody(
         .map_err(ReconciliationError::Storage)?;
     Ok(match verdict {
         ConfidentialCustody::Counted(custody) => Some(custody),
+        ConfidentialCustody::Held(hold) if hold.reconciled_on_public() => Some(public),
         _ => None,
     })
 }
@@ -3441,6 +3447,33 @@ mod tests {
                     )) if mints.contains(reason)
                 ),
                 "{reason}: {manual:?}"
+            );
+        }
+    }
+
+    /// A mint under a foreign key is compared on its public balance on both paths: exact
+    /// passes, a ledger above the public balance is a shortfall.
+    #[tokio::test]
+    async fn startup_and_manual_reconcile_a_foreign_key_mint_on_its_public_balance() {
+        use crate::operator::confidential_custody::tests::healthy;
+        let keys = private_channel_confidential::test_support::keys();
+        let mut foreign = healthy(&keys);
+        foreign.elgamal_pubkey = private_channel_confidential::test_support::other_keys().pubkey();
+        let (startup, manual) = confidential_verdicts(&foreign, 900, false).await;
+        assert!(startup.is_ok(), "{startup:?}");
+        assert!(manual.is_ok(), "{manual:?}");
+
+        let (startup, manual) = confidential_verdicts(&foreign, 901, false).await;
+        for result in [startup, manual] {
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::MismatchExceedsThreshold { .. }
+                            | ReconciliationError::SupplyExceedsCustody { .. }
+                    ))
+                ),
+                "{result:?}"
             );
         }
     }

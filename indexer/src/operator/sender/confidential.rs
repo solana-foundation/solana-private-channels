@@ -100,6 +100,15 @@ pub struct ConfidentialSender {
     /// Releases confirmed by this process whose row update may not be written yet.
     pub settled_releases: std::collections::HashSet<i64>,
     pub last_background_check: Option<Instant>,
+    /// Releases with a journaled attempt held in the sender after a transient pre-send error.
+    pub held: HashMap<u64, TransientHold>,
+}
+
+/// A release waiting in the sender to retry; `request` is taken while it runs.
+pub struct TransientHold {
+    pub since: DateTime<Utc>,
+    pub next_at: DateTime<Utc>,
+    pub request: Option<ConfidentialReleaseRequest>,
 }
 
 impl ConfidentialSender {
@@ -117,6 +126,7 @@ impl ConfidentialSender {
             release_mints: HashMap::new(),
             settled_releases: std::collections::HashSet::new(),
             last_background_check: None,
+            held: HashMap::new(),
         }
     }
 
@@ -1535,6 +1545,7 @@ async fn park_through_journal(
         if let Some(nonce) = ctx.withdrawal_nonce {
             conf.stale_budget.remove(&nonce);
             conf.requests.remove(&nonce);
+            conf.held.remove(&nonce);
         }
         // Best effort: without it a restart during the wait ends in the remint, still safe.
         if let Err(e) = state
@@ -1673,6 +1684,7 @@ fn forget_release(state: &mut SenderState, nonce: u64) {
     if let Some(conf) = state.confidential.as_mut() {
         conf.stale_budget.remove(&nonce);
         conf.requests.remove(&nonce);
+        conf.held.remove(&nonce);
     }
 }
 
@@ -1683,8 +1695,8 @@ async fn journaled(state: &SenderState, transaction_id: i64) -> Result<bool, Str
         .map_err(|_| "journal unreadable".to_string())
 }
 
-/// No balance could be verified: before any attempt the row waits in `Pending`; after one
-/// it parks through the journal gate.
+/// A transient error before anything new went out: before any attempt the row waits in
+/// `Pending`; after one it is held in the sender.
 async fn wait_or_park(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -1718,16 +1730,7 @@ async fn wait_or_park(
             }
             forget_release(state, nonce);
         }
-        Ok(true) => {
-            park_through_journal(
-                state,
-                ctx,
-                storage_tx,
-                metrics::BAIL_REASON_CONFIDENTIAL_STALE_PROOF,
-                reason,
-            )
-            .await
-        }
+        Ok(true) => hold_or_park(state, ctx, request, storage_tx, reason).await,
         // Unknown journal: leave the row Processing for recovery.
         Err(e) => {
             warn!(nonce, "Leaving the release to recovery: {e}");
@@ -1779,30 +1782,20 @@ async fn requeue_unsent(
     forget_release(state, nonce);
 }
 
-/// A simulation that says nothing about the release. Before any send the row waits in
-/// `Pending`; after one it is resent on the retry budget (true) and ends on the gate.
-async fn resend_or_wait(
-    state: &mut SenderState,
-    request: &ConfidentialReleaseRequest,
-    reason: &str,
-) -> bool {
-    warn!(
-        nonce = request.nonce,
-        "Confidential release not simulated: {reason}"
-    );
-    match journaled(state, request.transaction_id).await {
-        Ok(false) => {
-            requeue_unsent(state, request, reason).await;
-            false
-        }
-        Ok(true) | Err(_) => true,
-    }
-}
-
 // Recovery owns the row now; a kept retry count would end its next run at max retries.
 fn leave_to_recovery(state: &mut SenderState, nonce: u64) {
     state.in_flight_withdrawals.remove(&nonce);
     state.retry_counts.remove(&nonce);
+    if let Some(conf) = state.confidential.as_mut() {
+        conf.held.remove(&nonce);
+    }
+}
+
+// Nothing went out, so the attempt does not count against the retry budget.
+fn unspend_retry(state: &mut SenderState, nonce: u64) {
+    if let Some(count) = state.retry_counts.get_mut(&nonce) {
+        *count = count.saturating_sub(1);
+    }
 }
 
 async fn park(
@@ -1826,6 +1819,83 @@ async fn park(
     }
 }
 
+/// Retry the held releases whose backoff is due, one at a time like any other send.
+pub async fn retry_held(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    let now = Utc::now();
+    let due: Vec<u64> = match state.confidential.as_ref() {
+        Some(conf) => conf
+            .held
+            .iter()
+            .filter(|(_, hold)| hold.request.is_some() && hold.next_at <= now)
+            .map(|(nonce, _)| *nonce)
+            .collect(),
+        None => return,
+    };
+    for nonce in due {
+        let Some(request) = state
+            .confidential
+            .as_mut()
+            .and_then(|conf| conf.held.get_mut(&nonce))
+            .and_then(|hold| hold.request.take())
+        else {
+            continue;
+        };
+        submit_release(state, request, storage_tx, AttemptCause::StaleProofs, false).await;
+        // Held again only if it failed the same way; any other end drops the hold.
+        if let Some(conf) = state.confidential.as_mut() {
+            if conf
+                .held
+                .get(&nonce)
+                .is_some_and(|hold| hold.request.is_none())
+            {
+                conf.held.remove(&nonce);
+            }
+        }
+    }
+}
+
+/// A transient error before the resend of a journaled release: it stays `Processing` and
+/// in flight here and retries with backoff, then parks through the gate at the ceiling.
+async fn hold_or_park(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    request: &ConfidentialReleaseRequest,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    reason: &str,
+) {
+    let now = Utc::now();
+    let nonce = request.nonce;
+    let Some(conf) = state.confidential.as_mut() else {
+        return;
+    };
+    let since = conf.held.get(&nonce).map_or(now, |hold| hold.since);
+    if (now - since).to_std().unwrap_or_default() >= TRANSIENT_FAILURE_CEILING {
+        conf.held.remove(&nonce);
+        park_through_journal(
+            state,
+            ctx,
+            storage_tx,
+            metrics::BAIL_REASON_CONFIDENTIAL_TRANSIENT_FAILURE,
+            reason,
+        )
+        .await;
+        return;
+    }
+    let (next_at, _) = next_wait(now, Some(since));
+    warn!(nonce, %next_at, "Confidential release held in the sender: {reason}");
+    conf.held.insert(
+        nonce,
+        TransientHold {
+            since,
+            next_at,
+            request: Some(request.clone()),
+        },
+    );
+}
+
 /// Submit a confidential release: verify the balance, apply if needed, prove, journal,
 /// send as v1, and route the outcome. `arm_lease` is false when the caller (the rotation
 /// drain) already holds a newer lease.
@@ -1842,6 +1912,10 @@ pub async fn submit_release(
         state
             .release_leases
             .insert(nonce, request.fetched_updated_at);
+        // A fresh pickup holds a newer lease than any hold of this nonce.
+        if let Some(conf) = state.confidential.as_mut() {
+            conf.held.remove(&nonce);
+        }
     }
     if let Some(info) = &request.remint_info {
         state.remint_cache.insert(nonce, info.clone());
@@ -1888,7 +1962,7 @@ pub async fn submit_release(
                     return;
                 }
                 // A read or apply failed: like a build or sign error, the row waits before
-                // any attempt and parks stale through the journal gate after one.
+                // any attempt and is held in the sender after one.
                 Err(reason) => {
                     warn!(
                         nonce,
@@ -1934,6 +2008,7 @@ pub async fn submit_release(
                 return;
             }
             Err(e) => {
+                unspend_retry(state, nonce);
                 wait_or_park(
                     state,
                     &ctx,
@@ -1947,7 +2022,7 @@ pub async fn submit_release(
         };
 
         // Simulated at the maximum no older than our last landing, then signed again on the same
-        // blockhash with what it used. A node behind the floor is resent like a send error.
+        // blockhash with what it used. A node behind the floor is a transient error.
         let floor = state
             .confidential
             .as_ref()
@@ -1958,11 +2033,11 @@ pub async fn submit_release(
             .await
         {
             Ok(simulated) => simulated,
+            // Says nothing about the release, so it is handled like a build error.
             Err(e) => {
-                if resend_or_wait(state, &request, &format!("simulation: {e}")).await {
-                    cause = AttemptCause::TimeoutResend;
-                    continue;
-                }
+                unspend_retry(state, nonce);
+                let reason = format!("simulation: {e}");
+                wait_or_park(state, &ctx, &request, storage_tx, &reason).await;
                 return;
             }
         };
@@ -1970,10 +2045,9 @@ pub async fn submit_release(
             Some(err) => {
                 let err = solana_sdk::transaction::TransactionError::from(err);
                 if err == solana_sdk::transaction::TransactionError::BlockhashNotFound {
-                    if resend_or_wait(state, &request, &format!("simulation: {err}")).await {
-                        cause = AttemptCause::TimeoutResend;
-                        continue;
-                    }
+                    unspend_retry(state, nonce);
+                    let reason = format!("simulation: {err}");
+                    wait_or_park(state, &ctx, &request, storage_tx, &reason).await;
                     return;
                 }
                 let origin = simulated.logs.as_deref().and_then(failing_program);
@@ -1994,6 +2068,7 @@ pub async fn submit_release(
                 match resign_v1(&ix, LOADED_ACCOUNTS_DATA_SIZE_LIMIT, &signed.blockhash()).await {
                     Ok(signed) => (signed, ix, None),
                     Err(e) => {
+                        unspend_retry(state, nonce);
                         let reason = format!("build/sign: {e}");
                         wait_or_park(state, &ctx, &request, storage_tx, &reason).await;
                         return;
@@ -3151,21 +3226,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_a_journaled_attempt_it_parks_only_through_the_journal_gate() {
+    async fn after_a_journaled_attempt_an_unverifiable_balance_stays_in_the_sender() {
         let (_, spec) = escrow(5_000, 1);
         let mock = MockStorage::new();
         push_processing_row(&mock, 1);
-        mock.release_signatures.lock().unwrap().insert(
-            1,
-            vec![StoredSig {
-                signature: Signature::new_unique().to_string(),
-                last_valid_block_height: 100,
-                blockhash_slot: Some(9),
-            }],
-        );
+        journal_one(&mock, 1);
         let (mut state, _server, _) = sender_reading(&spec, 10, mock.clone()).await;
         let lease = row_updated_at(&mock, 1).unwrap();
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::channel(8);
 
         submit_release(
             &mut state,
@@ -3176,54 +3244,30 @@ mod tests {
         )
         .await;
 
-        // Not parked yet: handed to the finality gate with the park label remembered.
-        assert_eq!(row_status(&mock, 1), Some(TransactionStatus::PendingRemint));
-        assert_eq!(
-            state
-                .confidential
-                .as_ref()
-                .unwrap()
-                .parks
-                .get(&1)
-                .map(String::as_str),
-            Some(metrics::BAIL_REASON_CONFIDENTIAL_STALE_PROOF)
-        );
-        assert_eq!(state.pending_remints.len(), 1);
-
-        // The gate proved nothing landed: the row parks instead of reminting.
-        assert!(finish_gated_park(&mut state, 1, None, "stale", PROVEN_ABSENT, &tx).await);
-        let update = rx.recv().await.unwrap();
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        assert!(!update.remint_attempted);
-        assert!(
-            !finish_gated_park(&mut state, 1, None, "stale", PROVEN_ABSENT, &tx).await,
-            "parks once"
-        );
+        assert_held(&state, &mock, 0);
     }
 
-    /// A row that parked through the journal gate after a journaled attempt.
+    /// A row that parked stale through the journal gate after a journaled attempt.
     async fn gated_park(mock: &MockStorage) -> SenderState {
         let (_, spec) = escrow(5_000, 1);
         push_processing_row(mock, 1);
         mock.pending_transactions.lock().unwrap()[0].confidential = true;
-        mock.release_signatures.lock().unwrap().insert(
-            1,
-            vec![StoredSig {
-                signature: Signature::new_unique().to_string(),
-                last_valid_block_height: 100,
-                blockhash_slot: Some(9),
-            }],
-        );
+        journal_one(mock, 1);
         let (mut state, server, _) = sender_reading(&spec, 10, mock.clone()).await;
         std::mem::forget(server);
         let lease = row_updated_at(mock, 1).unwrap();
+        let request = request_for(1, Pubkey::new_unique(), lease);
+        state.release_leases.insert(7, lease);
+        state
+            .remint_cache
+            .insert(7, request.remint_info.clone().unwrap());
         let (tx, _rx) = mpsc::channel(8);
-        submit_release(
+        park_through_journal(
             &mut state,
-            request_for(1, Pubkey::new_unique(), lease),
+            &release_ctx(&request),
             &tx,
-            AttemptCause::First,
-            true,
+            metrics::BAIL_REASON_CONFIDENTIAL_STALE_PROOF,
+            "proofs refused",
         )
         .await;
         assert_eq!(row_status(mock, 1), Some(TransactionStatus::PendingRemint));
@@ -3311,15 +3355,8 @@ mod tests {
         assert!(state.pending_remints.is_empty());
     }
 
-    /// A journaled row whose escrow account cannot be read parks stale through the journal
-    /// gate, with its retry count cleared, instead of going to recovery.
-    #[tokio::test]
-    async fn an_unreadable_account_after_an_attempt_parks_through_the_gate() {
-        let mock = MockStorage::new();
-        push_processing_row(&mock, 1);
-        journal_one(&mock, 1);
-        // Nothing answers getAccountInfo, so every read fails.
-        let server = mockito::Server::new_async().await;
+    /// A sender with keys whose RPC answers only what `server` was told to.
+    fn sender_on(server: &mockito::ServerGuard, mock: &MockStorage) -> SenderState {
         let mut state =
             sender_state_with_storage_and_role(&server.url(), mock.clone(), ProgramType::Withdraw);
         state.confidential = Some(Box::new(ConfidentialSender::new(
@@ -3328,6 +3365,18 @@ mod tests {
             Pubkey::new_unique(),
             Pubkey::new_unique(),
         )));
+        state
+    }
+
+    /// A journaled row whose escrow account cannot be read stays in the sender.
+    #[tokio::test]
+    async fn an_unreadable_account_after_an_attempt_stays_in_the_sender() {
+        let mock = MockStorage::new();
+        push_processing_row(&mock, 1);
+        journal_one(&mock, 1);
+        // Nothing answers getAccountInfo, so every read fails.
+        let server = mockito::Server::new_async().await;
+        let mut state = sender_on(&server, &mock);
         state.retry_counts.insert(7, 2);
         let lease = row_updated_at(&mock, 1).unwrap();
         let (tx, _rx) = mpsc::channel(8);
@@ -3339,18 +3388,142 @@ mod tests {
             true,
         )
         .await;
-        assert_gated_stale_park(&state, &mock);
+        assert_held(&state, &mock, 2);
     }
 
-    /// A build failure (here the blockhash fetch) after a journaled attempt parks the same way.
+    /// A load-balanced node behind our floor answers "minimum context slot not reached".
     #[tokio::test]
-    async fn a_build_failure_after_an_attempt_parks_through_the_gate() {
-        let (_, spec) = escrow(5_000, 5_000);
+    async fn a_node_behind_the_floor_after_an_attempt_stays_in_the_sender() {
         let mock = MockStorage::new();
         push_processing_row(&mock, 1);
         journal_one(&mock, 1);
-        let (mut state, _server, _) = sender_reading(&spec, 10, mock.clone()).await;
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "error": {
+                        "code": -32016,
+                        "message": "Minimum context slot has not been reached",
+                        "data": {"contextSlot": 5},
+                    },
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let mut state = sender_on(&server, &mock);
+        let lease = row_updated_at(&mock, 1).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        submit_release(
+            &mut state,
+            request_for(1, Pubkey::new_unique(), lease),
+            &tx,
+            AttemptCause::First,
+            true,
+        )
+        .await;
+        assert_held(&state, &mock, 0);
+    }
+
+    /// The reviewer's case: attempt 1 timed out, then the resend's blockhash fetch fails.
+    async fn held_after_a_blockhash_failure(
+        mock: &MockStorage,
+    ) -> (SenderState, mockito::ServerGuard) {
+        let (_, spec) = escrow(5_000, 5_000);
+        push_processing_row(mock, 1);
+        journal_one(mock, 1);
+        let (mut state, server, _) = sender_reading(&spec, 10, mock.clone()).await;
         state.retry_counts.insert(7, 1);
+        let lease = row_updated_at(mock, 1).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        submit_release(
+            &mut state,
+            full_request(1, Pubkey::new_unique(), lease),
+            &tx,
+            AttemptCause::TimeoutResend,
+            true,
+        )
+        .await;
+        (state, server)
+    }
+
+    #[tokio::test]
+    async fn a_blockhash_failure_after_an_attempt_stays_in_the_sender() {
+        let mock = MockStorage::new();
+        let (state, _server) = held_after_a_blockhash_failure(&mock).await;
+        assert_held(&state, &mock, 1);
+    }
+
+    /// A held row is retried when its backoff is due, keeps the time of its first failure,
+    /// and parks `confidential_transient_failure` through the journal gate past the ceiling.
+    #[tokio::test]
+    async fn a_held_release_retries_with_backoff_then_parks_transient_after_the_ceiling() {
+        let mock = MockStorage::new();
+        let (mut state, _server) = held_after_a_blockhash_failure(&mock).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let first = held(&state).unwrap().since;
+
+        // Not due yet: nothing is retried.
+        retry_held(&mut state, &tx).await;
+        assert!(held(&state).unwrap().request.is_some());
+
+        // Due: retried, fails the same way, held again from the same first failure.
+        let hold = state
+            .confidential
+            .as_mut()
+            .unwrap()
+            .held
+            .get_mut(&7)
+            .unwrap();
+        hold.next_at = Utc::now() - chrono::Duration::seconds(1);
+        retry_held(&mut state, &tx).await;
+        assert_held(&state, &mock, 1);
+        let hold = held(&state).unwrap();
+        assert_eq!(hold.since, first);
+        assert!(hold.next_at > Utc::now());
+
+        // Past the ceiling: parked through the gate under its own label.
+        let hold = state
+            .confidential
+            .as_mut()
+            .unwrap()
+            .held
+            .get_mut(&7)
+            .unwrap();
+        hold.since = Utc::now()
+            - chrono::Duration::from_std(TRANSIENT_FAILURE_CEILING).unwrap()
+            - chrono::Duration::seconds(1);
+        hold.next_at = Utc::now() - chrono::Duration::seconds(1);
+        retry_held(&mut state, &tx).await;
+        let label = metrics::BAIL_REASON_CONFIDENTIAL_TRANSIENT_FAILURE;
+        assert_eq!(row_status(&mock, 1), Some(TransactionStatus::PendingRemint));
+        let conf = state.confidential.as_ref().unwrap();
+        assert_eq!(conf.parks.get(&1).map(String::as_str), Some(label));
+        assert!(conf.held.is_empty());
+        assert_eq!(state.pending_remints.len(), 1);
+        assert!(finish_gated_park(&mut state, 1, None, "transient", PROVEN_ABSENT, &tx).await);
+        let update = rx.recv().await.unwrap();
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update.error_message.unwrap().starts_with(label));
+    }
+
+    /// A fresh pickup of a held nonce carries a newer lease, so it replaces the hold.
+    #[tokio::test]
+    async fn a_fresh_pickup_of_a_held_release_replaces_the_hold() {
+        let mock = MockStorage::new();
+        let (mut state, _server) = held_after_a_blockhash_failure(&mock).await;
+        let earlier = Utc::now() - chrono::Duration::minutes(10);
+        state
+            .confidential
+            .as_mut()
+            .unwrap()
+            .held
+            .get_mut(&7)
+            .unwrap()
+            .since = earlier;
         let lease = row_updated_at(&mock, 1).unwrap();
         let (tx, _rx) = mpsc::channel(8);
         submit_release(
@@ -3361,7 +3534,27 @@ mod tests {
             true,
         )
         .await;
-        assert_gated_stale_park(&state, &mock);
+        assert!(held(&state).unwrap().since > earlier);
+    }
+
+    fn held(state: &SenderState) -> Option<&TransientHold> {
+        state.confidential.as_ref().unwrap().held.get(&7)
+    }
+
+    /// Still `Processing` and in flight in the sender, not parked, no budget spent.
+    fn assert_held(state: &SenderState, mock: &MockStorage, retries: u32) {
+        assert_eq!(row_status(mock, 1), Some(TransactionStatus::Processing));
+        let conf = state.confidential.as_ref().unwrap();
+        assert!(conf.parks.is_empty(), "not parked");
+        assert!(state.pending_remints.is_empty());
+        assert!(held(state).is_some_and(|hold| hold.request.is_some()));
+        assert_eq!(conf.stale_budget.get(&7), Some(&STALE_PROOF_BUDGET));
+        assert_eq!(state.retry_counts.get(&7).copied().unwrap_or(0), retries);
+        assert!(
+            state.in_flight_withdrawals.contains(&7),
+            "an attempt may still land"
+        );
+        assert!(state.release_leases.contains_key(&7));
     }
 
     fn journal_one(mock: &MockStorage, transaction_id: i64) {
@@ -3373,23 +3566,6 @@ mod tests {
                 blockhash_slot: Some(9),
             }],
         );
-    }
-
-    fn assert_gated_stale_park(state: &SenderState, mock: &MockStorage) {
-        assert_eq!(row_status(mock, 1), Some(TransactionStatus::PendingRemint));
-        assert_eq!(
-            state
-                .confidential
-                .as_ref()
-                .unwrap()
-                .parks
-                .get(&1)
-                .map(String::as_str),
-            Some(metrics::BAIL_REASON_CONFIDENTIAL_STALE_PROOF)
-        );
-        assert_eq!(state.pending_remints.len(), 1);
-        assert!(state.retry_counts.is_empty(), "no retry count survives");
-        assert!(!state.in_flight_withdrawals.contains(&7));
     }
 
     /// `request_for` with every account the escrow instruction needs, signed by the test signers.
@@ -3732,18 +3908,25 @@ mod tests {
         }
     }
 
-    /// After a journaled attempt the row cannot go back to `Pending`: it is resent on the
-    /// retry budget and then refunded through the gate.
+    /// After a journaled attempt the row cannot go back to `Pending`: it is held in the
+    /// sender with no retry spent, like any transient error before the resend.
     #[tokio::test]
-    async fn a_transient_simulation_failure_after_a_send_ends_on_the_gate() {
-        let run = release_run(SendReply::SimulationBehind, true).await;
-        assert_eq!(run.attempts, 3, "one attempt per retry");
-        assert_eq!(run.sends, 0);
-        assert_eq!(
-            row_status(&run.mock, 1),
-            Some(TransactionStatus::PendingRemint)
-        );
-        assert_eq!(run.state.pending_remints[0].signatures.len(), 1);
+    async fn a_transient_simulation_failure_after_a_send_stays_in_the_sender() {
+        for reply in [
+            SendReply::SimulationBehind,
+            SendReply::SimulationBlockhashNotFound,
+        ] {
+            let run = release_run(reply, true).await;
+            assert_eq!(run.attempts, 1, "no resend in place");
+            assert_eq!(run.sends, 0);
+            assert_eq!(
+                row_status(&run.mock, 1),
+                Some(TransactionStatus::Processing)
+            );
+            assert!(run.state.pending_remints.is_empty());
+            assert!(held(&run.state).is_some_and(|hold| hold.request.is_some()));
+            assert_eq!(run.state.retry_counts.get(&7).copied().unwrap_or(0), 0);
+        }
     }
 
     /// A refusal seen only in simulation on a row that never broadcast is refunded at once,

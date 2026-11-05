@@ -242,10 +242,12 @@ pub const BAIL_REASON_CONFIDENTIAL_ESCROW_ACCOUNT_NOT_READY: &str =
     "confidential_escrow_account_not_ready";
 /// A confidential release ran out of compute, in the escrow or in the mint's hook.
 pub const BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED: &str = "confidential_compute_exceeded";
+/// A release with a journaled attempt kept failing before its resend went out.
+pub const BAIL_REASON_CONFIDENTIAL_TRANSIENT_FAILURE: &str = "confidential_transient_failure";
 /// A public release on a confidential-configured mint whose public balance is short.
 pub const BAIL_REASON_PUBLIC_BALANCE_LOW: &str = "public_balance_low";
 
-pub const CONFIDENTIAL_BAIL_REASONS: [&str; 9] = [
+pub const CONFIDENTIAL_BAIL_REASONS: [&str; 10] = [
     BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
     BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
     BAIL_REASON_DESTINATION_NOT_READY,
@@ -254,6 +256,7 @@ pub const CONFIDENTIAL_BAIL_REASONS: [&str; 9] = [
     BAIL_REASON_CONFIDENTIAL_TX_TOO_LARGE,
     BAIL_REASON_CONFIDENTIAL_ESCROW_ACCOUNT_NOT_READY,
     BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED,
+    BAIL_REASON_CONFIDENTIAL_TRANSIENT_FAILURE,
     BAIL_REASON_PUBLIC_BALANCE_LOW,
 ];
 

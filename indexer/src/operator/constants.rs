@@ -53,6 +53,9 @@ pub mod confidential_constants {
     pub const WAIT_BACKOFF_BASE: Duration = Duration::from_secs(5);
     /// Waits and repair backoff double up to this.
     pub const WAIT_BACKOFF_CAP: Duration = Duration::from_secs(300);
+    /// How long a release with a journaled attempt keeps retrying transient pre-send errors
+    /// in the sender before it parks `confidential_transient_failure`.
+    pub const TRANSIENT_FAILURE_CEILING: Duration = Duration::from_secs(30 * 60);
     /// A confidential park older than this alerts (mirrored in the alert rules).
     pub const PARK_AGE_ALERT: Duration = Duration::from_secs(3600);
     /// Compute for a `MoveToPublic` with inline proofs; it calls no hook.

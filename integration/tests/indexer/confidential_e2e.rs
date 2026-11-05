@@ -746,8 +746,8 @@ async fn test_37_releases_continue_with_the_indexer_stopped() -> TestResult {
 }
 
 /// 38. A mint configured under a key the instance does not hold: its confidential deposit
-/// is kept undecrypted and never credited, the mint is held, its confidential withdrawals
-/// park, and the other confidential mint and public deposits are unaffected. Recovery
+/// is kept undecrypted and never credited, the mint is held and reconciled on its public
+/// balance alone, its confidential withdrawals park, and the other confidential mint and public deposits are unaffected. Recovery
 /// refuses the mint, so nothing is ever credited from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_38_wrong_key_poisons_one_mint_and_recovery_is_refused() -> TestResult {
@@ -778,9 +778,11 @@ async fn test_38_wrong_key_poisons_one_mint_and_recovery_is_refused() -> TestRes
         Some("pending".to_string()),
         "an undecrypted deposit is never minted"
     );
+    // The key mismatch explains the poison, so the mint is held on it and reconciled on its
+    // public balance alone.
     assert_eq!(
         env.custody_verdict(&poisoned).await?,
-        ConfidentialCustody::Held(ConfidentialHold::Poisoned)
+        ConfidentialCustody::Held(ConfidentialHold::KeyMismatch)
     );
 
     let blocked = env.withdraw(&bob, poisoned, 50_000, true).await?;
@@ -825,7 +827,7 @@ async fn test_38_wrong_key_poisons_one_mint_and_recovery_is_refused() -> TestRes
     assert_eq!(row.status, "pending");
     assert_eq!(
         env.custody_verdict(&poisoned).await?,
-        ConfidentialCustody::Held(ConfidentialHold::Poisoned)
+        ConfidentialCustody::Held(ConfidentialHold::KeyMismatch)
     );
     assert_eq!(wait_counted(&env, &good).await?, 200_000);
     env.reconcile(&mut stack).await?;
