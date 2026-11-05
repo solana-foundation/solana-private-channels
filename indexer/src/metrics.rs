@@ -175,6 +175,20 @@ gauge_vec!(
 );
 
 gauge_vec!(
+    OPERATOR_PUBLIC_WITHDRAWALS_WAITING,
+    "private_channel_operator_public_withdrawals_waiting",
+    "Public withdrawals on a configured mint waiting in Pending for their custody to be provable",
+    &["program_type"]
+);
+
+gauge_vec!(
+    OPERATOR_PUBLIC_WITHDRAWAL_OLDEST_WAIT_SECONDS,
+    "private_channel_operator_public_withdrawal_oldest_wait_seconds",
+    "Age of the oldest public withdrawal waiting in Pending (0 when none)",
+    &["program_type"]
+);
+
+gauge_vec!(
     OPERATOR_PENDING_REMINTS,
     "private_channel_operator_pending_remints",
     "Deferred remints in the withdraw sender after its last tick, including backlog rows not loaded yet",
@@ -601,6 +615,8 @@ pub fn init_labels(program_type: &str) {
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
     OPERATOR_UNDECRYPTED_DEPOSITS_HELD.with_label_values(&[program_type]);
+    OPERATOR_PUBLIC_WITHDRAWALS_WAITING.with_label_values(&[program_type]);
+    OPERATOR_PUBLIC_WITHDRAWAL_OLDEST_WAIT_SECONDS.with_label_values(&[program_type]);
     // FEEPAYER_BALANCE_LAMPORTS is seeded by the withdraw operator's monitor, the only
     // writer; seeding it here would pin every other process at a 0 SOL balance.
 
@@ -741,6 +757,8 @@ pub fn init() {
         OPERATOR_MINTS_SENT,
         OPERATOR_BACKLOG_DEPTH,
         OPERATOR_UNDECRYPTED_DEPOSITS_HELD,
+        OPERATOR_PUBLIC_WITHDRAWALS_WAITING,
+        OPERATOR_PUBLIC_WITHDRAWAL_OLDEST_WAIT_SECONDS,
         FEEPAYER_BALANCE_LAMPORTS,
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,

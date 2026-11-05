@@ -1107,13 +1107,13 @@ pub(super) async fn handle_success(
 /// is nothing to wait out: the only open question is which of our broadcasts did
 /// it. The existing signature classifier answers that, and skipping the finality
 /// delay is safe precisely because the bit already settled the outcome.
-/// Returns true when one of our own broadcasts consumed the nonce.
+/// Returns the broadcast of ours that consumed the nonce, if one did.
 pub(super) async fn handle_nonce_already_used(
     state: &mut SenderState,
     ctx: &TransactionContext,
     signature: Signature,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-) -> bool {
+) -> Option<Signature> {
     let mut signatures = ctx
         .withdrawal_nonce
         .and_then(|nonce| state.pending_signatures.get(&nonce).cloned())
@@ -1137,7 +1137,7 @@ pub(super) async fn handle_nonce_already_used(
                         &signature,
                         &format!("nonce already used and the journal could not be read: {reason}"),
                     );
-                    return false;
+                    return None;
                 }
             };
         }
@@ -1155,7 +1155,7 @@ pub(super) async fn handle_nonce_already_used(
             "nonce already consumed on-chain with no broadcast signature of ours to account for it",
         )
         .await;
-        return false;
+        return None;
     }
 
     match classify_signatures(&state.dest_finality(), &signatures).await {
@@ -1165,7 +1165,7 @@ pub(super) async fn handle_nonce_already_used(
                 "Nonce already consumed by our own earlier broadcast; recording it as complete"
             );
             handle_success(state, ctx, landed, storage_tx).await;
-            true
+            Some(landed)
         }
         // One of ours may still be the one that landed, so re-check after finality.
         SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
@@ -1180,7 +1180,7 @@ pub(super) async fn handle_nonce_already_used(
                 &format!("nonce already consumed on-chain; awaiting finality: {reason}"),
             )
             .await;
-            false
+            None
         }
         // Every broadcast of ours failed yet the nonce is spent, so a human decides.
         SigFinality::Dead => {
@@ -1196,7 +1196,7 @@ pub(super) async fn handle_nonce_already_used(
                 "nonce consumed on-chain but none of our broadcast signatures landed",
             )
             .await;
-            false
+            None
         }
     }
 }

@@ -1535,6 +1535,40 @@ groups:
                     params: [3600]
               refId: C
 
+      - uid: public-withdrawal-wait-age
+        title: "A public withdrawal has waited over 15 minutes for its custody check"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the oldest public withdrawal on a configured mint has waited {{ $values.A }}s for its custody to be provable (a release of the mint not yet recorded, or a lagging confidential balance). At 30 minutes it parks public_balance_low. Runbook: docs/runbooks/confidential_transfers.md, section public_balance_low."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job) (private_channel_operator_public_withdrawal_oldest_wait_seconds)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [900]
+              refId: C
+
       - uid: bitmap-generation-near-full-with-parks
         title: "Bitmap generation nearly used while withdrawals are parked"
         condition: C

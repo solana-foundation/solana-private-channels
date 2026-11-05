@@ -1360,6 +1360,8 @@ enum Prepared {
     Ready {
         instructions: Vec<solana_sdk::instruction::Instruction>,
         verified: u64,
+        /// Slot of the account read `verified` was proven against.
+        read_slot: u64,
     },
     Wait(String),
     /// An earlier write on the mint could still land.
@@ -1376,7 +1378,7 @@ async fn prepare_release(
         return Ok(Prepared::Blocked(reason));
     }
     let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
-    let Some((view, _)) = read_ours(&state.rpc_client, conf, &mint).await? else {
+    let Some((view, mut read_slot)) = read_ours(&state.rpc_client, conf, &mint).await? else {
         return Ok(Prepared::Park(
             metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
             format!("escrow account for {mint} is not configured with our key"),
@@ -1395,10 +1397,11 @@ async fn prepare_release(
             };
         }
         let conf = state.confidential.as_ref().ok_or("no confidential keys")?;
-        let Some((fresh, _)) = read_ours(&state.rpc_client, conf, &mint).await? else {
+        let Some((fresh, slot)) = read_ours(&state.rpc_client, conf, &mint).await? else {
             return Err("escrow account unreadable after the apply".into());
         };
         view = fresh;
+        read_slot = slot;
         verified = verified_available(&state.rpc_client, conf, &mint, &view).await;
     }
 
@@ -1444,6 +1447,7 @@ async fn prepare_release(
     Ok(Prepared::Ready {
         instructions: request.instructions(&proofs),
         verified: available,
+        read_slot,
     })
 }
 
@@ -1843,24 +1847,11 @@ pub async fn retry_held(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    let now = Utc::now();
-    // The backoff can reach recovery's stale threshold, so a waiting row is refreshed apart from its retry.
-    let refresh_after = chrono::Duration::from_std(RECOVERY_INTERVAL).expect("interval fits");
-    let stale: Vec<(u64, i64)> = match state.confidential.as_ref() {
-        Some(conf) => conf
-            .held
-            .iter()
-            .filter_map(|(nonce, hold)| {
-                let request = hold.request.as_ref()?;
-                (now - hold.refreshed_at >= refresh_after)
-                    .then_some((*nonce, request.transaction_id))
-            })
-            .collect(),
-        None => return,
-    };
-    for (nonce, transaction_id) in stale {
-        refresh_held_lease(state, nonce, transaction_id).await;
+    if state.confidential.is_none() {
+        return;
     }
+    let now = Utc::now();
+    refresh_aged_holds(state).await;
     let due: Vec<u64> = match state.confidential.as_ref() {
         Some(conf) => conf
             .held
@@ -1871,6 +1862,19 @@ pub async fn retry_held(
         None => return,
     };
     for nonce in due {
+        // A hung RPC can stretch one retry to minutes: the rows waiting behind it are kept
+        // fresh between retries, and each row is refreshed right before its own.
+        refresh_aged_holds(state).await;
+        let Some(transaction_id) = state
+            .confidential
+            .as_ref()
+            .and_then(|conf| conf.held.get(&nonce))
+            .and_then(|hold| hold.request.as_ref())
+            .map(|request| request.transaction_id)
+        else {
+            continue;
+        };
+        refresh_held_lease(state, nonce, transaction_id).await;
         let Some(request) = state
             .confidential
             .as_mut()
@@ -1890,6 +1894,28 @@ pub async fn retry_held(
                 conf.held.remove(&nonce);
             }
         }
+    }
+}
+
+/// Refresh every held row not refreshed for a recovery interval; the backoff alone can reach
+/// recovery's stale threshold.
+async fn refresh_aged_holds(state: &mut SenderState) {
+    let now = Utc::now();
+    let refresh_after = chrono::Duration::from_std(RECOVERY_INTERVAL).expect("interval fits");
+    let aged: Vec<(u64, i64)> = match state.confidential.as_ref() {
+        Some(conf) => conf
+            .held
+            .iter()
+            .filter_map(|(nonce, hold)| {
+                let request = hold.request.as_ref()?;
+                (now - hold.refreshed_at >= refresh_after)
+                    .then_some((*nonce, request.transaction_id))
+            })
+            .collect(),
+        None => return,
+    };
+    for (nonce, transaction_id) in aged {
+        refresh_held_lease(state, nonce, transaction_id).await;
     }
 }
 
@@ -2009,7 +2035,7 @@ pub async fn submit_release(
     }
 
     let mut cause = cause;
-    let mut prepared: Option<(Vec<solana_sdk::instruction::Instruction>, u64)> = None;
+    let mut prepared: Option<(Vec<solana_sdk::instruction::Instruction>, u64, u64)> = None;
     // Set once a send below the maximum ran out of compute: the resend goes at the maximum.
     let mut at_max = false;
     loop {
@@ -2018,7 +2044,8 @@ pub async fn submit_release(
                 Ok(Prepared::Ready {
                     instructions,
                     verified,
-                }) => prepared = Some((instructions, verified)),
+                    read_slot,
+                }) => prepared = Some((instructions, verified, read_slot)),
                 Ok(Prepared::Wait(reason)) => {
                     wait_or_park(state, &ctx, &request, storage_tx, &reason).await;
                     return;
@@ -2043,7 +2070,7 @@ pub async fn submit_release(
                 }
             }
         }
-        let (instructions, verified) = prepared.clone().expect("prepared above");
+        let (instructions, verified, read_slot) = prepared.clone().expect("prepared above");
         let ix = release_ix(instructions.clone(), CU_CONFIDENTIAL_RELEASE_MAX);
 
         // Retry bound shared with public releases.
@@ -2317,16 +2344,18 @@ pub async fn submit_release(
                 return;
             }
             ConfidentialFailure::Escrow(PrivateChannelEscrowProgramError::NonceAlreadyUsed) => {
-                if handle_nonce_already_used(state, &ctx, signed.signature, storage_tx).await {
+                if let Some(landed) =
+                    handle_nonce_already_used(state, &ctx, signed.signature, storage_tx).await
+                {
                     mark_settled(state, request.transaction_id);
-                    settle_local(
-                        state,
-                        &request.mint,
-                        verified,
-                        request.amount,
-                        slot.unwrap_or(0),
-                    )
-                    .await;
+                    // An earlier attempt landed; a read at or after its slot already shows it.
+                    let landed_slot = landing_slot(&state.rpc_client, &landed).await.ok();
+                    let spent = match landed_slot {
+                        Some(landed_slot) if landed_slot > read_slot => request.amount,
+                        _ => 0,
+                    };
+                    let slot = landed_slot.unwrap_or(read_slot).max(slot.unwrap_or(0));
+                    settle_local(state, &request.mint, verified, spent, slot).await;
                 }
                 forget_release(state, nonce);
                 return;
@@ -3323,6 +3352,7 @@ mod tests {
             .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": 300}).to_string())
             .create_async()
             .await;
+        mock_signature_statuses(&mut server, serde_json::Value::Null).await;
 
         for id in [1, 2] {
             let lease = row_updated_at(&mock, id).unwrap();
@@ -3342,6 +3372,58 @@ mod tests {
             .unwrap();
         assert!(waiting.not_before.unwrap() > Utc::now());
         assert_eq!(row_status(&mock, 2), Some(TransactionStatus::Processing));
+    }
+
+    async fn mock_signature_statuses(server: &mut mockito::ServerGuard, status: serde_json::Value) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(r#""getSignatureStatuses""#.into()))
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 500}, "value": [status]
+                }})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+    }
+
+    /// The reviewer's case: an attempt that timed out but landed has an expired journal too.
+    /// The row is left to recovery, which completes it, instead of going back to `Pending`.
+    #[tokio::test]
+    async fn a_blocked_release_whose_expired_attempt_landed_is_left_to_recovery() {
+        for status in [
+            Some(
+                serde_json::json!({"slot": 100, "confirmations": null, "err": null,
+                "status": {"Ok": null}, "confirmationStatus": "confirmed"}),
+            ),
+            // The lookup fails: nothing proves the attempt did not land.
+            None,
+        ] {
+            let (_, spec) = escrow(5_000, 1);
+            let mock = MockStorage::new();
+            push_processing_row(&mock, 1);
+            journal_one(&mock, 1);
+            let (mut state, mut server, _) = sender_reading(&spec, 10, mock.clone()).await;
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""getBlockHeight".*"confirmed""#.into(),
+                ))
+                .with_body(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": 300}).to_string(),
+                )
+                .create_async()
+                .await;
+            if let Some(status) = status {
+                mock_signature_statuses(&mut server, status).await;
+            }
+            let lease = row_updated_at(&mock, 1).unwrap();
+            let request = request_for(1, Pubkey::new_unique(), lease);
+            state.release_leases.insert(request.nonce, lease);
+            wait_or_leave(&mut state, &request, "mint blocked").await;
+            assert_eq!(row_status(&mock, 1), Some(TransactionStatus::Processing));
+        }
     }
 
     #[tokio::test]
@@ -3700,6 +3782,101 @@ mod tests {
         assert!(update.error_message.unwrap().starts_with(label));
     }
 
+    /// The reviewer's case: three held releases and an RPC that stops answering. Each row's
+    /// lease is refreshed right before its own retry, so time spent on the earlier retries
+    /// never counts toward recovery's stale threshold.
+    #[tokio::test]
+    async fn each_held_release_is_refreshed_right_before_its_retry() {
+        let mock = MockStorage::new();
+        let instance = Pubkey::new_unique();
+        let mints: Vec<Pubkey> = (0..3).map(|_| Pubkey::new_unique()).collect();
+        let atas: Vec<String> = mints
+            .iter()
+            .map(|mint| escrow_ata(&instance, mint).to_string())
+            .collect();
+        // Each read of a row's escrow account notes every row's lease at that moment.
+        type Seen = Vec<(usize, Vec<DateTime<Utc>>)>;
+        let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
+        let mut server = mockito::Server::new_async().await;
+        {
+            let (seen, rows) = (seen.clone(), mock.clone());
+            server
+                .mock("POST", "/")
+                .with_status(503)
+                .with_body_from_request(move |request| {
+                    let body = String::from_utf8_lossy(request.body().unwrap()).to_string();
+                    if let Some(row) = atas.iter().position(|ata| body.contains(ata.as_str())) {
+                        let rows = rows.pending_transactions.lock().unwrap();
+                        let leases = (1..=3)
+                            .map(|id| rows.iter().find(|t| t.id == id).unwrap().updated_at)
+                            .collect();
+                        seen.lock().unwrap().push((row, leases));
+                    }
+                    "down".into()
+                })
+                .create_async()
+                .await;
+        }
+        let mut state =
+            sender_state_with_storage_and_role(&server.url(), mock.clone(), ProgramType::Withdraw);
+        state.confidential = Some(Box::new(ConfidentialSender::new(
+            Arc::new(cts::keys()),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            instance,
+        )));
+        let old = Utc::now() - chrono::Duration::minutes(4);
+        for (i, mint) in mints.iter().enumerate() {
+            let id = i as i64 + 1;
+            push_processing_row(&mock, id);
+            journal_one(&mock, id);
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|t| t.id == id)
+                .unwrap()
+                .updated_at = old;
+            let mut request = request_for(id, *mint, old);
+            request.nonce = 7 + i as u64;
+            state.release_leases.insert(request.nonce, old);
+            state.in_flight_withdrawals.insert(request.nonce);
+            state.confidential.as_mut().unwrap().held.insert(
+                request.nonce,
+                TransientHold {
+                    since: Utc::now(),
+                    next_at: Utc::now() - chrono::Duration::seconds(1),
+                    refreshed_at: Utc::now(),
+                    request: Some(request),
+                },
+            );
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        retry_held(&mut state, &tx).await;
+
+        let seen = seen.lock().unwrap().clone();
+        let mut firsts: Vec<(usize, Vec<DateTime<Utc>>)> = Vec::new();
+        for (row, leases) in seen {
+            if firsts.iter().all(|(r, _)| *r != row) {
+                firsts.push((row, leases));
+            }
+        }
+        assert_eq!(firsts.len(), 3, "every held row was retried");
+        let (first, ref at_first) = firsts[0];
+        assert!(at_first[first] > old, "row {first} was not refreshed");
+        for pair in firsts.windows(2) {
+            let (row, ref at_own) = pair[1];
+            let (_, ref at_previous) = pair[0];
+            assert!(
+                at_own[row] > at_previous[row],
+                "row {row} was not refreshed right before its retry"
+            );
+        }
+        for id in 1..=3 {
+            assert_eq!(row_status(&mock, id), Some(TransactionStatus::Processing));
+        }
+    }
+
     /// Age the row and the sender's lease on it together, as time passing would.
     fn age_lease(state: &mut SenderState, mock: &MockStorage, at: DateTime<Utc>) {
         let mut rows = mock.pending_transactions.lock().unwrap();
@@ -3817,6 +3994,9 @@ mod tests {
         LandedOutOfComputeAtMax,
         /// The simulation fails with escrow code 33 and no log naming the program.
         SimulationUnreadable,
+        /// The simulation says the nonce is used; the earlier journaled attempt landed at
+        /// this slot.
+        NonceUsedLandedAt(u64),
     }
 
     /// What one `release_with` run saw.
@@ -3912,6 +4092,13 @@ mod tests {
                         )],
                         "accounts": null, "unitsConsumed": 40_000, "returnData": null
                     }),
+                    SendReply::NonceUsedLandedAt(_) => serde_json::json!({
+                        "err": {"InstructionError": [2, {"Custom": 12}]},
+                        "logs": [format!(
+                            "Program {PRIVATE_CHANNEL_ESCROW_PROGRAM_ID} failed: custom program error: 0xc"
+                        )],
+                        "accounts": null, "unitsConsumed": 40_000, "returnData": null
+                    }),
                     SendReply::SimulationUnreadable => serde_json::json!({
                         "err": {"InstructionError": [2, {"Custom": 33}]},
                         "logs": [], "accounts": null, "unitsConsumed": 40_000,
@@ -3994,6 +4181,14 @@ mod tests {
             SendReply::FailedWithUnreadableLog => statuses.with_body(failed_with(
                 serde_json::json!({"InstructionError": [0, {"Custom": 33}]}),
             )),
+            SendReply::NonceUsedLandedAt(slot) => statuses.with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 60},
+                    "value": [{"slot": slot, "confirmations": null, "status": {"Ok": null},
+                               "err": null, "confirmationStatus": "finalized"}]
+                }})
+                .to_string(),
+            ),
             SendReply::LandedOutOfCompute | SendReply::LandedOutOfComputeAtMax => statuses
                 .with_body(failed_with(
                     serde_json::json!({"InstructionError": [2, "ComputationalBudgetExceeded"]}),
@@ -4160,6 +4355,21 @@ mod tests {
         let entry = &run.state.pending_remints[0];
         assert_eq!(entry.signatures.len(), 1);
         assert!(!entry.release_refused_on_chain);
+    }
+
+    /// The reviewer's case: a held retry rebuilt from a fresh read finds the nonce used by
+    /// the earlier attempt. The kept balance takes the release off only when the read
+    /// predates that landing; a read after it already shows the release.
+    #[tokio::test]
+    async fn a_nonce_used_settle_keeps_the_balance_the_read_verified() {
+        for (landed, kept) in [(RELEASE_FLOOR - 5, 5_000), (RELEASE_FLOOR + 40, 4_900)] {
+            let run = release_run(SendReply::NonceUsedLandedAt(landed), true).await;
+            assert_eq!(run.sends, 0);
+            let conf = run.state.confidential.as_ref().unwrap();
+            let locals: Vec<_> = conf.books.values().map(|book| book.local).collect();
+            assert_eq!(locals, vec![Some(kept)], "landed at {landed}");
+            assert!(conf.min_context_slot >= landed);
+        }
     }
 
     /// A refusal with no provable origin seen only in simulation spends the retry budget;

@@ -7,13 +7,17 @@ use crate::{
         decode_confidential_event, ConfidentialEvent, ConfidentialEventBody,
     },
     metrics,
-    operator::utils::rpc_util::RpcClientWithRetry,
+    operator::utils::{
+        account_util::find_allowed_mint_pda, instruction_util::RetryPolicy,
+        rpc_util::RpcClientWithRetry,
+    },
     storage::{
         common::{amount::TokenAmount, storage::live_lock::LiveLockGuard},
         Storage,
     },
 };
 use private_channel_confidential::Keys;
+use solana_account_decoder_client_types::UiAccount;
 use solana_sdk::pubkey::Pubkey;
 use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensions,
@@ -41,11 +45,12 @@ pub trait EscrowKeySource: Send + Sync {
     /// `None` when the account does not exist or is not configured.
     async fn configured_key(&self, escrow_ata: &Pubkey) -> Result<Option<[u8; 32]>, String>;
 
-    /// Every escrow account of `instance` configured for confidential transfers, as
-    /// `(mint, key)`, read from chain so an empty database still sees them.
+    /// The escrow accounts of `instance` configured for confidential transfers, as
+    /// `(mint, key)`, among the confidential-capable mints of `mints` the admin allowed.
     async fn configured_escrow_keys(
         &self,
         instance: &Pubkey,
+        mints: &[Pubkey],
     ) -> Result<Vec<(Pubkey, [u8; 32])>, String>;
 }
 
@@ -73,53 +78,99 @@ impl EscrowKeySource for RpcEscrowKeySource {
     async fn configured_escrow_keys(
         &self,
         instance: &Pubkey,
+        mints: &[Pubkey],
     ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
-        use solana_rpc_client_api::{request::RpcRequest, response::Response};
-        let response = self
-            .rpc
-            .with_retry(
-                "get_token_accounts_by_owner",
-                crate::operator::utils::instruction_util::RetryPolicy::Idempotent,
-                || async {
-                    self.rpc
-                        .rpc_client
-                        .send::<Response<Vec<solana_rpc_client_api::response::RpcKeyedAccount>>>(
-                            RpcRequest::GetTokenAccountsByOwner,
-                            serde_json::json!([
-                                instance.to_string(),
-                                {"programId": spl_token_2022::ID.to_string()},
-                                {"encoding": "base64", "commitment": "confirmed"}
-                            ]),
-                        )
-                        .await
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        use private_channel_escrow_program_client::{
+            AllowedMint, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        };
+        // Read by address, never listed: only the admin's AllowMint creates these accounts,
+        // while anyone can open token accounts for the instance.
+        let pdas: Vec<Pubkey> = mints
+            .iter()
+            .map(|mint| find_allowed_mint_pda(instance, mint))
+            .collect();
+        let allowed = self.read_accounts(&pdas).await?;
+        let escrow_program = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+        let confidential: Vec<Pubkey> = mints
+            .iter()
+            .zip(allowed)
+            .filter_map(|(mint, account)| {
+                let account = account.filter(|account| account.owner == escrow_program)?;
+                let allowed = AllowedMint::from_bytes(&account.data.decode()?).ok()?;
+                (allowed.token_program == spl_token_2022::ID
+                    && allowed.extensions & CONFIDENTIAL_TRANSFER_MINT_BIT != 0)
+                    .then_some(*mint)
+            })
+            .collect();
+        let atas: Vec<Pubkey> = confidential
+            .iter()
+            .map(|mint| {
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    instance,
+                    mint,
+                    &spl_token_2022::ID,
+                )
+            })
+            .collect();
         let mut configured = Vec::new();
-        for keyed in response.value {
-            let data = keyed
-                .account
+        for ((mint, ata), account) in confidential
+            .iter()
+            .zip(&atas)
+            .zip(self.read_accounts(&atas).await?)
+        {
+            let Some(account) = account else { continue };
+            let data = account
                 .data
                 .decode()
-                .ok_or_else(|| format!("token account {} did not decode", keyed.pubkey))?;
+                .ok_or_else(|| format!("escrow account {ata} did not decode"))?;
             let account = StateWithExtensions::<spl_token_2022::state::Account>::unpack(&data)
-                .map_err(|e| format!("token account {}: {e}", keyed.pubkey))?;
-            let mint = account.base.mint;
-            let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
-                instance,
-                &mint,
-                &spl_token_2022::ID,
-            );
-            // Only the escrow account of each mint holds custody.
-            if keyed.pubkey != ata.to_string() {
-                continue;
-            }
+                .map_err(|e| format!("escrow account {ata}: {e}"))?;
             if let Ok(extension) = account.get_extension::<ConfidentialTransferAccount>() {
-                configured.push((mint, extension.elgamal_pubkey.0));
+                configured.push((*mint, extension.elgamal_pubkey.0));
             }
         }
         Ok(configured)
+    }
+}
+
+/// `ExtensionType::ConfidentialTransferMint` in `AllowedMint.extensions`.
+const CONFIDENTIAL_TRANSFER_MINT_BIT: u64 =
+    1 << (spl_token_2022::extension::ExtensionType::ConfidentialTransferMint as u8);
+
+/// Most keys one `getMultipleAccounts` call accepts.
+const MAX_ACCOUNTS_PER_CALL: usize = 100;
+
+impl RpcEscrowKeySource {
+    /// `keys` at confirmed commitment, in chunks; `None` for an absent account.
+    async fn read_accounts(&self, keys: &[Pubkey]) -> Result<Vec<Option<UiAccount>>, String> {
+        use solana_rpc_client_api::{request::RpcRequest, response::Response};
+        type Accounts = Response<Vec<Option<UiAccount>>>;
+        let mut accounts = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_ACCOUNTS_PER_CALL) {
+            let params = serde_json::json!([
+                chunk.iter().map(Pubkey::to_string).collect::<Vec<_>>(),
+                {"encoding": "base64", "commitment": "confirmed"}
+            ]);
+            let response = self
+                .rpc
+                .with_retry("get_multiple_accounts", RetryPolicy::Idempotent, || async {
+                    self.rpc
+                        .rpc_client
+                        .send::<Accounts>(RpcRequest::GetMultipleAccounts, params.clone())
+                        .await
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.value.len() != chunk.len() {
+                return Err(format!(
+                    "read returned {} accounts for {} keys",
+                    response.value.len(),
+                    chunk.len()
+                ));
+            }
+            accounts.extend(response.value);
+        }
+        Ok(accounts)
     }
 }
 
@@ -141,10 +192,23 @@ pub async fn check_keys_at_boot(
     for mint in storage.get_confidential_poisoned_mints().await? {
         report_poisoned(&mint);
     }
-    // From chain, not the database: a resync into an empty database must still see them.
-    // Fail closed: a key we cannot compare is not a key we accept.
+    // The instance's mints as the database knows them, listed or seen only in history; the
+    // chain then says which the admin allowed. Fail closed on a key we cannot compare.
+    let mut mints: Vec<Pubkey> = Vec::new();
+    let listed = storage
+        .get_mint_addresses()
+        .await?
+        .into_iter()
+        .map(|(mint, _)| mint);
+    for mint in listed.chain(storage.get_unlisted_mints().await?) {
+        if let Ok(mint) = Pubkey::from_str(&mint) {
+            if !mints.contains(&mint) {
+                mints.push(mint);
+            }
+        }
+    }
     let configured: Vec<(String, [u8; 32])> = source
-        .configured_escrow_keys(instance)
+        .configured_escrow_keys(instance, &mints)
         .await
         .map_err(|e| DataSourceError::InvalidConfig {
             reason: format!("could not read the instance's escrow accounts: {e}"),
@@ -361,7 +425,8 @@ mod tests {
         (Storage::Mock(mock.clone()), mock)
     }
 
-    /// Escrow accounts keyed by ATA, as `(mint, key)`, for the boot check.
+    /// Escrow accounts keyed by ATA, as `(mint, key)`, for the boot check. Only the mints the
+    /// check asks about are seen, as the chain source reads them by address.
     struct FakeAccounts(HashMap<Pubkey, (Pubkey, [u8; 32])>);
 
     #[async_trait::async_trait]
@@ -373,8 +438,14 @@ mod tests {
         async fn configured_escrow_keys(
             &self,
             _: &Pubkey,
+            mints: &[Pubkey],
         ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
-            Ok(self.0.values().copied().collect())
+            Ok(self
+                .0
+                .values()
+                .filter(|(mint, _)| mints.contains(mint))
+                .copied()
+                .collect())
         }
     }
 
@@ -415,22 +486,84 @@ mod tests {
             .unwrap();
     }
 
-    /// A fresh database lists no mint, so the check reads the escrow accounts from chain:
-    /// a resync into it without the key refuses.
+    /// The instance's mints come from the database, listed or not: a mint seen only in a
+    /// deposit is still checked, and without the key the check refuses.
     #[tokio::test]
-    async fn boot_check_reads_the_configured_accounts_from_chain_not_the_database() {
-        let (storage, _mock) = storage_with(vec![]);
-        let source = accounts(&[(MINT, cts::keys().pubkey())]);
+    async fn boot_check_reads_the_instance_mints_from_the_database() {
+        let keys = cts::keys();
+        let source = accounts(&[(MINT, keys.pubkey())]);
+        let (storage, _mock) = storage_with(vec![undecrypted(1, deposit_raw(&keys, 5))]);
         let err = check_keys_at_boot(&storage, None, &source, &instance())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("configured"), "{err}");
+        let (empty, _) = storage_with(vec![]);
+        check_keys_at_boot(&empty, None, &source, &instance())
+            .await
+            .unwrap();
     }
 
-    /// The chain source lists the instance's escrow accounts with a confidential extension,
-    /// and skips token accounts that are not a mint's escrow account.
+    /// `AllowedMint` account data for a Token-2022 mint with `extensions`.
+    fn allowed_mint(extensions: u64) -> serde_json::Value {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let allowed = private_channel_escrow_program_client::AllowedMint {
+            discriminator: 2,
+            bump: 255,
+            deposits_blocked: false,
+            withdrawals_blocked: false,
+            decimals: 6,
+            token_program: spl_token_2022::ID,
+            extensions,
+            has_freeze_authority: false,
+            min_deposit_amount: 0,
+        };
+        serde_json::json!({
+            "data": [STANDARD.encode(borsh::to_vec(&allowed).unwrap()), "base64"],
+            "owner": private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+            "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+        })
+    }
+
+    /// Answer a `getMultipleAccounts` naming `key` with `value`.
+    async fn serve_accounts(
+        server: &mut mockito::ServerGuard,
+        key: &Pubkey,
+        value: serde_json::Value,
+        hits: usize,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""getMultipleAccounts""#.into()),
+                mockito::Matcher::Regex(key.to_string()),
+            ]))
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 1}, "value": value
+                }})
+                .to_string(),
+            )
+            .expect(hits)
+            .create_async()
+            .await
+    }
+
+    fn rpc_source(server: &mockito::ServerGuard) -> RpcEscrowKeySource {
+        RpcEscrowKeySource {
+            rpc: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                Default::default(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            )),
+        }
+    }
+
+    /// The reviewer's case: anyone can open token accounts for the instance, so the source
+    /// never lists them. It reads the admin's `AllowedMint` of each mint by address, then the
+    /// escrow account of each confidential-capable one.
     #[tokio::test]
-    async fn the_rpc_source_lists_the_configured_escrow_accounts() {
+    async fn the_rpc_source_reads_keys_through_the_allowed_mints() {
+        use crate::operator::utils::account_util::find_allowed_mint_pda;
         use crate::operator::utils::mint_util::confidential_fixtures::{
             account_with_confidential, AccountSpec,
         };
@@ -441,44 +574,80 @@ mod tests {
         sim.apply();
         let mut spec = AccountSpec::healthy(&keys, &sim, 0, 10);
         spec.owner = instance();
-        let data = STANDARD.encode(account_with_confidential(&spec));
+        let (confidential, plain, unallowed) =
+            (spec.mint, Pubkey::new_unique(), Pubkey::new_unique());
+        let ct_bit =
+            1u64 << (spl_token_2022::extension::ExtensionType::ConfidentialTransferMint as u8);
         let escrow_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &instance(),
-            &spec.mint,
+            &confidential,
             &spl_token_2022::ID,
         );
-        let keyed = |pubkey: Pubkey| {
-            serde_json::json!({"pubkey": pubkey.to_string(), "account": {
-                "data": [data.clone(), "base64"], "owner": spl_token_2022::ID.to_string(),
-                "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
-            }})
-        };
         let mut server = mockito::Server::new_async().await;
-        server
+        let listing = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"method": "getTokenAccountsByOwner"}),
+            .match_body(mockito::Matcher::Regex(
+                r#""getTokenAccountsByOwner""#.into(),
             ))
-            .with_body(
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                    "context": {"slot": 1},
-                    "value": [keyed(escrow_ata), keyed(Pubkey::new_unique())]
-                }})
-                .to_string(),
-            )
+            .expect(0)
             .create_async()
             .await;
-        let source = RpcEscrowKeySource {
-            rpc: Arc::new(RpcClientWithRetry::with_retry_config(
-                server.url(),
-                Default::default(),
-                solana_commitment_config::CommitmentConfig::confirmed(),
-            )),
-        };
+        let pdas = serve_accounts(
+            &mut server,
+            &find_allowed_mint_pda(&instance(), &confidential),
+            serde_json::json!([allowed_mint(ct_bit), allowed_mint(0), null]),
+            1,
+        )
+        .await;
+        let atas = serve_accounts(
+            &mut server,
+            &escrow_ata,
+            serde_json::json!([{
+                "data": [STANDARD.encode(account_with_confidential(&spec)), "base64"],
+                "owner": spl_token_2022::ID.to_string(),
+                "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+            }]),
+            1,
+        )
+        .await;
         assert_eq!(
-            source.configured_escrow_keys(&instance()).await.unwrap(),
-            vec![(spec.mint, keys.pubkey())]
+            rpc_source(&server)
+                .configured_escrow_keys(&instance(), &[confidential, plain, unallowed])
+                .await
+                .unwrap(),
+            vec![(confidential, keys.pubkey())]
         );
+        listing.assert_async().await;
+        pdas.assert_async().await;
+        atas.assert_async().await;
+    }
+
+    /// No mint, or no confidential-capable one: no escrow account is read at all.
+    #[tokio::test]
+    async fn a_channel_without_confidential_mints_reads_no_escrow_account() {
+        use crate::operator::utils::account_util::find_allowed_mint_pda;
+        let mut server = mockito::Server::new_async().await;
+        let plain = Pubkey::new_unique();
+        let pdas = serve_accounts(
+            &mut server,
+            &find_allowed_mint_pda(&instance(), &plain),
+            serde_json::json!([allowed_mint(0)]),
+            1,
+        )
+        .await;
+        let source = rpc_source(&server);
+        assert!(source
+            .configured_escrow_keys(&instance(), &[])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(source
+            .configured_escrow_keys(&instance(), &[plain])
+            .await
+            .unwrap()
+            .is_empty());
+        // One read, of the AllowedMint; any other call would find no mock and fail.
+        pdas.assert_async().await;
     }
 
     #[tokio::test]

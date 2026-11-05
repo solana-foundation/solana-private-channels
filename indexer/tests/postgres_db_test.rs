@@ -6045,24 +6045,66 @@ async fn pending_backlog_counts_only_rows_the_fetch_can_take(
             make_db_transaction("good", TransactionType::Deposit),
         ])
         .await?;
-    let one_each = PendingBacklog {
-        claimable: 1,
-        undecrypted: 0,
-    };
+    let withdrawals = storage
+        .count_pending_transactions(TransactionType::Withdrawal)
+        .await?;
+    assert_eq!((withdrawals.claimable, withdrawals.undecrypted), (1, 0));
+    let deposits = storage
+        .count_pending_transactions(TransactionType::Deposit)
+        .await?;
     assert_eq!(
-        storage
-            .count_pending_transactions(TransactionType::Withdrawal)
-            .await?,
-        one_each
-    );
-    assert_eq!(
-        storage
-            .count_pending_transactions(TransactionType::Deposit)
-            .await?,
+        deposits,
         PendingBacklog {
             claimable: 1,
-            undecrypted: 1
+            undecrypted: 1,
+            ..Default::default()
         }
+    );
+    Ok(())
+}
+
+/// Public withdrawals waiting for their mint's custody are counted with the age of the
+/// oldest wait, so a wait that never ends shows on a gauge. Confidential waits are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_backlog_reports_public_waits_and_their_age(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut ids = Vec::new();
+    for name in ["old", "new", "confidential", "due"] {
+        ids.push(
+            storage
+                .insert_db_transaction(&make_db_transaction(name, TransactionType::Withdrawal))
+                .await?,
+        );
+    }
+    for (id, started, not_before) in [
+        (ids[0], "20 minutes", "1 minute"),
+        (ids[1], "1 minute", "1 minute"),
+        (ids[2], "1 hour", "1 minute"),
+        (ids[3], "2 hours", "-1 minute"),
+    ] {
+        sqlx::query(
+            "UPDATE transactions SET wait_started_at = NOW() - $2::INTERVAL, \
+             not_before = NOW() + $3::INTERVAL WHERE id = $1",
+        )
+        .bind(id)
+        .bind(started)
+        .bind(not_before)
+        .execute(&pool)
+        .await?;
+    }
+    sqlx::query("UPDATE transactions SET confidential = TRUE WHERE id = $1")
+        .bind(ids[2])
+        .execute(&pool)
+        .await?;
+    let backlog = storage
+        .count_pending_transactions(TransactionType::Withdrawal)
+        .await?;
+    assert_eq!(backlog.claimable, 1);
+    assert_eq!(backlog.public_waiting, 2);
+    assert!(
+        (1195..1300).contains(&backlog.oldest_public_wait_secs),
+        "{backlog:?}"
     );
     Ok(())
 }
@@ -6130,14 +6172,83 @@ async fn a_park_keeps_its_label_on_the_row_public_or_confidential(
     };
     assert_eq!(label(conf).await?.as_deref(), Some("label_x"));
     assert_eq!(label(public).await?.as_deref(), Some("label_x"));
-    // Re-armed without clearing it, a public row's label never seeds a confidential park.
+    Ok(())
+}
+
+/// The reviewer's cases: a label belongs to one park. Re-armed by any SQL, the row drops it
+/// (and its wait), and a later park with no label of its own does not inherit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_park_label_does_not_outlive_its_park() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut confidential = make_db_transaction("conf", TransactionType::Withdrawal);
+    confidential.confidential = true;
+    let conf = storage.insert_db_transaction(&confidential).await?;
+    let public = storage
+        .insert_db_transaction(&make_db_transaction("pub", TransactionType::Withdrawal))
+        .await?;
+    let park_all = |label: Option<&'static str>| {
+        let storage = storage.clone();
+        async move {
+            for row in storage
+                .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+                .await?
+            {
+                assert!(
+                    storage
+                        .try_quarantine_processing(row.id, row.updated_at, None, None, label)
+                        .await?
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    };
+    let label = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT confidential_park_label FROM transactions WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    park_all(Some("public_balance_low")).await?;
+    sqlx::query("UPDATE transactions SET wait_started_at = NOW(), not_before = NOW()")
+        .execute(&pool)
+        .await?;
+    // The generic re-arm from the manual-review runbook.
+    sqlx::query(
+        "UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, \
+         updated_at = NOW() WHERE status = 'manual_review'",
+    )
+    .execute(&pool)
+    .await?;
+    for id in [conf, public] {
+        assert_eq!(label(id).await?, None);
+    }
+    let waits: Vec<(Option<chrono::DateTime<chrono::Utc>>,)> =
+        sqlx::query_as("SELECT wait_started_at FROM transactions")
+            .fetch_all(&pool)
+            .await?;
+    assert!(waits.iter().all(|(started,)| started.is_none()));
+    // After a restart, nothing seeds a confidential park from the old label.
     sqlx::query("UPDATE transactions SET status = 'processing'")
         .execute(&pool)
         .await?;
-    assert_eq!(
-        storage.get_confidential_park_labels().await?,
-        vec![(conf, "label_x".to_string())]
-    );
+    assert!(storage.get_confidential_park_labels().await?.is_empty());
+
+    // A later park with no label ("Max retries exceeded") does not keep an earlier one.
+    sqlx::query("UPDATE transactions SET status = 'pending'")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET confidential_park_label = 'public_balance_low'")
+        .execute(&pool)
+        .await?;
+    park_all(None).await?;
+    for id in [conf, public] {
+        assert_eq!(label(id).await?, None);
+    }
     Ok(())
 }
 
@@ -6249,6 +6360,7 @@ impl private_channel_indexer::indexer::confidential::EscrowKeySource for Configu
     async fn configured_escrow_keys(
         &self,
         _: &solana_sdk::pubkey::Pubkey,
+        _: &[solana_sdk::pubkey::Pubkey],
     ) -> Result<Vec<(solana_sdk::pubkey::Pubkey, [u8; 32])>, String> {
         Ok(Vec::new())
     }

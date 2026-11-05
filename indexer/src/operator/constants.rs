@@ -56,6 +56,9 @@ pub mod confidential_constants {
     /// How long a release with a journaled attempt keeps retrying transient pre-send errors
     /// in the sender before it parks `confidential_transient_failure`.
     pub const TRANSIENT_FAILURE_CEILING: Duration = Duration::from_secs(30 * 60);
+    /// How long a short public withdrawal waits for its mint's custody to be provable before
+    /// it parks `public_balance_low`.
+    pub const DRAIN_CHECK_WAIT_CEILING: Duration = Duration::from_secs(30 * 60);
     /// A confidential park older than this alerts (mirrored in the alert rules).
     pub const PARK_AGE_ALERT: Duration = Duration::from_secs(3600);
     /// Compute for a `MoveToPublic` with inline proofs; it calls no hook.

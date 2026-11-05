@@ -2444,15 +2444,7 @@ mod tests {
             )
             .create_async()
             .await;
-        // The boot key check lists the escrow accounts; none is configured.
-        destination
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"method": "getTokenAccountsByOwner"}),
-            ))
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[]}}"#)
-            .create_async()
-            .await;
+        // The database knows no mint, so the boot key check reads nothing.
         let mut source = mockito::Server::new_async().await;
         let source_balance = source
             .mock("POST", "/")
@@ -2553,54 +2545,91 @@ mod tests {
 
     // ---- Confidential keys at boot: the same check as the escrow indexer ----
 
-    /// A Solana RPC listing `instance`'s escrow account for one Token-2022 mint, configured
-    /// under `configured` (no confidential extension when `None`).
+    /// A database knowing one Token-2022 mint the admin allowed with confidential transfers,
+    /// and a Solana RPC serving its escrow account, configured under `configured` (no
+    /// confidential extension when `None`).
     async fn configured_escrow(
         configured: Option<[u8; 32]>,
         instance: &solana_sdk::pubkey::Pubkey,
     ) -> (Storage, Arc<RpcClientWithRetry>, mockito::ServerGuard) {
+        use crate::operator::utils::account_util::find_allowed_mint_pda;
         use crate::operator::utils::mint_util::confidential_fixtures::{
             account_with_confidential, AccountSpec,
         };
+        use crate::storage::common::models::DbMint;
         use crate::storage::common::storage::mock::MockStorage;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use private_channel_confidential::test_support::{self as cts, SimAccount};
+        use private_channel_escrow_program_client::{
+            AllowedMint, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        };
 
         let keys = cts::keys();
         let mut spec = AccountSpec::healthy(&keys, &SimAccount::new(&keys), 0, 0);
         spec.owner = *instance;
-        let accounts = match configured {
+        let escrow = match configured {
             Some(elgamal) => {
                 spec.elgamal_pubkey = elgamal;
-                let ata =
-                    spl_associated_token_account::get_associated_token_address_with_program_id(
-                        instance,
-                        &spec.mint,
-                        &spl_token_2022::ID,
-                    );
-                vec![serde_json::json!({"pubkey": ata.to_string(), "account": {
+                serde_json::json!({
                     "data": [STANDARD.encode(account_with_confidential(&spec)), "base64"],
                     "owner": spl_token_2022::ID.to_string(),
                     "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
-                }})]
+                })
             }
-            None => Vec::new(),
+            None => serde_json::Value::Null,
         };
+        let allowed = AllowedMint {
+            discriminator: 2,
+            bump: 255,
+            deposits_blocked: false,
+            withdrawals_blocked: false,
+            decimals: 6,
+            token_program: spl_token_2022::ID,
+            extensions: 1
+                << (spl_token_2022::extension::ExtensionType::ConfidentialTransferMint as u8),
+            has_freeze_authority: false,
+            min_deposit_amount: 0,
+        };
+        let allowed = serde_json::json!({
+            "data": [STANDARD.encode(borsh::to_vec(&allowed).unwrap()), "base64"],
+            "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+            "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+        });
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            instance,
+            &spec.mint,
+            &spl_token_2022::ID,
+        );
         let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"method": "getTokenAccountsByOwner"}),
-            ))
-            .with_body(
-                serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {
-                    "context": {"slot": 10}, "value": accounts
-                }})
-                .to_string(),
-            )
-            .create_async()
-            .await;
+        for (key, value) in [
+            (find_allowed_mint_pda(instance, &spec.mint), allowed),
+            (ata, escrow),
+        ] {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::AllOf(vec![
+                    mockito::Matcher::Regex(r#""getMultipleAccounts""#.into()),
+                    mockito::Matcher::Regex(key.to_string()),
+                ]))
+                .with_body(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {
+                        "context": {"slot": 10}, "value": [value]
+                    }})
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+        }
         let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            spec.mint.to_string(),
+            DbMint::new(
+                spec.mint.to_string(),
+                6,
+                spl_token_2022::ID.to_string(),
+                crate::storage::common::amount::TokenAmount(0),
+            ),
+        );
         let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
             server.url(),
             RetryConfig {

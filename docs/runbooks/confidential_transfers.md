@@ -66,7 +66,8 @@ indexer and both operators refuse to start without the key that account holds.
 A parked confidential withdrawal is a `manual_review` row whose
 `confidential_park_label` column holds the label, for pre-flight parks and parks after a
 send alike. A public release parked `public_balance_low` keeps its label in the same
-column. The alert webhook's `error_message` starts with it too; the database has no
+column. The label is the park's own: a later park without one clears it, and leaving
+`manual_review` by any re-arm SQL clears it together with the row's wait. The alert webhook's `error_message` starts with it too; the database has no
 `error_message` column.
 
 ```sql
@@ -217,17 +218,24 @@ pending. Public funds of the mint may cover it.
 ### public_balance_low
 
 A public release on a confidential-configured mint has more than the escrow's
-public balance to pay, and the whole custody (public plus the verified confidential
-balance) still covers what the ledger owes, so the funds sit in the confidential balance.
-A short public balance whose custody does not cover the ledger, or whose confidential part
-cannot be counted, parks `escrow_drained` instead (`insufficient escrow balance:`), see
+public balance to pay, and nothing proves the custody short of what the ledger owes. Either
+the whole custody (public plus the verified confidential balance) covers the ledger, so the
+funds sit in the confidential balance, or the confidential part could not be counted: the
+mint is poisoned, its custody does not open (`confidential custody is not proven`), or a wait
+below ran out. Only a custody proven short of the ledger parks `escrow_drained` instead
+(`insufficient escrow balance:`), see
 [withdrawal_manual_review.md](withdrawal_manual_review.md#triage---dispatch-by-error_message).
-Neither is decided while another release of the mint was sent but is not yet recorded
-(`processing` or `pending_remint` with a journaled signature and no observed release): the
-row goes back to `Pending` with the wait backoff and is judged again once those settle. A row
-with its own journal (re-armed by recovery) takes that wait only once every journaled
-signature is past its last valid block height at confirmed commitment; until then it stays
-`processing`.
+A foreign-key mint is judged on its public balance alone.
+The row is not judged while another release of the mint was sent but is not yet recorded
+(`processing` or `pending_remint` with a journaled signature and no observed release), or
+while the confidential balance lags in a way the sender clears (`stale_aes`,
+`pending_too_large`): it goes back to `Pending` with the wait backoff. A row with its own
+journal (re-armed by recovery) takes that wait only once every journaled signature is past
+its last valid block height at confirmed commitment and none landed; until then it stays
+`processing`. After 30 minutes from the first wait the row parks `public_balance_low`
+(`... after 30 min; rule out a drain`). Waiting rows show on
+`private_channel_operator_public_withdrawals_waiting`, and the
+`public-withdrawal-wait-age` alert fires when the oldest has waited over 15 minutes.
 
 1. Rule out a drain first: the mint's permanent delegate (if any) can move public funds
    but not confidential ones. Check `private_channel_reconciliation_confidential_mismatch{mint}`

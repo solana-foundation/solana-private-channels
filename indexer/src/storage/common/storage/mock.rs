@@ -959,6 +959,12 @@ impl MockStorage {
                 backlog.undecrypted += 1;
             } else if row.not_before.is_none_or(|at| at <= Utc::now()) {
                 backlog.claimable += 1;
+            } else if !row.confidential {
+                backlog.public_waiting += 1;
+                let age = row
+                    .wait_started_at
+                    .map_or(0, |at| (Utc::now() - at).num_seconds().max(0));
+                backlog.oldest_public_wait_secs = backlog.oldest_public_wait_secs.max(age);
             }
         }
         Ok(backlog)
@@ -1760,13 +1766,12 @@ impl MockStorage {
                 if remint_last_valid_block_heights.is_some() {
                     txn.remint_last_valid_block_heights = remint_last_valid_block_heights;
                 }
-                if let Some(label) = park_label {
-                    self.confidential_sender
-                        .lock()
-                        .unwrap()
-                        .park_labels
-                        .insert(transaction_id, label.to_string());
-                }
+                let mut sender = self.confidential_sender.lock().unwrap();
+                match park_label {
+                    Some(label) => sender.park_labels.insert(transaction_id, label.to_string()),
+                    None => sender.park_labels.remove(&transaction_id),
+                };
+                drop(sender);
                 let now = Utc::now();
                 txn.processed_at = Some(now);
                 txn.updated_at = now;

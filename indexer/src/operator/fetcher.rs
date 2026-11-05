@@ -56,6 +56,12 @@ pub async fn run_fetcher(
                 metrics::OPERATOR_UNDECRYPTED_DEPOSITS_HELD
                     .with_label_values(&[program_type.as_label()])
                     .set(counts.undecrypted as f64);
+                metrics::OPERATOR_PUBLIC_WITHDRAWALS_WAITING
+                    .with_label_values(&[program_type.as_label()])
+                    .set(counts.public_waiting as f64);
+                metrics::OPERATOR_PUBLIC_WITHDRAWAL_OLDEST_WAIT_SECONDS
+                    .with_label_values(&[program_type.as_label()])
+                    .set(counts.oldest_public_wait_secs as f64);
                 if counts.undecrypted > 0 && counts.undecrypted != undecrypted_held {
                     warn!(
                         held = counts.undecrypted,

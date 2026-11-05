@@ -914,6 +914,39 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // A park label and a wait belong to one park: leaving manual_review by any path, the
+        // runbooks' re-arm SQL included, drops both.
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION clear_park_on_rearm()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                IF OLD.status = 'manual_review' AND NEW.status <> 'manual_review' THEN
+                    NEW.confidential_park_label = NULL;
+                    NEW.wait_started_at = NULL;
+                    NEW.not_before = NULL;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'clear_transactions_park_on_rearm') THEN
+                    CREATE TRIGGER clear_transactions_park_on_rearm BEFORE UPDATE OF status ON transactions
+                    FOR EACH ROW EXECUTE FUNCTION clear_park_on_rearm();
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add trigger for indexer_state updated_at
         sqlx::query(
             r#"
@@ -2749,7 +2782,8 @@ impl PostgresDb {
     /// work: the `updated_at` trigger fires on the first write, after which this
     /// statement's `updated_at` compare can never match and the row would be
     /// stranded in `processing` forever. `COALESCE` keeps a `None` call inert,
-    /// so callers with no evidence to record leave both columns as they were.
+    /// so callers with no evidence to record leave both columns as they were. The park label
+    /// is this park's own, so `None` clears an older one.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,
@@ -2764,7 +2798,7 @@ impl PostgresDb {
             SET status = 'manual_review',
                 remint_signatures = COALESCE($3, remint_signatures),
                 remint_last_valid_block_heights = COALESCE($4, remint_last_valid_block_heights),
-                confidential_park_label = COALESCE($5, confidential_park_label),
+                confidential_park_label = $5,
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -4004,23 +4038,34 @@ impl PostgresDb {
         transaction_type: TransactionType,
     ) -> Result<PendingBacklog, sqlx::Error> {
         // Same exclusions as the fetch, so /health only sees rows it could pick up now.
-        let (claimable, undecrypted): (i64, i64) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FILTER (WHERE NOT {undecrypted} AND ({not_before} IS NULL OR {not_before} <= NOW())),
-                    COUNT(*) FILTER (WHERE {undecrypted})
-             FROM transactions WHERE {} = $1 AND {} = $2",
-            transaction_cols::STATUS,
-            transaction_cols::TRANSACTION_TYPE,
-            undecrypted = transaction_cols::CONFIDENTIAL_UNDECRYPTED,
-            not_before = transaction_cols::NOT_BEFORE,
-        ))
-        .bind(TransactionStatus::Pending)
-        .bind(transaction_type)
-        .fetch_one(&self.pool)
-        .await?;
+        let (claimable, undecrypted, public_waiting, oldest_public_wait_secs): (i64, i64, i64, i64) =
+            sqlx::query_as(&format!(
+                "SELECT COUNT(*) FILTER (WHERE NOT {undecrypted} AND ({not_before} IS NULL OR {not_before} <= NOW())),
+                        COUNT(*) FILTER (WHERE {undecrypted}),
+                        COUNT(*) FILTER (WHERE {waiting}),
+                        COALESCE(EXTRACT(EPOCH FROM NOW() - MIN({started}) FILTER (WHERE {waiting}))::BIGINT, 0)
+                 FROM transactions WHERE {} = $1 AND {} = $2",
+                transaction_cols::STATUS,
+                transaction_cols::TRANSACTION_TYPE,
+                undecrypted = transaction_cols::CONFIDENTIAL_UNDECRYPTED,
+                not_before = transaction_cols::NOT_BEFORE,
+                started = transaction_cols::WAIT_STARTED_AT,
+                waiting = format_args!(
+                    "NOT {} AND {} > NOW()",
+                    transaction_cols::CONFIDENTIAL,
+                    transaction_cols::NOT_BEFORE
+                ),
+            ))
+            .bind(TransactionStatus::Pending)
+            .bind(transaction_type)
+            .fetch_one(&self.pool)
+            .await?;
 
         Ok(PendingBacklog {
             claimable,
             undecrypted,
+            public_waiting,
+            oldest_public_wait_secs,
         })
     }
 

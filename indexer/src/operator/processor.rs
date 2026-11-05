@@ -2,6 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::confidential_custody::{judge_confidential_custody, ConfidentialCustody};
+use crate::operator::constants::confidential_constants::DRAIN_CHECK_WAIT_CEILING;
 use crate::operator::escrow_sweep::ConfidentialBalances;
 use crate::operator::instruction_util::ConfidentialReleaseRequest;
 use crate::operator::instruction_util::{
@@ -1183,9 +1184,10 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
-/// A short public balance on a configured mint is routine only while the whole custody
-/// still covers what the ledger owes. Otherwise, or when the confidential part cannot be
-/// counted, funds may have left the escrow, so the row parks as a drain.
+/// A short public balance on a configured mint parks as a drain only when the whole custody
+/// is proven short of what the ledger owes. While a release is unrecorded or the custody is
+/// held by lag the sender clears, the row waits, up to a ceiling; anything else unproven
+/// parks `public_balance_low`, whose runbook starts by ruling out a drain.
 async fn short_public_balance(
     processor_state: &ProcessorState,
     transaction: &DbTransaction,
@@ -1197,24 +1199,41 @@ async fn short_public_balance(
     let public = view.public_amount;
     let storage = processor_state.mint_cache.storage();
     let mint_address = mint.to_string();
-    // A release that paid out but is not yet recorded would count as owed and look like a drain.
-    if storage
-        .has_unrecorded_release(&mint_address, slot, transaction.id)
-        .await
-        .map_err(OperatorError::Storage)?
-    {
-        return Ok(BailReason {
+    let low = |why: String| {
+        BailReason::new(
+            metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            format!("escrow public balance {public} below release {amount} for mint {mint}; {why}"),
+        )
+    };
+    let waited_out = transaction.wait_started_at.is_some_and(|started| {
+        (Utc::now() - started).to_std().unwrap_or_default() >= DRAIN_CHECK_WAIT_CEILING
+    });
+    let wait = |why: String| async move {
+        if waited_out {
+            return low(format!(
+                "{why} after {} min; rule out a drain",
+                DRAIN_CHECK_WAIT_CEILING.as_secs() / 60
+            ));
+        }
+        BailReason {
             label: metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
             message: format!(
-                "escrow public balance {public} below release {amount} for mint {mint}; \
-                 waiting for its releases in flight to be recorded"
+                "escrow public balance {public} below release {amount} for mint {mint}; waiting: {why}"
             ),
             wait: true,
             expired_below: match processor_state.mint_cache.rpc_client() {
                 Some(rpc) => expired_journal_height(storage, rpc, transaction.id).await,
                 None => None,
             },
-        });
+        }
+    };
+    // A release that paid out but is not yet recorded would count as owed and look like a drain.
+    if storage
+        .has_unrecorded_release(&mint_address, slot, transaction.id)
+        .await
+        .map_err(OperatorError::Storage)?
+    {
+        return Ok(wait("releases of the mint in flight are not recorded yet".into()).await);
     }
     let custody = judge_confidential_custody(
         storage,
@@ -1225,6 +1244,25 @@ async fn short_public_balance(
     )
     .await
     .map_err(OperatorError::Storage)?;
+    let counted = match custody {
+        ConfidentialCustody::Counted(total) => total,
+        // No confidential deposit is ever credited under a foreign key.
+        ConfidentialCustody::Held(hold) if hold.reconciled_on_public() => public,
+        ConfidentialCustody::Held(hold) if hold.is_transient() => {
+            return Ok(wait(format!("confidential custody is held ({})", hold.label())).await);
+        }
+        ConfidentialCustody::Held(hold) => {
+            return Ok(low(format!(
+                "confidential custody is held ({}); rule out a drain",
+                hold.label()
+            )));
+        }
+        ConfidentialCustody::Mismatch(reason) => {
+            return Ok(low(format!(
+                "confidential custody is not proven ({reason}); rule out a drain"
+            )));
+        }
+    };
     let owed = storage
         .get_mint_balances_for_unpinned_reconciliation(slot)
         .await
@@ -1232,33 +1270,18 @@ async fn short_public_balance(
         .iter()
         .find(|row| row.mint_address == mint_address)
         .map_or(0, ledger_liability);
-    let drained = |why: String| {
+    Ok(if counted >= owed {
+        low(format!(
+            "custody {counted} covers liabilities {owed}; rebalance to public"
+        ))
+    } else {
         BailReason::new(
             metrics::BAIL_REASON_ESCROW_DRAINED,
             format!(
-                "insufficient escrow balance: public {public} below release {amount} for mint {mint} and {why}; \
+                "insufficient escrow balance: public {public} below release {amount} for mint {mint} and custody {counted} below liabilities {owed}; \
                  possible drain, do not re-arm"
             ),
         )
-    };
-    Ok(match custody {
-        ConfidentialCustody::Counted(total) if total >= owed => BailReason::new(
-            metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
-            format!(
-                "escrow public balance {public} below release {amount} for mint {mint}; \
-                 custody {total} covers liabilities {owed}; rebalance to public"
-            ),
-        ),
-        ConfidentialCustody::Counted(total) => {
-            drained(format!("custody {total} below liabilities {owed}"))
-        }
-        ConfidentialCustody::Held(hold) => drained(format!(
-            "its confidential custody is held ({})",
-            hold.label()
-        )),
-        ConfidentialCustody::Mismatch(reason) => {
-            drained(format!("its confidential custody is not proven: {reason}"))
-        }
     })
 }
 
@@ -6793,6 +6816,10 @@ mod tests {
             /// The row's own journal from an attempt before recovery re-armed it: its
             /// last valid block height, and the confirmed block height the chain reports.
             own_journal: Option<(i64, u64)>,
+            /// When the row's wait began, as a requeued row carries it.
+            wait_started_at: Option<chrono::DateTime<Utc>>,
+            /// The status of the row's own journaled signature; it never landed by default.
+            own_status: serde_json::Value,
         }
 
         impl Case {
@@ -6808,6 +6835,8 @@ mod tests {
                     owed: 0,
                     earlier: None,
                     own_journal: None,
+                    wait_started_at: None,
+                    own_status: serde_json::Value::Null,
                 }
             }
 
@@ -6843,6 +6872,7 @@ mod tests {
                 }
                 let mut txn = withdrawal_for(&mint, 5);
                 txn.confidential = self.confidential;
+                txn.wait_started_at = self.wait_started_at;
                 let instance = ps.release_funds_state.as_ref().unwrap().instance_pda;
                 let escrow_ata = get_associated_token_address_with_program_id(
                     &instance,
@@ -6924,6 +6954,18 @@ mod tests {
                                 r#""getBlockHeight".*"confirmed""#.into(),
                             ))
                             .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{height}}}"#))
+                            .create(),
+                    );
+                    mocks.push(
+                        server
+                            .mock("POST", "/")
+                            .match_body(mockito::Matcher::Regex(r#""getSignatureStatuses""#.into()))
+                            .with_body(
+                                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                                    "context": {"slot": 500}, "value": [self.own_status]
+                                }})
+                                .to_string(),
+                            )
                             .create(),
                     );
                 }
@@ -7218,13 +7260,18 @@ mod tests {
             );
         }
 
-        /// Confidential custody that cannot be counted cannot rule a drain out.
+        /// A foreign-key mint is judged on its public balance alone: a drain only when that
+        /// balance is proven short of the liabilities.
         #[tokio::test]
-        async fn a_short_public_balance_with_held_confidential_custody_parks_as_a_drain() {
-            let result = short_public_release(0, true).await;
-            let message = result.1.as_ref().and_then(|u| u.error_message.clone());
-            assert_parked(result, metrics::BAIL_REASON_ESCROW_DRAINED);
-            assert!(message.unwrap().contains("key_mismatch"));
+        async fn a_foreign_key_mint_is_judged_on_its_public_balance() {
+            assert_parked(
+                short_public_release(10_999, true).await,
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+            );
+            assert_parked(
+                short_public_release(999, true).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
         }
 
         /// A public release of 1,000 against 999 public and 10,000 confidential, after an
@@ -7363,6 +7410,31 @@ mod tests {
             );
         }
 
+        /// An expired attempt that landed is left to recovery rather than requeued.
+        #[tokio::test]
+        async fn a_rearmed_withdrawal_whose_expired_attempt_landed_is_not_requeued() {
+            let mock = MockStorage::new();
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.earlier = Some((TransactionStatus::Processing, false));
+            case.own_journal = Some((100, 400));
+            case.own_status = serde_json::json!({"slot": 90, "confirmations": null, "err": null,
+                "status": {"Ok": null}, "confirmationStatus": "finalized"});
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            let (outcome, update, builder) =
+                case.run_on(Arc::new(Storage::Mock(mock.clone()))).await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(update.is_none());
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(row.status, TransactionStatus::Processing);
+            assert!(row.not_before.is_none());
+        }
+
         /// A journaled signature that can still land keeps the row `Processing`.
         #[tokio::test]
         async fn a_journaled_withdrawal_with_a_live_signature_is_not_requeued() {
@@ -7397,6 +7469,136 @@ mod tests {
                     metrics::BAIL_REASON_ESCROW_DRAINED,
                 );
             }
+        }
+
+        fn assert_waits(
+            result: (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ),
+            mock: &MockStorage,
+        ) {
+            let (outcome, update, builder) = result;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "must not park: {:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none(), "nothing may be dispatched");
+            let row = row_9(mock);
+            assert_eq!(row.status, TransactionStatus::Pending);
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+        }
+
+        fn waited(minutes: i64) -> Option<chrono::DateTime<Utc>> {
+            Some(Utc::now() - chrono::Duration::minutes(minutes))
+        }
+
+        /// The reviewer's case: releases of the mint keep landing unrecorded. The row waits
+        /// until the ceiling, then parks as a low public balance instead of waiting forever.
+        #[tokio::test]
+        async fn a_short_public_balance_stops_waiting_for_releases_after_the_ceiling() {
+            let in_flight = (TransactionStatus::Processing, false);
+            let run = |started: Option<chrono::DateTime<Utc>>, mock: MockStorage| async move {
+                let mut case = Case::healthy();
+                case.confidential = false;
+                case.owed = 10_999;
+                case.earlier = Some(in_flight);
+                case.wait_started_at = started;
+                let (mut escrow, _) = healthy();
+                escrow.public = 999;
+                case.escrow = Some(account_with_confidential(&escrow));
+                case.destination = Some(create_mock_token_2022_account_data());
+                case.run_on(Arc::new(Storage::Mock(mock))).await
+            };
+            let mock = MockStorage::new();
+            assert_waits(run(waited(29), mock.clone()).await, &mock);
+            assert_parked(
+                run(waited(31), MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A public release of 1,000 against 999 public, whose confidential custody is held
+        /// by `escrow`, after waiting since `started`.
+        async fn short_release_with_custody(
+            escrow: AccountSpec,
+            poisoned: bool,
+            started: Option<chrono::DateTime<Utc>>,
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.poisoned = poisoned;
+            case.wait_started_at = started;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        /// The reviewer's case: a 2,000-token deposit on a 9-decimal mint raced the last
+        /// apply, so the AES copy is stale past the gap search. Custody covers everything.
+        fn stale_aes_escrow() -> AccountSpec {
+            let keys = cts::keys();
+            let mut sim = SimAccount::new(&keys);
+            sim.credit(&keys, 10_000, 0);
+            sim.apply();
+            sim.credit(&keys, 2_000_000_000_000, 0);
+            sim.apply();
+            let mut escrow = AccountSpec::healthy(&keys, &sim, 999, 10_000);
+            escrow.expected_pending_credit_counter = 1;
+            escrow.actual_pending_credit_counter = 2;
+            escrow
+        }
+
+        fn pending_too_large_escrow() -> AccountSpec {
+            let keys = cts::keys();
+            let mut sim = SimAccount::new(&keys);
+            sim.credit(&keys, 10_000, 0);
+            sim.apply();
+            sim.credit(&keys, 1 << 57, 0);
+            AccountSpec::healthy(&keys, &sim, 999, 10_000)
+        }
+
+        /// Holds the sender clears on its own wait like an unrecorded release, then park as
+        /// a low public balance at the ceiling; neither is proof of a drain.
+        #[tokio::test]
+        async fn a_short_public_balance_waits_out_a_lagging_custody_hold() {
+            for escrow in [stale_aes_escrow(), pending_too_large_escrow()] {
+                let mock = MockStorage::new();
+                assert_waits(
+                    short_release_with_custody(escrow.clone(), false, None, &mock).await,
+                    &mock,
+                );
+                let mock = MockStorage::new();
+                assert_waits(
+                    short_release_with_custody(escrow.clone(), false, waited(29), &mock).await,
+                    &mock,
+                );
+                assert_parked(
+                    short_release_with_custody(escrow, false, waited(31), &MockStorage::new())
+                        .await,
+                    metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+                );
+            }
+        }
+
+        /// A poisoned mint's custody cannot be counted, which proves no shortfall.
+        #[tokio::test]
+        async fn a_short_public_balance_on_a_poisoned_mint_parks_as_low_balance() {
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            assert_parked(
+                short_release_with_custody(escrow, true, None, &MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
         }
 
         /// A Token-2022 account with no extensions and an empty public balance.

@@ -1115,11 +1115,12 @@ mod tests {
             async fn configured_escrow_keys(
                 &self,
                 _: &Pubkey,
+                _: &[Pubkey],
             ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
                 Ok(vec![(Pubkey::new_unique(), [7; 32])])
             }
         }
-        // A fresh database: no mint is listed, the configured account is only on chain.
+        // The mock source reports a configured account for whatever mints the check asks about.
         let mock = MockStorage::new();
         let rpc_poller = Arc::new(RpcPoller::new(
             "http://127.0.0.1:1".to_string(),
@@ -1743,6 +1744,7 @@ mod tests {
             async fn configured_escrow_keys(
                 &self,
                 _: &Pubkey,
+                _: &[Pubkey],
             ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
                 Ok(Vec::new())
             }
