@@ -188,6 +188,17 @@ async fn primary_pitr_below_fence_refuses_boot() {
 
 /// Serve the escrow instance the operator's startup check reads from Solana.
 async fn mock_instance(server: &mut ServerGuard) -> mockito::Mock {
+    // The boot key check lists the escrow accounts; none is configured.
+    std::mem::forget(
+        server
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({"method": "getTokenAccountsByOwner"}),
+            ))
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[]}}"#)
+            .create_async()
+            .await,
+    );
     server
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(json!({"method": "getAccountInfo"})))
