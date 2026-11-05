@@ -6453,6 +6453,106 @@ async fn confidential_wait_refuses_a_journaled_row() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// A held release's lease is bumped only while it still names the `Processing` row.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_lease_refresh_needs_the_current_lease() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "lease_refresh",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    let lease = updated_at_of(&pool, id).await;
+    let stale = lease - chrono::Duration::seconds(1);
+    assert_eq!(storage.refresh_release_lease(id, stale).await?, None);
+    let fresh = storage
+        .refresh_release_lease(id, lease)
+        .await?
+        .expect("ours");
+    assert!(fresh > lease);
+    assert_eq!(updated_at_of(&pool, id).await, fresh);
+    // The old lease is spent.
+    assert_eq!(storage.refresh_release_lease(id, lease).await?, None);
+    sqlx::query("UPDATE transactions SET status = 'pending' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let lease = updated_at_of(&pool, id).await;
+    assert_eq!(storage.refresh_release_lease(id, lease).await?, None);
+    Ok(())
+}
+
+/// A journaled release still in flight is unrecorded until the indexer observes it by the
+/// slot asked about; an unjournaled row of the mint can be sent back to wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn unrecorded_release_and_withdrawal_wait() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let sent = storage
+        .insert_db_transaction(&make_db_transaction(
+            "unrecorded_sent",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    let next = storage
+        .insert_db_transaction(&make_db_transaction(
+            "unrecorded_next",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await?;
+    assert!(!storage.has_unrecorded_release("mint_addr", 100).await?);
+    let lease = updated_at_of(&pool, sent).await;
+    storage
+        .claim_and_persist_signature(sent, lease, "sig-unrecorded".to_string(), 10, Some(9))
+        .await?
+        .expect("claim");
+    assert!(storage.has_unrecorded_release("mint_addr", 100).await?);
+    assert!(!storage.has_unrecorded_release("other_mint", 100).await?);
+
+    let (nonce,): (i64,) =
+        sqlx::query_as("SELECT withdrawal_nonce FROM transactions WHERE id = $1")
+            .bind(sent)
+            .fetch_one(&pool)
+            .await?;
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: nonce,
+            signature: "sig-unrecorded".to_string(),
+            slot: 50,
+            amount: None,
+        }])
+        .await?;
+    assert!(!storage.has_unrecorded_release("mint_addr", 100).await?);
+    assert!(storage.has_unrecorded_release("mint_addr", 40).await?);
+
+    // The processor's wait: a journaled row never moves, an unjournaled one does.
+    let not_before = Utc::now() + chrono::Duration::minutes(5);
+    let lease = updated_at_of(&pool, sent).await;
+    assert!(
+        !storage
+            .requeue_withdrawal_wait(sent, lease, not_before, Utc::now())
+            .await?
+    );
+    let lease = updated_at_of(&pool, next).await;
+    assert!(
+        storage
+            .requeue_withdrawal_wait(next, lease, not_before, Utc::now())
+            .await?
+    );
+    let status: String = sqlx::query_scalar("SELECT status::TEXT FROM transactions WHERE id = $1")
+        .bind(next)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "pending");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oldest_confidential_park_reads_confidential_withdrawals_only(
 ) -> Result<(), Box<dyn std::error::Error>> {

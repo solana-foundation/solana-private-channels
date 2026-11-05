@@ -12,6 +12,7 @@ use crate::operator::reconciliation::ledger_liability;
 use crate::operator::recovery::{
     check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
 };
+use crate::operator::sender::confidential::next_wait;
 use crate::operator::sender::types::InstructionWithSigners;
 use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
@@ -177,11 +178,17 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
 struct BailReason {
     label: &'static str,
     message: String,
+    /// The row cannot be judged yet: it waits in `Pending` with the backoff instead.
+    wait: bool,
 }
 
 impl BailReason {
     fn new(label: &'static str, message: String) -> Self {
-        Self { label, message }
+        Self {
+            label,
+            message,
+            wait: false,
+        }
     }
 }
 
@@ -273,6 +280,10 @@ async fn park_row(
     transaction: &DbTransaction,
     bail: BailReason,
 ) {
+    if bail.wait {
+        requeue_to_wait(storage, transaction, &bail.message).await;
+        return;
+    }
     // The label leads the alert so it maps straight to its runbook entry.
     let message = format!("{}: {}", bail.label, bail.message);
     if quarantine_labelled(
@@ -288,6 +299,26 @@ async fn park_row(
         metrics::OPERATOR_TRANSACTION_QUARANTINED
             .with_label_values(&[pt_label, bail.label])
             .inc();
+    }
+}
+
+/// Hand the row back to the fetcher after the persisted backoff. A row that is no longer
+/// ours, or a failed write, is left `Processing` for recovery.
+async fn requeue_to_wait(storage: &Storage, transaction: &DbTransaction, reason: &str) {
+    let (not_before, started) = next_wait(Utc::now(), transaction.wait_started_at);
+    match storage
+        .requeue_withdrawal_wait(transaction.id, transaction.updated_at, not_before, started)
+        .await
+    {
+        Ok(true) => info!(txn_id = transaction.id, %not_before, "Withdrawal waits: {reason}"),
+        Ok(false) => warn!(
+            txn_id = transaction.id,
+            "Withdrawal no longer ours to requeue; leaving it"
+        ),
+        Err(e) => warn!(
+            txn_id = transaction.id,
+            "Could not requeue the waiting withdrawal; recovery will: {e}"
+        ),
     }
 }
 
@@ -1149,6 +1180,22 @@ async fn short_public_balance(
 ) -> Result<BailReason, OperatorError> {
     let public = view.public_amount;
     let storage = processor_state.mint_cache.storage();
+    let mint_address = mint.to_string();
+    // A release that paid out but is not yet recorded would count as owed and look like a drain.
+    if storage
+        .has_unrecorded_release(&mint_address, slot)
+        .await
+        .map_err(OperatorError::Storage)?
+    {
+        return Ok(BailReason {
+            label: metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            message: format!(
+                "escrow public balance {public} below release {amount} for mint {mint}; \
+                 waiting for its releases in flight to be recorded"
+            ),
+            wait: true,
+        });
+    }
     let custody = judge_confidential_custody(
         storage,
         processor_state.confidential_keys.as_deref(),
@@ -1158,7 +1205,6 @@ async fn short_public_balance(
     )
     .await
     .map_err(OperatorError::Storage)?;
-    let mint_address = mint.to_string();
     let owed = storage
         .get_mint_balances_for_unpinned_reconciliation(slot)
         .await
@@ -6721,6 +6767,9 @@ mod tests {
             confidential: bool,
             /// Ledger liabilities of the mint (deposits minus released withdrawals).
             owed: u64,
+            /// An earlier journaled 500 release of the mint: its status and whether the
+            /// escrow indexer observed it.
+            earlier: Option<(TransactionStatus, bool)>,
         }
 
         impl Case {
@@ -6734,6 +6783,7 @@ mod tests {
                     poisoned: false,
                     confidential: true,
                     owed: 0,
+                    earlier: None,
                 }
             }
 
@@ -6797,12 +6847,47 @@ mod tests {
                     &spl_token_2022::id(),
                     confidential_mint(Some(cts::other_keys().pubkey()), None),
                 ));
+                let (mut deposits, mut released) = (self.owed, 0u64);
+                if let (Some((status, observed)), Storage::Mock(ref mock)) =
+                    (self.earlier, &*storage)
+                {
+                    let mut earlier = withdrawal_for(&mint, 4);
+                    earlier.id = 78;
+                    earlier.amount = TokenAmount(500);
+                    earlier.status = status;
+                    mock.pending_transactions.lock().unwrap().push(earlier);
+                    deposits += 500;
+                    mock.release_signatures.lock().unwrap().insert(
+                        78,
+                        vec![crate::storage::common::models::StoredSig {
+                            signature: solana_sdk::signature::Signature::new_unique().to_string(),
+                            last_valid_block_height: 100,
+                            blockhash_slot: Some(9),
+                        }],
+                    );
+                    if observed {
+                        mock.observed_releases.lock().unwrap().insert(
+                            4,
+                            crate::storage::common::models::DbObservedRelease {
+                                withdrawal_nonce: 4,
+                                signature: solana_sdk::signature::Signature::new_unique()
+                                    .to_string(),
+                                slot: 0,
+                                amount: Some(TokenAmount(500)),
+                            },
+                        );
+                    }
+                    // What the ledger query counts as paid out.
+                    if observed || status == TransactionStatus::Completed {
+                        released = 500;
+                    }
+                }
                 if let Storage::Mock(ref mock) = *storage {
                     mock.mint_balances.lock().unwrap().push(MintDbBalance {
                         mint_address: mint.to_string(),
                         token_program: spl_token_2022::id().to_string(),
-                        total_deposits: bigdecimal::BigDecimal::from(self.owed),
-                        total_withdrawals: bigdecimal::BigDecimal::from(0u64),
+                        total_deposits: bigdecimal::BigDecimal::from(deposits),
+                        total_withdrawals: bigdecimal::BigDecimal::from(released),
                     });
                 }
                 if self.poisoned {
@@ -7095,6 +7180,81 @@ mod tests {
             let message = result.1.as_ref().and_then(|u| u.error_message.clone());
             assert_parked(result, metrics::BAIL_REASON_ESCROW_DRAINED);
             assert!(message.unwrap().contains("key_mismatch"));
+        }
+
+        /// A public release of 1,000 against 999 public and 10,000 confidential, after an
+        /// earlier 500 release of the mint; `owed` is what the ledger owes once that one is paid.
+        async fn short_public_release_after(
+            owed: u64,
+            earlier: (TransactionStatus, bool),
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = owed;
+            case.earlier = Some(earlier);
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        /// The reviewer's case: an earlier release paid out but its row is still `Processing`,
+        /// so the ledger still owes it. The next short withdrawal waits in `Pending` with the
+        /// backoff, and once that release settles it parks as a low public balance.
+        #[tokio::test]
+        async fn a_short_public_balance_waits_while_a_release_of_the_mint_is_in_flight() {
+            let mock = MockStorage::new();
+            let (outcome, update, builder) =
+                short_public_release_after(10_999, (TransactionStatus::Processing, false), &mock)
+                    .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "must not park: {:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none(), "nothing may be dispatched");
+            let row = mock
+                .pending_transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == 9)
+                .cloned()
+                .unwrap();
+            assert_eq!(row.status, TransactionStatus::Pending);
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+            assert!(row.wait_started_at.is_some());
+
+            assert_parked(
+                short_public_release_after(
+                    10_999,
+                    (TransactionStatus::Completed, false),
+                    &MockStorage::new(),
+                )
+                .await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// Once the release records cover the read, a real drain still parks as one.
+        #[tokio::test]
+        async fn a_drain_parks_once_the_releases_of_the_mint_are_recorded() {
+            for earlier in [
+                (TransactionStatus::Completed, false),
+                (TransactionStatus::Processing, true),
+            ] {
+                assert_parked(
+                    short_public_release_after(50_000, earlier, &MockStorage::new()).await,
+                    metrics::BAIL_REASON_ESCROW_DRAINED,
+                );
+            }
         }
 
         /// A Token-2022 account with no extensions and an empty public balance.

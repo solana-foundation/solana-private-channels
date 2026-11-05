@@ -222,6 +222,9 @@ balance) still covers what the ledger owes, so the funds sit in the confidential
 A short public balance whose custody does not cover the ledger, or whose confidential part
 cannot be counted, parks `escrow_drained` instead (`insufficient escrow balance:`), see
 [withdrawal_manual_review.md](withdrawal_manual_review.md#triage---dispatch-by-error_message).
+Neither is decided while an earlier release of the mint was sent but is not yet recorded
+(`processing` or `pending_remint` with a journaled signature and no observed release): the
+row goes back to `Pending` with the wait backoff and is judged again once those settle.
 
 1. Rule out a drain first: the mint's permanent delegate (if any) can move public funds
    but not confidential ones. Check `private_channel_reconciliation_confidential_mismatch{mint}`
@@ -249,8 +252,8 @@ A release with an earlier journaled attempt could not send its next attempt for 
 minutes: every try failed before broadcast (the escrow account or mint could not be read,
 no candidate available balance opened, a blockhash fetch or signing failed, the
 simulation could not answer, or the RPC kept answering "minimum context slot not
-reached"). The sender held the row `processing` and retried with backoff the whole time,
-spending no proof rebuild or retry; the journal gate then proved no attempt landed. Nothing
+reached"). The sender held the row `processing`, refreshing its lease so recovery left it
+alone, and retried with backoff the whole time, spending no proof rebuild or retry; the journal gate then proved no attempt landed. Nothing
 refused the release on chain.
 
 1. Check `operator-private-channel` logs for the nonce: `Confidential release held in the

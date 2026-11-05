@@ -2181,6 +2181,46 @@ impl MockStorage {
         Ok(true)
     }
 
+    pub async fn has_unrecorded_release(
+        &self,
+        mint: &str,
+        as_of_slot: u64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("has_unrecorded_release")?;
+        let journals = self.release_signatures.lock().unwrap();
+        let observed = self.observed_releases.lock().unwrap();
+        Ok(self.pending_transactions.lock().unwrap().iter().any(|t| {
+            t.transaction_type == TransactionType::Withdrawal
+                && t.mint == mint
+                && matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::PendingRemint
+                )
+                && journals.get(&t.id).is_some_and(|sigs| !sigs.is_empty())
+                && t.withdrawal_nonce
+                    .and_then(|nonce| observed.get(&nonce))
+                    .is_none_or(|r| r.slot as u64 > as_of_slot)
+        }))
+    }
+
+    pub async fn refresh_release_lease(
+        &self,
+        transaction_id: i64,
+        lease: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        self.check_should_fail("refresh_release_lease")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == lease
+        }) else {
+            return Ok(None);
+        };
+        txn.updated_at = Utc::now().max(lease + chrono::Duration::microseconds(1));
+        Ok(Some(txn.updated_at))
+    }
+
     pub async fn oldest_confidential_park(&self) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("oldest_confidential_park")?;
         Ok(self

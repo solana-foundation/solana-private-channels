@@ -11,7 +11,7 @@ use super::transaction::{
 use super::types::{InstructionWithSigners, PendingSig, SenderState, TransactionContext};
 use crate::metrics;
 use crate::operator::confidential_constants::*;
-use crate::operator::recovery::load_pending_sigs;
+use crate::operator::recovery::{load_pending_sigs, RECOVERY_INTERVAL};
 use crate::operator::utils::instruction_util::{
     apply_pending_balance_instruction, move_to_confidential_instruction,
     move_to_public_instructions, ConfidentialReleaseRequest, EscrowConfidentialAccounts,
@@ -108,6 +108,8 @@ pub struct ConfidentialSender {
 pub struct TransientHold {
     pub since: DateTime<Utc>,
     pub next_at: DateTime<Utc>,
+    /// Last time the row's lease was refreshed, so recovery never sees it as abandoned.
+    pub refreshed_at: DateTime<Utc>,
     pub request: Option<ConfidentialReleaseRequest>,
 }
 
@@ -1825,6 +1827,23 @@ pub async fn retry_held(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     let now = Utc::now();
+    // The backoff can reach recovery's stale threshold, so a waiting row is refreshed apart from its retry.
+    let refresh_after = chrono::Duration::from_std(RECOVERY_INTERVAL).expect("interval fits");
+    let stale: Vec<(u64, i64)> = match state.confidential.as_ref() {
+        Some(conf) => conf
+            .held
+            .iter()
+            .filter_map(|(nonce, hold)| {
+                let request = hold.request.as_ref()?;
+                (now - hold.refreshed_at >= refresh_after)
+                    .then_some((*nonce, request.transaction_id))
+            })
+            .collect(),
+        None => return,
+    };
+    for (nonce, transaction_id) in stale {
+        refresh_held_lease(state, nonce, transaction_id).await;
+    }
     let due: Vec<u64> = match state.confidential.as_ref() {
         Some(conf) => conf
             .held
@@ -1891,9 +1910,43 @@ async fn hold_or_park(
         TransientHold {
             since,
             next_at,
+            refreshed_at: now,
             request: Some(request.clone()),
         },
     );
+    refresh_held_lease(state, nonce, request.transaction_id).await;
+}
+
+/// Bump a held row's lease so recovery does not take it as abandoned. A row that is no
+/// longer ours is left to whoever took it; a failed write is tried again next interval.
+async fn refresh_held_lease(state: &mut SenderState, nonce: u64, transaction_id: i64) {
+    let Some(lease) = state.release_leases.get(&nonce).copied() else {
+        return;
+    };
+    if let Some(hold) = state
+        .confidential
+        .as_mut()
+        .and_then(|conf| conf.held.get_mut(&nonce))
+    {
+        hold.refreshed_at = Utc::now();
+    }
+    match state
+        .storage
+        .refresh_release_lease(transaction_id, lease)
+        .await
+    {
+        Ok(Some(new_lease)) => {
+            state.release_leases.insert(nonce, new_lease);
+        }
+        Ok(None) => {
+            warn!(
+                nonce,
+                "Held release is no longer ours; leaving it to recovery"
+            );
+            leave_to_recovery(state, nonce);
+        }
+        Err(e) => warn!(nonce, "Could not refresh the held release's lease: {e}"),
+    }
 }
 
 /// Submit a confidential release: verify the balance, apply if needed, prove, journal,
@@ -2884,6 +2937,7 @@ async fn await_rebalance(
 mod tests {
     use super::*;
     use crate::config::ProgramType;
+    use crate::operator::recovery::STALE_THRESHOLD;
     use crate::operator::sender::test_support::{
         ensure_test_signer, push_processing_row, row_status, row_updated_at,
         sender_state_with_storage_and_role,
@@ -2892,6 +2946,7 @@ mod tests {
         account_with_confidential, confidential_mint, rpc_account, AccountSpec,
     };
     use crate::storage::common::models::StoredSig;
+    use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_confidential::test_support::{self as cts, SimAccount};
     use private_channel_escrow_program_client::instructions::ConfidentialReleaseFundsBuilder;
@@ -3535,6 +3590,80 @@ mod tests {
         )
         .await;
         assert!(held(&state).unwrap().since > earlier);
+    }
+
+    /// A held row refreshes its lease on every hold and once per recovery interval while it
+    /// waits, so recovery never takes it; the hold keeps its start and still parks at the ceiling.
+    #[tokio::test]
+    async fn a_held_release_keeps_its_lease_past_the_stale_threshold() {
+        let mock = MockStorage::new();
+        let (mut state, _server) = held_after_a_blockhash_failure(&mock).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let first = held(&state).unwrap().since;
+        let old = Utc::now()
+            - chrono::Duration::from_std(STALE_THRESHOLD).unwrap()
+            - chrono::Duration::minutes(1);
+
+        // A retry that fails again is held again, with a fresh lease.
+        age_lease(&mut state, &mock, old);
+        held_mut(&mut state).next_at = Utc::now() - chrono::Duration::seconds(1);
+        retry_held(&mut state, &tx).await;
+        assert_held(&state, &mock, 1);
+        assert_lease_fresh(&state, &mock).await;
+
+        // Not due, but held for a whole recovery interval: the lease is refreshed anyway.
+        age_lease(&mut state, &mock, old);
+        let hold = held_mut(&mut state);
+        hold.refreshed_at = old;
+        hold.next_at = Utc::now() + chrono::Duration::minutes(5);
+        retry_held(&mut state, &tx).await;
+        assert!(held(&state).unwrap().request.is_some(), "not retried");
+        assert_lease_fresh(&state, &mock).await;
+        assert_eq!(held(&state).unwrap().since, first);
+
+        // The ceiling still parks it under its own label.
+        let hold = held_mut(&mut state);
+        hold.since = Utc::now()
+            - chrono::Duration::from_std(TRANSIENT_FAILURE_CEILING).unwrap()
+            - chrono::Duration::seconds(1);
+        hold.next_at = Utc::now() - chrono::Duration::seconds(1);
+        retry_held(&mut state, &tx).await;
+        let label = metrics::BAIL_REASON_CONFIDENTIAL_TRANSIENT_FAILURE;
+        assert_eq!(row_status(&mock, 1), Some(TransactionStatus::PendingRemint));
+        assert!(finish_gated_park(&mut state, 1, None, "transient", PROVEN_ABSENT, &tx).await);
+        let update = rx.recv().await.unwrap();
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update.error_message.unwrap().starts_with(label));
+    }
+
+    /// Age the row and the sender's lease on it together, as time passing would.
+    fn age_lease(state: &mut SenderState, mock: &MockStorage, at: DateTime<Utc>) {
+        let mut rows = mock.pending_transactions.lock().unwrap();
+        rows.iter_mut().find(|t| t.id == 1).unwrap().updated_at = at;
+        state.release_leases.insert(7, at);
+    }
+
+    /// Recovery's stale read skips the row, and the sender holds the row's current lease.
+    async fn assert_lease_fresh(state: &SenderState, mock: &MockStorage) {
+        let stale = mock
+            .get_stale_processing_transactions(STALE_THRESHOLD, 100, TransactionType::Withdrawal)
+            .await
+            .unwrap();
+        assert!(stale.is_empty(), "recovery would take the held row");
+        assert_eq!(
+            state.release_leases.get(&7).copied(),
+            row_updated_at(mock, 1)
+        );
+    }
+
+    fn held_mut(state: &mut SenderState) -> &mut TransientHold {
+        state
+            .confidential
+            .as_mut()
+            .unwrap()
+            .held
+            .get_mut(&7)
+            .unwrap()
     }
 
     fn held(state: &SenderState) -> Option<&TransientHold> {

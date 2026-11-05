@@ -2,6 +2,7 @@
 //! read-freshness seed, rebalance requests and the apply journal.
 
 use crate::error::StorageError;
+use crate::storage::common::storage::get_mint_balances_for_reconciliation::slot_bound;
 use crate::storage::common::storage::Storage;
 use chrono::{DateTime, Utc};
 
@@ -128,6 +129,64 @@ impl Storage {
                 mock.requeue_confidential_wait(transaction_id, lease, not_before, wait_started_at)
                     .await
             }
+        }
+    }
+
+    /// Bump a `Processing` row the sender still holds under `lease`, so recovery does not
+    /// take it as abandoned. Returns the new lease, or `None` once the row is not ours.
+    pub async fn refresh_release_lease(
+        &self,
+        transaction_id: i64,
+        lease: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .refresh_release_lease_internal(transaction_id, lease)
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.refresh_release_lease(transaction_id, lease).await,
+        }
+    }
+
+    /// The processor's twin of `requeue_confidential_wait`, written outside the sender lock
+    /// because the processor owns the row it just fetched.
+    pub async fn requeue_withdrawal_wait(
+        &self,
+        transaction_id: i64,
+        lease: DateTime<Utc>,
+        not_before: DateTime<Utc>,
+        wait_started_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .requeue_withdrawal_wait_internal(
+                    transaction_id,
+                    lease,
+                    not_before,
+                    wait_started_at,
+                )
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => {
+                mock.requeue_confidential_wait(transaction_id, lease, not_before, wait_started_at)
+                    .await
+            }
+        }
+    }
+
+    /// Whether a withdrawal of `mint` may have paid out without the ledger counting it as
+    /// of `as_of_slot`: a journaled send still in flight with no release observed by then.
+    pub async fn has_unrecorded_release(
+        &self,
+        mint: &str,
+        as_of_slot: u64,
+    ) -> Result<bool, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db
+                .has_unrecorded_release_internal(mint, slot_bound(as_of_slot))
+                .await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.has_unrecorded_release(mint, as_of_slot).await,
         }
     }
 

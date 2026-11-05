@@ -251,6 +251,21 @@ const DROP_STATEMENTS: [&str; 17] = [
 /// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
 const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
 
+/// Back to `Pending` until `not_before`, keeping the first `wait_started_at`. Same lease and
+/// journal guard as `requeue_unclaimed`; the attempt counter is untouched.
+const REQUEUE_WAIT_SQL: &str = r#"
+    UPDATE transactions
+    SET status = 'pending',
+        not_before = $3,
+        wait_started_at = COALESCE(wait_started_at, $4)
+    WHERE id = $1
+      AND status = 'processing'
+      AND updated_at = $2
+      AND NOT EXISTS (
+          SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+      )
+"#;
+
 /// Rows the reconciliation envelope counts: unsettled deposits only. A withdrawal burns before it releases,
 /// so an unsettled one can never explain supply above custody, only hide a real shortfall.
 const ENVELOPE_ROWS: &str =
@@ -4147,34 +4162,92 @@ impl PostgresDb {
         not_before: chrono::DateTime<chrono::Utc>,
         wait_started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, sqlx::Error> {
-        // Same lease and journal guard as `requeue_unclaimed`; the attempt counter is untouched.
         let result = self
             .run_sender_owned(move |conn| {
                 Box::pin(async move {
-                    sqlx::query(
-                        r#"
-                        UPDATE transactions
-                        SET status = 'pending',
-                            not_before = $3,
-                            wait_started_at = COALESCE(wait_started_at, $4)
-                        WHERE id = $1
-                          AND status = 'processing'
-                          AND updated_at = $2
-                          AND NOT EXISTS (
-                              SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
-                          )
-                        "#,
-                    )
-                    .bind(transaction_id)
-                    .bind(lease)
-                    .bind(not_before)
-                    .bind(wait_started_at)
-                    .execute(conn)
-                    .await
+                    sqlx::query(REQUEUE_WAIT_SQL)
+                        .bind(transaction_id)
+                        .bind(lease)
+                        .bind(not_before)
+                        .bind(wait_started_at)
+                        .execute(conn)
+                        .await
                 })
             })
             .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn requeue_withdrawal_wait_internal(
+        &self,
+        transaction_id: i64,
+        lease: chrono::DateTime<chrono::Utc>,
+        not_before: chrono::DateTime<chrono::Utc>,
+        wait_started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(REQUEUE_WAIT_SQL)
+            .bind(transaction_id)
+            .bind(lease)
+            .bind(not_before)
+            .bind(wait_started_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn has_unrecorded_release_internal(
+        &self,
+        mint: &str,
+        as_of_slot: i64,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM transactions t
+                WHERE t.transaction_type = 'withdrawal'
+                  AND t.mint = $1
+                  AND t.status IN ('processing', 'pending_remint')
+                  AND EXISTS (
+                      SELECT 1 FROM pending_release_signatures s WHERE s.transaction_id = t.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM observed_releases r
+                      WHERE r.withdrawal_nonce = t.withdrawal_nonce AND r.slot <= $2
+                  )
+            )
+            "#,
+        )
+        .bind(mint)
+        .bind(as_of_slot)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn refresh_release_lease_internal(
+        &self,
+        transaction_id: i64,
+        lease: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        // The trigger bumps `updated_at`; the CAS proves the row is still this lease's.
+        self.run_sender_owned(move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    r#"
+                    UPDATE transactions
+                    SET status = status
+                    WHERE id = $1
+                      AND status = 'processing'
+                      AND updated_at = $2
+                    RETURNING updated_at
+                    "#,
+                )
+                .bind(transaction_id)
+                .bind(lease)
+                .fetch_optional(conn)
+                .await
+            })
+        })
+        .await
     }
 
     pub async fn oldest_confidential_park_internal(
