@@ -29,27 +29,16 @@ pub async fn get_confidential_undecrypted(
 pub async fn recover_confidential_fenced(
     storage: &Storage,
     lock: &LiveLockGuard,
-    mint: &str,
     recovered: Vec<(i64, TokenAmount)>,
 ) -> Result<(), StorageError> {
-    let mint = mint.to_string();
     match storage {
         Storage::Postgres(_) => {
             lock.run_fenced(move |conn| {
-                Box::pin(async move {
-                    PostgresDb::recover_confidential_on(conn, &mint, &recovered).await
-                })
+                Box::pin(async move { PostgresDb::recover_confidential_on(conn, &recovered).await })
             })
             .await
         }
         #[cfg(any(test, feature = "test-mock-storage"))]
-        Storage::Mock(mock) => {
-            mock.confidential_sender
-                .lock()
-                .unwrap()
-                .mint_states
-                .remove(&mint);
-            mock.recover_confidential(&recovered).await
-        }
+        Storage::Mock(mock) => mock.recover_confidential(&recovered).await,
     }
 }

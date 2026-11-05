@@ -842,7 +842,7 @@ pub(super) fn handle_confirmation_result<'a>(
                 handle_nonce_outside_generation(
                     state,
                     ctx,
-                    signature,
+                    Some(signature),
                     slot,
                     instruction,
                     storage_tx,
@@ -1272,7 +1272,7 @@ pub(super) async fn park_release_for_rotation(
 pub(super) async fn handle_nonce_outside_generation(
     state: &mut SenderState,
     ctx: &TransactionContext,
-    signature: Signature,
+    signature: Option<Signature>,
     refused_at: u64,
     instruction: InstructionWithSigners,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -1315,7 +1315,9 @@ pub(super) async fn handle_nonce_outside_generation(
             }
             refund_predictable_refusal(state, nonce);
             // Out of the stash so a pre-broadcast failure can still requeue; the journal keeps it.
-            forget_stashed_signature(state, nonce, &signature);
+            if let Some(signature) = &signature {
+                forget_stashed_signature(state, nonce, signature);
+            }
             state.rotation_retry_queue.push((ctx.clone(), instruction));
             return;
         }
@@ -1349,7 +1351,9 @@ pub(super) async fn handle_nonce_outside_generation(
             nonce_generation, chain_generation, "Rotation has not landed yet; queuing for retry"
         );
         refund_predictable_refusal(state, nonce);
-        forget_rejected_signature(state, nonce, ctx.transaction_id, &signature).await;
+        if let Some(signature) = &signature {
+            forget_rejected_signature(state, nonce, ctx.transaction_id, signature).await;
+        }
         state.rotation_retry_queue.push((ctx.clone(), instruction));
         return;
     }
@@ -1365,18 +1369,17 @@ pub(super) async fn handle_nonce_outside_generation(
     // from the program itself, which is proof this transaction moved no funds;
     // the deferred path still classifies every signature we broadcast, so an
     // earlier attempt that did land is completed instead of paid twice.
-    remint_after_onchain_refusal(
-        state,
-        ctx,
-        storage_tx,
-        &ProgramError::GenerationMismatch {
-            nonce,
-            nonce_generation,
-            chain_generation,
-        }
-        .to_string(),
-    )
-    .await;
+    let reason = ProgramError::GenerationMismatch {
+        nonce,
+        nonce_generation,
+        chain_generation,
+    }
+    .to_string();
+    match signature {
+        Some(_) => remint_after_onchain_refusal(state, ctx, storage_tx, &reason).await,
+        // Seen only in a simulation: that attempt was never journaled or sent.
+        None => refund_failure_journaled_first(state, ctx, storage_tx, &reason, true).await,
+    }
 }
 
 /// Give back the attempt a generation refusal was charged. It was predictable and says
@@ -1707,6 +1710,45 @@ pub(super) async fn defer_remint_after_failure(
     error_msg: &str,
     release_refused_on_chain: bool,
 ) {
+    defer_remint(
+        state,
+        ctx,
+        storage_tx,
+        error_msg,
+        release_refused_on_chain,
+        false,
+    )
+    .await;
+}
+
+/// `handle_permanent_failure` for a caller that sends nothing it has not journaled first:
+/// there an empty journal proves nothing was broadcast, so the refund needs no signature.
+pub(super) async fn refund_failure_journaled_first(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    error_msg: &str,
+    release_refused_on_chain: bool,
+) {
+    defer_remint(
+        state,
+        ctx,
+        storage_tx,
+        error_msg,
+        release_refused_on_chain,
+        true,
+    )
+    .await;
+}
+
+async fn defer_remint(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    error_msg: &str,
+    release_refused_on_chain: bool,
+    journaled_first: bool,
+) {
     clear_rotation_retry_state(state, ctx);
 
     // Extract remint info BEFORE cleanup destroys builder cache
@@ -1774,7 +1816,8 @@ pub(super) async fn defer_remint_after_failure(
     // positive evidence that no payout occurred: an absent release record only
     // ever refuses a refund, it never permits one, and a bitmap that has rotated
     // cannot answer for the nonce at all. So a human settles it.
-    if signatures.is_empty() {
+    let never_sent = signatures.is_empty() && journaled_first;
+    if signatures.is_empty() && !journaled_first {
         error!(
             "No signatures to verify for nonce {:?}, cannot safely remint, sending to ManualReview",
             ctx.withdrawal_nonce,
@@ -1789,7 +1832,16 @@ pub(super) async fn defer_remint_after_failure(
         return;
     }
 
-    let deadline = Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+    // Nothing can land, so there is no finality to wait out. The refusal flag is what lets a
+    // restart load the entry with an empty journal; the bitmap and payout record still gate it.
+    let (deadline, release_refused_on_chain) = if never_sent {
+        (Utc::now(), true)
+    } else {
+        (
+            Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
+            release_refused_on_chain,
+        )
+    };
 
     // Atomically transition to PendingRemint, persisting the withdrawal signatures
     // needed for the finality check. This replaces the previous Failed write —

@@ -45,8 +45,8 @@ pub struct RebalanceRequest {
     pub direction: RebalanceDirection,
     pub amount: u64,
     pub expected_available: u64,
-    /// The public balance a move to confidential was made against; it spends only that.
-    pub expected_public: Option<u64>,
+    /// The operator's id for the request; a second request with it is refused.
+    pub request_id: String,
     pub status: String,
     pub signature: Option<String>,
     pub error: Option<String>,
@@ -238,8 +238,8 @@ impl Storage {
         direction: RebalanceDirection,
         amount: u64,
         expected_available: u64,
-        expected_public: Option<u64>,
-    ) -> Result<i64, StorageError> {
+        request_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db
                 .insert_rebalance_request_internal(
@@ -247,7 +247,7 @@ impl Storage {
                     direction,
                     amount,
                     expected_available,
-                    expected_public,
+                    request_id,
                 )
                 .await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
@@ -257,7 +257,7 @@ impl Storage {
                     direction,
                     amount,
                     expected_available,
-                    expected_public,
+                    request_id,
                 )
                 .await
             }
@@ -369,6 +369,17 @@ impl Storage {
             Storage::Postgres(db) => Ok(db.last_landed_operator_attempt_internal(mint).await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
             Storage::Mock(mock) => mock.last_landed_operator_attempt(mint).await,
+        }
+    }
+
+    /// Each mint's most recent landed apply or repair.
+    pub async fn last_landed_operator_attempts(
+        &self,
+    ) -> Result<Vec<OperatorAttempt>, StorageError> {
+        match self {
+            Storage::Postgres(db) => Ok(db.last_landed_operator_attempts_internal().await?),
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Storage::Mock(mock) => mock.last_landed_operator_attempts().await,
         }
     }
 

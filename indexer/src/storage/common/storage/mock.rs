@@ -1760,7 +1760,7 @@ impl MockStorage {
                 if remint_last_valid_block_heights.is_some() {
                     txn.remint_last_valid_block_heights = remint_last_valid_block_heights;
                 }
-                if let Some(label) = park_label.filter(|_| txn.confidential) {
+                if let Some(label) = park_label {
                     self.confidential_sender
                         .lock()
                         .unwrap()
@@ -2240,6 +2240,7 @@ impl MockStorage {
             .filter(|(id, _)| {
                 rows.iter().any(|t| {
                     t.id == **id
+                        && t.confidential
                         && matches!(
                             t.status,
                             TransactionStatus::Processing | TransactionStatus::PendingRemint
@@ -2283,13 +2284,20 @@ impl MockStorage {
         direction: crate::storage::common::storage::confidential_sender::RebalanceDirection,
         amount: u64,
         expected_available: u64,
-        expected_public: Option<u64>,
-    ) -> Result<i64, StorageError> {
+        request_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
         use crate::storage::common::storage::confidential_sender::{
             rebalance_status, RebalanceRequest,
         };
         self.check_should_fail("insert_rebalance_request")?;
         let mut state = self.confidential_sender.lock().unwrap();
+        if state
+            .rebalance_requests
+            .iter()
+            .any(|r| r.request_id == request_id)
+        {
+            return Ok(None);
+        }
         let id = state.rebalance_requests.len() as i64 + 1;
         state.rebalance_requests.push(RebalanceRequest {
             id,
@@ -2297,14 +2305,14 @@ impl MockStorage {
             direction,
             amount,
             expected_available,
-            expected_public,
+            request_id: request_id.to_string(),
             status: rebalance_status::PENDING.to_string(),
             signature: None,
             error: None,
             last_valid_block_height: None,
             blockhash_slot: None,
         });
-        Ok(id)
+        Ok(Some(id))
     }
 
     pub async fn get_rebalance_requests(
@@ -2456,6 +2464,29 @@ impl MockStorage {
             .filter(|a| a.mint == mint && a.status == attempt_status::LANDED)
             .max_by_key(|a| (a.landed_slot, a.id))
             .cloned())
+    }
+
+    pub async fn last_landed_operator_attempts(
+        &self,
+    ) -> Result<
+        Vec<crate::storage::common::storage::confidential_sender::OperatorAttempt>,
+        StorageError,
+    > {
+        use crate::storage::common::storage::confidential_sender::attempt_status;
+        self.check_should_fail("last_landed_operator_attempts")?;
+        let mut last = std::collections::BTreeMap::new();
+        for attempt in &self.confidential_sender.lock().unwrap().attempts {
+            if attempt.status != attempt_status::LANDED {
+                continue;
+            }
+            let entry = last
+                .entry(attempt.mint.clone())
+                .or_insert_with(|| attempt.clone());
+            if (attempt.landed_slot, attempt.id) > (entry.landed_slot, entry.id) {
+                *entry = attempt.clone();
+            }
+        }
+        Ok(last.into_values().collect())
     }
 
     pub async fn confidential_pending_inputs(

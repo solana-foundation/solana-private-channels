@@ -199,6 +199,10 @@ enum Mode {
         /// Move this many base units from public to confidential.
         #[arg(long)]
         to_confidential: Option<u64>,
+        /// Your id for this request. A second request with the same id is refused, so a
+        /// rerun never moves the amount twice.
+        #[arg(long)]
+        id: String,
         /// Solana RPC that serves the escrow account.
         #[arg(long)]
         rpc_url: String,
@@ -301,8 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mint,
             to_public,
             to_confidential,
+            id,
             rpc_url,
-        } => run_rebalance(figment, &mint, to_public, to_confidential, rpc_url).await,
+        } => run_rebalance(figment, &mint, to_public, to_confidential, &id, rpc_url).await,
     }
 }
 
@@ -312,6 +317,7 @@ async fn run_rebalance(
     mint: &str,
     to_public: Option<u64>,
     to_confidential: Option<u64>,
+    request_id: &str,
     rpc_url: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use private_channel_indexer::storage::common::storage::confidential_sender::RebalanceDirection;
@@ -355,9 +361,10 @@ async fn run_rebalance(
         &mint,
         direction,
         amount,
+        request_id,
     )
     .await?;
-    println!("rebalance request {id} recorded");
+    println!("rebalance request {id} ({request_id}) recorded");
     Ok(())
 }
 

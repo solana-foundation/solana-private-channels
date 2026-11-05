@@ -5,8 +5,8 @@
 
 use super::transaction::{
     claim_and_persist_or_abort, defer_remint_after_failure, handle_nonce_already_used,
-    handle_nonce_outside_generation, handle_permanent_failure, handle_success, send_fenced_outcome,
-    SignatureClaim,
+    handle_nonce_outside_generation, handle_success, refund_failure_journaled_first,
+    send_fenced_outcome, SignatureClaim,
 };
 use super::types::{InstructionWithSigners, PendingSig, SenderState, TransactionContext};
 use crate::metrics;
@@ -705,8 +705,8 @@ pub enum RebalanceDecision {
     Wait,
 }
 
-/// Each direction runs only if the balance it spends still equals what the request was made
-/// against, so a rerun after the move landed refuses instead of moving twice.
+/// A move to public runs only against the available it was made for; a move to confidential
+/// only needs enough public. The request id keeps a rerun from moving twice.
 pub fn rebalance_decision(
     request: &RebalanceRequest,
     verified: Option<u64>,
@@ -725,12 +725,6 @@ pub fn rebalance_decision(
         RebalanceDirection::ToPublic if request.amount > verified => RebalanceDecision::Refuse(
             format!("amount {} above available {verified}", request.amount),
         ),
-        RebalanceDirection::ToConfidential if request.expected_public != Some(public) => {
-            RebalanceDecision::Refuse(format!(
-                "public balance {public} differs from expected {:?}",
-                request.expected_public
-            ))
-        }
         RebalanceDirection::ToConfidential if request.amount > public => RebalanceDecision::Refuse(
             format!("amount {} above public balance {public}", request.amount),
         ),
@@ -1577,6 +1571,36 @@ pub async fn seed_mint_states(conf: &mut ConfidentialSender, storage: &Storage) 
     }
 }
 
+/// Seed candidate (d) of each mint with its last landed apply, as memory held it before a
+/// restart. Applies that land later replace it when the journal is settled.
+pub async fn seed_last_applies(conf: &mut ConfidentialSender, storage: &Storage) {
+    let attempts = match storage.last_landed_operator_attempts().await {
+        Ok(attempts) => attempts,
+        Err(e) => {
+            warn!("Could not restore the last landed applies: {e}");
+            return;
+        }
+    };
+    for attempt in attempts {
+        let (Ok(mint), Ok(signature), Some(prior_available)) = (
+            Pubkey::from_str(&attempt.mint),
+            Signature::from_str(&attempt.signature),
+            attempt.prior_available,
+        ) else {
+            continue;
+        };
+        conf.books
+            .entry(mint)
+            .or_default()
+            .last_apply
+            .get_or_insert(LastApply {
+                prior_available,
+                signature,
+                applied_pending: attempt.applied_pending,
+            });
+    }
+}
+
 /// Restore the parks a previous incarnation left waiting on their journal gate.
 pub async fn seed_parks(conf: &mut ConfidentialSender, storage: &Storage) {
     match storage.get_confidential_park_labels().await {
@@ -1721,29 +1745,57 @@ async fn wait_or_leave(
 ) {
     let nonce = request.nonce;
     match journaled(state, request.transaction_id).await {
-        Ok(false) => {
-            let Some(lease) = state.release_leases.get(&nonce).copied() else {
-                return;
-            };
-            let (not_before, started) = next_wait(Utc::now(), request.wait_started_at);
-            match state
-                .storage
-                .requeue_confidential_wait(request.transaction_id, lease, not_before, started)
-                .await
-            {
-                Ok(true) => info!(nonce, %not_before, "Confidential release waits: {reason}"),
-                Ok(false) => warn!(nonce, "Release no longer ours to requeue; leaving it"),
-                Err(e) => warn!(
-                    nonce,
-                    "Could not requeue the waiting release; recovery will: {e}"
-                ),
-            }
-            forget_release(state, nonce);
-        }
+        Ok(false) => requeue_unsent(state, request, reason).await,
         Ok(true) | Err(_) => {
             warn!(nonce, "Leaving the release to recovery: {reason}");
             leave_to_recovery(state, nonce);
         }
+    }
+}
+
+/// Back to `Pending` with the persisted backoff; the retry count goes with the attempt.
+async fn requeue_unsent(
+    state: &mut SenderState,
+    request: &ConfidentialReleaseRequest,
+    reason: &str,
+) {
+    let nonce = request.nonce;
+    let Some(lease) = state.release_leases.get(&nonce).copied() else {
+        return;
+    };
+    let (not_before, started) = next_wait(Utc::now(), request.wait_started_at);
+    match state
+        .storage
+        .requeue_confidential_wait(request.transaction_id, lease, not_before, started)
+        .await
+    {
+        Ok(true) => info!(nonce, %not_before, "Confidential release waits: {reason}"),
+        Ok(false) => warn!(nonce, "Release no longer ours to requeue; leaving it"),
+        Err(e) => warn!(
+            nonce,
+            "Could not requeue the waiting release; recovery will: {e}"
+        ),
+    }
+    forget_release(state, nonce);
+}
+
+/// A simulation that says nothing about the release. Before any send the row waits in
+/// `Pending`; after one it is resent on the retry budget (true) and ends on the gate.
+async fn resend_or_wait(
+    state: &mut SenderState,
+    request: &ConfidentialReleaseRequest,
+    reason: &str,
+) -> bool {
+    warn!(
+        nonce = request.nonce,
+        "Confidential release not simulated: {reason}"
+    );
+    match journaled(state, request.transaction_id).await {
+        Ok(false) => {
+            requeue_unsent(state, request, reason).await;
+            false
+        }
+        Ok(true) | Err(_) => true,
     }
 }
 
@@ -1814,6 +1866,8 @@ pub async fn submit_release(
 
     let mut cause = cause;
     let mut prepared: Option<(Vec<solana_sdk::instruction::Instruction>, u64)> = None;
+    // Set once a send below the maximum ran out of compute: the resend goes at the maximum.
+    let mut at_max = false;
     loop {
         if prepared.is_none() || !reuse_proofs(cause) {
             match prepare_release(state, &request).await {
@@ -1851,7 +1905,8 @@ pub async fn submit_release(
         // Retry bound shared with public releases.
         let attempts = state.retry_counts.get(&nonce).copied().unwrap_or(0);
         if attempts >= state.retry_max_attempts {
-            handle_permanent_failure(state, &ctx, storage_tx, "Max retries exceeded").await;
+            refund_failure_journaled_first(state, &ctx, storage_tx, "Max retries exceeded", false)
+                .await;
             return;
         }
         state.retry_counts.insert(nonce, attempts + 1);
@@ -1904,17 +1959,23 @@ pub async fn submit_release(
         {
             Ok(simulated) => simulated,
             Err(e) => {
-                warn!(
-                    nonce,
-                    "Confidential release simulation failed, resending: {e}"
-                );
-                cause = AttemptCause::TimeoutResend;
-                continue;
+                if resend_or_wait(state, &request, &format!("simulation: {e}")).await {
+                    cause = AttemptCause::TimeoutResend;
+                    continue;
+                }
+                return;
             }
         };
         let (signed, ix, refused) = match simulated.err {
             Some(err) => {
                 let err = solana_sdk::transaction::TransactionError::from(err);
+                if err == solana_sdk::transaction::TransactionError::BlockhashNotFound {
+                    if resend_or_wait(state, &request, &format!("simulation: {err}")).await {
+                        cause = AttemptCause::TimeoutResend;
+                        continue;
+                    }
+                    return;
+                }
                 let origin = simulated.logs.as_deref().and_then(failing_program);
                 let failure = classify_attempt(Some(&err), origin, &request.hook_extras);
                 (
@@ -1924,7 +1985,11 @@ pub async fn submit_release(
                 )
             }
             None => {
-                let limit = release_compute_limit(simulated.units_consumed);
+                let limit = if at_max {
+                    CU_CONFIDENTIAL_RELEASE_MAX
+                } else {
+                    release_compute_limit(simulated.units_consumed)
+                };
                 let ix = release_ix(instructions, limit);
                 match resign_v1(&ix, LOADED_ACCOUNTS_DATA_SIZE_LIMIT, &signed.blockhash()).await {
                     Ok(signed) => (signed, ix, None),
@@ -1936,6 +2001,8 @@ pub async fn submit_release(
                 }
             }
         };
+        // A refusal seen in simulation was never journaled or sent.
+        let sent = refused.is_none().then_some(signed.signature);
         let failure = if refused.is_some() {
             refused
         } else {
@@ -1983,7 +2050,14 @@ pub async fn submit_release(
                         Some((failure, None, e.to_string()))
                     }
                     None => {
-                        handle_permanent_failure(state, &ctx, storage_tx, &e.to_string()).await;
+                        refund_failure_journaled_first(
+                            state,
+                            &ctx,
+                            storage_tx,
+                            &e.to_string(),
+                            false,
+                        )
+                        .await;
                         return;
                     }
                 },
@@ -2082,6 +2156,17 @@ pub async fn submit_release(
                 );
                 cause = AttemptCause::StaleProofs;
             }
+            // Sent below the maximum, so the maximum may still fit: one fresh attempt at it.
+            ConfidentialFailure::Park(metrics::BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED)
+                if sent.is_some() && ix.compute_budget < Some(CU_CONFIDENTIAL_RELEASE_MAX) =>
+            {
+                warn!(
+                    nonce,
+                    "Confidential release ran out of compute below the maximum, resending at it: {detail}"
+                );
+                at_max = true;
+                cause = AttemptCause::TimeoutResend;
+            }
             ConfidentialFailure::Park(label) => {
                 park(state, &ctx, &request, storage_tx, label, &detail).await;
                 return;
@@ -2110,7 +2195,7 @@ pub async fn submit_release(
                 handle_nonce_outside_generation(
                     state,
                     &ctx,
-                    signed.signature,
+                    sent,
                     slot.unwrap_or(0),
                     ix,
                     storage_tx,
@@ -2119,7 +2204,7 @@ pub async fn submit_release(
                 return;
             }
             ConfidentialFailure::Escrow(_) | ConfidentialFailure::Other => {
-                handle_permanent_failure(state, &ctx, storage_tx, &detail).await;
+                refund_failure_journaled_first(state, &ctx, storage_tx, &detail, false).await;
                 return;
             }
         }
@@ -2369,8 +2454,9 @@ async fn mint_withdrawals_blocked(state: &SenderState, mint: &Pubkey) -> Result<
         .is_none_or(|allowed| allowed.withdrawals_blocked))
 }
 
-/// `indexer rebalance`: record a request against the balance it spends, read now. The
-/// sender runs it later and refuses it if that balance moved in between.
+/// `indexer rebalance`: record a request under the operator's `request_id`, refused if that id
+/// was used before. The sender runs it later and refuses it if the balance no longer allows it.
+#[allow(clippy::too_many_arguments)]
 pub async fn request_rebalance(
     storage: &Storage,
     rpc: &RpcClientWithRetry,
@@ -2379,7 +2465,11 @@ pub async fn request_rebalance(
     mint: &Pubkey,
     direction: RebalanceDirection,
     amount: u64,
+    request_id: &str,
 ) -> Result<i64, String> {
+    if request_id.is_empty() {
+        return Err("a request id is required".into());
+    }
     if amount == 0 {
         return Err("amount must be above zero".into());
     }
@@ -2401,8 +2491,7 @@ pub async fn request_rebalance(
         direction,
         amount,
         expected_available: available,
-        expected_public: (direction == RebalanceDirection::ToConfidential)
-            .then_some(view.public_amount),
+        request_id: request_id.to_string(),
         status: rebalance_status::PENDING.into(),
         signature: None,
         error: None,
@@ -2415,15 +2504,10 @@ pub async fn request_rebalance(
         return Err(reason);
     }
     storage
-        .insert_rebalance_request(
-            &request.mint,
-            direction,
-            amount,
-            available,
-            request.expected_public,
-        )
+        .insert_rebalance_request(&request.mint, direction, amount, available, request_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("rebalance request id {request_id} was already used; pick a new id"))
 }
 
 /// Run pending rebalance requests, and settle any left `sent` by a crash.
@@ -3121,6 +3205,7 @@ mod tests {
     async fn gated_park(mock: &MockStorage) -> SenderState {
         let (_, spec) = escrow(5_000, 1);
         push_processing_row(mock, 1);
+        mock.pending_transactions.lock().unwrap()[0].confidential = true;
         mock.release_signatures.lock().unwrap().insert(
             1,
             vec![StoredSig {
@@ -3355,6 +3440,14 @@ mod tests {
         SimulatedOutOfCompute,
         /// The simulating node is behind the read floor.
         SimulationBehind,
+        /// The simulation result says the blockhash is unknown.
+        SimulationBlockhashNotFound,
+        /// The simulation is refused by the escrow with this code.
+        SimulationRefused(u32),
+        /// Simulated near the maximum, so sent at it, then found failed out of compute.
+        LandedOutOfComputeAtMax,
+        /// The simulation fails with escrow code 33 and no log naming the program.
+        SimulationUnreadable,
     }
 
     /// What one `release_with` run saw.
@@ -3365,6 +3458,7 @@ mod tests {
         mock: MockStorage,
         simulated: Vec<serde_json::Value>,
         sent: Vec<serde_json::Value>,
+        state: SenderState,
     }
 
     /// Units the mock simulation reports a release consumed.
@@ -3374,10 +3468,18 @@ mod tests {
 
     /// Run one release whose simulation and sends go as `reply` says.
     async fn release_with(reply: SendReply) -> ReleaseRun {
+        release_run(reply, false).await
+    }
+
+    /// `release_with`, on a row with an earlier journaled attempt when `journaled`.
+    async fn release_run(reply: SendReply, journaled: bool) -> ReleaseRun {
         let (_, spec) = escrow(5_000, 5_000);
         let mock = MockStorage::new();
         push_processing_row(&mock, 1);
         mock.pending_transactions.lock().unwrap()[0].confidential = true;
+        if journaled {
+            journal_one(&mock, 1);
+        }
         let (mut state, mut server, _) = sender_reading(&spec, RELEASE_FLOOR, mock.clone()).await;
         state.confidential.as_mut().unwrap().min_context_slot = RELEASE_FLOOR;
         let mint = Pubkey::new_unique();
@@ -3429,6 +3531,26 @@ mod tests {
                         "err": {"InstructionError": [2, "ComputationalBudgetExceeded"]},
                         "logs": [], "accounts": null, "unitsConsumed": 1_400_000,
                         "returnData": null
+                    }),
+                    SendReply::SimulationBlockhashNotFound => serde_json::json!({
+                        "err": "BlockhashNotFound", "logs": [], "accounts": null,
+                        "unitsConsumed": 0, "returnData": null
+                    }),
+                    SendReply::SimulationRefused(code) => serde_json::json!({
+                        "err": {"InstructionError": [2, {"Custom": code}]},
+                        "logs": [format!(
+                            "Program {PRIVATE_CHANNEL_ESCROW_PROGRAM_ID} failed: custom program error: {code:#x}"
+                        )],
+                        "accounts": null, "unitsConsumed": 40_000, "returnData": null
+                    }),
+                    SendReply::SimulationUnreadable => serde_json::json!({
+                        "err": {"InstructionError": [2, {"Custom": 33}]},
+                        "logs": [], "accounts": null, "unitsConsumed": 40_000,
+                        "returnData": null
+                    }),
+                    SendReply::LandedOutOfComputeAtMax => serde_json::json!({
+                        "err": null, "logs": [], "accounts": null,
+                        "unitsConsumed": 1_300_000, "returnData": null
                     }),
                     _ => serde_json::json!({
                         "err": null, "logs": [], "accounts": null,
@@ -3503,9 +3625,10 @@ mod tests {
             SendReply::FailedWithUnreadableLog => statuses.with_body(failed_with(
                 serde_json::json!({"InstructionError": [0, {"Custom": 33}]}),
             )),
-            SendReply::LandedOutOfCompute => statuses.with_body(failed_with(
-                serde_json::json!({"InstructionError": [2, "ComputationalBudgetExceeded"]}),
-            )),
+            SendReply::LandedOutOfCompute | SendReply::LandedOutOfComputeAtMax => statuses
+                .with_body(failed_with(
+                    serde_json::json!({"InstructionError": [2, "ComputationalBudgetExceeded"]}),
+                )),
             _ => statuses.with_status(503).with_body("down"),
         }
         .create_async()
@@ -3535,6 +3658,7 @@ mod tests {
             mock,
             simulated,
             sent,
+            state,
         }
     }
 
@@ -3558,16 +3682,20 @@ mod tests {
         }
     }
 
-    /// A landed failure whose log cannot be read has no provable origin, so it is retried
-    /// within the budget like the public path, never refunded on the first failure.
+    /// A landed failure whose log cannot be read has no provable origin, so it is retried on
+    /// the retry budget like the public path; once that is spent it is refunded through the gate.
     #[tokio::test]
-    async fn a_failure_with_an_unreadable_log_is_retried_not_refunded() {
+    async fn a_failure_with_an_unreadable_log_is_retried_then_refunded_through_the_gate() {
         let run = release_with(SendReply::FailedWithUnreadableLog).await;
         assert_eq!(run.sends, 3, "one send per retry");
         assert_eq!(
             row_status(&run.mock, 1),
             Some(TransactionStatus::PendingRemint)
         );
+        let entry = &run.state.pending_remints[0];
+        assert!(!entry.signatures.is_empty(), "the gate checks the sends");
+        assert!(!entry.release_refused_on_chain);
+        assert!(run.state.confidential.as_ref().unwrap().parks.is_empty());
     }
 
     /// The simulation and the send are both pinned at or after our last landing, so a lagging
@@ -3581,15 +3709,95 @@ mod tests {
         }
     }
 
-    /// A node behind the floor says nothing about the release: it is resent, never refused.
+    /// A node behind the floor, or one that does not know the blockhash, says nothing about
+    /// the release: before any send the row waits in `Pending` and keeps its retry budget.
     #[tokio::test]
-    async fn a_simulation_behind_the_floor_is_resent() {
+    async fn a_transient_simulation_failure_waits_in_pending_without_spending_retries() {
         assert!(resendable(
             &crate::operator::utils::rpc_util::below_min_context_slot(1, 2)
         ));
-        let run = release_with(SendReply::SimulationBehind).await;
+        for reply in [
+            SendReply::SimulationBehind,
+            SendReply::SimulationBlockhashNotFound,
+        ] {
+            let run = release_with(reply).await;
+            assert_eq!(run.attempts, 1, "no resend in place");
+            assert_eq!(run.sends, 0, "nothing goes out unsimulated");
+            assert_eq!(row_status(&run.mock, 1), Some(TransactionStatus::Pending));
+            assert!(run.mock.pending_transactions.lock().unwrap()[0]
+                .not_before
+                .is_some());
+            assert!(run.state.retry_counts.is_empty(), "no retry spent");
+            assert!(run.state.pending_remints.is_empty());
+        }
+    }
+
+    /// After a journaled attempt the row cannot go back to `Pending`: it is resent on the
+    /// retry budget and then refunded through the gate.
+    #[tokio::test]
+    async fn a_transient_simulation_failure_after_a_send_ends_on_the_gate() {
+        let run = release_run(SendReply::SimulationBehind, true).await;
         assert_eq!(run.attempts, 3, "one attempt per retry");
-        assert_eq!(run.sends, 0, "nothing goes out unsimulated");
+        assert_eq!(run.sends, 0);
+        assert_eq!(
+            row_status(&run.mock, 1),
+            Some(TransactionStatus::PendingRemint)
+        );
+        assert_eq!(run.state.pending_remints[0].signatures.len(), 1);
+    }
+
+    /// A refusal seen only in simulation on a row that never broadcast is refunded at once,
+    /// with no signature to wait on: the wallet left the allow list (20), withdrawals are
+    /// blocked (16), the recipient is invalid (24), the mint is paused (32).
+    #[tokio::test]
+    async fn a_refusal_in_simulation_on_a_never_sent_row_is_refunded() {
+        for code in [20, 32, 16, 24] {
+            let run = release_with(SendReply::SimulationRefused(code)).await;
+            assert_eq!(run.sends, 0, "code {code}");
+            assert_eq!(
+                row_status(&run.mock, 1),
+                Some(TransactionStatus::PendingRemint),
+                "code {code}"
+            );
+            let entry = &run.state.pending_remints[0];
+            assert!(entry.signatures.is_empty(), "code {code}");
+            assert!(
+                entry.deadline <= Utc::now(),
+                "code {code}: no finality wait"
+            );
+            assert!(
+                run.mock.pending_transactions.lock().unwrap()[0].release_refused_on_chain,
+                "code {code}: kept across a restart"
+            );
+        }
+    }
+
+    /// The same refusal on a row with an earlier journaled attempt still waits on the gate.
+    #[tokio::test]
+    async fn a_refusal_in_simulation_after_a_send_goes_through_the_gate() {
+        let run = release_run(SendReply::SimulationRefused(20), true).await;
+        assert_eq!(run.sends, 0);
+        assert_eq!(
+            row_status(&run.mock, 1),
+            Some(TransactionStatus::PendingRemint)
+        );
+        let entry = &run.state.pending_remints[0];
+        assert_eq!(entry.signatures.len(), 1);
+        assert!(!entry.release_refused_on_chain);
+    }
+
+    /// A refusal with no provable origin seen only in simulation spends the retry budget;
+    /// with nothing ever sent it is then refunded directly, not sent to manual review.
+    #[tokio::test]
+    async fn retries_spent_with_nothing_sent_refund_directly() {
+        let run = release_with(SendReply::SimulationUnreadable).await;
+        assert_eq!(run.attempts, 3, "one attempt per retry");
+        assert_eq!(run.sends, 0);
+        assert_eq!(
+            row_status(&run.mock, 1),
+            Some(TransactionStatus::PendingRemint)
+        );
+        assert!(run.state.pending_remints[0].signatures.is_empty());
     }
 
     /// The release is simulated at the maximum, then sent with what it used plus 20%.
@@ -3602,33 +3810,20 @@ mod tests {
         );
         assert_eq!(release_compute_limit(None), CU_CONFIDENTIAL_RELEASE_MAX);
         let run = release_with(SendReply::AcceptedThenStatusFails).await;
-        let limit_of = |body: &serde_json::Value| {
-            let wire = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                body["params"][0].as_str().unwrap(),
-            )
-            .unwrap();
-            let first = wire.len() - usize::from(wire[1]) * 64;
-            // The message without its version prefix.
-            solana_sdk::message::v1::deserialize(&wire[1..first])
-                .unwrap()
-                .config
-                .compute_unit_limit
-        };
         assert_eq!(
-            limit_of(&run.simulated[0]),
+            compute_limit_of(&run.simulated[0]),
             Some(CU_CONFIDENTIAL_RELEASE_MAX)
         );
-        assert_eq!(limit_of(&run.sent[0]), Some(600_000));
+        assert_eq!(compute_limit_of(&run.sent[0]), Some(600_000));
     }
 
-    /// Running out of compute, in the simulation or on-chain, parks with its own label: no
-    /// resend passes it and it says nothing about the hook's `u64::MAX`.
+    /// Running out of compute in the simulation (run at the maximum) or in a send at the
+    /// maximum parks with its own label: no resend passes it.
     #[tokio::test]
-    async fn running_out_of_compute_parks_as_compute_exceeded() {
+    async fn running_out_of_compute_at_the_maximum_parks_as_compute_exceeded() {
         for reply in [
             SendReply::SimulatedOutOfCompute,
-            SendReply::LandedOutOfCompute,
+            SendReply::LandedOutOfComputeAtMax,
         ] {
             let run = release_with(reply).await;
             assert_eq!(run.attempts, 1, "no resend");
@@ -3639,18 +3834,61 @@ mod tests {
                 _ => TransactionStatus::PendingRemint,
             };
             assert_eq!(row_status(&run.mock, 1), Some(status));
-            let labels = run
-                .mock
-                .confidential_sender
-                .lock()
-                .unwrap()
-                .park_labels
-                .clone();
-            assert_eq!(
-                labels.get(&1).map(String::as_str),
-                Some(metrics::BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED)
-            );
+            if reply == SendReply::LandedOutOfComputeAtMax {
+                assert_eq!(
+                    compute_limit_of(&run.sent[0]),
+                    Some(CU_CONFIDENTIAL_RELEASE_MAX)
+                );
+            }
+            assert_compute_park(&run);
         }
+    }
+
+    /// A release sent below the maximum that runs out of compute on chain is resent once at
+    /// the maximum, journaled as usual; only that send failing too parks it.
+    #[tokio::test]
+    async fn running_out_of_compute_below_the_maximum_resends_once_at_the_maximum() {
+        let run = release_with(SendReply::LandedOutOfCompute).await;
+        assert_eq!(run.sends, 2);
+        assert_eq!(compute_limit_of(&run.sent[0]), Some(600_000));
+        assert_eq!(
+            compute_limit_of(&run.sent[1]),
+            Some(CU_CONFIDENTIAL_RELEASE_MAX)
+        );
+        assert_eq!(
+            row_status(&run.mock, 1),
+            Some(TransactionStatus::PendingRemint)
+        );
+        assert_compute_park(&run);
+    }
+
+    fn assert_compute_park(run: &ReleaseRun) {
+        let labels = run
+            .mock
+            .confidential_sender
+            .lock()
+            .unwrap()
+            .park_labels
+            .clone();
+        assert_eq!(
+            labels.get(&1).map(String::as_str),
+            Some(metrics::BAIL_REASON_CONFIDENTIAL_COMPUTE_EXCEEDED)
+        );
+    }
+
+    /// The compute limit a sent or simulated v1 release carries.
+    fn compute_limit_of(body: &serde_json::Value) -> Option<u32> {
+        let wire = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            body["params"][0].as_str().unwrap(),
+        )
+        .unwrap();
+        let first = wire.len() - usize::from(wire[1]) * 64;
+        // The message without its version prefix.
+        solana_sdk::message::v1::deserialize(&wire[1..first])
+            .unwrap()
+            .config
+            .compute_unit_limit
     }
 
     #[tokio::test]
@@ -3686,7 +3924,7 @@ mod tests {
     /// A 9-decimal mint: a 5,000-token deposit raced our apply and the operator restarted
     /// before the repair landed. The AES copy is stale, the gap is past the search and the
     /// apply is no longer in memory; the available the sender verified before the restart
-    /// still opens the ciphertext, so the mint keeps a provable balance.
+    /// still opens the ciphertext, even after a recover that found nothing to recover.
     #[tokio::test]
     async fn after_a_restart_the_last_verified_available_still_proves_the_balance() {
         let keys = cts::keys();
@@ -3719,6 +3957,26 @@ mod tests {
             .record_confidential_mint_state(&spec.mint.to_string(), available, 60)
             .await
             .unwrap();
+        // Ops ran confidential-recover on the mint only to clear poisoning; nothing recovered.
+        let lock = state
+            .storage
+            .try_acquire_live_lock(
+                crate::storage::common::storage::live_lock::LiveLockMode::Exclusive,
+                "recover",
+                tokio_util::sync::CancellationToken::new(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let report = crate::indexer::confidential::recover_mint(
+            &state.storage,
+            &lock,
+            &keys,
+            &spec.mint.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.recovered, 0);
         let (mut state, _server, _) = sender_reading(&spec, 10, mock).await;
         let storage = state.storage.clone();
         seed_mint_states(state.confidential.as_mut().unwrap(), &storage).await;
@@ -3726,6 +3984,52 @@ mod tests {
         assert_eq!(
             verified_available(&state.rpc_client, conf, &spec.mint, &view).await,
             Some((available, CandidateSource::Local))
+        );
+    }
+
+    /// At boot each mint's last landed apply is candidate (d) again, as it was in memory.
+    #[tokio::test]
+    async fn a_restart_restores_our_last_landed_apply_as_candidate_d() {
+        let mock = MockStorage::new();
+        let storage = Storage::Mock(mock.clone());
+        let mint = Pubkey::new_unique();
+        let signature = Signature::new_unique();
+        for (sig, slot) in [(Signature::new_unique(), 40), (signature, 50)] {
+            let id = storage
+                .journal_operator_attempt(&OperatorAttempt {
+                    id: 0,
+                    mint: mint.to_string(),
+                    kind: "background".into(),
+                    signature: sig.to_string(),
+                    last_valid_block_height: 100,
+                    blockhash_slot: 9,
+                    prior_available: Some(slot),
+                    applied_pending: Some(7),
+                    status: attempt_status::SENT.into(),
+                    landed_slot: None,
+                    created_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+            storage
+                .settle_operator_attempt(id, Some(slot))
+                .await
+                .unwrap();
+        }
+        let mut conf = ConfidentialSender::new(
+            Arc::new(cts::keys()),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        seed_last_applies(&mut conf, &storage).await;
+        assert_eq!(
+            conf.books[&mint].last_apply,
+            Some(LastApply {
+                prior_available: 50,
+                signature,
+                applied_pending: Some(7),
+            })
         );
     }
 
@@ -4175,7 +4479,7 @@ mod tests {
             direction,
             amount,
             expected_available: expected,
-            expected_public: None,
+            request_id: "r".into(),
             status: rebalance_status::PENDING.into(),
             signature: None,
             error: None,
@@ -4204,24 +4508,16 @@ mod tests {
             rebalance_decision(&too_much, Some(1_000), 0),
             RebalanceDecision::Refuse(_)
         ));
-        let mut to_confidential = rebalance(RebalanceDirection::ToConfidential, 50, 1_000);
-        to_confidential.expected_public = Some(50);
-        assert_eq!(
-            rebalance_decision(&to_confidential, Some(1_000), 50),
-            RebalanceDecision::Execute
-        );
+        // A move to confidential needs only enough public; its id keeps it from running twice.
+        let to_confidential = rebalance(RebalanceDirection::ToConfidential, 50, 1_000);
+        for (available, public) in [(1_000, 50), (900, 50), (1_000, 80)] {
+            assert_eq!(
+                rebalance_decision(&to_confidential, Some(available), public),
+                RebalanceDecision::Execute
+            );
+        }
         assert!(matches!(
             rebalance_decision(&to_confidential, Some(1_000), 49),
-            RebalanceDecision::Refuse(_)
-        ));
-        // A move to confidential spends public, so only the public balance guards it.
-        assert_eq!(
-            rebalance_decision(&to_confidential, Some(900), 50),
-            RebalanceDecision::Execute
-        );
-        to_confidential.expected_public = None;
-        assert!(matches!(
-            rebalance_decision(&to_confidential, Some(1_000), 50),
             RebalanceDecision::Refuse(_)
         ));
     }
@@ -4240,9 +4536,10 @@ mod tests {
                 RebalanceDirection::ToPublic,
                 300,
                 1_000,
-                None,
+                "r",
             )
             .await
+            .unwrap()
             .unwrap();
         let mut request = storage
             .get_rebalance_requests(rebalance_status::PENDING)
@@ -4260,9 +4557,10 @@ mod tests {
         assert!(refused[0].signature.is_none(), "nothing was sent");
     }
 
+    /// Ops runs `--to-confidential 200`, sees it complete, then reruns it thinking it failed:
+    /// the rerun carries the same id and is refused, whatever the first request's state.
     #[tokio::test]
-    async fn a_rerun_of_a_move_to_confidential_refuses_instead_of_moving_twice() {
-        // Available 1,000 and public 500; the operator asks to move 200 twice.
+    async fn a_rerun_with_the_same_id_is_refused_whatever_the_first_did() {
         let keys = cts::keys();
         let mut sim = SimAccount::new(&keys);
         sim.credit(&keys, 1_000, 0);
@@ -4270,7 +4568,7 @@ mod tests {
         let spec = AccountSpec::healthy(&keys, &sim, 500, 1_000);
         let mock = MockStorage::new();
         let (state, _server, instance) = sender_reading(&spec, 10, mock.clone()).await;
-        for _ in 0..2 {
+        let request = |id: &'static str| {
             request_rebalance(
                 &state.storage,
                 &state.rpc_client,
@@ -4279,30 +4577,71 @@ mod tests {
                 &spec.mint,
                 RebalanceDirection::ToConfidential,
                 200,
+                id,
             )
+        };
+        let first = request("r1").await.unwrap();
+        for to in [
+            rebalance_status::COMPLETED,
+            rebalance_status::REFUSED,
+            rebalance_status::FAILED,
+        ] {
+            mock.confidential_sender.lock().unwrap().rebalance_requests[0].status = to.into();
+            let rerun = request("r1").await.unwrap_err();
+            assert!(rerun.contains("r1"), "{rerun}");
+        }
+        let all = state
+            .storage
+            .get_rebalance_requests(rebalance_status::FAILED)
             .await
             .unwrap();
-        }
-        let requests = state
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].id, all[0].request_id.as_str()), (first, "r1"));
+        // A new id is a new request.
+        request("r2").await.unwrap();
+    }
+
+    /// On a busy mint a public deposit lands between the request and its run: the move still
+    /// runs, since the public balance still covers it.
+    #[tokio::test]
+    async fn a_move_to_confidential_runs_after_the_public_balance_grew() {
+        let keys = cts::keys();
+        let mut sim = SimAccount::new(&keys);
+        sim.credit(&keys, 1_000, 0);
+        sim.apply();
+        let spec = AccountSpec::healthy(&keys, &sim, 500, 1_000);
+        let mock = MockStorage::new();
+        let (state, _server, instance) = sender_reading(&spec, 10, mock.clone()).await;
+        request_rebalance(
+            &state.storage,
+            &state.rpc_client,
+            &keys,
+            &instance,
+            &spec.mint,
+            RebalanceDirection::ToConfidential,
+            200,
+            "busy",
+        )
+        .await
+        .unwrap();
+        let request = state
             .storage
             .get_rebalance_requests(rebalance_status::PENDING)
             .await
-            .unwrap();
-        assert!(requests.iter().all(|r| r.expected_public == Some(500)));
+            .unwrap()
+            .remove(0);
 
-        // The first move landed: public is 300 and available is still 1,000.
-        let mut moved = spec.clone();
-        moved.public = 300;
-        let (mut state, _server, _) = sender_reading(&moved, 10, mock).await;
-        execute_rebalance(&mut state, &requests[1]).await.unwrap();
-        let refused = state
+        let mut deposited = spec.clone();
+        deposited.public = 800;
+        let (mut state, _server, _) = sender_reading(&deposited, 10, mock).await;
+        // The mock node cannot take the send; only the decision matters here.
+        let _ = execute_rebalance(&mut state, &request).await;
+        assert!(state
             .storage
             .get_rebalance_requests(rebalance_status::REFUSED)
             .await
-            .unwrap();
-        assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].id, requests[1].id);
-        assert!(refused[0].signature.is_none(), "nothing was sent");
+            .unwrap()
+            .is_empty());
     }
 
     // ---- 26: a request left `sent` is settled only once its attempt can no longer land ----
@@ -4353,8 +4692,15 @@ mod tests {
     async fn sent_rebalance(mock: &MockStorage) -> i64 {
         let storage = Storage::Mock(mock.clone());
         let id = storage
-            .insert_rebalance_request("m", RebalanceDirection::ToConfidential, 5, 10, None)
+            .insert_rebalance_request(
+                "m",
+                RebalanceDirection::ToConfidential,
+                5,
+                10,
+                &Signature::new_unique().to_string(),
+            )
             .await
+            .unwrap()
             .unwrap();
         assert!(storage
             .claim_rebalance_request(id, &Signature::new_unique().to_string(), 200, 50)
@@ -4463,8 +4809,9 @@ mod tests {
         let mock = MockStorage::new();
         let storage = Storage::Mock(mock.clone());
         let id = storage
-            .insert_rebalance_request("m", RebalanceDirection::ToConfidential, 5, 10, None)
+            .insert_rebalance_request("m", RebalanceDirection::ToConfidential, 5, 10, "r")
             .await
+            .unwrap()
             .unwrap();
         storage
             .transition_rebalance_request(
@@ -4526,6 +4873,7 @@ mod tests {
             &mint,
             RebalanceDirection::ToPublic,
             400,
+            "r",
         )
         .await
         .unwrap();
@@ -4555,6 +4903,7 @@ mod tests {
                 &mint,
                 RebalanceDirection::ToPublic,
                 amount,
+                "r",
             )
             .await
             .is_err());
@@ -5224,8 +5573,9 @@ mod tests {
         let (mut state, _server, mint, _) = apply_chain(mock.clone(), Broadcast::SendFails).await;
         let storage = Storage::Mock(mock.clone());
         let id = storage
-            .insert_rebalance_request(&mint.to_string(), RebalanceDirection::ToPublic, 5, 10, None)
+            .insert_rebalance_request(&mint.to_string(), RebalanceDirection::ToPublic, 5, 10, "r")
             .await
+            .unwrap()
             .unwrap();
         storage
             .claim_rebalance_request(id, &Signature::new_unique().to_string(), 100, 11)

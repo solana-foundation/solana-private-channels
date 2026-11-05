@@ -1004,6 +1004,10 @@ impl Env {
                 &mint,
                 direction,
                 amount,
+                &format!(
+                    "{mint}-{}",
+                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
             )
             .await?,
         )

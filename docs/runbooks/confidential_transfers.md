@@ -21,8 +21,10 @@ How it works, in short:
 - The withdraw operator's sender is the only process that changes the escrow's
   confidential balance: releases, applies, AES repairs and rebalances all run in it,
   one at a time. After each of its transactions lands it keeps the available balance it
-  verified in `confidential_mint_state`, so a restart still has a value the opening check
-  can confirm; `confidential-recover` and an escrow resync clear it.
+  verified in `confidential_mint_state`, and at boot also takes back its last landed
+  apply from the apply journal, so a restart still has a value the opening check can
+  confirm. `confidential-recover` and an escrow resync keep it: it is checked against
+  the ciphertext before use, so a stale value is skipped, never spent.
 - Every park goes through the journal and finality gate, so a parked row never
   hides a release that later lands. A park is not a refund: the user's channel
   tokens were burned when the row was created.
@@ -63,13 +65,15 @@ indexer and both operators refuse to start without the key that account holds.
 
 A parked confidential withdrawal is a `manual_review` row whose
 `confidential_park_label` column holds the label, for pre-flight parks and parks after a
-send alike. The alert webhook's `error_message` starts with it too; the database has no
+send alike. A public release parked `public_balance_low` keeps its label in the same
+column. The alert webhook's `error_message` starts with it too; the database has no
 `error_message` column.
 
 ```sql
-SELECT id, withdrawal_nonce, mint, confidential_park_label, updated_at
+SELECT id, withdrawal_nonce, mint, confidential, confidential_park_label, updated_at
   FROM transactions
- WHERE confidential AND status = 'manual_review'
+ WHERE status = 'manual_review'
+   AND (confidential OR confidential_park_label = 'public_balance_low')
  ORDER BY updated_at;
 ```
 
@@ -197,14 +201,16 @@ The escrow's verified available balance is below the amount even after applying
 pending. Public funds of the mint may cover it.
 
 1. Move public funds into the confidential balance with a rebalance request:
-   `indexer rebalance --mint <mint> --to-confidential <amount>`. The request records
-   the escrow's public balance in `expected_public`; the sender executes it, journaled
-   like a release, and refuses it if the public balance differs (a `--to-public`
-   request is guarded the same way by the available balance, `expected_available`).
-   Running the same command twice therefore moves the amount once: the second request
-   is refused once the first has landed. A request left `sent` becomes `completed` once its
-   transaction finalizes, and `failed` only after its blockhash expired and the
-   signature is absent from history; until then it stays `sent`.
+   `indexer rebalance --mint <mint> --to-confidential <amount> --id <id>`. Pick a new id
+   for each move you mean, and keep it when you rerun the same move: a second request
+   with an id already used is refused, whatever happened to the first, so a rerun never
+   moves the amount twice. The sender executes it, journaled like a release, and refuses
+   it only if the public balance no longer covers the amount. A `--to-public` request
+   also records the available balance it was made against (`expected_available`) and is
+   refused if that changed before it ran, for example after a release or an apply on a
+   busy mint; check the balance and request again with a new id. A request left `sent`
+   becomes `completed` once its transaction finalizes, and `failed` only after its
+   blockhash expired and the signature is absent from history; until then it stays `sent`.
 2. Re-arm the row. Or release publicly if the public balance covers it.
 
 ### public_balance_low
@@ -212,7 +218,7 @@ pending. Public funds of the mint may cover it.
 A public release on a confidential-configured mint has more than the escrow's
 public balance to pay, because funds sit in the confidential balance.
 
-1. `indexer rebalance --mint <mint> --to-public <amount>`.
+1. `indexer rebalance --mint <mint> --to-public <amount> --id <id>`.
 2. Re-arm the row.
 
 ### confidential_stale_proof
@@ -249,11 +255,12 @@ these can only be about the escrow's own token account for the mint. Nothing mov
 
 ### confidential_compute_exceeded
 
-The release ran out of compute, in the simulation or on-chain, in the escrow or in the
-mint's transfer hook. The sender simulates every release at 1,400,000 compute units,
-the transaction maximum, and sends it with what it used plus a fifth, so this means the
-release does not fit one transaction at all, usually because the issuer's hook is too
-expensive. A resend cannot pass it.
+The release ran out of compute at 1,400,000 compute units, the transaction maximum, in
+the escrow or in the mint's transfer hook. The sender simulates every release at the
+maximum and sends it with what it used plus a fifth; a send that then runs out of compute
+on chain is resent once at the maximum. It parks only when the simulation or a send at
+the maximum runs out, so the release does not fit one transaction at all, usually
+because the issuer's hook is too expensive. A resend cannot pass it.
 
 - Release publicly: rebalance to public if needed, then clear `confidential` and
   re-arm. A public release runs the hook with the real amount and may cost less.

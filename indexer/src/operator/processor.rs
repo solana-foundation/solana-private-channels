@@ -6939,7 +6939,17 @@ mod tests {
             short.escrow = Some(account_with_confidential(&escrow));
             short.destination = Some(create_mock_token_2022_account_data());
             let _ = destination;
-            assert_parked(short.run().await, metrics::BAIL_REASON_PUBLIC_BALANCE_LOW);
+            let mock = MockStorage::new();
+            assert_parked(
+                short.run_on(Arc::new(Storage::Mock(mock.clone()))).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+            // The public row keeps its label too, so the runbook query finds it.
+            let labels = mock.confidential_sender.lock().unwrap().park_labels.clone();
+            assert_eq!(
+                labels.get(&9).map(String::as_str),
+                Some(metrics::BAIL_REASON_PUBLIC_BALANCE_LOW)
+            );
 
             // Enough public balance: released publicly.
             let mut enough = Case::healthy();

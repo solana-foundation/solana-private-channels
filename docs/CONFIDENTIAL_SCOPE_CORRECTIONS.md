@@ -89,11 +89,16 @@ are right.
   five, then park `confidential_stale_proof`; Token-2022 25 and 39, and escrow 25 to 29, park
   `destination_not_ready`; Token-2022 17 and 24 can only be about the escrow's own account,
   since the escrow checks the destination first, and park `confidential_escrow_account_not_ready`;
-  running out of compute parks `confidential_compute_exceeded`; escrow 22 parks
-  `confidential_mint_not_configured`. A custom error whose program cannot be read from the log is
-  retried, never refunded. Errors are classified by origin from the logs, since escrow
-  and Token-2022 codes collide. Every park after a send goes through the journal and finality
-  gate, so a late-landing attempt is seen before any remint. A timeout resend reuses its proofs.
+  running out of compute at the maximum parks `confidential_compute_exceeded` (a send below it
+  is resent once at the maximum first); escrow 22 parks `confidential_mint_not_configured`. A
+  custom error whose program cannot be read from the log is retried on the retry budget, then
+  refunded through the journal gate like the public path. Errors are classified by origin from
+  the logs, since escrow and Token-2022 codes collide. Every park after a send goes through the
+  journal and finality gate, so a late-landing attempt is seen before any remint. A timeout
+  resend reuses its proofs. Each release is simulated before it is journaled: a refusal there
+  on a row that never broadcast is refunded at once with no signature to wait on, while a row
+  with an earlier attempt still goes through the gate; a simulation that cannot answer (node
+  behind, unknown blockhash) sends the row back to `Pending` with its backoff.
 - **Scope:** "transfer-hook mints: supported, for deposits and releases".
   **Shipped with a limit:** Token-2022 calls the hook with `u64::MAX`; a hook that refuses it, or
   whose extras cannot be resolved for it, parks `hook_unresolvable`, and the withdrawal settles
@@ -105,11 +110,12 @@ are right.
 ## Rebalancing
 
 - **Scope:** a human runs a rebalance CLI that signs `MoveToConfidential` and `MoveToPublic`.
-  **Shipped:** `indexer rebalance --mint M --to-public N | --to-confidential N` inserts a request
-  row with the balance that direction spends: the available balance for `--to-public`, the
-  public balance (`expected_public`) for `--to-confidential`. The withdraw sender executes it,
-  journaled like a release, and refuses it if that balance differs. No second signer process,
-  and running the same request twice moves the amount once.
+  **Shipped:** `indexer rebalance --mint M --to-public N | --to-confidential N --id ID` inserts a
+  request row under the operator's id, unique in the table: a second request with the same id is
+  refused whatever the first one's state, so a rerun moves the amount once. The withdraw sender
+  executes it, journaled like a release. `--to-confidential` is refused only when the public
+  balance no longer covers the amount; `--to-public` is refused when the available balance differs
+  from the one it was made against. No second signer process.
 
 ## Open points the scope listed, now settled
 

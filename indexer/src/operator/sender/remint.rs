@@ -1021,7 +1021,13 @@ async fn process_pending_remints_within(
         // Classify the stored signatures against on-chain state. This runs on
         // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
         // not source_rpc_client which only the remint MintTo uses.
-        match classify_signatures(&state.dest_finality(), &entry.signatures).await {
+        // No signature only for a refusal before any send: there is nothing to classify.
+        let finality = if entry.signatures.is_empty() && entry.release_refused_on_chain {
+            SigFinality::Dead
+        } else {
+            classify_signatures(&state.dest_finality(), &entry.signatures).await
+        };
+        match finality {
             // Case 1: a sig finalized successfully, the withdrawal landed.
             // Nothing local to repair: the chain is the only record of consumption.
             SigFinality::Landed(sig) => {
@@ -2980,6 +2986,37 @@ mod tests {
             1,
             "an on-chain refusal is proof enough to return the tokens"
         );
+    }
+
+    /// A refund for a release refused before any send has no signature: the gate goes straight
+    /// to the bitmap and the payout record, with no signature status read.
+    #[tokio::test]
+    async fn a_refusal_before_any_send_is_reminted_without_a_signature_read() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSignatureStatuses"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        cover_release_window(&mock).await;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].signatures.clear();
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert_eq!(journaled_attempts(&mock, 99), 1, "the remint was sent");
+        statuses.assert_async().await;
     }
 
     /// Record a release for `nonce` the way the indexer does when it indexes one.

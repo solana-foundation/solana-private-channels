@@ -700,8 +700,19 @@ impl ResyncService {
             ));
         }
 
-        // Pre-flight 1a: the key check every service runs at startup. Without the key the
-        // escrow accounts hold, the rebuild would fail late or rebuild deposits as poisoned.
+        // Pre-flight 2: nothing this resync deletes may be in flight or below genesis, and a
+        // withdraw resync needs local proof no nonce was spent. Local reads, so before any RPC.
+        let blockers = self
+            .storage
+            .get_resync_blockers(self.program_type.owned_transaction_type())
+            .await?;
+        if let Some(refusal) = wipe_blocker(self.program_type, &blockers, genesis_slot) {
+            error!(?blockers, "Refusing to resync: {}", refusal);
+            return Err(refusal.into());
+        }
+
+        // Pre-flight 2a: the key check every service runs at startup, the first RPC read.
+        // Without the key the escrow accounts hold, the rebuild would make poisoned deposits.
         if let (ProgramType::Escrow, Some(instance)) = (self.program_type, self.escrow_instance_id)
         {
             let source = match &self.escrow_key_source {
@@ -722,17 +733,6 @@ impl ResyncService {
             )
             .await
             .inspect_err(|e| error!("Refusing to resync: {}", e))?;
-        }
-
-        // Pre-flight 2: nothing this resync deletes may be in flight or below genesis, and a
-        // withdraw resync needs local proof no nonce was spent. Local reads, so before any RPC.
-        let blockers = self
-            .storage
-            .get_resync_blockers(self.program_type.owned_transaction_type())
-            .await?;
-        if let Some(refusal) = wipe_blocker(self.program_type, &blockers, genesis_slot) {
-            error!(?blockers, "Refusing to resync: {}", refusal);
-            return Err(refusal.into());
         }
 
         // Pre-flight 2b: a withdraw rebuild restarts the nonce sequence, so the chain must
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     /// An escrow account configured under a key we do not have loaded: the services refuse
-    /// to start on it, and so does a resync, before it reads or deletes anything.
+    /// to start on it, and so does a resync into an empty database, before it deletes anything.
     #[tokio::test]
     async fn run_refuses_escrow_resync_without_the_key_the_escrow_accounts_hold() {
         use crate::indexer::confidential::EscrowKeySource;
@@ -1111,18 +1111,16 @@ mod tests {
             async fn configured_key(&self, _: &Pubkey) -> Result<Option<[u8; 32]>, String> {
                 Ok(Some([7; 32]))
             }
+
+            async fn configured_escrow_keys(
+                &self,
+                _: &Pubkey,
+            ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
+                Ok(vec![(Pubkey::new_unique(), [7; 32])])
+            }
         }
+        // A fresh database: no mint is listed, the configured account is only on chain.
         let mock = MockStorage::new();
-        let mint = Pubkey::new_unique().to_string();
-        mock.mints.lock().unwrap().insert(
-            mint.clone(),
-            crate::storage::common::models::DbMint::new(
-                mint,
-                6,
-                spl_token_2022::ID.to_string(),
-                crate::storage::common::amount::TokenAmount(0),
-            ),
-        );
         let rpc_poller = Arc::new(RpcPoller::new(
             "http://127.0.0.1:1".to_string(),
             UiTransactionEncoding::Json,
@@ -1733,6 +1731,25 @@ mod tests {
     }
 
     /// Escrow service with a scope set and every RPC on a dead port, so any network step errors.
+    /// No escrow account is configured on chain, so the key check passes.
+    fn no_escrow_accounts() -> Arc<dyn crate::indexer::confidential::EscrowKeySource> {
+        struct NoAccounts;
+        #[async_trait::async_trait]
+        impl crate::indexer::confidential::EscrowKeySource for NoAccounts {
+            async fn configured_key(&self, _: &Pubkey) -> Result<Option<[u8; 32]>, String> {
+                Ok(None)
+            }
+
+            async fn configured_escrow_keys(
+                &self,
+                _: &Pubkey,
+            ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
+                Ok(Vec::new())
+            }
+        }
+        Arc::new(NoAccounts)
+    }
+
     fn escrow_service(storage: Arc<Storage>) -> ResyncService {
         let rpc_poller = Arc::new(RpcPoller::new(
             "http://127.0.0.1:1".to_string(),
@@ -1754,6 +1771,7 @@ mod tests {
             backfill_config,
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO)
     }
 
@@ -2027,6 +2045,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         match service.run(genesis).await {
@@ -2115,6 +2134,7 @@ mod tests {
                 },
                 Some(Pubkey::new_unique()),
             )
+            .with_escrow_key_source(no_escrow_accounts())
             .with_stale_holder_grace(Duration::ZERO);
 
             let result = service.run(genesis).await;
@@ -2186,6 +2206,7 @@ mod tests {
                 },
                 Some(Pubkey::new_unique()),
             )
+            .with_escrow_key_source(no_escrow_accounts())
             .with_stale_holder_grace(Duration::ZERO);
 
             match service.run(genesis).await {
@@ -2251,6 +2272,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         service
@@ -2294,6 +2316,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         match service.run(genesis).await {
@@ -2505,6 +2528,7 @@ mod tests {
             backfill_config,
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO)
         .with_index_catch_up_budget(Duration::ZERO)
         .with_channel_reconcile(ChannelReconcileConfig {

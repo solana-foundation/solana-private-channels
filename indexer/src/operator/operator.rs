@@ -2444,6 +2444,15 @@ mod tests {
             )
             .create_async()
             .await;
+        // The boot key check lists the escrow accounts; none is configured.
+        destination
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getTokenAccountsByOwner"}),
+            ))
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":[]}}"#)
+            .create_async()
+            .await;
         let mut source = mockito::Server::new_async().await;
         let source_balance = source
             .mock("POST", "/")
@@ -2544,45 +2553,54 @@ mod tests {
 
     // ---- Confidential keys at boot: the same check as the escrow indexer ----
 
-    /// Storage listing one Token-2022 mint, and a Solana RPC whose escrow account for it
-    /// is configured under `configured` (unconfigured when `None`).
+    /// A Solana RPC listing `instance`'s escrow account for one Token-2022 mint, configured
+    /// under `configured` (no confidential extension when `None`).
     async fn configured_escrow(
         configured: Option<[u8; 32]>,
+        instance: &solana_sdk::pubkey::Pubkey,
     ) -> (Storage, Arc<RpcClientWithRetry>, mockito::ServerGuard) {
         use crate::operator::utils::mint_util::confidential_fixtures::{
-            account_with_confidential, rpc_account, AccountSpec,
+            account_with_confidential, AccountSpec,
         };
         use crate::storage::common::storage::mock::MockStorage;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         use private_channel_confidential::test_support::{self as cts, SimAccount};
 
         let keys = cts::keys();
         let mut spec = AccountSpec::healthy(&keys, &SimAccount::new(&keys), 0, 0);
-        let value = match configured {
+        spec.owner = *instance;
+        let accounts = match configured {
             Some(elgamal) => {
                 spec.elgamal_pubkey = elgamal;
-                rpc_account(&spl_token_2022::ID, &account_with_confidential(&spec), 10)
+                let ata =
+                    spl_associated_token_account::get_associated_token_address_with_program_id(
+                        instance,
+                        &spec.mint,
+                        &spl_token_2022::ID,
+                    );
+                vec![serde_json::json!({"pubkey": ata.to_string(), "account": {
+                    "data": [STANDARD.encode(account_with_confidential(&spec)), "base64"],
+                    "owner": spl_token_2022::ID.to_string(),
+                    "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+                }})]
             }
-            None => serde_json::json!({"context": {"slot": 10}, "value": null}),
+            None => Vec::new(),
         };
-        let mock = MockStorage::new();
-        mock.mints.lock().unwrap().insert(
-            spec.mint.to_string(),
-            crate::storage::common::models::DbMint::new(
-                spec.mint.to_string(),
-                6,
-                spl_token_2022::ID.to_string(),
-                crate::storage::common::amount::TokenAmount(0),
-            ),
-        );
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(
-                serde_json::json!({"method": "getAccountInfo"}),
+                serde_json::json!({"method": "getTokenAccountsByOwner"}),
             ))
-            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": value}).to_string())
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {
+                    "context": {"slot": 10}, "value": accounts
+                }})
+                .to_string(),
+            )
             .create_async()
             .await;
+        let mock = MockStorage::new();
         let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
             server.url(),
             RetryConfig {
@@ -2599,7 +2617,8 @@ mod tests {
     async fn operators_refuse_to_boot_without_the_key_of_a_configured_escrow_account() {
         use private_channel_confidential::test_support as cts;
         let instance = solana_sdk::pubkey::Pubkey::new_unique();
-        let (storage, rpc, _server) = configured_escrow(Some(cts::keys().pubkey())).await;
+        let (storage, rpc, _server) =
+            configured_escrow(Some(cts::keys().pubkey()), &instance).await;
 
         for keys in [None, Some(cts::other_keys())] {
             let err = check_confidential_keys(&storage, keys.as_ref(), &rpc, &instance)
@@ -2620,7 +2639,7 @@ mod tests {
     #[tokio::test]
     async fn operators_boot_without_a_key_until_an_escrow_account_is_configured() {
         let instance = solana_sdk::pubkey::Pubkey::new_unique();
-        let (storage, rpc, _server) = configured_escrow(None).await;
+        let (storage, rpc, _server) = configured_escrow(None, &instance).await;
         check_confidential_keys(&storage, None, &rpc, &instance)
             .await
             .expect("nothing configured, nothing required");

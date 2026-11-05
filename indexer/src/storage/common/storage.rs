@@ -336,10 +336,9 @@ impl Storage {
     pub async fn recover_confidential_fenced(
         &self,
         lock: &live_lock::LiveLockGuard,
-        mint: &str,
         recovered: Vec<(i64, crate::storage::common::amount::TokenAmount)>,
     ) -> Result<(), StorageError> {
-        confidential_deposits::recover_confidential_fenced(self, lock, mint, recovered).await
+        confidential_deposits::recover_confidential_fenced(self, lock, recovered).await
     }
 
     /// The release recorded for `nonce`, if the indexer has seen one.

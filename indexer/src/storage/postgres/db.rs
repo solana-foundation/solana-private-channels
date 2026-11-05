@@ -1308,8 +1308,8 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        // Operator rebalances between the escrow's public and confidential balances.
-        // `expected_available` makes a rerun after a crash refuse instead of moving twice.
+        // Operator rebalances between the escrow's public and confidential balances. The
+        // operator's `request_id` is used once, so a rerun of the same request never runs.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS rebalance_requests (
@@ -1328,11 +1328,16 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
-        // A move to confidential spends public, so it is guarded by the public balance instead.
         sqlx::query(
             "ALTER TABLE rebalance_requests ADD COLUMN IF NOT EXISTS last_valid_block_height BIGINT,
                                            ADD COLUMN IF NOT EXISTS blockhash_slot BIGINT,
-                                           ADD COLUMN IF NOT EXISTS expected_public NUMERIC(20,0)",
+                                           ADD COLUMN IF NOT EXISTS request_id TEXT",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebalance_requests_request_id
+                 ON rebalance_requests (request_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -1455,12 +1460,6 @@ impl PostgresDb {
             .bind(&key)
             .execute(&mut *tx)
             .await?;
-        // The sender's kept balances start again from fresh reads after an escrow rebuild.
-        if program == ProgramType::Escrow {
-            sqlx::query("DELETE FROM confidential_mint_state")
-                .execute(&mut *tx)
-                .await?;
-        }
 
         tx.commit().await?;
         info!(program = %key, "Program rows deleted");
@@ -2747,9 +2746,7 @@ impl PostgresDb {
             SET status = 'manual_review',
                 remint_signatures = COALESCE($3, remint_signatures),
                 remint_last_valid_block_heights = COALESCE($4, remint_last_valid_block_heights),
-                confidential_park_label = CASE WHEN confidential
-                    THEN COALESCE($5, confidential_park_label)
-                    ELSE confidential_park_label END,
+                confidential_park_label = COALESCE($5, confidential_park_label),
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -3311,18 +3308,12 @@ impl PostgresDb {
     }
 
     /// Recovery's write: every re-decrypted amount and its cleared flag, one transaction.
-    /// Only still-flagged rows change, so a rerun is a no-op. The sender's kept available
-    /// for the mint goes too, so it starts from a fresh read.
+    /// Only still-flagged rows change, so a rerun is a no-op.
     pub async fn recover_confidential_on(
         conn: &mut PgConnection,
-        mint: &str,
         recovered: &[(i64, TokenAmount)],
     ) -> Result<(), StorageError> {
         let mut tx = conn.begin().await?;
-        sqlx::query("DELETE FROM confidential_mint_state WHERE mint = $1")
-            .bind(mint)
-            .execute(&mut *tx)
-            .await?;
         for (id, amount) in recovered {
             // A zero deposit mints nothing, as at index time, so its row goes.
             let query = if amount.0 == 0 {
@@ -4224,7 +4215,7 @@ impl PostgresDb {
     ) -> Result<Vec<(i64, String)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, confidential_park_label FROM transactions \
-             WHERE confidential_park_label IS NOT NULL \
+             WHERE confidential AND confidential_park_label IS NOT NULL \
                AND status IN ('processing', 'pending_remint') ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -4316,16 +4307,18 @@ impl PostgresDb {
         direction: crate::storage::common::storage::confidential_sender::RebalanceDirection,
         amount: u64,
         expected_available: u64,
-        expected_public: Option<u64>,
-    ) -> Result<i64, sqlx::Error> {
+        request_id: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
         let mint = mint.to_string();
+        let request_id = request_id.to_string();
         self.run_sender_owned(move |conn| {
             Box::pin(async move {
                 sqlx::query_scalar(
                     r#"
                     INSERT INTO rebalance_requests
-                        (mint, direction, amount, expected_available, expected_public)
+                        (mint, direction, amount, expected_available, request_id)
                     VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (request_id) DO NOTHING
                     RETURNING id
                     "#,
                 )
@@ -4333,8 +4326,8 @@ impl PostgresDb {
                 .bind(direction.as_str())
                 .bind(TokenAmount(amount))
                 .bind(TokenAmount(expected_available))
-                .bind(expected_public.map(TokenAmount))
-                .fetch_one(conn)
+                .bind(request_id)
+                .fetch_optional(conn)
                 .await
             })
         })
@@ -4357,7 +4350,7 @@ impl PostgresDb {
             String,
             TokenAmount,
             TokenAmount,
-            Option<TokenAmount>,
+            Option<String>,
             String,
             Option<String>,
             Option<String>,
@@ -4366,7 +4359,7 @@ impl PostgresDb {
         );
         let rows: Vec<Row> = sqlx::query_as(
             r#"
-            SELECT id, mint, direction, amount, expected_available, expected_public, status,
+            SELECT id, mint, direction, amount, expected_available, request_id, status,
                    signature, error, last_valid_block_height, blockhash_slot
             FROM rebalance_requests
             WHERE status = $1
@@ -4384,7 +4377,7 @@ impl PostgresDb {
                     direction,
                     amount,
                     expected,
-                    expected_public,
+                    request_id,
                     status,
                     signature,
                     error,
@@ -4402,7 +4395,7 @@ impl PostgresDb {
                         direction,
                         amount: amount.value(),
                         expected_available: expected.value(),
-                        expected_public: expected_public.map(|amount| amount.value()),
+                        request_id: request_id.unwrap_or_default(),
                         status,
                         signature,
                         error,
@@ -4612,6 +4605,21 @@ impl PostgresDb {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(operator_attempt))
+    }
+
+    pub async fn last_landed_operator_attempts_internal(
+        &self,
+    ) -> Result<
+        Vec<crate::storage::common::storage::confidential_sender::OperatorAttempt>,
+        sqlx::Error,
+    > {
+        let rows: Vec<OperatorAttemptRow> = sqlx::query_as(&format!(
+            "SELECT DISTINCT ON (mint) {OPERATOR_ATTEMPT_COLS} FROM confidential_operator_attempts \
+             WHERE status = 'landed' ORDER BY mint, landed_slot DESC, id DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(operator_attempt).collect())
     }
 
     pub async fn confidential_pending_inputs_internal(
