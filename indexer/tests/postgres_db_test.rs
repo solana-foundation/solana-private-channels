@@ -6386,12 +6386,18 @@ async fn confidential_wait_requeues_with_not_before_and_keeps_the_first_start(
     // A stale lease moves nothing.
     assert!(
         !storage
-            .requeue_confidential_wait(id, lease - chrono::Duration::seconds(1), not_before, first)
+            .requeue_confidential_wait(
+                id,
+                lease - chrono::Duration::seconds(1),
+                not_before,
+                first,
+                None
+            )
             .await?
     );
     assert!(
         storage
-            .requeue_confidential_wait(id, lease, not_before, first)
+            .requeue_confidential_wait(id, lease, not_before, first, None)
             .await?
     );
     let (status, attempts): (String, i32) = sqlx::query_as(
@@ -6415,7 +6421,7 @@ async fn confidential_wait_requeues_with_not_before_and_keeps_the_first_start(
     let lease = updated_at_of(&pool, id).await;
     assert!(
         storage
-            .requeue_confidential_wait(id, lease, not_before, Utc::now())
+            .requeue_confidential_wait(id, lease, not_before, Utc::now(), None)
             .await?
     );
     let started: chrono::DateTime<Utc> =
@@ -6444,12 +6450,20 @@ async fn confidential_wait_refuses_a_journaled_row() -> Result<(), Box<dyn std::
         .claim_and_persist_signature(id, lease, "sig-conf".to_string(), 10, Some(4_242))
         .await?
         .expect("claim");
+    // The signature is valid through height 10, so only a height above it moves the row.
+    for height in [None, Some(10)] {
+        assert!(
+            !storage
+                .requeue_confidential_wait(id, lease, Utc::now(), Utc::now(), height)
+                .await?
+        );
+    }
+    assert_eq!(storage.max_release_journal_slot().await?, Some(4_242));
     assert!(
-        !storage
-            .requeue_confidential_wait(id, lease, Utc::now(), Utc::now())
+        storage
+            .requeue_confidential_wait(id, lease, Utc::now(), Utc::now(), Some(11))
             .await?
     );
-    assert_eq!(storage.max_release_journal_slot().await?, Some(4_242));
     Ok(())
 }
 
@@ -6486,8 +6500,8 @@ async fn release_lease_refresh_needs_the_current_lease() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// A journaled release still in flight is unrecorded until the indexer observes it by the
-/// slot asked about; an unjournaled row of the mint can be sent back to wait.
+/// A journaled release still in flight is unrecorded, for other rows of the mint, until the
+/// indexer observes it by the slot asked about. Waits follow the journal's expiry.
 #[tokio::test(flavor = "multi_thread")]
 async fn unrecorded_release_and_withdrawal_wait() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
@@ -6506,14 +6520,32 @@ async fn unrecorded_release_and_withdrawal_wait() -> Result<(), Box<dyn std::err
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
         .await?;
-    assert!(!storage.has_unrecorded_release("mint_addr", 100).await?);
+    assert!(
+        !storage
+            .has_unrecorded_release("mint_addr", 100, next)
+            .await?
+    );
     let lease = updated_at_of(&pool, sent).await;
     storage
         .claim_and_persist_signature(sent, lease, "sig-unrecorded".to_string(), 10, Some(9))
         .await?
         .expect("claim");
-    assert!(storage.has_unrecorded_release("mint_addr", 100).await?);
-    assert!(!storage.has_unrecorded_release("other_mint", 100).await?);
+    assert!(
+        storage
+            .has_unrecorded_release("mint_addr", 100, next)
+            .await?
+    );
+    assert!(
+        !storage
+            .has_unrecorded_release("other_mint", 100, next)
+            .await?
+    );
+    // A row never waits on its own journal.
+    assert!(
+        !storage
+            .has_unrecorded_release("mint_addr", 100, sent)
+            .await?
+    );
 
     let (nonce,): (i64,) =
         sqlx::query_as("SELECT withdrawal_nonce FROM transactions WHERE id = $1")
@@ -6528,21 +6560,37 @@ async fn unrecorded_release_and_withdrawal_wait() -> Result<(), Box<dyn std::err
             amount: None,
         }])
         .await?;
-    assert!(!storage.has_unrecorded_release("mint_addr", 100).await?);
-    assert!(storage.has_unrecorded_release("mint_addr", 40).await?);
-
-    // The processor's wait: a journaled row never moves, an unjournaled one does.
-    let not_before = Utc::now() + chrono::Duration::minutes(5);
-    let lease = updated_at_of(&pool, sent).await;
     assert!(
         !storage
-            .requeue_withdrawal_wait(sent, lease, not_before, Utc::now())
+            .has_unrecorded_release("mint_addr", 100, next)
+            .await?
+    );
+    assert!(
+        storage
+            .has_unrecorded_release("mint_addr", 40, next)
+            .await?
+    );
+
+    // The processor's wait: a journaled row moves only once its signature expired below
+    // the height; an unjournaled one always does.
+    let not_before = Utc::now() + chrono::Duration::minutes(5);
+    let lease = updated_at_of(&pool, sent).await;
+    for height in [None, Some(10)] {
+        assert!(
+            !storage
+                .requeue_withdrawal_wait(sent, lease, not_before, Utc::now(), height)
+                .await?
+        );
+    }
+    assert!(
+        storage
+            .requeue_withdrawal_wait(sent, lease, not_before, Utc::now(), Some(11))
             .await?
     );
     let lease = updated_at_of(&pool, next).await;
     assert!(
         storage
-            .requeue_withdrawal_wait(next, lease, not_before, Utc::now())
+            .requeue_withdrawal_wait(next, lease, not_before, Utc::now(), None)
             .await?
     );
     let status: String = sqlx::query_scalar("SELECT status::TEXT FROM transactions WHERE id = $1")
@@ -6945,7 +6993,7 @@ async fn confidential_sender_writes_fail_once_the_lock_is_lost(
         .await
         .is_err());
     assert!(storage
-        .requeue_confidential_wait(release, lease, Utc::now(), Utc::now())
+        .requeue_confidential_wait(release, lease, Utc::now(), Utc::now(), None)
         .await
         .is_err());
 

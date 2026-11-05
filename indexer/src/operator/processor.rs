@@ -10,7 +10,8 @@ use crate::operator::instruction_util::{
 };
 use crate::operator::reconciliation::ledger_liability;
 use crate::operator::recovery::{
-    check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
+    check_deposit, expired_journal_height, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS,
+    PREBROADCAST_CAP_REACHED,
 };
 use crate::operator::sender::confidential::next_wait;
 use crate::operator::sender::types::InstructionWithSigners;
@@ -180,6 +181,8 @@ struct BailReason {
     message: String,
     /// The row cannot be judged yet: it waits in `Pending` with the backoff instead.
     wait: bool,
+    /// For a waiting row with a journal, the confirmed height every signature expired below.
+    expired_below: Option<u64>,
 }
 
 impl BailReason {
@@ -188,6 +191,7 @@ impl BailReason {
             label,
             message,
             wait: false,
+            expired_below: None,
         }
     }
 }
@@ -281,7 +285,7 @@ async fn park_row(
     bail: BailReason,
 ) {
     if bail.wait {
-        requeue_to_wait(storage, transaction, &bail.message).await;
+        requeue_to_wait(storage, transaction, bail.expired_below, &bail.message).await;
         return;
     }
     // The label leads the alert so it maps straight to its runbook entry.
@@ -303,17 +307,28 @@ async fn park_row(
 }
 
 /// Hand the row back to the fetcher after the persisted backoff. A row that is no longer
-/// ours, or a failed write, is left `Processing` for recovery.
-async fn requeue_to_wait(storage: &Storage, transaction: &DbTransaction, reason: &str) {
+/// ours, one whose journal may still land, or a failed write, is left `Processing`.
+async fn requeue_to_wait(
+    storage: &Storage,
+    transaction: &DbTransaction,
+    expired_below: Option<u64>,
+    reason: &str,
+) {
     let (not_before, started) = next_wait(Utc::now(), transaction.wait_started_at);
     match storage
-        .requeue_withdrawal_wait(transaction.id, transaction.updated_at, not_before, started)
+        .requeue_withdrawal_wait(
+            transaction.id,
+            transaction.updated_at,
+            not_before,
+            started,
+            expired_below,
+        )
         .await
     {
         Ok(true) => info!(txn_id = transaction.id, %not_before, "Withdrawal waits: {reason}"),
         Ok(false) => warn!(
             txn_id = transaction.id,
-            "Withdrawal no longer ours to requeue; leaving it"
+            "Withdrawal not requeued: no longer ours or its journal may still land; leaving it"
         ),
         Err(e) => warn!(
             txn_id = transaction.id,
@@ -1142,7 +1157,7 @@ async fn check_withdrawal_preflights_inner(
             .await?;
         if let ConfidentialAccountRead::Configured(view) = escrow {
             if view.public_amount < amount {
-                return short_public_balance(processor_state, &mint, &view, amount, slot)
+                return short_public_balance(processor_state, transaction, &mint, &view, slot)
                     .await
                     .map(Some);
             }
@@ -1173,17 +1188,18 @@ async fn check_withdrawal_preflights_inner(
 /// counted, funds may have left the escrow, so the row parks as a drain.
 async fn short_public_balance(
     processor_state: &ProcessorState,
+    transaction: &DbTransaction,
     mint: &Pubkey,
     view: &ConfidentialAccountView,
-    amount: u64,
     slot: u64,
 ) -> Result<BailReason, OperatorError> {
+    let amount = transaction.amount.value();
     let public = view.public_amount;
     let storage = processor_state.mint_cache.storage();
     let mint_address = mint.to_string();
     // A release that paid out but is not yet recorded would count as owed and look like a drain.
     if storage
-        .has_unrecorded_release(&mint_address, slot)
+        .has_unrecorded_release(&mint_address, slot, transaction.id)
         .await
         .map_err(OperatorError::Storage)?
     {
@@ -1194,6 +1210,10 @@ async fn short_public_balance(
                  waiting for its releases in flight to be recorded"
             ),
             wait: true,
+            expired_below: match processor_state.mint_cache.rpc_client() {
+                Some(rpc) => expired_journal_height(storage, rpc, transaction.id).await,
+                None => None,
+            },
         });
     }
     let custody = judge_confidential_custody(
@@ -6770,6 +6790,9 @@ mod tests {
             /// An earlier journaled 500 release of the mint: its status and whether the
             /// escrow indexer observed it.
             earlier: Option<(TransactionStatus, bool)>,
+            /// The row's own journal from an attempt before recovery re-armed it: its
+            /// last valid block height, and the confirmed block height the chain reports.
+            own_journal: Option<(i64, u64)>,
         }
 
         impl Case {
@@ -6784,6 +6807,7 @@ mod tests {
                     confidential: true,
                     owed: 0,
                     earlier: None,
+                    own_journal: None,
                 }
             }
 
@@ -6881,6 +6905,27 @@ mod tests {
                     if observed || status == TransactionStatus::Completed {
                         released = 500;
                     }
+                }
+                if let (Some((lvbh, height)), Storage::Mock(ref mock)) =
+                    (self.own_journal, &*storage)
+                {
+                    mock.release_signatures.lock().unwrap().insert(
+                        txn.id,
+                        vec![crate::storage::common::models::StoredSig {
+                            signature: solana_sdk::signature::Signature::new_unique().to_string(),
+                            last_valid_block_height: lvbh,
+                            blockhash_slot: Some(8),
+                        }],
+                    );
+                    mocks.push(
+                        server
+                            .mock("POST", "/")
+                            .match_body(mockito::Matcher::Regex(
+                                r#""getBlockHeight".*"confirmed""#.into(),
+                            ))
+                            .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{height}}}"#))
+                            .create(),
+                    );
                 }
                 if let Storage::Mock(ref mock) = *storage {
                     mock.mint_balances.lock().unwrap().push(MintDbBalance {
@@ -7241,6 +7286,103 @@ mod tests {
                 .await,
                 metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
             );
+        }
+
+        /// A short public release re-armed by recovery, with its own journal and an optional
+        /// earlier release of the mint.
+        async fn rearmed_short_release(
+            own_journal: (i64, u64),
+            earlier: Option<(TransactionStatus, bool)>,
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.earlier = earlier;
+            case.own_journal = Some(own_journal);
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        fn row_9(mock: &MockStorage) -> DbTransaction {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == 9)
+                .cloned()
+                .unwrap()
+        }
+
+        /// The reviewer's case: a row re-armed with an expired journal does not wait on
+        /// itself. Behind another release it waits in `Pending`, then parks once that settles.
+        #[tokio::test]
+        async fn a_rearmed_withdrawal_waits_without_blocking_on_its_own_expired_journal() {
+            assert_parked(
+                rearmed_short_release((100, 400), None, &MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+
+            let mock = MockStorage::new();
+            let (outcome, update, builder) = rearmed_short_release(
+                (100, 400),
+                Some((TransactionStatus::Processing, false)),
+                &mock,
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(
+                row.status,
+                TransactionStatus::Pending,
+                "not left for recovery"
+            );
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+
+            assert_parked(
+                rearmed_short_release(
+                    (100, 400),
+                    Some((TransactionStatus::Completed, false)),
+                    &MockStorage::new(),
+                )
+                .await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A journaled signature that can still land keeps the row `Processing`.
+        #[tokio::test]
+        async fn a_journaled_withdrawal_with_a_live_signature_is_not_requeued() {
+            let mock = MockStorage::new();
+            let (outcome, update, builder) = rearmed_short_release(
+                (500, 400),
+                Some((TransactionStatus::Processing, false)),
+                &mock,
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(row.status, TransactionStatus::Processing);
+            assert!(row.not_before.is_none());
         }
 
         /// Once the release records cover the read, a real drain still parks as one.

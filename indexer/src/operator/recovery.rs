@@ -827,6 +827,25 @@ pub(crate) async fn load_pending_sigs(
     Ok(pending)
 }
 
+/// The confirmed block height every journaled signature of the row has expired below, so
+/// none can still land and the row may wait in `Pending`. `None` when the journal is empty,
+/// unread, or any signature may still land.
+pub(crate) async fn expired_journal_height(
+    storage: &Storage,
+    rpc: &RpcClientWithRetry,
+    id: i64,
+) -> Option<u64> {
+    let pending = load_pending_sigs(storage, id).await.ok()?;
+    if pending.is_empty() {
+        return None;
+    }
+    let height = rpc.get_confirmed_block_height().await.ok()?;
+    pending
+        .iter()
+        .all(|p| p.last_valid_block_height < height)
+        .then_some(height)
+}
+
 /// Split a row's journalled release signatures into the two parallel arrays the
 /// quarantine CAS stores. The inner `(None, None)` means there was nothing worth
 /// recording, which leaves the columns untouched.

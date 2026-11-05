@@ -2155,15 +2155,20 @@ impl MockStorage {
         lease: DateTime<Utc>,
         not_before: DateTime<Utc>,
         wait_started_at: DateTime<Utc>,
+        expired_below: Option<u64>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("requeue_confidential_wait")?;
-        let journaled = self
+        let live = self
             .release_signatures
             .lock()
             .unwrap()
             .get(&transaction_id)
-            .is_some_and(|sigs| !sigs.is_empty());
-        if journaled {
+            .is_some_and(|sigs| {
+                sigs.iter().any(|sig| {
+                    expired_below.is_none_or(|h| sig.last_valid_block_height >= h as i64)
+                })
+            });
+        if live {
             return Ok(false);
         }
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -2185,6 +2190,7 @@ impl MockStorage {
         &self,
         mint: &str,
         as_of_slot: u64,
+        except_id: i64,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("has_unrecorded_release")?;
         let journals = self.release_signatures.lock().unwrap();
@@ -2192,6 +2198,7 @@ impl MockStorage {
         Ok(self.pending_transactions.lock().unwrap().iter().any(|t| {
             t.transaction_type == TransactionType::Withdrawal
                 && t.mint == mint
+                && t.id != except_id
                 && matches!(
                     t.status,
                     TransactionStatus::Processing | TransactionStatus::PendingRemint

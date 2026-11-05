@@ -11,7 +11,7 @@ use super::transaction::{
 use super::types::{InstructionWithSigners, PendingSig, SenderState, TransactionContext};
 use crate::metrics;
 use crate::operator::confidential_constants::*;
-use crate::operator::recovery::{load_pending_sigs, RECOVERY_INTERVAL};
+use crate::operator::recovery::{expired_journal_height, load_pending_sigs, RECOVERY_INTERVAL};
 use crate::operator::utils::instruction_util::{
     apply_pending_balance_instruction, move_to_confidential_instruction,
     move_to_public_instructions, ConfidentialReleaseRequest, EscrowConfidentialAccounts,
@@ -1715,7 +1715,7 @@ async fn wait_or_park(
             let (not_before, started) = next_wait(Utc::now(), request.wait_started_at);
             match state
                 .storage
-                .requeue_confidential_wait(request.transaction_id, lease, not_before, started)
+                .requeue_confidential_wait(request.transaction_id, lease, not_before, started, None)
                 .await
             {
                 Ok(true) => {
@@ -1741,17 +1741,27 @@ async fn wait_or_park(
     }
 }
 
-/// The mint is blocked by an earlier write: before any attempt the row waits in `Pending`;
-/// after one it is left `Processing` for recovery, since the block lifts on its own.
+/// The mint is blocked by an earlier write: before any attempt, or once every journaled
+/// signature expired, the row waits in `Pending`; otherwise it is left `Processing` for
+/// recovery, since the block lifts on its own.
 async fn wait_or_leave(
     state: &mut SenderState,
     request: &ConfidentialReleaseRequest,
     reason: &str,
 ) {
     let nonce = request.nonce;
-    match journaled(state, request.transaction_id).await {
-        Ok(false) => requeue_unsent(state, request, reason).await,
-        Ok(true) | Err(_) => {
+    let expired = match journaled(state, request.transaction_id).await {
+        Ok(false) => Some(None),
+        Ok(true) => {
+            expired_journal_height(&state.storage, &state.rpc_client, request.transaction_id)
+                .await
+                .map(Some)
+        }
+        Err(_) => None,
+    };
+    match expired {
+        Some(expired_below) => requeue_unsent(state, request, reason, expired_below).await,
+        None => {
             warn!(nonce, "Leaving the release to recovery: {reason}");
             leave_to_recovery(state, nonce);
         }
@@ -1763,6 +1773,7 @@ async fn requeue_unsent(
     state: &mut SenderState,
     request: &ConfidentialReleaseRequest,
     reason: &str,
+    expired_below: Option<u64>,
 ) {
     let nonce = request.nonce;
     let Some(lease) = state.release_leases.get(&nonce).copied() else {
@@ -1771,7 +1782,13 @@ async fn requeue_unsent(
     let (not_before, started) = next_wait(Utc::now(), request.wait_started_at);
     match state
         .storage
-        .requeue_confidential_wait(request.transaction_id, lease, not_before, started)
+        .requeue_confidential_wait(
+            request.transaction_id,
+            lease,
+            not_before,
+            started,
+            expired_below,
+        )
         .await
     {
         Ok(true) => info!(nonce, %not_before, "Confidential release waits: {reason}"),
@@ -3278,6 +3295,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.iter().map(|t| t.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// A blocked mint sends a re-armed row back to `Pending` only once every journaled
+    /// signature has expired; one that can still land stays `Processing`.
+    #[tokio::test]
+    async fn a_blocked_release_waits_only_once_its_journal_has_expired() {
+        let (_, spec) = escrow(5_000, 1);
+        let mock = MockStorage::new();
+        push_processing_row(&mock, 1);
+        push_processing_row(&mock, 2);
+        journal_one(&mock, 1);
+        mock.release_signatures.lock().unwrap().insert(
+            2,
+            vec![StoredSig {
+                signature: Signature::new_unique().to_string(),
+                last_valid_block_height: 1_000,
+                blockhash_slot: Some(9),
+            }],
+        );
+        let (mut state, mut server, _) = sender_reading(&spec, 10, mock.clone()).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""getBlockHeight".*"confirmed""#.into(),
+            ))
+            .with_body(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": 300}).to_string())
+            .create_async()
+            .await;
+
+        for id in [1, 2] {
+            let lease = row_updated_at(&mock, id).unwrap();
+            let request = request_for(id, Pubkey::new_unique(), lease);
+            state.release_leases.insert(request.nonce, lease);
+            wait_or_leave(&mut state, &request, "mint blocked").await;
+        }
+
+        assert_eq!(row_status(&mock, 1), Some(TransactionStatus::Pending));
+        let waiting = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == 1)
+            .cloned()
+            .unwrap();
+        assert!(waiting.not_before.unwrap() > Utc::now());
+        assert_eq!(row_status(&mock, 2), Some(TransactionStatus::Processing));
     }
 
     #[tokio::test]

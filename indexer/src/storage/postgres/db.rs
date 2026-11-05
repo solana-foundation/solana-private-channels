@@ -251,8 +251,9 @@ const DROP_STATEMENTS: [&str; 17] = [
 /// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
 const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
 
-/// Back to `Pending` until `not_before`, keeping the first `wait_started_at`. Same lease and
-/// journal guard as `requeue_unclaimed`; the attempt counter is untouched.
+/// Back to `Pending` until `not_before`, keeping the first `wait_started_at`; the attempt
+/// counter is untouched. A journaled row moves only when every signature expired below the
+/// confirmed block height `$5`; with no height, only an unjournaled row moves.
 const REQUEUE_WAIT_SQL: &str = r#"
     UPDATE transactions
     SET status = 'pending',
@@ -262,7 +263,9 @@ const REQUEUE_WAIT_SQL: &str = r#"
       AND status = 'processing'
       AND updated_at = $2
       AND NOT EXISTS (
-          SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+          SELECT 1 FROM pending_release_signatures
+          WHERE transaction_id = $1
+            AND ($5::BIGINT IS NULL OR last_valid_block_height >= $5)
       )
 "#;
 
@@ -4161,6 +4164,7 @@ impl PostgresDb {
         lease: chrono::DateTime<chrono::Utc>,
         not_before: chrono::DateTime<chrono::Utc>,
         wait_started_at: chrono::DateTime<chrono::Utc>,
+        expired_below: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
         let result = self
             .run_sender_owned(move |conn| {
@@ -4170,6 +4174,7 @@ impl PostgresDb {
                         .bind(lease)
                         .bind(not_before)
                         .bind(wait_started_at)
+                        .bind(expired_below)
                         .execute(conn)
                         .await
                 })
@@ -4184,12 +4189,14 @@ impl PostgresDb {
         lease: chrono::DateTime<chrono::Utc>,
         not_before: chrono::DateTime<chrono::Utc>,
         wait_started_at: chrono::DateTime<chrono::Utc>,
+        expired_below: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(REQUEUE_WAIT_SQL)
             .bind(transaction_id)
             .bind(lease)
             .bind(not_before)
             .bind(wait_started_at)
+            .bind(expired_below)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
@@ -4199,6 +4206,7 @@ impl PostgresDb {
         &self,
         mint: &str,
         as_of_slot: i64,
+        except_id: i64,
     ) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(
             r#"
@@ -4206,6 +4214,7 @@ impl PostgresDb {
                 SELECT 1 FROM transactions t
                 WHERE t.transaction_type = 'withdrawal'
                   AND t.mint = $1
+                  AND t.id <> $3
                   AND t.status IN ('processing', 'pending_remint')
                   AND EXISTS (
                       SELECT 1 FROM pending_release_signatures s WHERE s.transaction_id = t.id
@@ -4219,6 +4228,7 @@ impl PostgresDb {
         )
         .bind(mint)
         .bind(as_of_slot)
+        .bind(except_id)
         .fetch_one(&self.pool)
         .await
     }

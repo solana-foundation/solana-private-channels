@@ -107,13 +107,15 @@ pub struct ConfidentialSenderMock {
 
 impl Storage {
     /// Send a confidential release back to `Pending` until `not_before`, keeping the first
-    /// `wait_started_at`. Only an unjournaled `Processing` row owned under `lease` moves.
+    /// `wait_started_at`. Only a `Processing` row owned under `lease` moves, and only when it
+    /// is unjournaled or every signature expired below the confirmed height `expired_below`.
     pub async fn requeue_confidential_wait(
         &self,
         transaction_id: i64,
         lease: DateTime<Utc>,
         not_before: DateTime<Utc>,
         wait_started_at: DateTime<Utc>,
+        expired_below: Option<u64>,
     ) -> Result<bool, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db
@@ -122,12 +124,19 @@ impl Storage {
                     lease,
                     not_before,
                     wait_started_at,
+                    expired_below.and_then(|h| i64::try_from(h).ok()),
                 )
                 .await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
             Storage::Mock(mock) => {
-                mock.requeue_confidential_wait(transaction_id, lease, not_before, wait_started_at)
-                    .await
+                mock.requeue_confidential_wait(
+                    transaction_id,
+                    lease,
+                    not_before,
+                    wait_started_at,
+                    expired_below,
+                )
+                .await
             }
         }
     }
@@ -156,6 +165,7 @@ impl Storage {
         lease: DateTime<Utc>,
         not_before: DateTime<Utc>,
         wait_started_at: DateTime<Utc>,
+        expired_below: Option<u64>,
     ) -> Result<bool, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db
@@ -164,29 +174,40 @@ impl Storage {
                     lease,
                     not_before,
                     wait_started_at,
+                    expired_below.and_then(|h| i64::try_from(h).ok()),
                 )
                 .await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
             Storage::Mock(mock) => {
-                mock.requeue_confidential_wait(transaction_id, lease, not_before, wait_started_at)
-                    .await
+                mock.requeue_confidential_wait(
+                    transaction_id,
+                    lease,
+                    not_before,
+                    wait_started_at,
+                    expired_below,
+                )
+                .await
             }
         }
     }
 
-    /// Whether a withdrawal of `mint` may have paid out without the ledger counting it as
-    /// of `as_of_slot`: a journaled send still in flight with no release observed by then.
+    /// Whether another withdrawal of `mint` than `except_id` may have paid out without the
+    /// ledger counting it as of `as_of_slot`: a journaled send with no release observed by then.
     pub async fn has_unrecorded_release(
         &self,
         mint: &str,
         as_of_slot: u64,
+        except_id: i64,
     ) -> Result<bool, StorageError> {
         match self {
             Storage::Postgres(db) => Ok(db
-                .has_unrecorded_release_internal(mint, slot_bound(as_of_slot))
+                .has_unrecorded_release_internal(mint, slot_bound(as_of_slot), except_id)
                 .await?),
             #[cfg(any(test, feature = "test-mock-storage"))]
-            Storage::Mock(mock) => mock.has_unrecorded_release(mint, as_of_slot).await,
+            Storage::Mock(mock) => {
+                mock.has_unrecorded_release(mint, as_of_slot, except_id)
+                    .await
+            }
         }
     }
 

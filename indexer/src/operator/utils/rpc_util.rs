@@ -267,6 +267,22 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// The block height at confirmed or the client's stricter commitment, for proving a
+    /// journaled signature expired: a processed height may sit on a fork that is dropped.
+    pub async fn get_confirmed_block_height(&self) -> Result<u64, Box<client_error::Error>> {
+        let commitment = if self.rpc_client.commitment().is_at_least_confirmed() {
+            self.rpc_client.commitment()
+        } else {
+            CommitmentConfig::confirmed()
+        };
+        self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
+            self.rpc_client
+                .get_block_height_with_commitment(commitment)
+                .await
+        })
+        .await
+    }
+
     /// Get the current slot with retry. Unanchored: a lagging node reports its own
     /// old slot, so it must not bound anything a refund or a verdict depends on.
     pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
