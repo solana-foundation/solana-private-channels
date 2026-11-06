@@ -20,18 +20,29 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # Grafana reads its DB password and webhook URL from secret files ($__file{...}):
 # the datasource must reach Postgres and the contact point must hold the current URL.
-grafana_checks() {
-  local g="${E2E_GRAFANA_URL:-http://127.0.0.1:3001}" auth
-  auth="$(printf 'user = "admin:%s"\n' "$(secret grafana_admin_password)")"
-  wait_for 120 "Grafana Postgres datasource healthy ($1)" bash -c "curl -s -K - '$g/api/datasources/uid/postgres-indexer/health' \
-    <<<'$auth' | grep -q '\"status\":\"OK\"'"
-  check "Grafana contact point holds the current webhook URL ($1)" bash -c "curl -s -K - \
-    '$g/api/v1/provisioning/contact-points/export?decrypt=true&format=json' <<<'$auth' | python3 -c '
-import json, sys, yaml
-want = yaml.safe_load(open(sys.argv[1]))[\"alert_webhook_url\"]
-cps = json.load(sys.stdin)[\"contactPoints\"]
-sys.exit(not any(r[\"settings\"].get(\"url\") == want for c in cps for r in c[\"receivers\"]))' '$E2E_WORK/deploy/secrets.yml'"
+# The admin credential reaches curl on stdin, never in a command string.
+grafana_api() {
+  printf 'user = "admin:%s"\n' "$(secret grafana_admin_password)" | curl -s -K - "${E2E_GRAFANA_URL:-http://127.0.0.1:3001}$1"
 }
+grafana_ds_ok() { grafana_api /api/datasources/uid/postgres-indexer/health | grep -q '"status":"OK"'; }
+grafana_cp_ok() {
+  grafana_api '/api/v1/provisioning/contact-points/export?decrypt=true&format=json' | python3 -c '
+import json, sys, yaml
+want = yaml.safe_load(open(sys.argv[1]))["alert_webhook_url"]
+cps = json.load(sys.stdin)["contactPoints"]
+sys.exit(not any(r["settings"].get("url") == want for c in cps for r in c["receivers"]))' "$E2E_WORK/deploy/secrets.yml"
+}
+grafana_checks() {
+  wait_for 120 "Grafana Postgres datasource healthy ($1)" grafana_ds_ok
+  check "Grafana contact point holds the current webhook URL ($1)" grafana_cp_ok
+}
+
+# pg_login <password> <role>: a TCP login on the primary; the password goes through env.
+pg_login() {
+  PGPASSWORD="$1" docker exec -e PGPASSWORD private-channel-postgres-primary \
+    psql -h 127.0.0.1 -U "$2" -d private_channel -c 'SELECT 1' >/dev/null 2>&1
+}
+pg_refused() { ! pg_login "$@"; }
 
 step1() {
   say "step 1: deploy with separate admin and operator keys"
@@ -121,15 +132,12 @@ step5() {
     "SELECT count(*) FROM pg_stat_activity WHERE usename='private_channel_runtime' AND backend_start > '$t0'")" -gt 0
   check "a DB-touching RPC succeeds" bash -c "curl -s -X POST $READ -H 'Content-Type: application/json' \
     -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$MINT\"]}' | grep -q '\"result\"'"
-  check "the old runtime password is refused" bash -c "! PGPASSWORD='$old' docker exec -e PGPASSWORD private-channel-postgres-primary \
-    psql -h 127.0.0.1 -U private_channel_runtime -d private_channel -c 'SELECT 1' >/dev/null 2>&1"
+  check "the old runtime password is refused" pg_refused "$old" private_channel_runtime
   # Postgres reads only its superuser password after initdb, so role rotations leave it running.
   check "postgres-primary not recreated by role-password rotations" test "$(cid private-channel-postgres-primary)" = "$p"
   check "gateway recreated" test "$(cid private-channel-gateway)" != "$g"
-  check "the gateway role logs in with the new password" bash -c "PGPASSWORD='$(secret postgres_gateway_password)' docker exec \
-    -e PGPASSWORD private-channel-postgres-primary psql -h 127.0.0.1 -U private_channel_gateway -d private_channel -c 'SELECT 1' >/dev/null"
-  check "the old gateway password is refused" bash -c "! PGPASSWORD='$oldgw' docker exec -e PGPASSWORD private-channel-postgres-primary \
-    psql -h 127.0.0.1 -U private_channel_gateway -d private_channel -c 'SELECT 1' >/dev/null 2>&1"
+  check "the gateway role logs in with the new password" pg_login "$(secret postgres_gateway_password)" private_channel_gateway
+  check "the old gateway password is refused" pg_refused "$oldgw" private_channel_gateway
   grafana_checks "after rotation"
 }
 
@@ -157,28 +165,30 @@ step6() {
   check "postgres-primary recreated" test "$(cid private-channel-postgres-primary)" != "$p"
   check "postgres-replica recreated" test "$(cid private-channel-postgres-replica)" != "$rp"
   wait_for 300 "pg-backup-primary first base backup" bash -c "docker logs private-channel-pg-backup-primary 2>&1 | grep -q 'Backup complete'"
-  check "superuser logs in with the new password" bash -c "PGPASSWORD='$(secret postgres_password)' docker exec -e PGPASSWORD \
-    private-channel-postgres-primary psql -h 127.0.0.1 -U private_channel -d private_channel -c 'SELECT 1' >/dev/null"
+  check "superuser logs in with the new password" pg_login "$(secret postgres_password)" private_channel
   check "a read through the replica succeeds" bash -c "curl -s -X POST $READ -H 'Content-Type: application/json' \
     -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$MINT\"]}' | grep -q '\"result\"'"
 }
 
+# Credentials reach curl on stdin, never on its argv.
 auth_token() {
-  curl -s -X POST "$AUTH/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$1\",\"password\":\"$2\"}" | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])'
+  printf '{"username":"%s","password":"%s"}' "$1" "$2" | curl -s -X POST "$AUTH/auth/login" \
+    -H 'Content-Type: application/json' --data @- | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])'
 }
 gated_status() {
-  curl -s -o /dev/null -w '%{http_code}' -X POST "$GW" -H 'Content-Type: application/json' -H "Authorization: Bearer $1" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}'
+  printf 'header = "Authorization: Bearer %s"\n' "$1" | curl -s -K - -o /dev/null -w '%{http_code}' -X POST "$GW" \
+    -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}'
 }
-wallets_status() { curl -s -o /dev/null -w '%{http_code}' "$AUTH/auth/wallets" -H "Authorization: Bearer $1"; }
+wallets_status() {
+  printf 'header = "Authorization: Bearer %s"\n' "$1" | curl -s -K - -o /dev/null -w '%{http_code}' "$AUTH/auth/wallets"
+}
 
 step7() {
   say "step 7: JWT rotation with a previous key"
   local user pw a b
   user="e2e$(openssl rand -hex 4)" pw="$(openssl rand -hex 16)"
-  curl -s -o /dev/null -X POST "$AUTH/auth/register" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$user\",\"password\":\"$pw\"}"
+  printf '{"username":"%s","password":"%s"}' "$user" "$pw" | curl -s -o /dev/null -X POST "$AUTH/auth/register" \
+    -H 'Content-Type: application/json' --data @-
   a="$(auth_token "$user" "$pw")"
   # A valid User-role token gets 403 on getBlock (operator only); an invalid one 401.
   check "token A valid before rotation" test "$(gated_status "$a")" = 403
