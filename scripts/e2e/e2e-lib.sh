@@ -190,6 +190,11 @@ unsettled_withdrawals() {
     AND status::text NOT IN ('completed', 'failed', 'failed_reminted')"
 }
 has_unsettled_withdrawal() { test "$(unsettled_withdrawals)" -gt 0; }
+# set_last_withdrawal_status <status>: the newest withdrawal row, for the remove_operator gate test.
+set_last_withdrawal_status() {
+  psql_indexer -c "UPDATE transactions SET status = '$1' WHERE id = (SELECT max(id) FROM transactions
+    WHERE transaction_type = 'withdrawal')" >/dev/null
+}
 no_unsettled_withdrawal() { test "$(unsettled_withdrawals)" -eq 0; }
 indexer_db_url() { echo "postgres://private_channel_indexer:$(secret postgres_indexer_password)@127.0.0.1:5434/indexer"; }
 

@@ -399,11 +399,15 @@ test_render_signers() {
       local bk="${backend^^}"
       [[ $backend == memory ]] && bk=PRIVATE_KEY
       want="$(grep -oE "\"${up}_${bk}[A-Z_]*\"" "$su" | tr -d '"' | sort -u)"
-      got="$(grep -oE "^${up}_(PRIVATE_KEY|VAULT|TURNKEY|PRIVY)[A-Z_]*=" "$TMP/sig-$backend-$role.env" | tr -d '=' | sort -u)"
+      # The private key line is always present (blank for a remote signer), so compose
+      # does not warn; only the selected backend's own vars are compared.
+      local keys="(VAULT|TURNKEY|PRIVY)"
+      [[ $backend == memory ]] && keys="(PRIVATE_KEY|VAULT|TURNKEY|PRIVY)"
+      got="$(grep -oE "^${up}_${keys}[A-Z_]*=" "$TMP/sig-$backend-$role.env" | tr -d '=' | sort -u)"
       [[ "$want" == "$got" ]] || fail "render $backend/$role: .env keys '$(echo $got)' != signer_util '$(echo $want)'"
       grep -qx "${up}_SIGNER=$backend" "$TMP/sig-$backend-$role.env" || fail "render $backend/$role: ${up}_SIGNER not $backend"
       if [[ $backend != memory ]]; then
-        grep -qE "^${up}_PRIVATE_KEY=" "$TMP/sig-$backend-$role.env" && fail "render $backend/$role: a private key var is rendered"
+        grep -qx "${up}_PRIVATE_KEY=" "$TMP/sig-$backend-$role.env" || fail "render $backend/$role: ${up}_PRIVATE_KEY missing or not blank"
       fi
     done
   done
@@ -576,7 +580,7 @@ EOF
     grep -q 'ALERT_WEBHOOK_URL_FILE' "$host/config/compose.override.yml" && fail "a cleared webhook kept its _FILE var"
     labels_of "$host/config/compose.override.yml" >"$TMP/labels2"
     local changed
-    changed="$( (diff "$TMP/labels1" "$TMP/labels2" || true) | grep '^>' | awk '{print $2}' | sort | tr '\n' ' ')"
+    changed="$( (diff "$TMP/labels1" "$TMP/labels2" || true) | { grep '^>' || true; } | awk '{print $2}' | sort | tr '\n' ' ')"
     # Postgres reads only its superuser password after initdb, so a role password leaves it alone.
     [[ "$changed" == "indexer-private-channel indexer-solana operator-private-channel operator-solana read-node write-node " ]] \
       || fail "secrets-rev changed for: '$changed'"
@@ -592,18 +596,19 @@ EOF
       return
     fi
     labels_of "$host/config/compose.override.yml" >"$TMP/labels-$name"
-    changed="$( (diff "$TMP/labels2" "$TMP/labels-$name" || true) | grep '^>' | awk '{print $2}' | sort | tr '\n' ' ')"
+    changed="$( (diff "$TMP/labels2" "$TMP/labels-$name" || true) | { grep '^>' || true; } | awk '{print $2}' | sort | tr '\n' ' ')"
     [[ "$changed" == "$want" ]] || fail "$name: secrets-rev changed for '$changed', want '$want'"
     cp "$TMP/labels-$name" "$TMP/labels2"
   }
   sed -i -E "s/^(postgres_(gateway|monitoring|auth_owner|auth_runtime|grafana)_password): (.*)/\1: \3new/" "$D/secrets.yml"
   rev_case rev_role_passwords "auth auth-migrate gateway "
   sed -i -E "s/^postgres_replication_password: (.*)/postgres_replication_password: \1new/" "$D/secrets.yml"
-  rev_case rev_replication "pg-backup-primary postgres-replica "
+  # The databases take password changes live (ALTER ROLE, replica passfile), so they never restart.
+  rev_case rev_replication "pg-backup-primary "
   sed -i -E "s/^postgres_password: (.*)/postgres_password: \1new/" "$D/secrets.yml"
-  rev_case rev_superuser "postgres-primary postgres-replica "
+  rev_case rev_superuser ""
   sed -i -E "s/^postgres_indexer_password: (.*)/postgres_indexer_password: \1new/" "$D/secrets.yml"
-  rev_case rev_indexer_superuser "indexer-private-channel indexer-solana operator-private-channel operator-solana pg-backup-indexer postgres-indexer "
+  rev_case rev_indexer_superuser "indexer-private-channel indexer-solana operator-private-channel operator-solana pg-backup-indexer "
 
   # A standalone --tags deploy renders the tree, labels and override from the same tasks.
   playbook "$TMP/deploy-tasks.log" "$D/deploy.yml" --list-tasks --tags deploy "${args[@]}"

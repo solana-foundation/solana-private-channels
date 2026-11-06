@@ -451,6 +451,7 @@ build-devnet:
 	@$(MAKE) generate-operator-keypair
 	@$(MAKE) generate-withdraw-operator-keypair
 	@./scripts/update-admin-env.sh --operator-keypair keypairs/withdraw-operator.json .env.devnet keypairs/operator-keypair.json
+	@echo "Withdraw operator: $$(solana-keygen pubkey keypairs/withdraw-operator.json). Register it once per instance with add_operator, or every ReleaseFunds fails."
 
 deploy-devnet:
 	@echo "Deploying all programs to devnet..."

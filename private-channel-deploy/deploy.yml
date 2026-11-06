@@ -1468,8 +1468,10 @@
     block:
     # Pull pinned tag. Runs from the target's config dir so the host doesn't
     # need the repo.
-    # The PAT lives only in a throwaway 0700 DOCKER_CONFIG for this pull, never in
-    # the user's ~/.docker/config.json. up and restarts use the local images.
+    # The PAT lives only in a throwaway 0700 DOCKER_CONFIG used for the GHCR images,
+    # never in the user's ~/.docker/config.json. Every other image (postgres, Docker
+    # Hub) pulls with the host's own config, logins and credential helpers. up and
+    # restarts use the local images.
     - name: Pull images from registry
       block:
       - name: Create a throwaway docker config dir
@@ -1478,13 +1480,6 @@
           state: directory
           suffix: .pc-docker
         register: _pull_cfg
-
-      # docker looks for CLI plugins (compose) under DOCKER_CONFIG first.
-      - name: Keep the user's docker CLI plugins visible
-        when: _registry_host == 'ghcr.io'
-        ansible.builtin.shell: |
-          if [ -d "$HOME/.docker/cli-plugins" ]; then ln -s "$HOME/.docker/cli-plugins" "{{ _pull_cfg.path }}/cli-plugins"; fi
-        changed_when: false
 
       - name: Log in to GHCR with the throwaway config
         when: _registry_host == 'ghcr.io'
@@ -1497,11 +1492,20 @@
         no_log: true
 
       - name: Pull the images
-        ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
+        ansible.builtin.shell:
+          cmd: |
+            set -euo pipefail
+            {{ compose_cmd }} config --images {{ compose_services }} | sort -u | while read -r img; do
+              case "$img" in
+            {% if _registry_host == 'ghcr.io' %}
+                ghcr.io/*) DOCKER_CONFIG="{{ _pull_cfg.path }}" docker pull -q "$img" ;;
+            {% endif %}
+                *) docker pull -q "$img" ;;
+              esac
+            done
+          executable: /bin/bash
         args:
           chdir: "{{ target_config_dir }}"
-        environment:
-          DOCKER_CONFIG: "{{ _pull_cfg.path if (_registry_host == 'ghcr.io') else (ansible_env.DOCKER_CONFIG | default(ansible_env.HOME ~ '/.docker')) }}"
         changed_when: true
       # An image without the wrapper would start every service with blank secrets
       # (old tags, rollbacks such as v0.1.0), so refuse it before anything starts.

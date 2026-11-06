@@ -286,11 +286,13 @@ mod tests {
             assert_eq!(config.jwt_secret_previous(), None);
         }
 
+        // Auth refuses a blank current secret outright, so a previous without a current
+        // is caught by that rule here; the gateway needs its own check for it.
         let previous = "p".repeat(32);
         let mut config = with_previous(Some(&previous));
         config.jwt_secret = String::new();
         let err = config.validate().expect_err("previous without a current");
-        assert!(err.contains("JWT_SECRET"), "got: {err}");
+        assert!(err.starts_with("JWT_SECRET must be at least"), "got: {err}");
 
         for short in ["p".repeat(31), format!("  {}  ", "p".repeat(31))] {
             let err = with_previous(Some(&short))

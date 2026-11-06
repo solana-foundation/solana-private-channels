@@ -12,11 +12,14 @@ in [RELEASING.md](RELEASING.md). Per-release notes are in [CHANGELOG.md](CHANGEL
    confirmed:
 
    ```bash
-   docker compose exec pg-backup-primary sh -c \
-     'pg_basebackup -h postgres-primary -U "$PGUSER" -D /backups/pre-upgrade_$(date +%Y%m%d_%H%M%S) -Ft -z -X stream'
-   docker compose exec pg-backup-indexer sh -c \
-     'pg_basebackup -h postgres-indexer -U "$PGUSER" -D /backups/pre-upgrade_$(date +%Y%m%d_%H%M%S) -Ft -z -X stream'
+   docker compose exec pg-backup-primary sh -c '[ -n "${PGPASSWORD_FILE:-}" ] && PGPASSWORD="$(cat "$PGPASSWORD_FILE")";
+     export PGPASSWORD; pg_basebackup -h postgres-primary -U "$PGUSER" -D /backups/pre-upgrade_$(date +%Y%m%d_%H%M%S) -Ft -z -X stream'
+   docker compose exec pg-backup-indexer sh -c '[ -n "${PGPASSWORD_FILE:-}" ] && PGPASSWORD="$(cat "$PGPASSWORD_FILE")";
+     export PGPASSWORD; pg_basebackup -h postgres-indexer -U "$PGUSER" -D /backups/pre-upgrade_$(date +%Y%m%d_%H%M%S) -Ft -z -X stream'
    ```
+
+   On a stack deployed with `private-channel-deploy` the sidecars get the password as a
+   file (`PGPASSWORD_FILE`), not in env, so the command reads it from there first.
 
    The sidecar only prunes directories named `base_*`, so `pre-upgrade_*` survives
    retention. It carries its own WAL (`-X stream`) and restores to the moment it was
@@ -95,10 +98,20 @@ image swap:
 
 ## Secrets management upgrade
 
-For stacks deployed with `private-channel-deploy`. Raw compose is unchanged: `make
-docker-up` on `.env.local` still signs both roles with the one admin key and reads
+For stacks deployed with `private-channel-deploy`. Raw compose on `.env.local` is
+unchanged: `make docker-up` still signs both roles with the one admin key and reads
 secrets from env. Check that by hand after pulling this release (`make docker-up`, then a
 deposit and a withdrawal).
+
+Raw compose on devnet changes: the next `make build-devnet` creates
+`keypairs/withdraw-operator.json` and writes it to `.env` as `OPERATOR_PRIVATE_KEY`, and
+the withdraw operator signs releases with it. Register it before restarting the stack,
+or every `ReleaseFunds` fails:
+
+```bash
+cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> \
+  "$(solana-keygen pubkey keypairs/withdraw-operator.json)"
+```
 
 1. **Register the new withdraw operator key first.** The withdraw operator now signs
    `ReleaseFunds` with its own key, not the channel admin's. Create it (or set up a remote
@@ -144,7 +157,7 @@ deposit and a withdrawal).
    unset DATABASE_URL
    ```
 
-   It reads the indexer database and refuses while a withdrawal is not settled.
+   It reads the indexer database and refuses while a release is in flight.
 
 A separate operator key also lowers how many transfer-hook accounts a release fits, from
 15 to 12; see the CHANGELOG note before upgrading a stack that allows hook mints.

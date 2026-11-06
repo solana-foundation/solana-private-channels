@@ -161,9 +161,9 @@ step6() {
     -d postgres -tAq -c 'SHOW primary_conninfo' | grep -qE \"host='?postgres-primary'? port=5432\" && docker exec private-channel-postgres-replica \
     psql -U private_channel -d postgres -tAq -c 'SHOW primary_conninfo' | grep -vq 'password='"
   check "pg-backup-primary recreated" test "$(cid private-channel-pg-backup-primary)" != "$b"
-  # Both read the superuser password file on every start, so they are recreated.
-  check "postgres-primary recreated" test "$(cid private-channel-postgres-primary)" != "$p"
-  check "postgres-replica recreated" test "$(cid private-channel-postgres-replica)" != "$rp"
+  # ALTER ROLE and the replica passfile apply these, so neither database restarts.
+  check "postgres-primary not recreated" test "$(cid private-channel-postgres-primary)" = "$p"
+  check "postgres-replica not recreated" test "$(cid private-channel-postgres-replica)" = "$rp"
   wait_for 300 "pg-backup-primary first base backup" bash -c "docker logs private-channel-pg-backup-primary 2>&1 | grep -q 'Backup complete'"
   check "superuser logs in with the new password" pg_login "$(secret postgres_password)" private_channel
   check "a read through the replica succeeds" bash -c "curl -s -X POST $READ -H 'Content-Type: application/json' \
@@ -243,24 +243,26 @@ step9() {
   check "the new operator signs releases" grep -qw "$(pub operator2)" <<<"$signers"
   pda="$(solana find-program-derived-address "$ESCROW_PROGRAM_ID" string:operator \
     "pubkey:$INSTANCE" "pubkey:$(pub operator)")"
-  # An unsettled withdrawal blocks remove_operator until it is released.
+  # A release in flight blocks remove_operator; a withdrawal still pending does not.
   compose stop operator-private-channel >/dev/null 2>&1
   deposit_and_burn
-  wait_for 120 "a withdrawal is unsettled" has_unsettled_withdrawal
+  wait_for 120 "a withdrawal is pending" has_unsettled_withdrawal
+  # Stand in for a sent, unconfirmed release by marking the pending row processing.
+  set_last_withdrawal_status processing
   if DATABASE_URL="$(indexer_db_url)" bin remove_operator "$LOCAL_RPC" "$E2E_WORK/keys/escrow-admin.json" "$INSTANCE" \
     "$(pub operator)" >"$E2E_WORK/logs/remove_operator-refused.log" 2>&1; then
-    die "remove_operator ran with an unsettled withdrawal"
+    die "remove_operator ran with a release in flight"
   fi
-  check "remove_operator refused with the count and oldest row" grep -qE "[0-9]+ withdrawal\(s\) not settled; oldest: id [0-9]+ status" \
+  check "remove_operator refused with the count and oldest row" grep -qE "[0-9]+ withdrawal\(s\) in flight; oldest: id [0-9]+ status processing" \
     "$E2E_WORK/logs/remove_operator-refused.log"
   check "the refused run left the old PDA" bash -c "curl -s -X POST $LOCAL_RPC -H 'Content-Type: application/json' \
     -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$pda\"]}' | grep -q '\"owner\"'"
-  compose start operator-private-channel >/dev/null 2>&1
-  wait_for 360 "the pending withdrawal released" more_withdrawals_than "$BEFORE_W"
-  wait_for 120 "every withdrawal settled" no_unsettled_withdrawal
+  set_last_withdrawal_status pending
   DATABASE_URL="$(indexer_db_url)" bin remove_operator "$LOCAL_RPC" "$E2E_WORK/keys/escrow-admin.json" "$INSTANCE" \
     "$(pub operator)" >"$E2E_WORK/logs/remove_operator.log" 2>&1 || die "remove_operator failed (logs/remove_operator.log)"
-  check "remove_operator found nothing in flight" grep -q "No withdrawal in flight" "$E2E_WORK/logs/remove_operator.log"
+  check "remove_operator passed with only a pending withdrawal" grep -q "No withdrawal in flight" "$E2E_WORK/logs/remove_operator.log"
+  compose start operator-private-channel >/dev/null 2>&1
+  wait_for 360 "the new operator released the pending withdrawal" more_withdrawals_than "$BEFORE_W"
   # ReleaseFunds requires this PDA, so a release signed by the old key now fails on chain.
   check "the old operator's PDA is closed" bash -c "curl -s -X POST $LOCAL_RPC -H 'Content-Type: application/json' \
     -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$pda\"]}' | grep -q '\"value\":null'"

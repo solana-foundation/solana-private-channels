@@ -147,12 +147,15 @@ secret_files:
   - { key: DATA_SOURCE_PASS, value: "{{ postgres_monitoring_password }}" }
   mon-pgexp-indexer:
   - { key: DATA_SOURCE_PASS, value: "{{ postgres_indexer_password }}" }
-# Postgres reads only these secret files on each start (the init scripts read the rest once,
-# and the deploy applies later changes by ALTER ROLE), so only they feed its secrets-rev.
+# Secrets that need a restart to take effect feed a service's secrets-rev; a service not
+# listed uses all of its secrets. Postgres uses its passwords only at initdb (the deploy
+# applies changes by ALTER ROLE and the replica passfile), and the replica re-reads its
+# files from the live mount on each start. Grafana's admin password is reset by grafana-cli.
 secrets_rev_keys:
-  postgres-primary: [ POSTGRES_PASSWORD ]
-  postgres-indexer: [ POSTGRES_PASSWORD ]
-  postgres-replica: [ POSTGRES_PASSWORD, POSTGRES_REPLICATION_PASSWORD ]
+  postgres-primary: []
+  postgres-indexer: []
+  postgres-replica: []
+  mon-grafana: [ POSTGRES_GRAFANA_PASSWORD, ALERT_WEBHOOK_URL ]
 _pc_operator_solana_secrets:
   - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
   - { key: COMMON_SOURCE_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }

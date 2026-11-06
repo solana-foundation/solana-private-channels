@@ -41,10 +41,10 @@ release is refused during the swap.
    docker stop private-channel-operator-private-channel
    ```
 
-   You do not have to judge "settled" by eye: `remove_operator` in step 5 reads the
-   indexer database and refuses while any withdrawal is not `completed`, `failed` or
-   `failed_reminted`, printing the count and the oldest row. Withdrawals left pending
-   here are released by the new operator after step 4.
+   You do not have to judge this by eye: `remove_operator` in step 5 reads the indexer
+   database and refuses while any withdrawal is `processing` (a release sent and not yet
+   confirmed), printing the count and the oldest row. Withdrawals left `pending` here are
+   released by the new operator after step 4, and `manual_review` rows do not block.
 
 3. **Swap the operator signer** in `vars/<env>.yml` (or the `-e @` signer file):
    - memory: point `operator_keypair_path` at the new keypair, or replace Doppler
@@ -70,13 +70,12 @@ release is refused during the swap.
    unset DATABASE_URL
    ```
 
-   It refuses while a withdrawal is unsettled; wait and rerun. A row stuck in
-   `manual_review` also blocks it until resolved (see the withdrawal runbooks). The
-   closed PDA's rent goes to the `Instance.admin`. A release signed by the old key now
-   fails on chain.
+   It refuses while a release is in flight; wait a few seconds and rerun. The closed
+   PDA's rent goes to the `Instance.admin`. A release signed by the old key now fails on
+   chain.
 
 If the old key is compromised, run step 2 and then step 5 at once, before the rest,
-with `--force` on `remove_operator` (it then only warns about unsettled withdrawals):
+with `--force` on `remove_operator` (it then only warns about releases in flight):
 the removal makes every release signed with the old key fail on chain, and with the
 operator stopped, withdrawals wait as pending until step 4.
 
@@ -180,7 +179,7 @@ keys.
    unset DATABASE_URL
    ```
 
-   Like operator step 5, it refuses while a withdrawal is not settled.
+   Like operator step 5, it refuses while a release is in flight.
 
 If the old admin key is compromised, the overlap of step 3 lets it keep signing admin
 instructions on the channel until step 6, and it can mint until step 5. Run steps 3 to 6

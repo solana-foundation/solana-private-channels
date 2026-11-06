@@ -3,13 +3,15 @@
 # pg_basebackup -R left the replication password in primary_conninfo, and Postgres
 # logs that value whenever it changes. So the password lives in a 0600 passfile in
 # PGDATA instead; a rotation rewrites the file and restarts the walreceiver.
-- name: Check whether the replica is running
-  ansible.builtin.command: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' private-channel-postgres-replica
-  register: _replica_running
+# A running container is not enough: while it waits for the primary or runs
+# pg_basebackup, Postgres is not listening. Skip then; a fresh base backup needs no fix.
+- name: Check whether the replica's Postgres accepts connections
+  ansible.builtin.command: docker exec private-channel-postgres-replica pg_isready -q
+  register: _replica_ready
   changed_when: false
   failed_when: false
 - name: Point the replica's replication login at the current replicator password
-  when: _replica_running.stdout | default('') | trim == 'true'
+  when: _replica_ready.rc == 0
   ansible.builtin.shell:
     cmd: |
       while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done

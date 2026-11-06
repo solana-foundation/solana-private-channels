@@ -1,20 +1,16 @@
 //! The withdraw operator's releases in flight, read from the indexer DB, so an operator
-//! is not removed while a withdrawal it may still have to sign is unsettled.
+//! is not removed while a release it may have signed is still unconfirmed.
 
-/// The indexer's settled withdrawal statuses; every other one may still need a release.
-pub const TERMINAL_STATUSES: [&str; 3] = ["completed", "failed", "failed_reminted"];
+/// The only status with a release transaction in flight. `pending` rows are not sent yet
+/// (the new operator sends them) and `manual_review` rows are parked, so neither blocks.
+pub const IN_FLIGHT_STATUS: &str = "processing";
 
-/// One row: the unsettled count and the oldest unsettled withdrawal.
+/// One row: the in-flight count and the oldest in-flight withdrawal.
 pub fn pending_query() -> String {
-    let terminal = TERMINAL_STATUSES
-        .iter()
-        .map(|s| format!("'{s}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
         "SELECT count(*) OVER (), id, status::text, withdrawal_nonce, signature, created_at::text \
          FROM transactions WHERE transaction_type = 'withdrawal' \
-         AND status::text NOT IN ({terminal}) ORDER BY created_at, id LIMIT 1"
+         AND status::text = '{IN_FLIGHT_STATUS}' ORDER BY created_at, id LIMIT 1"
     )
 }
 
@@ -33,13 +29,13 @@ impl Pending {
     fn describe(&self) -> String {
         let nonce = self.nonce.map_or("none".to_string(), |n| n.to_string());
         format!(
-            "{} withdrawal(s) not settled; oldest: id {} status {} nonce {} created {} burn {}",
+            "{} withdrawal(s) in flight; oldest: id {} status {} nonce {} created {} burn {}",
             self.count, self.id, self.status, nonce, self.created_at, self.signature
         )
     }
 }
 
-/// Refuses while any withdrawal is unsettled; `force` turns that into a warning.
+/// Refuses while any release is in flight; `force` turns that into a warning.
 pub fn gate(pending: Option<&Pending>, force: bool) -> Result<Option<String>, String> {
     match pending {
         None => Ok(None),
@@ -48,7 +44,7 @@ pub fn gate(pending: Option<&Pending>, force: bool) -> Result<Option<String>, St
             p.describe()
         ))),
         Some(p) => Err(format!(
-            "{}. Let them settle first, or pass --force",
+            "{}. Wait for them to confirm and rerun, or pass --force",
             p.describe()
         )),
     }
@@ -72,7 +68,13 @@ mod tests {
     #[test]
     fn refuses_with_the_count_and_the_oldest_row() {
         let err = gate(Some(&row(2)), false).unwrap_err();
-        for part in ["2 withdrawal(s)", "id 7", "processing", "nonce 3", "Burn1"] {
+        for part in [
+            "2 withdrawal(s) in flight",
+            "id 7",
+            "processing",
+            "nonce 3",
+            "Burn1",
+        ] {
             assert!(err.contains(part), "{err}");
         }
     }
@@ -85,21 +87,10 @@ mod tests {
     }
 
     #[test]
-    fn the_query_excludes_exactly_the_terminal_statuses() {
+    fn the_query_counts_only_withdrawals_in_flight() {
         let q = pending_query();
-        assert!(
-            q.contains("NOT IN ('completed', 'failed', 'failed_reminted')"),
-            "{q}"
-        );
-        assert!(q.contains("transaction_type = 'withdrawal'"));
-        for unsettled in [
-            "pending",
-            "processing",
-            "parked",
-            "pending_remint",
-            "manual_review",
-        ] {
-            assert!(!TERMINAL_STATUSES.contains(&unsettled));
-        }
+        assert!(q.contains("status::text = 'processing'"), "{q}");
+        assert!(q.contains("transaction_type = 'withdrawal'"), "{q}");
+        assert!(!q.contains("NOT IN"), "{q}");
     }
 }
