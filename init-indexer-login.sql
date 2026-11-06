@@ -1,6 +1,7 @@
 -- Bring the indexer cluster's login into being on a data directory that
--- predates it. Run with psql -v target_user=… -v target_pw=… -v prior_user=…,
--- connected as whichever login currently works.
+-- predates it. Run with psql -v target_user=… -v prior_user=… and the new
+-- password in the TARGET_PW env var (never on argv), connected as whichever
+-- login currently works.
 --
 -- Not an entrypoint script: the entrypoint only ever runs on an empty data
 -- directory, which is exactly the case this file does not have to handle. It is
@@ -9,6 +10,8 @@
 -- Runs as superuser, so unqualified calls resolve to the built-ins only, never
 -- to a function some other login created in public.
 SET search_path = pg_catalog, pg_temp;
+
+\set target_pw `printf '%s' "$TARGET_PW"`
 
 \o /dev/null
 SELECT set_config('init.target_user', :'target_user', false);

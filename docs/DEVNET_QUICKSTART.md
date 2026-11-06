@@ -133,6 +133,8 @@ solana-keygen new -o operator-keypair.json -s --no-bip39-passphrase
 solana-keygen pubkey operator-keypair.json
 ```
 
+This is the channel admin key. The withdraw operator signs releases with its own key, which `make build-devnet` creates at `keypairs/withdraw-operator.json` and writes to `.env` as `OPERATOR_PRIVATE_KEY`. Step 7 registers that one.
+
 ## Step 5: Configure Environment Variables
 
 Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
@@ -272,15 +274,17 @@ cargo run --bin allow_mint -- \
 
 ### Add Operator
 
-Run `add_operator` with your operator's public key (from Step 4):
+Run `add_operator` with the withdraw operator's public key, not the Step 4 key. Without it every `ReleaseFunds` fails on chain:
 
 ```shell
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
-  <OPERATOR_PUBKEY>
+  $(solana-keygen pubkey keypairs/withdraw-operator.json)
 ```
+
+`make build-devnet` keeps that key across reruns, so this is needed once per instance. If you delete the file, the next build makes a new key and you must register it again.
 
 ## Step 8: Test Deposits and Withdrawals
 

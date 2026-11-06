@@ -27,6 +27,11 @@ pub struct Config {
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: String,
 
+    /// The secret JWT_SECRET replaced, accepted for verification only during a
+    /// rotation. Tokens are always signed with JWT_SECRET. Blank means off.
+    #[arg(long, env = "JWT_SECRET_PREVIOUS")]
+    pub jwt_secret_previous: Option<String>,
+
     /// Value for the Access-Control-Allow-Origin header.
     /// Set to the frontend origin in production (e.g. "https://app.private_channel.xyz").
     /// Defaults to "*" so local dev works without extra config, but should be
@@ -147,7 +152,28 @@ impl Config {
             ));
         }
 
+        // Same rules as the gateway's, and likewise never formats a value.
+        if let Some(previous) = self.jwt_secret_previous() {
+            let trimmed_len = previous.trim().len();
+            if trimmed_len < MIN_JWT_SECRET_BYTES {
+                return Err(format!(
+                    "JWT_SECRET_PREVIOUS must be at least {MIN_JWT_SECRET_BYTES} bytes after \
+                     trimming whitespace (got {trimmed_len})",
+                ));
+            }
+            if previous.trim() == self.jwt_secret.trim() {
+                return Err("JWT_SECRET_PREVIOUS must differ from JWT_SECRET".to_string());
+            }
+        }
+
         Ok(())
+    }
+
+    /// The previous JWT secret, or `None` when unset or blank.
+    pub fn jwt_secret_previous(&self) -> Option<&str> {
+        self.jwt_secret_previous
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -242,6 +268,63 @@ mod tests {
             with_secret(&secret)
                 .validate()
                 .expect("32 trimmed bytes is enough");
+        }
+    }
+
+    fn with_previous(previous: Option<&str>) -> Config {
+        let mut config = valid_config();
+        config.jwt_secret_previous = previous.map(str::to_string);
+        config
+    }
+
+    /// The same vectors are pinned in the gateway's startup tests.
+    #[test]
+    fn the_previous_jwt_secret_rule_matches_the_gateway() {
+        for off in [None, Some(""), Some("  \t\n")] {
+            let config = with_previous(off);
+            config.validate().expect("unset or blank previous is off");
+            assert_eq!(config.jwt_secret_previous(), None);
+        }
+
+        // Auth refuses a blank current secret outright, so a previous without a current
+        // is caught by that rule here; the gateway needs its own check for it.
+        let previous = "p".repeat(32);
+        let mut config = with_previous(Some(&previous));
+        config.jwt_secret = String::new();
+        let err = config.validate().expect_err("previous without a current");
+        assert!(err.starts_with("JWT_SECRET must be at least"), "got: {err}");
+
+        for short in ["p".repeat(31), format!("  {}  ", "p".repeat(31))] {
+            let err = with_previous(Some(&short))
+                .validate()
+                .expect_err("a short previous must be refused");
+            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        }
+        for same in [STRONG_SECRET.to_string(), format!(" {STRONG_SECRET}\n")] {
+            let err = with_previous(Some(&same))
+                .validate()
+                .expect_err("previous equal to current must be refused");
+            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        }
+        for good in [previous.clone(), format!(" {previous}\n")] {
+            let config = with_previous(Some(&good));
+            config
+                .validate()
+                .expect("a distinct 32 byte previous is valid");
+            assert_eq!(config.jwt_secret_previous(), Some(good.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_rejected_previous_jwt_secret_is_never_echoed() {
+        let long_marker = "LEAKMARKER-0123456789abcdef0123456789";
+        let mut blank_current = with_previous(Some(long_marker));
+        blank_current.jwt_secret = String::new();
+        let mut equal = with_previous(Some(long_marker));
+        equal.jwt_secret = long_marker.to_string();
+        for config in [with_previous(Some("LEAKMARKER-xyz")), blank_current, equal] {
+            let err = config.validate().expect_err("previous must be refused");
+            assert!(!err.contains("LEAK"), "secret leaked: {err}");
         }
     }
 

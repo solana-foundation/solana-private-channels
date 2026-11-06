@@ -108,6 +108,13 @@ gateway_enforce_jwt: true
 # drain escrow custody after the handover.
 admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
 
+# === Withdraw operator keypair ==============================================
+# The key operator-private-channel signs ReleaseFunds with, separate from the
+# channel admin (which stays fee payer, mint authority and fee treasury). Its
+# pubkey needs an Operator PDA (add_operator) before the deploy, which checks it
+# off localnet. Auto-generated on localnet with reset_state, like the admin key.
+operator_keypair_path: "{{ repo_root }}/keypairs/withdraw-operator.json"
+
 # === Seize keys =============================================================
 # permanent_delegate: base58 pubkey written into every channel mint as its
 # Token-2022 permanent delegate, rendered for both the write node and the

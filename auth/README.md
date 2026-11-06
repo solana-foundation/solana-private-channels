@@ -9,6 +9,7 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `AUTH_PORT` | `8903` | Port to listen on |
 | `AUTH_DATABASE_URL` | — | Postgres connection URL. Connect as `private_channel_auth_runtime`, which may read and write users, challenges and wallets, and nothing else. Creating the schema is `auth-admin migrate`'s job, as its owner. |
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. At least 32 bytes after trimming whitespace, or auth refuses to start. |
+| `JWT_SECRET_PREVIOUS` | none | Optional, only during a secret rotation: the previous `JWT_SECRET`. Auth signs with `JWT_SECRET` only; it verifies with `JWT_SECRET`, then this one, so tokens issued before the rotation keep working. Must match the gateway's. Blank or unset is off. Refused at startup when under 32 bytes after trimming, equal to `JWT_SECRET`, or set without `JWT_SECRET`; the value is never echoed. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
 | `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |
@@ -249,6 +250,10 @@ Tokens are signed with HS256. The payload contains:
 ```
 
 The gateway validates `iss`, `aud`, and `exp` on every request. A token issued by any other service, even with the same secret but missing these claims, will be rejected.
+
+### Rotating the secret
+
+Set `JWT_SECRET_PREVIOUS` to the old secret and `JWT_SECRET` to a new one on both auth and the gateway, and restart them. New tokens are signed with the new secret, and tokens signed with either are accepted, with the same `iss`, `aud` and `exp` checks. Once every old token has expired (24 hours), clear `JWT_SECRET_PREVIOUS` and restart again. Until then a leaked previous secret can still forge tokens, so after a compromise replace `JWT_SECRET` and leave `JWT_SECRET_PREVIOUS` blank: every user logs in again. For an Ansible deploy, `scripts/rotate-secret.sh jwt_secret` and `--finish` do this; see [docs/runbooks/secret_rotation.md](../docs/runbooks/secret_rotation.md#jwt).
 
 ## Running tests
 

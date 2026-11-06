@@ -162,6 +162,29 @@ test_pruned_new_backup_is_not_logged_complete() {
   ! grep -q "Backup complete" "$d/out" || fail "clock-back: must not claim success when this cycle's backup is gone"
 }
 
+# The deploy mounts the password as a file; it must reach the pg_* tools as PGPASSWORD.
+test_password_file() {
+  local d
+  d="$(new_case password_file)"
+  cat >"$d/bin/pg_isready" <<STUB
+#!/bin/sh
+echo "pg_isready PGPASSWORD=\$PGPASSWORD" >>"$d/calls"
+exit 0
+STUB
+  chmod +x "$d/bin/pg_isready"
+  printf 'fromfile\n' >"$d/pw"
+  set +e
+  env -i PATH="$d/bin:$PATH" PGHOST=h PGUSER=u PGPASSWORD_FILE="$d/pw" \
+    BACKUP_DIR="$d/backups" WAL_ARCHIVE_DIR="$d/wal" sh "$SCRIPT" >"$d/out" 2>&1
+  set -e
+  grep -q "PGPASSWORD=fromfile$" "$d/calls" || fail "password file: PGPASSWORD_FILE did not reach the pg tools"
+
+  d="$(new_case password_file_missing)"
+  run_script "$d" PGPASSWORD= PGPASSWORD_FILE="$d/nope"
+  [ "$(cat "$d/status")" != 0 ] || fail "missing password file: must fail"
+  ! grep -q pg_ "$d/calls" || fail "missing password file: a pg_* tool ran"
+}
+
 test_rejects_bad_retention
 test_rejects_bad_interval
 test_valid_values_complete_one_cycle
@@ -169,4 +192,5 @@ test_defaults_apply_when_unset_or_empty
 test_missing_complete_backup_skips_wal_pruning
 test_prunes_older_backups_and_keeps_this_cycles
 test_pruned_new_backup_is_not_logged_complete
+test_password_file
 echo "pg-backup tests passed"

@@ -1,0 +1,37 @@
+# HashiCorp Vault signers: each role signs with an ed25519 key in Vault's transit
+# engine. No private key reaches the host; only the Vault token does, as a secret file.
+# Use with: ansible-playbook deploy.yml -l <group> -e @examples/signers/vault.yml
+#
+# Secrets (secrets.yml or Doppler, never this file):
+#   admin_vault_token     (Doppler ADMIN_VAULT_TOKEN)
+#   operator_vault_token  (Doppler OPERATOR_VAULT_TOKEN)
+#
+# One-time Vault setup, one key per role:
+#   vault secrets enable transit
+#   vault write -f transit/keys/pc-admin type=ed25519
+#   vault write -f transit/keys/pc-operator type=ed25519
+#
+# Token policy per role (signing plus the key read the signer's health check makes):
+#   path "transit/sign/pc-admin" { capabilities = ["update"] }
+#   path "transit/keys/pc-admin" { capabilities = ["read"] }
+#
+# The signer never checks the configured pubkey against Vault at startup, so check it
+# yourself. Vault prints the public key base64; this turns the latest version into the
+# base58 pubkey to put in admin_pubkey (repeat for pc-operator / operator_pubkey):
+#   vault read -format=json -field=keys transit/keys/pc-admin | python3 -c 'import json,sys,base64;k=json.load(sys.stdin);b=base64.b64decode(k[max(k,key=int)]["public_key"]);A="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";n=int.from_bytes(b,"big");print("1"*(len(b)-len(b.lstrip(b"\0")))+"".join(A[n//58**i%58] for i in range(50) if n//58**i)[::-1])'
+#
+# Never run `vault write -f transit/keys/<name>/rotate` on these keys: Vault then signs
+# with a new key that no longer matches the pubkey. Rotate by creating a new key name
+# and following docs/runbooks/key_rotation.md.
+
+admin_signer: vault
+# Must be https: the signer client refuses plain http, and the deploy refuses it too.
+# The Vault server certificate must chain to a CA the app image trusts.
+admin_vault_addr: "https://vault.example.internal:8200"
+admin_vault_key_name: pc-admin
+admin_pubkey: "<base58 pubkey of transit/keys/pc-admin>"
+
+operator_signer: vault
+operator_vault_addr: "https://vault.example.internal:8200"
+operator_vault_key_name: pc-operator
+operator_pubkey: "<base58 pubkey of transit/keys/pc-operator>"

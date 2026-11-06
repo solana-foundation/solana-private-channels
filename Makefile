@@ -423,8 +423,13 @@ clean-geyser: yellowstone-clean
 #############
 # Common
 #############
+# Despite its name, keypairs/operator-keypair.json is the CHANNEL ADMIN key.
 generate-operator-keypair:
 	@./scripts/ensure-operator-keypair.sh keypairs/operator-keypair.json
+
+# The withdraw operator's own release key. Register its pubkey with add_operator.
+generate-withdraw-operator-keypair:
+	@./scripts/ensure-operator-keypair.sh keypairs/withdraw-operator.json
 
 #############
 # Localnet
@@ -444,7 +449,9 @@ build-devnet:
 	@$(MAKE) -C private-channel-escrow-program build-devnet
 	@$(MAKE) -C private-channel-withdraw-program build-devnet
 	@$(MAKE) generate-operator-keypair
-	@./scripts/update-admin-env.sh .env.devnet keypairs/operator-keypair.json
+	@$(MAKE) generate-withdraw-operator-keypair
+	@./scripts/update-admin-env.sh --operator-keypair keypairs/withdraw-operator.json .env.devnet keypairs/operator-keypair.json
+	@echo "Withdraw operator: $$(solana-keygen pubkey keypairs/withdraw-operator.json). Register it once per instance with add_operator, or every ReleaseFunds fails."
 
 deploy-devnet:
 	@echo "Deploying all programs to devnet..."

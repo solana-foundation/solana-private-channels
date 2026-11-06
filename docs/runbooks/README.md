@@ -187,6 +187,13 @@ The runbooks call this out at every relevant site.
   Token-2022 channel: drain, sign off that every channel mint's supply is 0 and
   nothing is pending, wipe the channel account state, and start the new release.
   Planned work, not paged.
+- [`secret_rotation.md`](secret_rotation.md) - rotating every deploy secret
+  (Postgres passwords including superuser and replicator, JWT with its previous-key
+  window, Grafana admin, GHCR PAT, webhooks, provider URLs, signer secrets) with
+  `scripts/rotate-secret.sh` and a redeploy. Planned work, not paged.
+- [`key_rotation.md`](key_rotation.md) - rotating the withdraw operator key, the
+  channel admin key (fee sweep, mint authority move with `rotate_channel_admin`) and
+  `Instance.admin`, plus the Vault signer caveats. Planned work, not paged.
 
 ## Drills
 

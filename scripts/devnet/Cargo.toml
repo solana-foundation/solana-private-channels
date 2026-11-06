@@ -11,8 +11,17 @@ path = "src/lib.rs"
 private-channel-escrow-program-client.workspace = true
 private-channel-withdraw-program-client.workspace = true
 solana-client = { workspace = true }
+solana-keychain = { version = "1.4.0", default-features = false, features = [
+    "memory",
+    "vault",
+    "privy",
+    "turnkey",
+    "sdk-v4",
+] }
 solana-sdk.workspace = true
 solana-system-interface.workspace = true
 spl-associated-token-account.workspace = true
 spl-token.workspace = true
 spl-token-2022.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

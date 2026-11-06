@@ -1,6 +1,9 @@
 # Rendered by Ansible — do not edit by hand.
 # Source: monitoring/monitoring.compose.yml.j2
 #
+# Holds no secret: each service mounts only its own {{ host_data_dir }}/secrets/<dir>
+# at /run/secrets and reads the values from files there.
+#
 # Sibling stack to docker-compose.yml. Joins the upstream `private-channel_private-channel-network`
 # (created by the Solana Private Channels compose) so blackbox can resolve service hostnames
 # and cAdvisor sees every running container. Prometheus + Grafana run on
@@ -58,17 +61,15 @@ services:
       # Skip the forced first-login password change so the rest of the
       # playbook can hit /api/* with the password from secrets.sops.yml.
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/GF_SECURITY_ADMIN_PASSWORD
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_USERS_ALLOW_SIGN_UP=false
       # Provisioning files under monitoring/provisioning/ reference these
       # env vars at Grafana startup. Same set + defaults as docker-compose.yml's
       # grafana service so both deploy paths see identical config.
       - PROMETHEUS_URL=http://prometheus:9090
-      # alerting/contact-points.yml uses these; the no-op defaults keep Grafana
-      # from failing provisioning when no real notifier is configured. Set
-      # alert_contact_type (e.g. slack) + alert_webhook_url to enable alerting.
-      - ALERT_WEBHOOK_URL={{ alert_webhook_url | default('http://localhost:9/no-op') }}
+      # alerting/contact-points.yml reads the webhook from its secret file; the
+      # no-op default keeps provisioning valid when no notifier is configured.
       - ALERT_CONTACT_TYPE={{ alert_contact_type | default('webhook') }}
       # External URL Grafana uses when generating links (alert notifications,
       # share links). Without it Grafana emits localhost links that are useless
@@ -78,11 +79,12 @@ services:
       # Postgres datasource (for the Postgres dashboard's direct-DB queries).
       - POSTGRES_INDEXER_HOST=postgres-indexer
       - POSTGRES_INDEXER_DB={{ postgres_indexer_db }}
-      # SELECT on the transaction_monitoring view and nothing else. A Grafana
-      # session can issue arbitrary SQL through this datasource, so the cluster
-      # owner has no business here.
-      - POSTGRES_GRAFANA_PASSWORD={{ postgres_grafana_password }}
+      # The datasource password (SELECT on transaction_monitoring only) is read by
+      # datasources/postgres.yml from /run/secrets via Grafana's $__file{}.
+    labels:
+      secrets-rev: "{{ _secrets_rev['mon-grafana'] | default('none') }}"
     volumes:
+      - {{ host_data_dir }}/secrets/mon-grafana:/run/secrets:ro
       # Single mount per side mirrors the bind-mount layout in
       # docker-compose.yml so both deploy paths see identical provisioning.
       # Provisioning ships datasources/, dashboards/, alerting/ in one tree.
@@ -158,7 +160,13 @@ services:
     environment:
       # pg_monitor only. This container is long-lived on the same network as the
       # auth tables, so the bootstrap superuser has no business being here.
-      - DATA_SOURCE_NAME=postgresql://private_channel_monitoring:{{ postgres_monitoring_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+      - DATA_SOURCE_URI=postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+      - DATA_SOURCE_USER=private_channel_monitoring
+      - DATA_SOURCE_PASS_FILE=/run/secrets/DATA_SOURCE_PASS
+    labels:
+      secrets-rev: "{{ _secrets_rev['mon-pgexp-primary'] | default('none') }}"
+    volumes:
+      - {{ host_data_dir }}/secrets/mon-pgexp-primary:/run/secrets:ro
     ports:
       - "{{ monitoring_bind_address }}{{ monitoring_postgres_exporter_port }}:9187"
     networks: [private-channel]
@@ -170,7 +178,13 @@ services:
     environment:
       # The indexer cluster's own superuser. Not the primary's: this container
       # can reach postgres-primary too.
-      - DATA_SOURCE_NAME=postgresql://{{ postgres_indexer_user }}:{{ postgres_indexer_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
+      - DATA_SOURCE_URI=postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
+      - DATA_SOURCE_USER={{ postgres_indexer_user }}
+      - DATA_SOURCE_PASS_FILE=/run/secrets/DATA_SOURCE_PASS
+    labels:
+      secrets-rev: "{{ _secrets_rev['mon-pgexp-indexer'] | default('none') }}"
+    volumes:
+      - {{ host_data_dir }}/secrets/mon-pgexp-indexer:/run/secrets:ro
     ports:
       # Distinct from monitoring_postgres_exporter_port so primary + indexer
       # exporters don't collide on the host. Defined in vars/<env>.yml.

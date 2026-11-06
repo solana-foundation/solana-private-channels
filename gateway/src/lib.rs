@@ -161,6 +161,16 @@ pub struct Args {
     #[arg(long, env = "JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
+    /// The secret JWT_SECRET replaced, accepted for verification only while tokens
+    /// signed with it are still live. Blank means off.
+    #[arg(long, env = "JWT_SECRET_PREVIOUS")]
+    pub jwt_secret_previous: Option<String>,
+
+    /// When `1`, refuse to start with a blank JWT_SECRET instead of running with
+    /// auth off, so a secret lost in deployment cannot silently disable RBAC.
+    #[arg(long, env = "GATEWAY_REQUIRE_JWT")]
+    pub require_jwt: Option<String>,
+
     /// Connection URL for the auth service's Postgres database.
     /// Required when JWT_SECRET is set (used for wallet ownership checks).
     #[arg(long, env = "AUTH_DATABASE_URL")]
@@ -376,9 +386,9 @@ pub struct Gateway {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
     >,
-    /// Pre-built decoding key derived from JWT_SECRET at startup.
-    /// `None` means auth enforcement is disabled.
-    jwt_secret: Option<DecodingKey>,
+    /// Decoding keys built from JWT_SECRET, then JWT_SECRET_PREVIOUS, at startup.
+    /// Empty means auth enforcement is disabled.
+    jwt_keys: Vec<DecodingKey>,
     /// Connection pool to the auth service's Postgres database.
     /// Used for wallet ownership checks on gated methods.
     /// `None` when auth enforcement is disabled.
@@ -833,6 +843,45 @@ fn resolve_jwt_secret(secret: Option<&str>) -> Result<Option<&str>, String> {
     Ok(Some(secret))
 }
 
+/// Startup rule for `JWT_SECRET_PREVIOUS`, given the already resolved current secret and
+/// pinned to the same vectors as the auth service. Blank means off. The error never
+/// includes either secret.
+fn resolve_jwt_secret_previous<'a>(
+    current: Option<&str>,
+    previous: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    let Some(previous) = previous.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Some(current) = current else {
+        return Err("JWT_SECRET_PREVIOUS is set but JWT_SECRET is blank; \
+                    a previous key only makes sense during a rotation"
+            .to_string());
+    };
+    let trimmed_len = previous.trim().len();
+    if trimmed_len < MIN_JWT_SECRET_BYTES {
+        return Err(format!(
+            "JWT_SECRET_PREVIOUS must be at least {MIN_JWT_SECRET_BYTES} bytes after \
+             trimming whitespace (got {trimmed_len})"
+        ));
+    }
+    if previous.trim() == current.trim() {
+        return Err("JWT_SECRET_PREVIOUS must differ from JWT_SECRET".to_string());
+    }
+    Ok(Some(previous))
+}
+
+/// `GATEWAY_REQUIRE_JWT=1` turns a blank `JWT_SECRET` from "RBAC off" into a startup error.
+fn check_require_jwt(require: Option<&str>, auth_enabled: bool) -> Result<(), String> {
+    if require == Some("1") && !auth_enabled {
+        return Err(
+            "GATEWAY_REQUIRE_JWT=1 but JWT_SECRET is blank; refusing to start without auth"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A blank `GATEWAY_INTERNAL_PORT` means "no internal listener", the same way a
 /// blank `JWT_SECRET` means "no auth". Compose substitutes an unset variable as
 /// the empty string, so an env file that predates the internal listener must
@@ -949,15 +998,17 @@ impl Gateway {
         let client = Client::builder(TokioExecutor::new()).build(https);
         // Treat an empty or whitespace-only JWT_SECRET as "not set"; key is built from the
         // untrimmed bytes so it stays identical to the auth service's signing key.
-        let jwt_secret = configured_secret(jwt_secret.as_deref())
-            .map(|s| DecodingKey::from_secret(s.as_bytes()));
+        let jwt_keys = configured_secret(jwt_secret.as_deref())
+            .map(|s| DecodingKey::from_secret(s.as_bytes()))
+            .into_iter()
+            .collect();
         Self {
             write_url,
             read_url,
             cors_allowed_origin,
             limits: Limits::default(),
             client,
-            jwt_secret,
+            jwt_keys,
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
             role_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -968,6 +1019,19 @@ impl Gateway {
             block_list_ip_counts: Arc::new(Mutex::new(HashMap::new())),
             withdraw_whitelist: None,
         }
+    }
+
+    /// Also accepts tokens signed with the previous secret, checked after the current one.
+    /// Lenient like `new`: ignored when blank or when there is no current secret.
+    pub fn with_previous_jwt_secret(mut self, previous: Option<String>) -> Self {
+        if let (false, Some(previous)) = (
+            self.jwt_keys.is_empty(),
+            configured_secret(previous.as_deref()),
+        ) {
+            self.jwt_keys
+                .push(DecodingKey::from_secret(previous.as_bytes()));
+        }
+        self
     }
 
     /// Overrides the default resource limits.
@@ -1288,12 +1352,12 @@ impl Gateway {
         // mode, so a caller reads the balance straight from getTokenAccountBalance
         // instead of inferring it from error codes. Redacting would also hit the
         // operator services, since with no key we cannot tell who is an Operator.
-        let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
-            (Some(k), Some(db)) => (k, db),
+        let (decoding_keys, auth_db) = match (self.jwt_keys.as_slice(), &self.auth_db) {
+            (keys @ [_, ..], Some(db)) => (keys, db),
             _ => return Ok(CallPolicy::passthrough()),
         };
 
-        let mut claims = verify_bearer(auth_header, decoding_key);
+        let mut claims = verify_bearer(auth_header, decoding_keys);
 
         // Re-check an Operator claim against the DB and downgrade to User when the
         // role was revoked. This runs before the ungated branch below so redaction
@@ -2374,11 +2438,18 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
 
     // Config rules run before anything connects, so a bad value never opens the pool.
-    let auth_enabled = resolve_jwt_secret(args.jwt_secret.as_deref())?.is_some();
+    let current_secret = resolve_jwt_secret(args.jwt_secret.as_deref())?;
+    let auth_enabled = current_secret.is_some();
+    check_require_jwt(args.require_jwt.as_deref(), auth_enabled)?;
+    let rotating =
+        resolve_jwt_secret_previous(current_secret, args.jwt_secret_previous.as_deref())?.is_some();
     info!(
         "  Auth enforcement: {}",
         if auth_enabled { "enabled" } else { "disabled" }
     );
+    if rotating {
+        info!("  JWT previous key: accepted for verification");
+    }
     let limits = Limits {
         max_connections: args.max_connections,
         max_connections_per_ip: args.max_connections_per_ip,
@@ -2459,6 +2530,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.jwt_secret,
             auth_db,
         )
+        .with_previous_jwt_secret(args.jwt_secret_previous)
         .with_limits(limits)
         .with_withdraw_whitelist(withdraw_whitelist),
     );
@@ -4905,6 +4977,36 @@ mod tests {
         }
     }
 
+    /// The same vectors are pinned in the auth service's config tests.
+    #[test]
+    fn previous_jwt_secret_rule_matches_the_auth_service() {
+        let current = "c".repeat(32);
+        let previous = "p".repeat(32);
+        for off in [None, Some(""), Some("  \t\n")] {
+            assert_eq!(resolve_jwt_secret_previous(Some(&current), off), Ok(None));
+            assert_eq!(resolve_jwt_secret_previous(None, off), Ok(None));
+        }
+        let err = resolve_jwt_secret_previous(None, Some(&previous))
+            .expect_err("previous without a current must be refused");
+        assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        for short in ["p".repeat(31), format!("  {}  ", "p".repeat(31))] {
+            let err = resolve_jwt_secret_previous(Some(&current), Some(&short))
+                .expect_err("a short previous must be refused");
+            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        }
+        for same in [current.clone(), format!(" {current}\n")] {
+            let err = resolve_jwt_secret_previous(Some(&current), Some(&same))
+                .expect_err("previous equal to current must be refused");
+            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        }
+        for good in [previous.clone(), format!(" {previous}\n")] {
+            assert_eq!(
+                resolve_jwt_secret_previous(Some(&current), Some(&good)),
+                Ok(Some(good.as_str()))
+            );
+        }
+    }
+
     #[test]
     fn a_rejected_jwt_secret_is_never_echoed() {
         let marker = "LEAKMARKER-xyz";
@@ -4913,6 +5015,49 @@ mod tests {
             !err.contains(marker) && !err.contains("LEAK"),
             "leaked: {err}"
         );
+
+        let long_marker = "LEAKMARKER-0123456789abcdef0123456789";
+        let current = "c".repeat(32);
+        for (current, previous) in [
+            (Some(current.as_str()), marker),
+            (None, long_marker),
+            (Some(long_marker), long_marker),
+        ] {
+            let err = resolve_jwt_secret_previous(current, Some(previous))
+                .expect_err("previous must be refused");
+            assert!(!err.contains("LEAK"), "leaked: {err}");
+        }
+    }
+
+    /// Previous is only used when there is a current to rotate from, and blank means off.
+    #[test]
+    fn the_gateway_holds_current_then_previous() {
+        let gateway = |current: Option<&str>, previous: Option<&str>| {
+            Gateway::new(
+                "http://w".into(),
+                "http://r".into(),
+                "*".into(),
+                current.map(str::to_string),
+                None,
+            )
+            .with_previous_jwt_secret(previous.map(str::to_string))
+        };
+        assert_eq!(gateway(Some("current"), None).jwt_keys.len(), 1);
+        assert_eq!(gateway(Some("current"), Some(" ")).jwt_keys.len(), 1);
+        assert_eq!(gateway(Some("current"), Some("previous")).jwt_keys.len(), 2);
+        assert_eq!(gateway(None, Some("previous")).jwt_keys.len(), 0);
+        assert_eq!(gateway(Some(" "), Some("previous")).jwt_keys.len(), 0);
+    }
+
+    #[test]
+    fn require_jwt_refuses_only_a_blank_secret_when_set_to_one() {
+        let err = check_require_jwt(Some("1"), false).expect_err("blank secret with 1");
+        assert!(err.contains("GATEWAY_REQUIRE_JWT"), "got: {err}");
+        assert!(err.contains("JWT_SECRET"), "got: {err}");
+        assert_eq!(check_require_jwt(Some("1"), true), Ok(()));
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(check_require_jwt(off, false), Ok(()), "{off:?}");
+        }
     }
 
     #[test]
@@ -5022,11 +5167,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_refuses_a_bad_previous_secret_before_connecting() {
+        let current = "0123456789abcdef0123456789abcdef01234567";
+        let marker = "LEAKMARKER-xyz";
+        for (current, previous) in [(current, marker), (current, current), ("", current)] {
+            let args = parse_args(&[
+                "--port",
+                "0",
+                "--jwt-secret",
+                current,
+                "--jwt-secret-previous",
+                previous,
+                "--auth-database-url",
+                UNREACHABLE_AUTH_DB,
+            ]);
+            let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+                .await
+                .expect("a bad previous secret must be refused, not served")
+                .expect_err("a bad previous secret must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("JWT_SECRET_PREVIOUS"), "got: {msg}");
+            assert!(!msg.contains(marker), "secret leaked: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_blank_secret_when_jwt_is_required() {
+        let mut args = parse_args(&["--port", "0", "--jwt-secret", "", "--require-jwt", "1"]);
+        args.jwt_secret_previous = None;
+        args.auth_database_url = None;
+        let err = tokio::time::timeout(Duration::from_secs(5), run(args))
+            .await
+            .expect("a required but blank secret must be refused, not served")
+            .expect_err("a required but blank secret must be refused");
+        assert!(
+            err.to_string().contains("GATEWAY_REQUIRE_JWT"),
+            "got: {err}"
+        );
+    }
+
     /// Blank means RBAC off, so the gateway keeps serving.
     #[tokio::test]
     async fn run_serves_with_a_blank_secret() {
         let mut args = parse_args(&["--port", "0", "--jwt-secret", ""]);
         args.auth_database_url = None;
+        // Both also read the environment; unset is the case under test.
+        args.require_jwt = None;
+        args.jwt_secret_previous = None;
         let outcome = tokio::time::timeout(Duration::from_millis(500), run(args)).await;
         assert!(
             outcome.is_err(),

@@ -11,11 +11,32 @@
 
 # Prepend image_registry so `compose pull` resolves to GHCR (or whatever registry).
 {% set img_prefix = image_registry ~ '/' %}
+{# Env keys signer_util reads for a remote backend; memory's key is in the base compose. #}
+{% set signer_keys = {
+  'memory': [],
+  'vault': ['VAULT_ADDR', 'VAULT_TOKEN', 'VAULT_KEY_NAME', 'VAULT_PUBKEY'],
+  'turnkey': ['TURNKEY_API_PUBLIC_KEY', 'TURNKEY_API_PRIVATE_KEY', 'TURNKEY_ORGANIZATION_ID', 'TURNKEY_PRIVATE_KEY_ID', 'TURNKEY_PUBKEY'],
+  'privy': ['PRIVY_APP_ID', 'PRIVY_APP_SECRET', 'PRIVY_WALLET_ID'],
+} %}
+{# Signer secrets reach the container as files, never through .env. #}
+{% set signer_secret_env = ['ADMIN_VAULT_TOKEN', 'ADMIN_TURNKEY_API_PRIVATE_KEY', 'ADMIN_PRIVY_APP_SECRET',
+                            'OPERATOR_VAULT_TOKEN', 'OPERATOR_TURNKEY_API_PRIVATE_KEY', 'OPERATOR_PRIVY_APP_SECRET'] %}
+{# operator-solana signs as the channel admin only; the withdraw operator also gets its release key. #}
+{% set signer_roles = {
+  'operator-solana': ['admin'],
+  'operator-private-channel': ['admin', 'operator'],
+} %}
+
+{# Services that read secrets; the monitoring ones live in monitoring.compose.yml. #}
+{% set secret_services = secret_files.keys() | reject('match', '^mon-') | reject('equalto', 'streamer' if network != 'localnet' else '') | list %}
+{% set app_services = ['write-node', 'read-node', 'gateway', 'streamer', 'auth', 'auth-migrate',
+                       'indexer-solana', 'indexer-private-channel', 'operator-solana', 'operator-private-channel'] %}
 
 services:
-{% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth', 'auth-migrate',
-               'indexer-solana', 'indexer-private-channel', 'operator-solana', 'operator-private-channel'] %}
+{% for svc in (app_services + secret_services) | unique %}
+{% if svc != 'streamer' or network == 'localnet' %}
   {{ svc }}:
+{% if svc in app_services %}
     # Pin every Solana Private Channels-app service to the deployed image. With
     # signature verification on, pin the exact digest cosign verified in preflight
     # (pc_app_image_digest) so `compose pull` can't resolve a tag that moved after
@@ -26,6 +47,32 @@ services:
     image: {{ img_prefix }}private-channel-app@{{ pc_app_image_digest | mandatory('verify_image_signature is enabled but no cosign-verified digest was recorded. Run the verify (preflight) phase before rendering so the digest is captured.') }}
 {% else %}
     image: {{ img_prefix }}private-channel-app:{{ image_tag }}
+{% endif %}
+{% endif %}
+{% set _env = [] %}
+{% for role in signer_roles.get(svc, []) %}
+{% for k in signer_keys[lookup('vars', role ~ '_signer', default='memory')] %}
+{% set _ = _env.append(role | upper ~ '_' ~ k) %}
+{% endfor %}
+{% endfor %}
+{% set _files = secret_files.get(svc, []) | selectattr('value') | map(attribute='key') | list %}
+{% if _env or _files %}
+    environment:
+{% for k in _env if k not in signer_secret_env %}
+      {{ k }}: ${{ '{' }}{{ k }}{{ '}' }}
+{% endfor %}
+{% for k in _files %}
+      {{ k }}_FILE: /run/secrets/{{ k }}
+{% endfor %}
+{% endif %}
+{% if svc in secret_services %}
+    # Only this service's own secrets, read-only. The parent dir is root 0700.
+    volumes:
+      - {{ host_data_dir }}/secrets/{{ svc }}:/run/secrets:ro
+    # Changes when this service's secrets change, so compose recreates exactly it.
+    labels:
+      secrets-rev: "{{ _secrets_rev[svc] | default('none') }}"
+{% endif %}
 {% endif %}
 {% endfor %}
 

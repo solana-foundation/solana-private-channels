@@ -1,0 +1,25 @@
+# Memory signers: each role's private key is loaded from a keypair file on the
+# control node and delivered to the host as a root-only secret file.
+# Use with: ansible-playbook deploy.yml -l <group> -e @examples/signers/memory.yml
+#
+# Allowed on localnet and devnet. Mainnet refuses memory for either role.
+# Off localnet the two keys must differ, and the operator key needs an Operator PDA
+# (add_operator, signed by the escrow Instance.admin) before the deploy.
+#
+# Instead of a path, a key can come from Doppler ADMIN_KEYPAIR / OPERATOR_KEYPAIR
+# (the keypair JSON byte array), which wins over the path. Refused on mainnet.
+
+admin_signer: memory
+operator_signer: memory
+
+# Channel admin: fee payer, mint and freeze authority of every receipt mint, and the
+# withdraw fee treasury. Create with: solana-keygen new --outfile keypairs/admin.json
+admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
+
+# Withdraw operator: signs ReleaseFunds. Create with:
+#   solana-keygen new --outfile keypairs/withdraw-operator.json
+operator_keypair_path: "{{ repo_root }}/keypairs/withdraw-operator.json"
+
+# Optional: the deploy derives each pubkey from its keypair and refuses a mismatch.
+# admin_pubkey: "<admin base58 pubkey>"
+# operator_pubkey: "<operator base58 pubkey>"

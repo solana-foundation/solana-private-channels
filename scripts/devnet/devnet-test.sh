@@ -92,14 +92,24 @@ USER=$(solana-keygen pubkey "$USER_KEYPAIR")
 # Derived from the secret itself, not from a keypair path: a path could name a key the
 # containers never load, which would both defeat the check below and register an Operator
 # that cannot sign ReleaseFunds.
-if ! OPERATOR=$(printf '%s\n' "$ADMIN_PRIVATE_KEY" | solana-keygen pubkey -); then
+if ! CHANNEL_ADMIN=$(printf '%s\n' "$ADMIN_PRIVATE_KEY" | solana-keygen pubkey -); then
   echo "ERROR: could not derive a pubkey from ADMIN_PRIVATE_KEY." >&2
   echo "       Expected the JSON byte array that \`make build-devnet\` writes to .env." >&2
   exit 1
 fi
 
+# The withdraw operator signs releases with its own key when one is set, else with
+# the channel admin key (the compose fallback). That key gets the Operator PDA.
+OPERATOR="$CHANNEL_ADMIN"
+if [ -n "${OPERATOR_PRIVATE_KEY:-}" ]; then
+  if ! OPERATOR=$(printf '%s\n' "$OPERATOR_PRIVATE_KEY" | solana-keygen pubkey -); then
+    echo "ERROR: could not derive a pubkey from OPERATOR_PRIVATE_KEY." >&2
+    exit 1
+  fi
+fi
+
 # Fail closed on the collapsed-key configuration this script used to ship with.
-if [ "$ESCROW_ADMIN" = "$OPERATOR" ]; then
+if [ "$ESCROW_ADMIN" = "$CHANNEL_ADMIN" ] || [ "$ESCROW_ADMIN" = "$OPERATOR" ]; then
   echo "ERROR: the escrow admin and the channel admin are the same key ($ESCROW_ADMIN)." >&2
   echo "       SetNewAdmin cannot revoke a key that also holds receipt-mint authority" >&2
   echo "       and an Operator PDA. Use two distinct keypairs." >&2
@@ -114,7 +124,8 @@ get_token_balance() {
 }
 
 echo "Escrow admin (Instance.admin): $ESCROW_ADMIN"
-echo "Channel admin / operator: $OPERATOR"
+echo "Channel admin: $CHANNEL_ADMIN"
+echo "Withdraw operator: $OPERATOR"
 echo "Mint: $MINT"
 echo "User: $USER"
 
