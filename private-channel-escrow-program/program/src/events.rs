@@ -75,6 +75,8 @@ pub struct AllowMintEvent {
     pub min_withdraw_amount: u64,
     /// Smallest amount a deposit must land in the escrow, 0 for none
     pub min_deposit_amount: u64,
+    /// The mint has ConfidentialMintBurn, so the channel refuses public withdrawals
+    pub confidential_only: bool,
 }
 
 impl AllowMintEvent {
@@ -85,6 +87,7 @@ impl AllowMintEvent {
         withdraw_fee: u64,
         min_withdraw_amount: u64,
         min_deposit_amount: u64,
+        confidential_only: bool,
     ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::AllowMint as u8,
@@ -94,13 +97,15 @@ impl AllowMintEvent {
             withdraw_fee,
             min_withdraw_amount,
             min_deposit_amount,
+            confidential_only,
         }
     }
 
     // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
     // + 8 (withdraw_fee) + 8 (min_withdraw_amount) + 8 (min_deposit_amount)
+    // + 1 (confidential_only)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(98);
+        let mut data = Vec::with_capacity(99);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -109,6 +114,7 @@ impl AllowMintEvent {
         data.extend_from_slice(&self.withdraw_fee.to_le_bytes());
         data.extend_from_slice(&self.min_withdraw_amount.to_le_bytes());
         data.extend_from_slice(&self.min_deposit_amount.to_le_bytes());
+        data.push(self.confidential_only as u8);
         data
     }
 }
@@ -821,6 +827,7 @@ mod tests {
             withdraw_fee,
             min_withdraw_amount,
             min_deposit_amount,
+            true,
         );
 
         assert_eq!(
@@ -833,17 +840,20 @@ mod tests {
         assert_eq!(event.withdraw_fee, withdraw_fee);
         assert_eq!(event.min_withdraw_amount, min_withdraw_amount);
         assert_eq!(event.min_deposit_amount, min_deposit_amount);
+        assert!(event.confidential_only);
 
         // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
         // + 8 (withdraw_fee) + 8 (min_withdraw_amount) + 8 (min_deposit_amount)
+        // + 1 (confidential_only)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 98);
+        assert_eq!(bytes.len(), 99);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::AllowMint as u8);
         assert_eq!(bytes[73], 6);
         assert_eq!(&bytes[74..82], &withdraw_fee.to_le_bytes());
         assert_eq!(&bytes[82..90], &min_withdraw_amount.to_le_bytes());
         assert_eq!(&bytes[90..98], &min_deposit_amount.to_le_bytes());
+        assert_eq!(bytes[98], 1);
     }
 
     #[test]

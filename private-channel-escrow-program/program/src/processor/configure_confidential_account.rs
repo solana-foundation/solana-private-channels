@@ -37,8 +37,8 @@ use spl_token_2022::extension::ExtensionType;
 /// mint, then turns confidential credits off so they only arrive through
 /// ConfidentialDeposit and MoveToConfidential. Public credits stay on. Refuses a
 /// mint recreated since AllowMint, as Deposit does, a mint without
-/// `ConfidentialTransferMint`, a fee mint without `ConfidentialTransferFeeConfig`
-/// and a `ConfidentialMintBurn` mint. Token-2022 refuses an account configured
+/// `ConfidentialTransferMint` and a fee mint without
+/// `ConfidentialTransferFeeConfig`. Token-2022 refuses an account configured
 /// before.
 ///
 /// # Account Layout
@@ -109,12 +109,10 @@ pub fn process_configure_confidential_account(
     }
 
     // Token-2022 refuses every confidential transfer of a fee mint without the
-    // confidential fee config. A ConfidentialMintBurn mint has no public balance,
-    // so a public withdrawal from the channel could never be released.
+    // confidential fee config.
     if !allowed_mint.has_extension(ExtensionType::ConfidentialTransferMint)
         || (allowed_mint.has_extension(ExtensionType::TransferFeeConfig)
             && !allowed_mint.has_extension(ExtensionType::ConfidentialTransferFeeConfig))
-        || allowed_mint.has_extension(ExtensionType::ConfidentialMintBurn)
     {
         return Err(PrivateChannelEscrowProgramError::UnsupportedConfidentialMint.into());
     }

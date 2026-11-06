@@ -6,24 +6,24 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                                                                                                                                                              |
-| ----------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Instruction handlers          | 100% (3/3)   | WithdrawFunds, SetWithdrawConfig, ConfidentialWithdrawFunds                                                                                                                                          |
-| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, withdraw config owner/address, treasury, system program                                                                                    |
-| Business logic error branches | 100% (11/11) | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, below minimum, at minimum, treasury exemptions, mint authority, wrong mint                                               |
-| Custom error codes exercised  | 100% (9/9)   | InvalidMint, ZeroAmount, InvalidWithdrawConfig, WithdrawConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, AmountBelowMinimum, AmountAboveConfidentialMaximum |
-| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, withdraw config layout                                                                                                                      |
-| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                                                                                            |
-| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign withdraw config, wrong treasury, pre-funded config PDA                                                                                        |
-| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                                                                                      |
+| Category                      | Coverage     | Details                                                                                                                                                                                                                    |
+| ----------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Instruction handlers          | 100% (3/3)   | WithdrawFunds, SetWithdrawConfig, ConfidentialWithdrawFunds                                                                                                                                                                |
+| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, withdraw config owner/address, treasury, system program                                                                                                          |
+| Business logic error branches | 100% (11/11) | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, below minimum, at minimum, treasury exemptions, mint authority, wrong mint                                                                     |
+| Custom error codes exercised  | 100% (10/10) | InvalidMint, ZeroAmount, InvalidWithdrawConfig, WithdrawConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, AmountBelowMinimum, AmountAboveConfidentialMaximum, ConfidentialOnlyMint |
+| State & trait coverage (unit) | 100% (18/18) | Instruction parsing, discriminator, event serialization, withdraw config layout                                                                                                                                            |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                                                                                                                  |
+| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign withdraw config, wrong treasury, pre-funded config PDA                                                                                                              |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                                                                                                            |
 
 ## Test Inventory
 
-**16 unit tests** + **30 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
+**18 unit tests** + **45 integration tests** (LiteSVM) + **13 TypeScript SDK tests**.
 
-### Unit Tests (16 tests)
+### Unit Tests (18 tests)
 
-#### WithdrawFunds Instruction Data Parsing (8 tests in `withdraw_funds.rs`)
+#### WithdrawFunds Instruction Data Parsing (9 tests in `withdraw_funds.rs`)
 
 - `test_parse_instruction_data_valid_with_destination` — 41-byte data with destination
 - `test_parse_instruction_data_valid_without_destination` — 9-byte data, no destination
@@ -35,17 +35,18 @@
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 - `test_confidential_withdraw_funds_cap_is_checked_before_accounts` — 2^48 refused with AmountAboveConfidentialMaximum, 2^48 - 1 passes the cap
 
-#### SetWithdrawConfig (2 tests in `set_withdraw_config.rs`)
+#### SetWithdrawConfig (3 tests in `set_withdraw_config.rs`)
 
-- `test_parse_instruction_data_valid` — fee, AllowMint slot, treasury and minimum parsed from 56 bytes
+- `test_parse_instruction_data_valid` — fee, AllowMint slot, treasury, minimum and confidential-only flag parsed from 57 bytes
 - `test_parse_instruction_data_missing_minimum` — the 48-byte layout without a minimum rejected
+- `test_parse_instruction_data_missing_flag` — the 56-byte layout without the confidential-only flag rejected
 
 #### Withdraw Config State (2 tests in `state/withdraw_config.rs`)
 
-- `test_withdraw_config_serialization_roundtrip` — 89-byte layout, distinct values for every field catch field order and endianness
+- `test_withdraw_config_serialization_roundtrip` — 90-byte layout, distinct values for every field catch field order and endianness
 - `test_withdraw_config_try_from_bytes_wrong_length` — short data returns the custom InvalidWithdrawConfig, never a builtin error
 
-#### Discriminator (2 tests in `discriminator.rs`)
+#### Discriminator (3 tests in `discriminator.rs`)
 
 - `test_discriminator_valid` — byte 0 maps to WithdrawFunds
 - `test_discriminator_confidential_withdraw_funds` — byte 2 maps to ConfidentialWithdrawFunds
@@ -55,13 +56,16 @@
 
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### ConfidentialWithdrawFunds — Integration Tests (8 tests in `test_confidential_withdraw_funds.rs`)
+### ConfidentialWithdrawFunds — Integration Tests (11 tests in `test_confidential_withdraw_funds.rs`)
 
 - `test_confidential_withdraw_funds_burns_and_pays_the_fee` — burn, fee and the same WithdrawFundsEvent as WithdrawFunds
 - `test_confidential_withdraw_funds_without_destination_releases_to_the_user` — event destination defaults to the user
 - `test_confidential_withdraw_funds_accepts_the_maximum` — 2^48 - 1 accepted
 - `test_confidential_withdraw_funds_refuses_above_the_maximum` — 2^48 and near u64::MAX refused, nothing moves
 - `test_withdraw_funds_above_the_confidential_maximum_is_unchanged` — WithdrawFunds has no cap
+- `test_withdraw_funds_refuses_a_confidential_only_mint` — ConfidentialOnlyMint, nothing moves
+- `test_withdraw_funds_refuses_the_treasury_on_a_confidential_only_mint` — the treasury's exemptions do not reach past the refusal
+- `test_confidential_withdraw_funds_accepts_a_confidential_only_mint`
 - `test_confidential_withdraw_funds_keeps_the_fee_exemptions` — treasury exemption and zero-fee mint
 - `test_confidential_withdraw_funds_makes_the_same_checks_as_withdraw_funds` — 17 refusal cases run as both instructions, same error, nothing moves
 - `test_confidential_withdraw_funds_matches_the_withdraw_funds_layout` — accounts and data equal WithdrawFunds apart from the discriminator

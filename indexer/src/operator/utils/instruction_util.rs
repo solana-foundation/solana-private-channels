@@ -460,6 +460,9 @@ pub struct WithdrawConfigSetup {
     pub allow_mint_slot: u64,
     pub treasury: Pubkey,
     pub min_withdraw_amount: u64,
+    /// The Solana mint has ConfidentialMintBurn; the channel refuses its public
+    /// withdrawals.
+    pub confidential_only: bool,
 }
 
 /// Builder for channel Token-2022 mint instructions (deposit flow)
@@ -609,6 +612,7 @@ impl MintToBuilder {
                     .allow_mint_slot(withdraw_config_setup.allow_mint_slot)
                     .treasury(withdraw_config_setup.treasury)
                     .min_withdraw_amount(withdraw_config_setup.min_withdraw_amount)
+                    .confidential_only(withdraw_config_setup.confidential_only)
                     .instruction(),
             );
         }
@@ -789,6 +793,7 @@ mod tests {
                 allow_mint_slot: 0,
                 treasury,
                 min_withdraw_amount: 100,
+                confidential_only: false,
             });
 
         let ixs = b.instructions().unwrap();

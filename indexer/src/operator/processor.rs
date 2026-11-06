@@ -1911,6 +1911,7 @@ pub async fn process_deposit_funds(
                     allow_mint_slot: mint_row.allow_mint_slot as u64,
                     treasury: processor_state.admin_pubkey,
                     min_withdraw_amount: mint_row.min_withdraw_amount.value(),
+                    confidential_only: mint_row.confidential_only,
                 });
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
@@ -2042,6 +2043,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
@@ -2096,6 +2098,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4006,6 +4009,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -4096,6 +4100,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -4163,6 +4168,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4773,6 +4779,7 @@ mod tests {
             let mint_row = mints.get_mut(&mint_pubkey.to_string()).unwrap();
             mint_row.allow_mint_slot = allow_mint_slot as i64;
             mint_row.min_withdraw_amount = TokenAmount(min_withdraw_amount);
+            mint_row.confidential_only = true;
         }
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4810,10 +4817,10 @@ mod tests {
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
 
-        // The deposit writes the withdraw config: the fee, minimum and their
+        // The deposit writes the withdraw config: the fee, minimum, flag and their
         // AllowMint slot from the mints row, and the operator admin as treasury.
         // Data is [discriminator][fee u64 LE][allow_mint_slot u64 LE][treasury]
-        // [min_withdraw_amount u64 LE].
+        // [min_withdraw_amount u64 LE][confidential_only u8].
         let instructions = b.builder.instructions().unwrap();
         let set_withdraw_config = &instructions[1];
         assert_eq!(
@@ -4833,6 +4840,7 @@ mod tests {
             &set_withdraw_config.data[49..57],
             &min_withdraw_amount.to_le_bytes()
         );
+        assert_eq!(set_withdraw_config.data[57], 1);
     }
 
     /// The deposit mint's on-chain memo must key on the event's chain coordinates,
@@ -5233,6 +5241,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -5883,6 +5892,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -6024,6 +6034,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -6393,6 +6404,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -6502,6 +6514,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),

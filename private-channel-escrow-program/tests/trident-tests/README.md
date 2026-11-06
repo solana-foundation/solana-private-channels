@@ -40,8 +40,8 @@ Tests the bitmap rotation lifecycle across multiple generations.
 
 Tests the confidential instructions (12-17) next to public deposits and releases on
 the same escrow account. Each iteration picks a confidential Token-2022 mint: plain,
-with a transfer fee, or now and then ConfidentialMintBurn, which configure must
-refuse (`UnsupportedConfidentialMint`). The escrow starts unconfigured, as every
+with a transfer fee, or now and then ConfidentialMintBurn, whose user holds nothing
+(public mint and deposit are refused on it). The escrow starts unconfigured, as every
 deployed one is, so configure can land after public deposits and fees, and every
 confidential flow also runs before it. The whitelist starts in a random state.
 Proofs go inline, into context accounts, or mixed.

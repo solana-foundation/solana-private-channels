@@ -710,6 +710,7 @@ fn convert_to_db_models(
                     (
                         Some(DbMint {
                             min_withdraw_amount: TokenAmount(data.min_withdraw_amount),
+                            confidential_only: event.confidential_only,
                             allow_mint_slot: instruction_meta.slot as i64,
                             ..DbMint::new(
                                 mint_address.clone(),
@@ -1016,7 +1017,10 @@ mod tests {
                     withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
                     min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
                 },
-                event: AllowMintEvent { decimals },
+                event: AllowMintEvent {
+                    decimals,
+                    confidential_only: false,
+                },
             })),
             slot,
             program_type: ProgramType::Escrow,
@@ -1215,7 +1219,14 @@ mod tests {
 
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
-        let ix = make_allow_mint_instruction(200, Some("sig3".to_string()), 6);
+        let mut ix = make_allow_mint_instruction(200, Some("sig3".to_string()), 6);
+        let ProgramInstruction::Escrow(escrow) = &mut ix.instruction else {
+            unreachable!("built as an escrow instruction");
+        };
+        let EscrowInstruction::AllowMint { event, .. } = escrow.as_mut() else {
+            unreachable!("built as AllowMint");
+        };
+        event.confidential_only = true;
         let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
         let status = status.expect("AllowMint must emit a status change");
@@ -1233,6 +1244,7 @@ mod tests {
             mint.min_withdraw_amount,
             TokenAmount(ALLOW_MINT_MIN_WITHDRAW_AMOUNT)
         );
+        assert!(mint.confidential_only);
         assert_eq!(
             mint.allow_mint_slot, 200,
             "the fee is stamped with its AllowMint's slot"
@@ -1387,7 +1399,10 @@ mod tests {
                     withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
                     min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
                 },
-                event: AllowMintEvent { decimals: 6 },
+                event: AllowMintEvent {
+                    decimals: 6,
+                    confidential_only: false,
+                },
             })),
             slot: 200,
             program_type: ProgramType::Escrow,

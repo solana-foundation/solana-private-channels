@@ -230,6 +230,8 @@ Before burning, make sure the destination can take it:
 
 Otherwise the withdrawal parks with `destination_not_ready`: nothing is lost, but it waits for an operator, who can re-arm it once you fix the account, release it publicly or remint it. Funds arrive in your **pending** balance; run Token-2022 `ApplyPendingBalance` to make them spendable, and decrypt the amount with your ElGamal key.
 
+On a confidential-only mint (one with Token-2022 `ConfidentialMintBurn` on Solana), `WithdrawFunds` fails with custom error 9 (`ConfidentialOnlyMint`), so `ConfidentialWithdrawFunds` is the only way out. Configure the destination before burning: a parked withdrawal of such a mint can only be re-armed or reminted, never released publicly.
+
 From the repository, `cargo run --bin confidential_withdraw -- <gateway-rpc> <keypair> <mint> <amount> [destination]` sends it, and with `SOLANA_RPC_URL` set it checks the destination first. `confidential_deposit` configures your account on its first run.
 
 ### Related Documentation

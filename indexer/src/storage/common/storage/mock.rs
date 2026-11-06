@@ -517,6 +517,7 @@ impl MockStorage {
                         existing.token_program = mint.token_program.clone();
                         existing.withdraw_fee = mint.withdraw_fee;
                         existing.min_withdraw_amount = mint.min_withdraw_amount;
+                        existing.confidential_only = mint.confidential_only;
                         existing.allow_mint_slot = mint.allow_mint_slot;
                     }
                 }

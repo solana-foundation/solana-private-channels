@@ -143,6 +143,8 @@ pub const TOKEN_CONFIDENTIAL_CREDITS_EXCEEDED_ERROR: u32 =
 pub const TOKEN_MINT_PAUSED_ERROR: u32 = TokenError::MintPaused as u32;
 pub const TOKEN_ACCOUNT_FROZEN_ERROR: u32 = TokenError::AccountFrozen as u32;
 pub const TOKEN_CPI_GUARD_TRANSFER_BLOCKED_ERROR: u32 = TokenError::CpiGuardTransferBlocked as u32;
+pub const TOKEN_ILLEGAL_MINT_BURN_CONVERSION_ERROR: u32 =
+    TokenError::IllegalMintBurnConversion as u32;
 
 /// Withdraw fee every test AllowMint sets. The escrow records it but does not
 /// act on it.

@@ -55,6 +55,18 @@
                 "format": "u64",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "confidentialOnly",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -144,6 +156,12 @@
         "kind": "errorNode",
         "message": "Confidential withdrawal amount is above 2^48 - 1",
         "name": "amountAboveConfidentialMaximum"
+      },
+      {
+        "code": 9,
+        "kind": "errorNode",
+        "message": "The mint only takes confidential withdrawals",
+        "name": "confidentialOnlyMint"
       }
     ],
     "instructions": [
@@ -349,6 +367,18 @@
               "endian": "le",
               "format": "u64",
               "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "confidentialOnly",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
             }
           }
         ],

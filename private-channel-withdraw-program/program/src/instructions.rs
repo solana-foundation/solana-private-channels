@@ -26,7 +26,7 @@ pub enum PrivateChannelWithdrawProgramInstruction {
         destination: Option<Pubkey>,
     } = 0,
 
-    /// Create or overwrite the mint's withdraw fee and minimum (mint authority only)
+    /// Create or overwrite the mint's withdraw fee, minimum and confidential-only flag (mint authority only)
     #[codama(account(
         name = "authority",
         docs = "Mint authority, also pays for the config",
@@ -49,6 +49,8 @@ pub enum PrivateChannelWithdrawProgramInstruction {
         treasury: Pubkey,
         /// Smallest amount a withdrawal may move, 0 for none
         min_withdraw_amount: u64,
+        /// The Solana mint has ConfidentialMintBurn; WithdrawFunds is refused
+        confidential_only: bool,
     } = 1,
 
     /// Same as WithdrawFunds, but the escrow releases into the destination's confidential balance

@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **228 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
+**95 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **229 integration tests** (end-to-end behavior). The confidential tests use real proofs against mainnet's Token-2022 v11.1.0, which `TestContext` loads from `core/precompiles/`.
 
 ### CreateInstance (6 integration tests)
 
@@ -33,13 +33,14 @@
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
 
-### AllowMint (13 integration tests)
+### AllowMint (14 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
 - `test_allow_mint_twice_repins_instead_of_failing` — since BlockMint stopped closing the PDA, a second AllowMint re-pins the profile and re-opens both gates; expires the blockhash so the second transaction is not dropped as a replay
 - `test_allow_mint_invalid_pda` — wrong PDA rejected
 - `test_allow_mint_zero_fee_and_minimum_accepted` — a zero `withdraw_fee`, `min_withdraw_amount` and `min_deposit_amount` are allowed and create the AllowedMint PDA
-- `test_allow_mint_event_records_fee_and_minimums` — the emitted 98-byte `AllowMintEvent` carries all three values from the instruction data
+- `test_allow_mint_event_records_fee_and_minimums` — the emitted 99-byte `AllowMintEvent` carries all three values from the instruction data, and `confidential_only` 0 for a plain mint
+- `test_allow_mint_event_flags_a_confidential_mint_burn_mint` — a ConfidentialMintBurn mint's event carries `confidential_only` 1
 - `test_allow_mint_native_mint_rejected` — the spl-token native mint is rejected with InvalidMint, and with InvalidAccountOwner under a token program that does not own it
 - `test_allow_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_allow_mint_invalid_admin` — wrong admin rejected
@@ -223,7 +224,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### ConfigureConfidentialAccount (10 integration tests)
+### ConfigureConfidentialAccount (9 integration tests)
 
 - `test_configure_confidential_account_success` — escrow account carries the instance key, approved, confidential credits off and public credits on
 - `test_configure_confidential_account_fee_mint` — a fee mint's escrow account also gets `ConfidentialTransferFeeAmount`
@@ -232,7 +233,6 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_configure_confidential_account_rejects_spl_token_program`
 - `test_configure_confidential_account_rejects_mint_without_extension` — UnsupportedConfidentialMint
 - `test_configure_confidential_account_rejects_fee_mint_without_confidential_fee_config` — a pre-v0.9 mint, written by hand
-- `test_configure_confidential_account_rejects_confidential_mint_burn` — no public balance to release a public withdrawal from
 - `test_configure_confidential_account_rejects_recreated_mint` — MintProfileChanged, so a ConfidentialMintBurn added after AllowMint can't slip through
 - `test_configure_confidential_account_twice_fails` — the key cannot change
 
@@ -256,7 +256,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_deposit_frozen_escrow_account_rejected` — Token-2022's AccountFrozen, though the escrow turned its credits on
 - `test_confidential_deposit_cpi_guard_rejected` — Token-2022's CpiGuardTransferBlocked: the escrow spends from the user's account inside a CPI
 
-### ConfidentialReleaseFunds (35 integration tests)
+### ConfidentialReleaseFunds (36 integration tests)
 
 - `test_confidential_release_funds_inline_proofs` — the event amount decrypts to the release; nonce consumed
 - `test_confidential_release_funds_context_account_proofs`
@@ -293,6 +293,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_mixed_proofs` — equality inline, validity in the first context account: the event amount is read from it by position
 - `test_confidential_release_funds_transfer_fee_hook_context_account_proofs` — the most accounts: fee, five context accounts and the 32 hook accounts the escrow allows, the most its CPI can carry (41 of the 42 it allows)
 - `test_confidential_release_funds_transfer_fee_hook_inline_proofs` — fee, a 3-account hook and five inline proofs: 3,844 of 4,096 bytes, room for about 7 more hook accounts
+- `test_confidential_mint_burn_mint_deposits_applies_and_releases` — a ConfidentialMintBurn escrow configures, takes a confidential deposit, applies and releases, while Token-2022 refuses its `MoveToPublic` (IllegalMintBurnConversion); the user's balance is written directly, since public mint and Deposit are refused
 
 ### ApplyPendingBalance (6 integration tests)
 
