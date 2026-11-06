@@ -26,7 +26,7 @@ pub enum PrivateChannelWithdrawProgramInstruction {
         destination: Option<Pubkey>,
     } = 0,
 
-    /// Create or overwrite the mint's withdraw fee and minimum (mint authority only)
+    /// Create or overwrite the mint's withdraw fee, minimum and confidential-only flag (mint authority only)
     #[codama(account(
         name = "authority",
         docs = "Mint authority, also pays for the config",

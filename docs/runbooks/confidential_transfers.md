@@ -142,7 +142,9 @@ Every label has three possible ends:
          updated_at = NOW()
    WHERE id = :transaction_id
      AND status = 'manual_review'
-     AND landed_remint_signature IS NULL;
+     AND landed_remint_signature IS NULL
+     AND NOT EXISTS (SELECT 1 FROM mints m
+                      WHERE m.mint_address = transactions.mint AND m.confidential_only);
   ```
 - **Remint**: give the user back their channel tokens and mark the row terminal, as in
   [withdrawal_failed_reminted.md](withdrawal_failed_reminted.md). Use only when the
@@ -272,6 +274,11 @@ its last valid block height at confirmed commitment and none landed; until then 
    [escalate](_escalation.md).
 2. `indexer rebalance --mint <mint> --to-public <amount> --id <id>`.
 3. Re-arm the row.
+
+On a confidential-only mint (`mints.confidential_only`) the `--to-public` move fails on
+chain (`IllegalMintBurnConversion`), so this row can never be paid: remint it. Such a row
+only exists if the mint's config lacked the flag when it was burned (a mint allowed before
+the flag, or a `mints` backfill without it); run `allow_mint` again to set it.
 
 ### confidential_stale_proof
 

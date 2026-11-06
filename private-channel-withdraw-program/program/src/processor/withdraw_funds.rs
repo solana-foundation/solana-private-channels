@@ -48,9 +48,10 @@ pub const MAX_CONFIDENTIAL_WITHDRAW_AMOUNT: u64 = (1 << 48) - 1;
 
 /// Processes the ConfidentialWithdrawFunds instruction.
 ///
-/// Same accounts, data and checks as WithdrawFunds, with `amount` capped at
-/// 2^48 - 1. The burn is the same; only the indexer treats it differently and
-/// has the escrow release into the destination's confidential balance.
+/// Same accounts, data and checks as WithdrawFunds, except that it accepts a
+/// confidential-only mint, with `amount` capped at 2^48 - 1. The burn is the
+/// same; only the indexer treats it differently and has the escrow release
+/// into the destination's confidential balance.
 pub fn process_confidential_withdraw_funds(
     program_id: &Address,
     accounts: &[AccountView],
