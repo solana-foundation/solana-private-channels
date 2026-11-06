@@ -278,7 +278,9 @@ its last valid block height at confirmed commitment and none landed; until then 
 On a confidential-only mint (`mints.confidential_only`) the `--to-public` move fails on
 chain (`IllegalMintBurnConversion`), so this row can never be paid: remint it. Such a row
 only exists if the mint's config lacked the flag when it was burned (a mint allowed before
-the flag, or a `mints` backfill without it); run `allow_mint` again to set it.
+the flag, or a `mints` backfill without it). Run `allow_mint` again to set it. The channel's
+withdraw config only picks it up from the next deposit, so public burns still go through
+until one lands.
 
 ### confidential_stale_proof
 
