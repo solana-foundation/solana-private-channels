@@ -14,8 +14,8 @@ use crate::utils::{
     get_token_balance, set_mint, set_mint_supply, set_mint_with_delegate, set_token_balance,
     set_withdraw_config, set_withdraw_config_with_minimum, setup_test_balances, TestContext,
     AMOUNT_ABOVE_CONFIDENTIAL_MAXIMUM_ERROR, AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID,
-    INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR, INVALID_MINT_ERROR,
-    INVALID_TREASURY_ACCOUNT_ERROR, INVALID_WITHDRAW_CONFIG_ERROR,
+    CONFIDENTIAL_ONLY_MINT_ERROR, INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+    INVALID_MINT_ERROR, INVALID_TREASURY_ACCOUNT_ERROR, INVALID_WITHDRAW_CONFIG_ERROR,
     MISSING_REQUIRED_SIGNATURE_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR, ZERO_AMOUNT_ERROR,
@@ -97,6 +97,18 @@ fn as_confidential(mut instruction: Instruction) -> Instruction {
     assert_eq!(instruction.data[0], WITHDRAW_FUNDS_DISCRIMINATOR);
     instruction.data[0] = CONFIDENTIAL_WITHDRAW_FUNDS_DISCRIMINATOR;
     instruction
+}
+
+/// Sets the config's last byte, its `confidential_only` flag.
+fn set_confidential_only(context: &mut TestContext, withdraw_config: &Pubkey) {
+    let mut account = context
+        .get_account(withdraw_config)
+        .expect("withdraw config should exist");
+    *account.data.last_mut().expect("withdraw config has data") = 1;
+    context
+        .svm
+        .set_account(*withdraw_config, account)
+        .expect("Failed to set withdraw config");
 }
 
 /// The log line pinocchio_log writes for a WithdrawFundsEvent.
@@ -243,6 +255,79 @@ fn test_withdraw_funds_above_the_confidential_maximum_is_unchanged() {
         .send_transaction_with_signers(instruction, &[&user])
         .expect("WithdrawFunds has no cap");
     assert_eq!(get_token_balance(&mut setup.context, &setup.user_ata), 0);
+}
+
+/// A confidential-only mint has no public balance on Solana, so a public withdrawal could
+/// never be released. It is refused before anything moves.
+#[test]
+fn test_withdraw_funds_refuses_a_confidential_only_mint() {
+    let mut setup = Setup::new(INITIAL_BALANCE);
+    set_confidential_only(&mut setup.context, &setup.withdraw_config);
+    let supply_before = get_mint_supply(&mut setup.context, &setup.mint);
+
+    let instruction = setup.withdraw(WITHDRAW_AMOUNT);
+    let user = setup.user.insecure_clone();
+    let result = setup
+        .context
+        .send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, CONFIDENTIAL_ONLY_MINT_ERROR);
+    assert_eq!(
+        get_token_balance(&mut setup.context, &setup.user_ata),
+        INITIAL_BALANCE
+    );
+    assert_eq!(
+        get_token_balance(&mut setup.context, &setup.treasury_token_account),
+        0
+    );
+    assert_eq!(
+        get_mint_supply(&mut setup.context, &setup.mint),
+        supply_before
+    );
+}
+
+/// The treasury's exemptions do not reach past the refusal: it moves its fees out with
+/// ConfidentialWithdrawFunds instead.
+#[test]
+fn test_withdraw_funds_refuses_the_treasury_on_a_confidential_only_mint() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new().pubkey();
+    set_mint(&mut context, &mint);
+    let (withdraw_config, _) =
+        set_withdraw_config(&mut context, &mint, TEST_WITHDRAW_FEE, &admin.pubkey());
+    set_confidential_only(&mut context, &withdraw_config);
+    setup_test_balances(&mut context, &admin, &mint, INITIAL_BALANCE);
+    let admin_ata = channel_ata(&admin.pubkey(), &mint);
+    let instruction = WithdrawFundsBuilder::new()
+        .user(admin.pubkey())
+        .mint(mint)
+        .token_account(admin_ata)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(Pubkey::new_unique())
+        .amount(WITHDRAW_AMOUNT)
+        .instruction();
+    let result = context.send_transaction_with_signers(instruction, &[&admin]);
+    assert_program_error(result, CONFIDENTIAL_ONLY_MINT_ERROR);
+    assert_eq!(get_token_balance(&mut context, &admin_ata), INITIAL_BALANCE);
+}
+
+#[test]
+fn test_confidential_withdraw_funds_accepts_a_confidential_only_mint() {
+    let mut setup = Setup::new(INITIAL_BALANCE);
+    set_confidential_only(&mut setup.context, &setup.withdraw_config);
+
+    let instruction = setup.confidential(WITHDRAW_AMOUNT, None);
+    let user = setup.user.insecure_clone();
+    setup
+        .context
+        .send_transaction_with_signers(instruction, &[&user])
+        .expect("a confidential-only mint takes confidential withdrawals");
+
+    assert_eq!(
+        get_token_balance(&mut setup.context, &setup.user_ata),
+        INITIAL_BALANCE - WITHDRAW_AMOUNT - TEST_WITHDRAW_FEE
+    );
 }
 
 /// The treasury pays no fee and has no minimum, and a zero-fee mint never reads the

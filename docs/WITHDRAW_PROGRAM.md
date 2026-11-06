@@ -18,7 +18,7 @@ The program runs on the channel, where Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC
 | Instruction | Description | Discriminator |
 |-------------|-------------|---------------|
 | [`WithdrawFunds`](#withdrawfunds) | Burns tokens from the user's token account and emits a withdrawal event with an optional destination | 0 |
-| [`SetWithdrawConfig`](#setwithdrawconfig) | Creates or overwrites the mint's withdraw config: fee, minimum and treasury (mint authority only) | 1 |
+| [`SetWithdrawConfig`](#setwithdrawconfig) | Creates or overwrites the mint's withdraw config: fee, minimum, treasury and confidential-only flag (mint authority only) | 1 |
 | [`ConfidentialWithdrawFunds`](#confidentialwithdrawfunds) | `WithdrawFunds` whose release lands in the destination's confidential balance on Solana | 2 |
 
 ### Instruction Details
@@ -26,7 +26,7 @@ The program runs on the channel, where Token-2022 (`TokenzQdBNbLqP5VEhdkAS6EPFLC
 #### WithdrawFunds
 Burns tokens from the user's token account and emits a `WithdrawFundsEvent` containing the amount and destination. The `destination` is metadata only — it does not route tokens. The indexer decodes the instruction data (not the log) and triggers the corresponding `ReleaseFunds` on Mainnet.
 
-Before burning, it transfers the mint's fee from the same token account to the treasury's, so the balance must cover `amount + fee` or nothing happens. The fee is never reminted when a Solana release fails, so each retry of a withdrawal that cannot settle costs the user the fee. An `amount` below the mint's `min_withdraw_amount` fails with `AmountBelowMinimum` before anything moves, since every accepted withdrawal becomes its own Solana release. The treasury itself withdraws without the fee or the minimum. A mint whose fee is `0` charges nothing and never reads `treasury_token_account` (see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint)). Read `treasury_token_account` from the [withdraw config](#withdrawconfig); a mint with no config cannot be withdrawn, whatever its fee.
+Before burning, it transfers the mint's fee from the same token account to the treasury's, so the balance must cover `amount + fee` or nothing happens. The fee is never reminted when a Solana release fails, so each retry of a withdrawal that cannot settle costs the user the fee. An `amount` below the mint's `min_withdraw_amount` fails with `AmountBelowMinimum` before anything moves, since every accepted withdrawal becomes its own Solana release. The treasury itself withdraws without the fee or the minimum. A mint whose fee is `0` charges nothing and never reads `treasury_token_account` (see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint)). Read `treasury_token_account` from the [withdraw config](#withdrawconfig); a mint with no config cannot be withdrawn, whatever its fee. A mint whose config is `confidential_only` fails with `ConfidentialOnlyMint` before anything moves, the treasury included: its Solana mint has `ConfidentialMintBurn` and no public balance, so only `ConfidentialWithdrawFunds` can be released.
 
 Discriminator: `0`
 
@@ -66,7 +66,7 @@ Roll the withdraw indexer out before the program. The 0.1.0 indexer parses any u
 Discriminator: `2`
 
 #### SetWithdrawConfig
-Creates the mint's withdraw config on first use and overwrites it on later calls whose `allow_mint_slot` is at or after the stored one. Only the mint authority can sign it, and the channel node also requires a configured admin signer. The operator sends it in every deposit mint transaction with the fee, minimum and slot of the escrow's latest `AllowMint` and its own admin as the treasury, so re-allowing a mint with new values reprices it from the next deposit on. Deposits land in any order, so a deposit built before a reprice carries an older `allow_mint_slot`; its write succeeds without changing the config, and the deposit still mints.
+Creates the mint's withdraw config on first use and overwrites it on later calls whose `allow_mint_slot` is at or after the stored one. Only the mint authority can sign it, and the channel node also requires a configured admin signer. The operator sends it in every deposit mint transaction with the fee, minimum, confidential-only flag and slot of the escrow's latest `AllowMint` and its own admin as the treasury, so re-allowing a mint with new values reprices it from the next deposit on. Deposits land in any order, so a deposit built before a reprice carries an older `allow_mint_slot`; its write succeeds without changing the config, and the deposit still mints.
 
 Every failure is a custom error or a builtin the operator does not retry on. The deposit transaction carries this instruction, and the operator treats `InvalidAccountData`, `UninitializedAccount` or `IncorrectProgramId` from it as a missing mint and retries forever.
 
@@ -79,6 +79,7 @@ Discriminator: `1`
 | `allow_mint_slot` | u64 | Slot of the `AllowMint` these values came from. A value older than the stored one leaves the config unchanged |
 | `treasury` | Pubkey | Owner of the token account fees are paid to. Its Token-2022 ATA is derived and stored; the account itself may not exist yet |
 | `min_withdraw_amount` | u64 | Smallest `amount` a withdrawal may burn. `0` means no minimum |
+| `confidential_only` | bool | The Solana mint has `ConfidentialMintBurn`, from the `AllowMint` event; `WithdrawFunds` is refused |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -91,7 +92,7 @@ Discriminator: `1`
 ## Accounts
 
 #### WithdrawConfig
-Seeds: `["withdraw_config", mint]`. 89 bytes, no discriminator (it is the program's only account type).
+Seeds: `["withdraw_config", mint]`. 90 bytes, no discriminator (it is the program's only account type).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -101,10 +102,11 @@ Seeds: `["withdraw_config", mint]`. 89 bytes, no discriminator (it is the progra
 | `treasury` | Pubkey | Withdraws without the fee or the minimum |
 | `treasury_token_account` | Pubkey | The treasury's ATA for this mint; fees are credited here |
 | `min_withdraw_amount` | u64 | Smallest `amount` a withdrawal may burn, `0` for none |
+| `confidential_only` | bool | Refuses `WithdrawFunds`; only `ConfidentialWithdrawFunds` works |
 
 ## Treasury
 
-The treasury is the operator admin (`ADMIN_SIGNER`), the same key that pays Solana fees for `ReleaseFunds`. Collected fees sit in its channel ATA. It moves them out with an ordinary `WithdrawFunds`, for example `scripts/devnet/src/bin/withdraw.rs`, with no fee and no minimum, since collected fees can add up to less than it. The exemption goes with the configured treasury, so once a rotation switches it, the old key's fees pay the fee and minimum like any balance. Sweep them before rotating. To reprice a mint, run the escrow's `AllowMint` again with the new values.
+The treasury is the operator admin (`ADMIN_SIGNER`), the same key that pays Solana fees for `ReleaseFunds`. Collected fees sit in its channel ATA. It moves them out with an ordinary `WithdrawFunds`, for example `scripts/devnet/src/bin/withdraw.rs`, with no fee and no minimum, since collected fees can add up to less than it. On a confidential-only mint it uses `ConfidentialWithdrawFunds` instead, to a Solana account configured for confidential transfers. The exemption goes with the configured treasury, so once a rotation switches it, the old key's fees pay the fee and minimum like any balance. Sweep them before rotating. To reprice a mint, run the escrow's `AllowMint` again with the new values.
 
 ## Errors
 
@@ -120,3 +122,5 @@ The program defines the following custom errors:
 | 5 | `InvalidTreasuryAccount` | Fee destination is not the configured treasury token account |
 | 6 | `InvalidSystemProgram` | System program account is not the system program |
 | 7 | `AmountBelowMinimum` | Withdrawal amount is below the mint's minimum |
+| 8 | `AmountAboveConfidentialMaximum` | Confidential withdrawal amount is above 2^48 - 1 |
+| 9 | `ConfidentialOnlyMint` | The mint only takes confidential withdrawals |

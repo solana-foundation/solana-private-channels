@@ -975,8 +975,8 @@ async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// A backfill or resync can write an older AllowMint after a newer one. The fee
-/// and minimum follow the AllowMint's slot, not the order the rows were written in.
+/// A backfill or resync can write an older AllowMint after a newer one. The fee,
+/// minimum and flag follow the AllowMint's slot, not the order the rows were written in.
 #[tokio::test(flavor = "multi_thread")]
 async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -988,6 +988,7 @@ async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
     storage
         .upsert_mints_batch(&[DbMint {
             min_withdraw_amount: newer_min_withdraw_amount,
+            confidential_only: true,
             allow_mint_slot: 100,
             ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), newer_fee)
         }])
@@ -1004,6 +1005,7 @@ async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
     let got = storage.get_mint(mint).await?.unwrap();
     assert_eq!(got.withdraw_fee, newer_fee);
     assert_eq!(got.min_withdraw_amount, newer_min_withdraw_amount);
+    assert!(got.confidential_only);
     assert_eq!(got.allow_mint_slot, 100);
 
     // A later AllowMint still reprices both.
@@ -1019,6 +1021,7 @@ async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
     let got = storage.get_mint(mint).await?.unwrap();
     assert_eq!(got.withdraw_fee, repriced_fee);
     assert_eq!(got.min_withdraw_amount, repriced_min_withdraw_amount);
+    assert!(!got.confidential_only);
     assert_eq!(got.allow_mint_slot, 110);
     Ok(())
 }

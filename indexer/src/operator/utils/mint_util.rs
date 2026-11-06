@@ -1065,6 +1065,7 @@ mod tests {
                 withdraw_fee: TokenAmount(1),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),

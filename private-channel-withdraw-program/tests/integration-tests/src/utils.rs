@@ -52,6 +52,8 @@ pub const AMOUNT_BELOW_MINIMUM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::AmountBelowMinimum as u32;
 pub const AMOUNT_ABOVE_CONFIDENTIAL_MAXIMUM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::AmountAboveConfidentialMaximum as u32;
+pub const CONFIDENTIAL_ONLY_MINT_ERROR: u32 =
+    PrivateChannelWithdrawProgramError::ConfidentialOnlyMint as u32;
 
 /// Fee the test configs charge on top of each withdrawal.
 pub const TEST_WITHDRAW_FEE: u64 = 1_000;
@@ -460,6 +462,7 @@ pub fn set_withdraw_config_with_minimum(
     data.extend_from_slice(treasury.as_ref());
     data.extend_from_slice(treasury_token_account.as_ref());
     data.extend_from_slice(&min_withdraw_amount.to_le_bytes());
+    data.push(0); // confidential_only
     context.create_account(
         &withdraw_config,
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,

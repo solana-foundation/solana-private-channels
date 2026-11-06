@@ -322,64 +322,6 @@ fn test_configure_confidential_account_rejects_fee_mint_without_confidential_fee
     );
 }
 
-// Token-2022 refuses public mint and burn on a ConfidentialMintBurn mint, so the
-// escrow would hold no public balance, and a public withdrawal from the channel
-// could never be released.
-#[test]
-fn test_configure_confidential_account_rejects_confidential_mint_burn() {
-    let mut context = TestContext::new();
-    let admin = Keypair::new();
-    let instance_seed = Keypair::new();
-    let keys = ConfidentialKeys::new();
-    let mint = create_confidential_mint(
-        &mut context,
-        ConfidentialMintOptions {
-            confidential_mint_burn: true,
-            ..Default::default()
-        },
-    );
-
-    let (instance_pda, _) =
-        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
-            .expect("CreateInstance should succeed");
-    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
-        &mut context,
-        &admin,
-        &instance_pda,
-        &mint.address,
-        false,
-        false,
-    )
-    .expect("AllowMint should succeed");
-
-    let instruction = ConfigureConfidentialAccountBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.address)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(get_associated_token_address_with_program_id(
-            &instance_pda,
-            &mint.address,
-            &TOKEN_2022_PROGRAM_ID,
-        ))
-        .decryptable_zero_balance(keys.decryptable(0).0)
-        .proof_instruction_offset(1)
-        .instruction();
-    let proof = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(
-        None,
-        &build_pubkey_validity_proof_data(&keys.elgamal).unwrap(),
-    );
-
-    let result = context.send_v1(&[instruction, proof], &[&admin]);
-
-    assert_failed_first(
-        result,
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-        &custom_error(UNSUPPORTED_CONFIDENTIAL_MINT_ERROR),
-    );
-}
-
 // The mint was recreated at the same address after AllowMint, here with
 // ConfidentialMintBurn added. Configure refuses it as Deposit does, instead of
 // deciding from the extensions recorded at AllowMint.

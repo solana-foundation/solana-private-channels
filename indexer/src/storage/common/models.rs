@@ -242,6 +242,9 @@ pub struct DbMint {
     /// Smallest channel withdrawal amount from the latest AllowMint, 0 for
     /// none. Read and written with `withdraw_fee`.
     pub min_withdraw_amount: TokenAmount,
+    /// The latest AllowMint's mint has ConfidentialMintBurn, so the channel
+    /// refuses its public withdrawals. Read and written with `withdraw_fee`.
+    pub confidential_only: bool,
     /// Slot of the AllowMint this row came from. An upsert from an older slot
     /// is ignored, so a replay or gap repair cannot restore older values.
     pub allow_mint_slot: i64,
@@ -265,6 +268,7 @@ impl DbMint {
             withdraw_fee,
             // The AllowMint path sets the real one; other callers want none.
             min_withdraw_amount: TokenAmount(0),
+            confidential_only: false,
             // The indexer sets the AllowMint's slot; 0 loses to any real one.
             allow_mint_slot: 0,
             created_at: Utc::now(),

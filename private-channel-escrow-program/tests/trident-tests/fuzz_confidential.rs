@@ -1,8 +1,8 @@
 //! # Fuzz harness: confidential transfers through the escrow
 //!
 //! One escrow per iteration on a confidential Token-2022 mint: plain, with a
-//! transfer fee, or now and then a ConfidentialMintBurn mint, which the escrow
-//! refuses to configure. The escrow starts unconfigured, as every deployed one is,
+//! transfer fee, or now and then a ConfidentialMintBurn mint, whose user holds
+//! nothing. The escrow starts unconfigured, as every deployed one is,
 //! and configure is a flow, so it can land after public deposits and fees, and
 //! every confidential flow also runs before it. Flows mix confidential deposits and
 //! releases, applies from fresh or stale operator reads, moves between the two
@@ -94,8 +94,6 @@ struct Escrow {
     /// A second wallet, as deposit recipient or release withdrawer, so the
     /// whitelist checks two different wallets.
     other: Pubkey,
-    /// False for a ConfidentialMintBurn mint, which configure must refuse.
-    configurable: bool,
 }
 
 impl Escrow {
@@ -446,7 +444,6 @@ impl FuzzTest {
             user_ata,
             user_keys,
             other: trident.random_pubkey(),
-            configurable: !mint_burn,
         });
         self.model = model;
 
@@ -998,21 +995,8 @@ impl FuzzTest {
             ],
             "configure_confidential_account",
         );
-        if model.configured || !escrow.configurable {
-            assert!(
-                !outcome.success,
-                "configure landed twice or on an unsupported mint"
-            );
-            if !escrow.configurable {
-                assert!(
-                    outcome.refused_by(
-                        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-                        PrivateChannelEscrowProgramError::UnsupportedConfidentialMint as u32,
-                    ),
-                    "configure on a ConfidentialMintBurn mint: {}",
-                    outcome.logs
-                );
-            }
+        if model.configured {
+            assert!(!outcome.success, "configure landed twice");
             assert_eq!(account_bytes(trident, &[escrow.escrow_ata]), before);
             return;
         }

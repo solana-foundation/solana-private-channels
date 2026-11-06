@@ -2,7 +2,7 @@ use crate::{
     assertions::assert_nonce_consumed,
     pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_withdrawal_bitmap_pda},
     state_utils::{
-        assert_get_or_add_allowed_wallet, assert_get_or_block_mint,
+        apply_escrow_pending, assert_get_or_add_allowed_wallet, assert_get_or_block_mint,
         assert_get_or_set_whitelist_enabled, fund_escrow_available, setup_confidential_escrow,
     },
     utils::{
@@ -20,7 +20,8 @@ use crate::{
     },
 };
 use private_channel_escrow_program_client::instructions::{
-    ConfidentialReleaseFundsBuilder, MoveToPublicBuilder, ReleaseFundsBuilder,
+    ConfidentialDepositBuilder, ConfidentialReleaseFundsBuilder, MoveToPublicBuilder,
+    ReleaseFundsBuilder,
 };
 use solana_sdk::{
     account::Account,
@@ -2658,5 +2659,131 @@ fn test_confidential_release_funds_transfer_fee_hook_inline_proofs() {
     assert_eq!(
         decrypt_pending(&mut context, &user_ata, &user_keys),
         RELEASE_AMOUNT - fee
+    );
+}
+
+// Token-2022 refuses the public mint, burn and conversions of a ConfidentialMintBurn
+// mint, but not configure, confidential transfers or apply, so the whole confidential
+// path works. The user's balance is written directly: public mint and Deposit are refused.
+#[test]
+fn test_confidential_mint_burn_mint_deposits_applies_and_releases() {
+    let mut context = TestContext::new();
+    let escrow = setup_confidential_escrow(
+        &mut context,
+        ConfidentialMintOptions {
+            confidential_mint_burn: true,
+            ..Default::default()
+        },
+    );
+    let user = Keypair::new();
+    let user_keys = ConfidentialKeys::new();
+    let user_ata = create_confidential_account(&mut context, &user, &escrow.mint, &user_keys);
+    let mut user_ata_account = context.svm.get_account(&user_ata).unwrap();
+    {
+        let mut state =
+            StateWithExtensionsMut::<Token2022Account>::unpack(&mut user_ata_account.data).unwrap();
+        let extension = state
+            .get_extension_mut::<ConfidentialTransferAccount>()
+            .unwrap();
+        extension.available_balance = user_keys.elgamal.pubkey().encrypt(ESCROW_BALANCE).into();
+        extension.decryptable_available_balance = user_keys.decryptable(ESCROW_BALANCE);
+    }
+    context.svm.set_account(user_ata, user_ata_account).unwrap();
+    let (user_allowed_wallet_pda, _) =
+        find_allowed_wallet_pda(&escrow.instance_pda, &user.pubkey());
+    let allowed_mint = find_allowed_mint_pda(&escrow.instance_pda, &escrow.mint.address).0;
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &user_ata,
+        &user_keys,
+        escrow.keys.elgamal.pubkey(),
+        &escrow.mint,
+        ESCROW_BALANCE,
+        ProofPlacement::Inline,
+    );
+    let deposit = ConfidentialDepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(escrow.instance_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(allowed_mint)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .recipient_allowed_wallet_pda(user_allowed_wallet_pda)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    context
+        .send_v1(&transfer.proofs.with(deposit), &[&user])
+        .expect("ConfidentialDeposit should succeed on a mint-burn mint");
+
+    apply_escrow_pending(&mut context, &escrow)
+        .expect("ApplyPendingBalance should succeed on a mint-burn mint");
+    assert_eq!(
+        decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
+        ESCROW_BALANCE
+    );
+
+    let transfer = prepare_transfer(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        user_keys.elgamal.pubkey(),
+        &escrow.mint,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let release = ConfidentialReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&escrow.instance_pda).0)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .allowed_mint(allowed_mint)
+        .user_ata(user_ata)
+        .instance_ata(escrow.escrow_ata)
+        .user_allowed_wallet_pda(user_allowed_wallet_pda)
+        .withdrawer_allowed_wallet_pda(user_allowed_wallet_pda)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .withdrawer(user.pubkey())
+        .expected_available_balance(transfer.expected_available_balance)
+        .new_source_decryptable_available_balance(transfer.new_source_decryptable_available_balance)
+        .auditor_ciphertext_lo(transfer.auditor_ciphertext_lo)
+        .auditor_ciphertext_hi(transfer.auditor_ciphertext_hi)
+        .equality_proof_instruction_offset(transfer.equality_proof_instruction_offset)
+        .ciphertext_validity_proof_instruction_offset(
+            transfer.ciphertext_validity_proof_instruction_offset,
+        )
+        .range_proof_instruction_offset(transfer.range_proof_instruction_offset)
+        .fee_sigma_proof_instruction_offset(transfer.fee_sigma_proof_instruction_offset)
+        .fee_ciphertext_validity_proof_instruction_offset(
+            transfer.fee_ciphertext_validity_proof_instruction_offset,
+        )
+        .instruction();
+    context
+        .send_v1(&transfer.proofs.with(release), &[&escrow.operator])
+        .expect("ConfidentialReleaseFunds should succeed on a mint-burn mint");
+
+    assert_eq!(
+        decrypt_pending(&mut context, &user_ata, &user_keys),
+        RELEASE_AMOUNT
+    );
+    assert_eq!(
+        decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
+        ESCROW_BALANCE - RELEASE_AMOUNT
     );
 }

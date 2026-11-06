@@ -11,8 +11,8 @@ const SYSTEM_PROGRAM_ADDRESS = '11111111111111111111111111111111';
 
 describe('set_withdraw_config', () => {
     // The program parses these bytes by hand: discriminator, fee (u64 LE), AllowMint slot (u64 LE),
-    // treasury, minimum withdraw amount (u64 LE).
-    it('should encode discriminator, fee, AllowMint slot, treasury and minimum in the order the program parses them', async () => {
+    // treasury, minimum withdraw amount (u64 LE), confidential-only flag (u8).
+    it('should encode discriminator, fee, AllowMint slot, treasury, minimum and flag in the order the program parses them', async () => {
         const authority = mockTransactionSigner(TEST_ADDRESSES.ADMIN);
         const fee = 1_234_567n;
         const allowMintSlot = 7_654_321n;
@@ -25,6 +25,7 @@ describe('set_withdraw_config', () => {
             allowMintSlot,
             treasury: TEST_ADDRESSES.ADMIN,
             minWithdrawAmount,
+            confidentialOnly: true,
         });
 
         expect(instruction.data[0]).toBe(SET_WITHDRAW_CONFIG_DISCRIMINATOR);
@@ -37,7 +38,8 @@ describe('set_withdraw_config', () => {
         expect(Array.from(instruction.data.slice(49, 57))).toEqual(
             Array.from(getU64Encoder().encode(minWithdrawAmount)),
         );
-        expect(instruction.data).toHaveLength(57);
+        expect(instruction.data[57]).toBe(1);
+        expect(instruction.data).toHaveLength(58);
     });
 
     it('should derive withdrawConfig from the mint and default the system program', async () => {
@@ -55,6 +57,7 @@ describe('set_withdraw_config', () => {
             allowMintSlot: 0n,
             treasury: TEST_ADDRESSES.ADMIN,
             minWithdrawAmount: 100n,
+            confidentialOnly: false,
         });
 
         expect(instruction.programAddress).toBe(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS);

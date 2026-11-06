@@ -38,6 +38,7 @@ use crate::{
 /// * `allow_mint_slot` (u64) - Slot of the AllowMint these values came from
 /// * `treasury` (Pubkey) - Owner of the token account fees are paid to
 /// * `min_withdraw_amount` (u64) - Smallest amount a withdrawal may move, 0 for none
+/// * `confidential_only` (bool) - The Solana mint has ConfidentialMintBurn
 pub fn process_set_withdraw_config(
     program_id: &Address,
     accounts: &[AccountView],
@@ -116,6 +117,7 @@ pub fn process_set_withdraw_config(
         treasury: args.treasury,
         treasury_token_account,
         min_withdraw_amount: args.min_withdraw_amount,
+        confidential_only: args.confidential_only,
     };
     withdraw_config_info
         .try_borrow_mut()?
@@ -130,10 +132,11 @@ pub struct SetWithdrawConfigArgs {
     pub allow_mint_slot: u64,
     pub treasury: Address,
     pub min_withdraw_amount: u64,
+    pub confidential_only: bool,
 }
 
 fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawConfigArgs, ProgramError> {
-    require_len!(data, 8 + 8 + 32 + 8);
+    require_len!(data, 8 + 8 + 32 + 8 + 1);
 
     let fee = u64::from_le_bytes(
         data[..8]
@@ -159,11 +162,18 @@ fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawConfigArgs, ProgramE
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
+    let confidential_only = match data[56] {
+        0 => false,
+        1 => true,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
     Ok(SetWithdrawConfigArgs {
         fee,
         allow_mint_slot,
         treasury,
         min_withdraw_amount,
+        confidential_only,
     })
 }
 
@@ -185,6 +195,7 @@ mod tests {
         instruction_data.extend_from_slice(&allow_mint_slot.to_le_bytes());
         instruction_data.extend_from_slice(treasury.as_ref());
         instruction_data.extend_from_slice(&min_withdraw_amount.to_le_bytes());
+        instruction_data.push(1);
 
         let args = parse_instruction_data(&instruction_data).unwrap();
 
@@ -194,7 +205,8 @@ mod tests {
                 fee,
                 allow_mint_slot,
                 treasury,
-                min_withdraw_amount
+                min_withdraw_amount,
+                confidential_only: true,
             }
         );
     }

@@ -723,6 +723,7 @@ async fn set_withdraw_config(client: &RpcClient, admin: &Keypair, mint: Pubkey) 
                 .allow_mint_slot(0)
                 .treasury(admin.pubkey())
                 .min_withdraw_amount(1)
+                .confidential_only(false)
                 .instruction(),
         ],
         admin,

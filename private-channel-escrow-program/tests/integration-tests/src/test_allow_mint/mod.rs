@@ -3,12 +3,13 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
     utils::{
-        assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
-        set_mint_2022_with_permanent_delegate, setup_hook_mint, TestContext,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ACCOUNT_OWNER_ERROR, INVALID_ADMIN_ERROR,
-        INVALID_ALLOWED_MINT_ERROR, INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT,
-        TEST_WITHDRAW_FEE, TOKEN_2022_PROGRAM_ID,
+        assert_program_error, create_confidential_mint, event_data, set_mint, set_mint_2022_basic,
+        set_mint_2022_with_pausable, set_mint_2022_with_permanent_delegate, setup_hook_mint,
+        ConfidentialMintOptions, TestContext, INVALID_ACCOUNT_DATA_ERROR,
+        INVALID_ACCOUNT_OWNER_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
+        INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
+        TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::AllowMintBuilder;
@@ -272,6 +273,7 @@ fn test_allow_mint_event_records_fee_and_minimums() {
 
     // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
     // + 8 (withdraw_fee) + 8 (min_withdraw_amount) + 8 (min_deposit_amount)
+    // + 1 (confidential_only)
     let event_tag = [228, 69, 165, 46, 81, 203, 154, 29];
     let allow_mint_discriminator = 1;
     let event_data = transaction_metadata
@@ -284,10 +286,65 @@ fn test_allow_mint_event_records_fee_and_minimums() {
         })
         .expect("AllowMint event should be emitted");
 
-    assert_eq!(event_data.len(), 98);
+    assert_eq!(event_data.len(), 99);
     assert_eq!(&event_data[74..82], &withdraw_fee.to_le_bytes());
     assert_eq!(&event_data[82..90], &min_withdraw_amount.to_le_bytes());
     assert_eq!(&event_data[90..98], &min_deposit_amount.to_le_bytes());
+    assert_eq!(event_data[98], 0, "a mint without ConfidentialMintBurn");
+}
+
+// A ConfidentialMintBurn mint has no public balance, so the event tells the
+// channel to refuse its public withdrawals.
+#[test]
+fn test_allow_mint_event_flags_a_confidential_mint_burn_mint() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+    let mint = create_confidential_mint(
+        &mut context,
+        ConfidentialMintOptions {
+            confidential_mint_burn: true,
+            ..Default::default()
+        },
+    );
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.address);
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let instance_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.address,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let instruction = AllowMintBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.address)
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
+        .instruction();
+
+    let transaction_metadata = context
+        .send_transaction_with_signers_with_transaction_result(instruction, &[&admin], false, None)
+        .expect("AllowMint should succeed");
+
+    // `event_data` drops the tag and discriminator, so the flag sits at 98 - 9.
+    let event = event_data(&transaction_metadata, 1);
+    assert_eq!(event[89], 1);
 }
 
 #[test]

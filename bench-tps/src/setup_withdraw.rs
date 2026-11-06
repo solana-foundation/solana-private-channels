@@ -622,6 +622,7 @@ pub async fn run_setup_withdraw_phase(
                         .allow_mint_slot(0)
                         .treasury(admin_keypair.pubkey())
                         .min_withdraw_amount(BENCH_MIN_WITHDRAW_AMOUNT)
+                        .confidential_only(false)
                         .instruction();
                     let tx = Transaction::new_signed_with_payer(
                         &[create_treasury_ata_ix, set_withdraw_config_ix],

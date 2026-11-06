@@ -64,7 +64,16 @@ Once per mint:
    poisons the mint at index time; stop here and [escalate](_escalation.md) (Tier 1).
 4. On a mint that requires approval, have the issuer's confidential authority
    approve the escrow account.
-5. `allow_mint` again to reopen deposits.
+5. On a `ConfidentialMintBurn` mint (confidential-only: the channel refuses its
+   public withdrawals, including the treasury's):
+   - Configure the Solana account the treasury withdraws its fees to for confidential
+     transfers, approved if the mint requires it. Otherwise every fee withdrawal parks
+     [`destination_not_ready`](#destination_not_ready).
+   - If it has a transfer hook, check the hook accepts `u64::MAX`. Such a mint has no
+     public release, so with a hook that refuses it no withdrawal can ever be paid, and
+     every one ends in remint. Nothing on chain detects this.
+6. `allow_mint` again to reopen deposits, with the same arguments. This also records
+   whether the mint is confidential-only.
 
 Never remove `ESCROW_CONFIDENTIAL_KEYS` or `ESCROW_CONFIDENTIAL_PUBKEY` once any escrow
 account is configured: the indexer and both operators refuse to start without the key
@@ -123,7 +132,9 @@ Every label has three possible ends:
   with `ReleaseFunds` into the destination's public balance. Needs enough public
   escrow balance (rebalance to public first, see
   [Confidential balance low](#confidential_balance_low)) and a destination that
-  accepts public credits.
+  accepts public credits. Never on a confidential-only mint (`mints.confidential_only`):
+  it has no public balance and Token-2022 refuses its `MoveToPublic`, so a row parked
+  `public_balance_low` would never settle. Remint instead.
   ```sql
   UPDATE transactions
      SET confidential = FALSE, status = 'pending', recovery_requeue_attempts = 0,
@@ -170,7 +181,7 @@ nothing is minted for its undecrypted deposits.
      into the channel. `confidential-recover` refuses it, its confidential
      deposits stay undecrypted and are never credited, its custody stays held and
      its confidential withdrawals keep parking (release them publicly if the
-     public balance covers them). No instance key can move or verify its
+     public balance covers them, or remint on a confidential-only mint). No instance key can move or verify its
      confidential balance. [Escalate](_escalation.md) (Tier 1) and stop here.
 2. Load the right key (`ESCROW_CONFIDENTIAL_KEYS`, the instance key), restart the
    services.
@@ -205,7 +216,8 @@ it calls Token-2022, so a Token-2022 17 or 24 is about the escrow's own account;
 - The user fixes their account (create and configure it, apply their pending
   balance, ask the issuer to approve or thaw it), then re-arm. `confidential_withdraw`
   with `SOLANA_RPC_URL` set checks the same conditions.
-- If they cannot, release publicly to their public balance, or remint.
+- If they cannot, release publicly to their public balance, or remint (the only end on a
+  confidential-only mint).
 
 ### confidential_balance_low
 
@@ -287,7 +299,8 @@ refused the release on chain.
 ### confidential_tx_too_large
 
 The release does not fit one v1 transaction (4,096 bytes or 64 accounts), usually
-a fee mint with many hook accounts. It will never fit. Release publicly.
+a fee mint with many hook accounts. It will never fit. Release publicly, or remint on a
+confidential-only mint.
 
 ### confidential_escrow_account_not_ready
 
@@ -314,6 +327,7 @@ because the issuer's hook is too expensive. A resend cannot pass it.
 
 - Release publicly: rebalance to public if needed, then clear `confidential` and
   re-arm. A public release runs the hook with the real amount and may cost less.
+  On a confidential-only mint, remint.
 - If the hook was changed since, re-arm once to try again.
 
 ### hook_unresolvable (on a confidential row)
@@ -323,7 +337,8 @@ mint's hook refuses it or its extra accounts cannot be resolved for it. A hook t
 runs out of compute parks [`confidential_compute_exceeded`](#confidential_compute_exceeded)
 instead.
 Release publicly: rebalance to public if needed, then clear `confidential` and
-re-arm.
+re-arm. On a confidential-only mint no withdrawal can be paid while the hook refuses
+`u64::MAX`: remint, and [escalate](_escalation.md) to the issuer.
 
 ## Alerts
 

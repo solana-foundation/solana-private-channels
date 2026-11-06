@@ -997,6 +997,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // From the AllowMint event: a ConfidentialMintBurn mint, whose channel
+        // config refuses public withdrawals. Existing rows backfill to false; a
+        // mint-burn mint allowed before this needs its AllowMint run again.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS confidential_only BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -3680,14 +3689,15 @@ impl PostgresDb {
                 r#"
                 INSERT INTO mints
                     (mint_address, decimals, token_program, status, withdraw_fee,
-                     min_withdraw_amount, allow_mint_slot)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     min_withdraw_amount, allow_mint_slot, confidential_only)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program,
                     withdraw_fee = EXCLUDED.withdraw_fee,
                     min_withdraw_amount = EXCLUDED.min_withdraw_amount,
-                    allow_mint_slot = EXCLUDED.allow_mint_slot
+                    allow_mint_slot = EXCLUDED.allow_mint_slot,
+                    confidential_only = EXCLUDED.confidential_only
                 -- Slot-ordered: a backfill or resync replaying an older
                 -- AllowMint cannot restore older values.
                 WHERE mints.allow_mint_slot <= EXCLUDED.allow_mint_slot
@@ -3700,6 +3710,7 @@ impl PostgresDb {
             .bind(mint.withdraw_fee)
             .bind(mint.min_withdraw_amount)
             .bind(mint.allow_mint_slot)
+            .bind(mint.confidential_only)
             .execute(&mut *tx)
             .await?;
         }

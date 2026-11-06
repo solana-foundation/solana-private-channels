@@ -117,6 +117,7 @@ impl TestEnvironment {
                 .allow_mint_slot(0)
                 .treasury(admin.pubkey())
                 .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+                .confidential_only(false)
                 .instruction(),
         ];
         send_and_confirm_instructions(

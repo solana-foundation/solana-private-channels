@@ -19,7 +19,8 @@ use crate::{
 /// destination that refuses the transfer cost the user every time. A zero-fee
 /// mint charges nothing and leaves `treasury_token_account` unread. An `amount`
 /// below the mint's minimum is rejected before anything moves. The treasury
-/// pays no fee and has no minimum.
+/// pays no fee and has no minimum. A confidential-only mint is refused, the
+/// treasury included.
 ///
 /// # Account Layout
 /// 0. `[signer]` user - User initiating the withdrawal
@@ -38,7 +39,7 @@ pub fn process_withdraw_funds(
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    withdraw(program_id, accounts, instruction_data, u64::MAX)
+    withdraw(program_id, accounts, instruction_data, false)
 }
 
 /// Largest amount a confidential release can carry: the escrow splits it into a
@@ -55,26 +56,21 @@ pub fn process_confidential_withdraw_funds(
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    withdraw(
-        program_id,
-        accounts,
-        instruction_data,
-        MAX_CONFIDENTIAL_WITHDRAW_AMOUNT,
-    )
+    withdraw(program_id, accounts, instruction_data, true)
 }
 
 fn withdraw(
     program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
-    max_amount: u64,
+    confidential: bool,
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
     if args.amount == 0 {
         return Err(PrivateChannelWithdrawProgramError::ZeroAmount.into());
     }
-    if args.amount > max_amount {
+    if confidential && args.amount > MAX_CONFIDENTIAL_WITHDRAW_AMOUNT {
         return Err(PrivateChannelWithdrawProgramError::AmountAboveConfidentialMaximum.into());
     }
 
@@ -111,6 +107,11 @@ fn withdraw(
     .map_err(|_| PrivateChannelWithdrawProgramError::InvalidWithdrawConfig)?;
     if withdraw_config_info.address() != &expected_withdraw_config {
         return Err(PrivateChannelWithdrawProgramError::InvalidWithdrawConfig.into());
+    }
+
+    // The Solana mint has no public balance, so a public release could never land.
+    if withdraw_config.confidential_only && !confidential {
+        return Err(PrivateChannelWithdrawProgramError::ConfidentialOnlyMint.into());
     }
 
     // The treasury moves out the fees it collected, which can sit below the

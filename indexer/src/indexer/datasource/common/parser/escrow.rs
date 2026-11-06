@@ -61,6 +61,9 @@ const EVENT_DISCRIMINATOR_INDEX: usize = 8;
 const ALLOW_MINT_EVENT_MINT_INDEX: usize = 41;
 // AllowMintEvent: tag(8)+disc(1)+instance_seed(32)+mint(32) = 73
 const EVENT_DECIMALS_INDEX: usize = 73;
+// AllowMintEvent: decimals(73)+1, then withdraw_fee, min_withdraw_amount and
+// min_deposit_amount (8 each) = 98. Events from before the flag end here.
+const ALLOW_MINT_EVENT_CONFIDENTIAL_ONLY_INDEX: usize = 98;
 // DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
 // (same offset, different event)
 const EVENT_AMOUNT_INDEX: usize = 73;
@@ -445,6 +448,8 @@ impl ReleaseFundsData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintEvent {
     pub decimals: u8,
+    /// The mint has ConfidentialMintBurn; false on an event from before the flag.
+    pub confidential_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -622,12 +627,12 @@ fn check_event_matches_deposit(
     }
 }
 
-/// Decode an inner instruction and return its decimals only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the decimals.
-fn allow_mint_event_decimals(
+/// Decode an inner instruction and return its event only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the values.
+fn allow_mint_event(
     inner: &InnerInstruction,
     account_keys: &[Pubkey],
     mint: &Pubkey,
-) -> Option<u8> {
+) -> Option<AllowMintEvent> {
     let program_id = account_keys.get(inner.instruction.program_id_index as usize)?;
     if program_id.to_string() != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
         return None;
@@ -638,7 +643,10 @@ fn allow_mint_event_decimals(
         && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
         && event_data[ALLOW_MINT_EVENT_MINT_INDEX..EVENT_DECIMALS_INDEX] == *mint.as_ref()
     {
-        Some(event_data[EVENT_DECIMALS_INDEX])
+        Some(AllowMintEvent {
+            decimals: event_data[EVENT_DECIMALS_INDEX],
+            confidential_only: event_data.get(ALLOW_MINT_EVENT_CONFIDENTIAL_ONLY_INDEX) == Some(&1),
+        })
     } else {
         None
     }
@@ -714,20 +722,20 @@ fn parse_allow_mint(
 
     // AllowMint is only indexed top-level (see `escrow_inner_discriminator_excluded`),
     // so the inner set at its own index is its whole subtree.
-    let decimals = inner_instructions
+    let event = inner_instructions
         .iter()
         .find(|set| set.index as u32 == location.top_level_index)
         .and_then(|set| {
             set.instructions
                 .iter()
-                .find_map(|inner| allow_mint_event_decimals(inner, account_keys, &accounts.mint))
+                .find_map(|inner| allow_mint_event(inner, account_keys, &accounts.mint))
         });
 
-    match decimals {
-        Some(decimals) => Ok(Some(EscrowInstruction::AllowMint {
+    match event {
+        Some(event) => Ok(Some(EscrowInstruction::AllowMint {
             accounts,
             data: ix_data,
-            event: AllowMintEvent { decimals },
+            event,
         })),
         None => Err(ParserError::InstructionParseFailed {
             reason: "No allow mint event found".to_string(),
@@ -1307,13 +1315,59 @@ mod tests {
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert!(parsed.is_some());
-        if let Some(EscrowInstruction::AllowMint { data, .. }) = parsed {
+        if let Some(EscrowInstruction::AllowMint { data, event, .. }) = parsed {
             assert_eq!(data.bump, 123);
             assert_eq!(data.withdraw_fee, ALLOW_MINT_WITHDRAW_FEE);
             assert_eq!(data.min_withdraw_amount, ALLOW_MINT_MIN_WITHDRAW_AMOUNT);
+            assert!(
+                !event.confidential_only,
+                "an event without the flag byte reads false"
+            );
         } else {
             panic!("Expected AllowMint instruction");
         }
+    }
+
+    /// The flag is the event's last byte, after the AllowMint values.
+    #[test]
+    fn allow_mint_event_reads_the_confidential_only_flag() {
+        let borsh_data = create_allow_mint_borsh_data();
+        let instruction = create_instruction_with_accounts(11, "dummy".to_string());
+        let account_keys = create_n_account_keys(11);
+        let mut event = vec![];
+        event.extend_from_slice(EVENT_IX_TAG_LE);
+        event.push(ALLOW_MINT_EVENT_DISCRIMINATOR);
+        event.extend_from_slice(&[0u8; 32]); // instance_seed
+        event.extend_from_slice(account_keys[3].as_ref());
+        event.push(2); // decimals
+        event.extend_from_slice(&[0u8; 24]); // withdraw fee and both minimums
+        event.push(1); // confidential_only
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![InnerInstruction {
+                instruction: CompiledInstruction {
+                    program_id_index: ESCROW_PROGRAM_KEY_INDEX,
+                    accounts: vec![],
+                    data: bs58::encode(&event).into_string(),
+                },
+                stack_height: Some(2),
+            }],
+        }];
+
+        let parsed = parse_allow_mint(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap();
+
+        let Some(EscrowInstruction::AllowMint { event, .. }) = parsed else {
+            panic!("Expected AllowMint instruction");
+        };
+        assert_eq!(event.decimals, 2);
+        assert!(event.confidential_only);
     }
 
     #[test]
