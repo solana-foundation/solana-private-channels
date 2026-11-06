@@ -82,6 +82,8 @@
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
         ghcr_token: "{{ _d.GHCR_TOKEN | default('') }}"
         yellowstone_token: "{{ _d.YELLOWSTONE_TOKEN | default('') }}"
+        escrow_confidential_keys: "{{ _d.ESCROW_CONFIDENTIAL_KEYS | default('') }}"
+        escrow_confidential_pubkey: "{{ _d.ESCROW_CONFIDENTIAL_PUBKEY | default('') }}"
         # yellowstone_endpoint normally comes from vars/<env>.yml; only override it
         # when the Doppler config carries DEVNET_YELLOWSTONE_ENDPOINT (its .env name).
         # These use the boolean form of default() so a key that exists in Doppler
@@ -635,6 +637,26 @@
       ansible.builtin.assert:
         that: network in ['localnet', 'devnet', 'mainnet']
         fail_msg: "network={{ network }} must be localnet, devnet or mainnet."
+
+    # Optional until an escrow account is configured; a malformed value would only
+    # surface as the indexer and operators refusing to start. The message never shows it.
+    - name: Assert escrow_confidential_keys has the shape the services load
+      when: escrow_confidential_keys | default('') | trim | length > 0
+      ansible.builtin.assert:
+        # Regex only, so no parse error can echo the value; the services do the full parse.
+        that:
+        - escrow_confidential_keys | string | trim is match('^\\{.*\\}$')
+        - escrow_confidential_keys | string is search('"elgamal_secret"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        - escrow_confidential_keys | string is search('"aes_key"\\s*:\\s*"[A-Za-z0-9+/=]+"')
+        fail_msg: escrow_confidential_keys is not JSON with base64 elgamal_secret and aes_key; regenerate it with confidential_keygen.
+
+    - name: Assert escrow_confidential_pubkey is a base64 pubkey with its keys set
+      when: escrow_confidential_pubkey | default('') | trim | length > 0
+      ansible.builtin.assert:
+        that:
+        - escrow_confidential_pubkey | string | trim is match('^[A-Za-z0-9+/]{43}=$')
+        - escrow_confidential_keys | default('') | trim | length > 0
+        fail_msg: escrow_confidential_pubkey must be the base64 pubkey confidential_keygen printed, and escrow_confidential_keys must be set with it.
 
     - name: Assert program IDs equal the compiled ones
       ansible.builtin.assert:

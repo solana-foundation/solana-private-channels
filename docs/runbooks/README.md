@@ -100,6 +100,7 @@ payload.
 | `status=failed` | `withdrawal` | Single row terminated without on-chain proof. Rare for withdrawals. | [`withdrawal_failed.md`](withdrawal_failed.md) |
 | `status=failed` | `deposit` | **Primary deposit alert.** Sender-side terminal failure (RPC, build, confirmation, on-chain rejection). | [`deposit_failed.md`](deposit_failed.md) |
 | `status=failed_reminted` | `withdrawal` | Withdrawal failed; remint succeeded. Reconcile only. | [`withdrawal_failed_reminted.md`](withdrawal_failed_reminted.md) |
+| `status=manual_review` with a confidential park label (`confidential_*`, `destination_not_ready`, `public_balance_low`) | `withdrawal` | A confidential withdrawal, or a public one on a confidential mint, parked before or after a journal-gated send. | [`confidential_transfers.md`](confidential_transfers.md#park-labels) |
 
 ## First action regardless of alert
 
@@ -183,6 +184,11 @@ The runbooks call this out at every relevant site.
   database records a completed or failed withdrawal or an observed release.
   Log-discovered, not paged; fails closed before deleting anything, so the
   database is intact. The supported path is a fresh instance, not a resync.
+- [`confidential_transfers.md`](confidential_transfers.md) - the escrow instance's
+  confidential keys and setup ceremony, one entry per confidential park label
+  (re-arm, release publicly, or remint) and per confidential alert: poisoned mint,
+  custody mismatch and lagging, hold age, AES repair deferred, pending credit counter,
+  park age, bitmap generation near full and long waits.
 - [`t22_channel_reset.md`](t22_channel_reset.md) - the one-time cutover to the
   Token-2022 channel: drain, sign off that every channel mint's supply is 0 and
   nothing is pending, wipe the channel account state, and start the new release.

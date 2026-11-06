@@ -109,6 +109,29 @@ pub async fn execute_user_withdrawal_to(
     total_deposited: u64,
     destination: Pubkey,
 ) -> Result<UserTransaction, String> {
+    withdraw(client, user, mint, total_deposited, destination, false).await
+}
+
+/// `ConfidentialWithdrawFunds` to `destination`: released into its confidential balance.
+#[allow(dead_code)]
+pub async fn execute_user_confidential_withdrawal_to(
+    client: &RpcClient,
+    user: &solana_sdk::signer::keypair::Keypair,
+    mint: Pubkey,
+    amount: u64,
+    destination: Pubkey,
+) -> Result<UserTransaction, String> {
+    withdraw(client, user, mint, amount, destination, true).await
+}
+
+async fn withdraw(
+    client: &RpcClient,
+    user: &solana_sdk::signer::keypair::Keypair,
+    mint: Pubkey,
+    total_deposited: u64,
+    destination: Pubkey,
+    confidential: bool,
+) -> Result<UserTransaction, String> {
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
 
@@ -126,7 +149,7 @@ pub async fn execute_user_withdrawal_to(
         .map_err(|e| format!("withdraw config {withdraw_config} not decodable: {e}"))?
         .treasury_token_account;
 
-    let withdraw_ix = WithdrawFunds {
+    let accounts = WithdrawFunds {
         user: user.pubkey(),
         mint,
         token_account: user_ata,
@@ -134,11 +157,17 @@ pub async fn execute_user_withdrawal_to(
         associated_token_program: spl_associated_token_account::ID,
         withdraw_config,
         treasury_token_account,
-    }
-    .instruction(WithdrawFundsInstructionArgs {
+    };
+    let args = WithdrawFundsInstructionArgs {
         amount: total_deposited,
         destination: Some(destination),
-    });
+    };
+    let withdraw_ix = if confidential {
+        devnet_scripts::confidential::confidential_withdraw_instruction(accounts, args)
+            .map_err(|e| e.to_string())?
+    } else {
+        accounts.instruction(args)
+    };
 
     let signature =
         send_and_confirm_instructions(client, &[withdraw_ix], user, &[user], "Withdraw")

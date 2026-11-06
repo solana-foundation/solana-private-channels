@@ -1922,7 +1922,7 @@ async fn promote_and_recovery_race_single_write() {
         .updated_at;
 
     assert!(storage
-        .try_quarantine_processing(id, captured, None, None)
+        .try_quarantine_processing(id, captured, None, None, None)
         .await
         .unwrap());
     let completed = storage

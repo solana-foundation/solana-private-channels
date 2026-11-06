@@ -50,6 +50,8 @@ pub const INVALID_SYSTEM_PROGRAM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidSystemProgram as u32;
 pub const AMOUNT_BELOW_MINIMUM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::AmountBelowMinimum as u32;
+pub const AMOUNT_ABOVE_CONFIDENTIAL_MAXIMUM_ERROR: u32 =
+    PrivateChannelWithdrawProgramError::AmountAboveConfidentialMaximum as u32;
 
 /// Fee the test configs charge on top of each withdrawal.
 pub const TEST_WITHDRAW_FEE: u64 = 1_000;
@@ -410,6 +412,19 @@ fn set_mint_with(
         .expect("Failed to set mint account");
 }
 
+/// Overwrites a mint's supply, for withdrawals larger than the default 1_000_000.
+pub fn set_mint_supply(context: &mut TestContext, mint: &Pubkey, supply: u64) {
+    let mut account = context.get_account(mint).expect("mint should exist");
+    let mut state =
+        StateWithExtensionsMut::<Mint>::unpack(&mut account.data).expect("mint should unpack");
+    state.base.supply = supply;
+    state.pack_base();
+    context
+        .svm
+        .set_account(*mint, account)
+        .expect("Failed to set mint account");
+}
+
 pub fn find_withdraw_config_pda(mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
@@ -554,6 +569,7 @@ fn get_operation_name(instruction: &Instruction) -> &'static str {
     match instruction.data[0] {
         0 => "WithdrawFunds",
         1 => "SetWithdrawConfig",
+        2 => "ConfidentialWithdrawFunds",
         _ => "Unknown",
     }
 }

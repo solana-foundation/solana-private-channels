@@ -28,6 +28,11 @@ mod helpers;
 #[path = "setup.rs"]
 mod setup;
 
+#[allow(dead_code)]
+#[path = "confidential_harness.rs"]
+mod confidential_harness;
+
+use helpers::worker::Worker;
 use helpers::WAIT_TIMEOUT_SECS;
 use private_channel_escrow_program_client::{
     instructions::DepositBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -247,6 +252,12 @@ fn make_channel_resync_service(
         escrow_instance_id,
     )
     .with_stale_holder_grace(Duration::ZERO)
+    // As the resync binary does: confidential deposits rebuild with the instance keys.
+    .with_confidential_keys(
+        private_channel_confidential::Keys::from_env()
+            .expect("well-formed confidential keys")
+            .map(Arc::new),
+    )
     .with_channel_reconcile(ChannelReconcileConfig {
         channel_rpc_url,
         authority,
@@ -1760,6 +1771,7 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
         // The channel is modeled by the mock (empty), where the supply invariant reads.
         Some(&mock.url()),
         &env.instance,
+        None,
     )
     .await;
     assert!(
@@ -3275,53 +3287,6 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
 // End to end: real indexers and operators around a resync, on one validator
 // ════════════════════════════════════════════════════════════════════════════
 
-/// A worker on its own runtime, so stopping it ends every task it spawned, like a process exit.
-struct Worker {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Worker {
-    /// Returns once `start` has finished, so workers start one at a time.
-    async fn spawn<F, Fut>(start: F) -> Self
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
-    {
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let (ready, started) = tokio::sync::oneshot::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("worker runtime");
-            runtime.block_on(async move {
-                start().await;
-                let _ = ready.send(());
-                let _ = stopped.await;
-            });
-            runtime.shutdown_timeout(Duration::from_secs(5));
-        });
-        let _ = started.await;
-        Self {
-            stop: Some(stop),
-            thread: Some(thread),
-        }
-    }
-
-    async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            tokio::task::spawn_blocking(move || thread.join())
-                .await
-                .expect("join the worker thread")
-                .expect("a worker failed to start");
-        }
-    }
-}
-
 /// The helper default gives up confirming after five 400ms polls, but this validator confirms a
 /// mint in several seconds under four workers, which would leave every mint to the 5-minute recovery.
 fn e2e_operator_config() -> OperatorConfig {
@@ -4051,6 +4016,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         &rpc_url,
         Some(&mock.url()),
         &env.instance,
+        None,
     )
     .await;
     assert!(recon.is_ok(), "startup reconciliation must pass: {recon:?}");
@@ -4096,6 +4062,7 @@ async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::
         &rpc_url,
         Some(&mock.url()),
         &env.instance,
+        None,
     )
     .await;
     assert!(
@@ -4657,5 +4624,103 @@ async fn e2e_resync_after_real_admin_rotation_does_not_reopen_deposit(
         0,
         "nothing may be minted again"
     );
+    Ok(())
+}
+
+/// Every deposit row as live indexing wrote it, and every observed release.
+async fn confidential_outcomes(
+    db_url: &str,
+) -> (
+    Vec<(String, String, bool, bool, String, Option<String>)>,
+    Vec<(i64, String, Option<String>)>,
+) {
+    let pool = fresh_pool(db_url).await;
+    let deposits = sqlx::query_as(
+        "SELECT signature, amount::text, confidential, confidential_undecrypted, status::text, \
+         counterpart_signature FROM transactions WHERE transaction_type = 'deposit' ORDER BY signature",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("deposit read");
+    let releases = sqlx::query_as(
+        "SELECT withdrawal_nonce, signature, amount::text FROM observed_releases \
+         ORDER BY withdrawal_nonce",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("observed release read");
+    (deposits, releases)
+}
+
+/// 39. An escrow resync after confidential activity (deposits with and without a fee, one
+/// through a CPI wrapper, a public one, a confidential release, and a deposit into a mint
+/// configured under a foreign key) rebuilds the deposit rows and the observed releases
+/// exactly as live indexing wrote them; the poisoned mint is rebuilt poisoned.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_escrow_resync_rebuilds_confidential_rows_identically(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use confidential_harness::{Env, MintSpec};
+    let env = Env::start("e2e_confidential").await?;
+    let plain = env.mint(MintSpec::default()).await?;
+    let fee = env
+        .mint(MintSpec {
+            fee: Some((100, 5_000)),
+            ..MintSpec::default()
+        })
+        .await?;
+    let poisoned = env
+        .mint_under(MintSpec::default(), confidential_harness::foreign_keys())
+        .await?;
+    let mut stack = confidential_harness::Stack::start(&env).await;
+    let user = env.user().await?;
+
+    let unreadable = env
+        .deposit_confidential(&user, poisoned, 70_000, false)
+        .await?;
+    confidential_harness::wait_until("the undecrypted deposit row", || async {
+        env.row(&unreadable.to_string()).await
+    })
+    .await?;
+    let deposits = [
+        env.deposit_confidential(&user, plain, 1_000_000, false)
+            .await?,
+        env.deposit_confidential(&user, fee, 1_000_000, false)
+            .await?,
+        env.deposit_confidential(&user, plain, 200_000, true)
+            .await?,
+        env.deposit_public(&user, plain, 300_000).await?,
+    ];
+    for deposit in &deposits {
+        env.wait_status(&deposit.to_string(), "completed").await?;
+    }
+    let withdrawal = env.withdraw(&user, plain, 400_000, true).await?;
+    let row = env.wait_status(&withdrawal, "completed").await?;
+    let nonce = row.nonce.ok_or("no nonce")?;
+    confidential_harness::wait_until("the release to be observed", || async {
+        env.observed_release(nonce).await
+    })
+    .await?;
+    stack.stop_all().await;
+
+    let before = confidential_outcomes(&env.db_url).await;
+    assert_eq!(before.0.iter().filter(|row| row.2).count(), 4);
+    // The poisoned deposit: amount 0, flagged, never credited.
+    assert_eq!(
+        before
+            .0
+            .iter()
+            .filter(|row| row.3)
+            .map(|row| (&*row.1, &*row.4))
+            .collect::<Vec<_>>(),
+        vec![("0", "pending")]
+    );
+    escrow_resync(&env.rpc_url, &env.db_url, env.instance, 0, admin().pubkey())
+        .await
+        .expect("the escrow resync must succeed after confidential activity");
+    assert_eq!(confidential_outcomes(&env.db_url).await, before);
+
+    stack.start_all().await;
+    env.reconcile(&mut stack).await?;
+    stack.stop().await;
     Ok(())
 }

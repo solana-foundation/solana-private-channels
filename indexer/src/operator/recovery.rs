@@ -827,6 +827,39 @@ pub(crate) async fn load_pending_sigs(
     Ok(pending)
 }
 
+/// The confirmed block height every journaled signature of the row has expired below, so
+/// none can still land, and none landed, so the row may wait in `Pending`. `None` when the
+/// journal is empty or unread, any signature may still land or did, or a lookup fails.
+pub(crate) async fn expired_journal_height(
+    storage: &Storage,
+    rpc: &RpcClientWithRetry,
+    id: i64,
+) -> Option<u64> {
+    let pending = load_pending_sigs(storage, id).await.ok()?;
+    if pending.is_empty() {
+        return None;
+    }
+    let height = rpc.get_confirmed_block_height().await.ok()?;
+    if !pending.iter().all(|p| p.last_valid_block_height < height) {
+        return None;
+    }
+    // A landed attempt is recovery's to complete, not a row to send again.
+    let signatures: Vec<Signature> = pending.iter().map(|p| p.signature).collect();
+    let statuses = rpc
+        .get_signature_statuses_with_history(&signatures)
+        .await
+        .ok()?
+        .value;
+    let landed = statuses.iter().any(|status| {
+        status.as_ref().is_some_and(|status| {
+            status.err.is_none()
+                && status
+                    .satisfies_commitment(solana_commitment_config::CommitmentConfig::confirmed())
+        })
+    });
+    (statuses.len() == signatures.len() && !landed).then_some(height)
+}
+
 /// Split a row's journalled release signatures into the two parallel arrays the
 /// quarantine CAS stores. The inner `(None, None)` means there was nothing worth
 /// recording, which leaves the columns untouched.
@@ -970,7 +1003,7 @@ async fn route_outcome(
             };
             // Noisy by design — page on uncertainty, never silently demote.
             match storage
-                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights)
+                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights, None)
                 .await
             {
                 Ok(true) => {
@@ -1164,6 +1197,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         }
     }
 

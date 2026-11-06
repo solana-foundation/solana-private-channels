@@ -19,6 +19,7 @@ use crate::{
     storage::postgres::lock_connection::PROBE_TIMEOUT,
     storage::Storage,
 };
+use private_channel_confidential::Keys;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::{
@@ -188,6 +189,12 @@ pub struct ResyncService {
     stale_holder_grace: Duration,
     // How long to wait for the channel address index to catch up. Only tests override it.
     index_catch_up_budget: Duration,
+    // Decrypts confidential events in both passes; `None` leaves deposits undecrypted.
+    confidential_keys: Option<Arc<Keys>>,
+    // The instance's pinned ElGamal pubkey; when set the key check needs the matching key.
+    pinned_pubkey: Option<[u8; 32]>,
+    // Where the startup key check reads the escrow accounts; `None` uses the backfill RPC.
+    escrow_key_source: Option<Arc<dyn crate::indexer::confidential::EscrowKeySource>>,
 }
 
 impl ResyncService {
@@ -209,7 +216,29 @@ impl ResyncService {
             lock_heartbeat_interval: LIVE_LOCK_HEARTBEAT_INTERVAL,
             stale_holder_grace: STALE_HOLDER_GRACE,
             index_catch_up_budget: INDEX_CATCH_UP_BUDGET,
+            confidential_keys: None,
+            pinned_pubkey: None,
+            escrow_key_source: None,
         }
+    }
+
+    pub fn with_confidential_keys(mut self, keys: Option<Arc<Keys>>) -> Self {
+        self.confidential_keys = keys;
+        self
+    }
+
+    pub fn with_pinned_pubkey(mut self, pinned: Option<[u8; 32]>) -> Self {
+        self.pinned_pubkey = pinned;
+        self
+    }
+
+    /// Read the escrow accounts' keys from `source` instead of the backfill RPC (tests).
+    pub fn with_escrow_key_source(
+        mut self,
+        source: Arc<dyn crate::indexer::confidential::EscrowKeySource>,
+    ) -> Self {
+        self.escrow_key_source = Some(source);
+        self
     }
 
     /// Probe the live-state lock on `interval` instead of the production one, so a
@@ -384,6 +413,7 @@ impl ResyncService {
         let (checkpoint_tx, _checkpoint_rx) = mpsc::channel(1);
         let row_mints = Arc::new(Mutex::new(BTreeSet::new()));
         let mut validator = TransactionProcessor::new(self.storage.clone(), checkpoint_tx)
+            .with_confidential_keys(self.confidential_keys.clone())
             .with_consumed_set(consumed)
             .with_row_mint_sink(row_mints.clone())
             .validate_only();
@@ -689,6 +719,31 @@ impl ResyncService {
             return Err(refusal.into());
         }
 
+        // Pre-flight 2a: the key check every service runs at startup, the first RPC read.
+        // Without the key the escrow accounts hold, the rebuild would make poisoned deposits.
+        if let (ProgramType::Escrow, Some(instance)) = (self.program_type, self.escrow_instance_id)
+        {
+            let source = match &self.escrow_key_source {
+                Some(source) => source.clone(),
+                None => Arc::new(crate::indexer::confidential::RpcEscrowKeySource {
+                    rpc: Arc::new(RpcClientWithRetry::with_retry_config(
+                        self.backfill_config_base.rpc_url.clone(),
+                        RetryConfig::default(),
+                        CommitmentConfig::confirmed(),
+                    )),
+                }),
+            };
+            crate::indexer::confidential::check_keys_at_boot(
+                &self.storage,
+                self.confidential_keys.as_deref(),
+                self.pinned_pubkey,
+                source.as_ref(),
+                &instance,
+            )
+            .await
+            .inspect_err(|e| error!("Refusing to resync: {}", e))?;
+        }
+
         // Pre-flight 2b: a withdraw rebuild restarts the nonce sequence, so the chain must
         // not have issued any nonce yet. Refuses on an unreadable bitmap as well.
         self.refuse_if_bitmap_advanced().await?;
@@ -840,7 +895,8 @@ impl ResyncService {
 
         // Start transaction processor as separate tokio task
         let mut transaction_processor =
-            TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
+            TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone())
+                .with_confidential_keys(self.confidential_keys.clone());
         // Wire the escrow instance scope. Pre-flight 1 guarantees Some for the Escrow
         // program. For Withdraw it names the bitmap checked above; the processor only
         // scopes escrow instructions by it, so withdraw rows are unaffected.
@@ -1053,6 +1109,111 @@ mod tests {
         }
     }
 
+    /// An escrow account configured under a key we do not have loaded: the services refuse
+    /// to start on it, and so does a resync into an empty database, before it deletes anything.
+    #[tokio::test]
+    async fn run_refuses_escrow_resync_without_the_key_the_escrow_accounts_hold() {
+        use crate::indexer::confidential::EscrowKeySource;
+        struct OneConfigured;
+        #[async_trait::async_trait]
+        impl EscrowKeySource for OneConfigured {
+            async fn configured_key(&self, _: &Pubkey) -> Result<Option<[u8; 32]>, String> {
+                Ok(Some([7; 32]))
+            }
+
+            async fn configured_escrow_keys(
+                &self,
+                _: &Pubkey,
+                _: &[Pubkey],
+            ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
+                Ok(vec![(Pubkey::new_unique(), [7; 32])])
+            }
+        }
+        // The mock source reports a configured account for whatever mints the check asks about.
+        let mock = MockStorage::new();
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+        let service = ResyncService::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            rpc_poller,
+            ProgramType::Escrow,
+            backfill_config,
+            Some(Pubkey::new_unique()),
+        )
+        .with_stale_holder_grace(Duration::ZERO)
+        .with_escrow_key_source(Arc::new(OneConfigured));
+
+        match service.run(100).await {
+            Err(IndexerError::ConfidentialKeys { reason }) => {
+                assert!(reason.contains("configured"), "{reason}")
+            }
+            other => panic!("a resync without the escrow key must refuse, got: {other:?}"),
+        }
+        assert_eq!(mock.get_unfinished_resync().unwrap(), None, "nothing wiped");
+    }
+
+    /// A resync into an empty database knows no mint, so only the pinned pubkey can refuse
+    /// a missing or foreign key there, before anything is wiped.
+    #[tokio::test]
+    async fn run_into_an_empty_database_requires_the_pinned_key() {
+        use private_channel_confidential::test_support as cts;
+        let keys = cts::keys();
+        let pinned = Some(keys.pubkey());
+        let cases = [
+            (None, pinned, true),
+            (Some(cts::other_keys()), pinned, true),
+            (Some(keys.clone()), pinned, false),
+            (None, None, false),
+        ];
+        for (loaded, pinned, refuses) in cases {
+            let mock = MockStorage::new();
+            let backfill_config = BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                batch_size: 50,
+                max_gap_slots: 500,
+                start_slot: None,
+            };
+            let service = ResyncService::new(
+                Arc::new(Storage::Mock(mock.clone())),
+                Arc::new(RpcPoller::new(
+                    "http://127.0.0.1:1".to_string(),
+                    UiTransactionEncoding::Json,
+                    CommitmentLevel::Finalized,
+                )),
+                ProgramType::Escrow,
+                backfill_config,
+                Some(Pubkey::new_unique()),
+            )
+            .with_stale_holder_grace(Duration::ZERO)
+            .with_escrow_key_source(no_escrow_accounts())
+            .with_confidential_keys(loaded.map(Arc::new))
+            .with_pinned_pubkey(pinned);
+            // Past the key check the run reads the unreachable RPC and fails there instead.
+            let result = service.run(100).await;
+            let refused = matches!(&result, Err(IndexerError::ConfidentialKeys { reason })
+                if reason.contains(private_channel_confidential::PUBKEY_ENV));
+            assert_eq!(refused, refuses, "{result:?}");
+            assert!(
+                result.is_err(),
+                "the unreachable RPC never lets a resync finish"
+            );
+            assert_eq!(mock.get_unfinished_resync().unwrap(), None, "nothing wiped");
+        }
+    }
+
     // ── withdrawal bitmap pre-flight ─────────────────────────────────
 
     use crate::storage::common::amount::TokenAmount;
@@ -1196,6 +1357,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -1626,6 +1792,26 @@ mod tests {
     }
 
     /// Escrow service with a scope set and every RPC on a dead port, so any network step errors.
+    /// No escrow account is configured on chain, so the key check passes.
+    fn no_escrow_accounts() -> Arc<dyn crate::indexer::confidential::EscrowKeySource> {
+        struct NoAccounts;
+        #[async_trait::async_trait]
+        impl crate::indexer::confidential::EscrowKeySource for NoAccounts {
+            async fn configured_key(&self, _: &Pubkey) -> Result<Option<[u8; 32]>, String> {
+                Ok(None)
+            }
+
+            async fn configured_escrow_keys(
+                &self,
+                _: &Pubkey,
+                _: &[Pubkey],
+            ) -> Result<Vec<(Pubkey, [u8; 32])>, String> {
+                Ok(Vec::new())
+            }
+        }
+        Arc::new(NoAccounts)
+    }
+
     fn escrow_service(storage: Arc<Storage>) -> ResyncService {
         let rpc_poller = Arc::new(RpcPoller::new(
             "http://127.0.0.1:1".to_string(),
@@ -1647,6 +1833,7 @@ mod tests {
             backfill_config,
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO)
     }
 
@@ -1920,6 +2107,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         match service.run(genesis).await {
@@ -2008,6 +2196,7 @@ mod tests {
                 },
                 Some(Pubkey::new_unique()),
             )
+            .with_escrow_key_source(no_escrow_accounts())
             .with_stale_holder_grace(Duration::ZERO);
 
             let result = service.run(genesis).await;
@@ -2079,6 +2268,7 @@ mod tests {
                 },
                 Some(Pubkey::new_unique()),
             )
+            .with_escrow_key_source(no_escrow_accounts())
             .with_stale_holder_grace(Duration::ZERO);
 
             match service.run(genesis).await {
@@ -2144,6 +2334,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         service
@@ -2187,6 +2378,7 @@ mod tests {
             },
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO);
 
         match service.run(genesis).await {
@@ -2398,6 +2590,7 @@ mod tests {
             backfill_config,
             Some(Pubkey::new_unique()),
         )
+        .with_escrow_key_source(no_escrow_accounts())
         .with_stale_holder_grace(Duration::ZERO)
         .with_index_catch_up_budget(Duration::ZERO)
         .with_channel_reconcile(ChannelReconcileConfig {

@@ -110,6 +110,33 @@ if [[ ${#shared[@]} -gt 0 ]]; then
   exit 1
 fi
 
+# Optional, but a set value must have the shape the services load, or they refuse to start.
+# The message names the variable only, never its value.
+confidential_keys="$(resolve_var ESCROW_CONFIDENTIAL_KEYS "$@")"
+if [[ -n "${confidential_keys//[[:space:]]/}" ]] \
+  && ! [[ "$confidential_keys" =~ ^[[:space:]]*\{.*\"elgamal_secret\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]+\".*\}[[:space:]]*$ \
+    && "$confidential_keys" =~ \"aes_key\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]+\" ]]; then
+  echo "FATAL: ESCROW_CONFIDENTIAL_KEYS is set but is not JSON with base64 elgamal_secret and aes_key." >&2
+  echo "Leave it blank until an escrow account is configured, or regenerate it with confidential_keygen." >&2
+  exit 1
+fi
+
+# The pinned pubkey is base64 of 32 bytes, and pins nothing without the keys it names.
+confidential_pubkey="$(resolve_var ESCROW_CONFIDENTIAL_PUBKEY "$@")"
+if [[ -n "${confidential_pubkey//[[:space:]]/}" ]]; then
+  if ! [[ "$confidential_pubkey" =~ ^[[:space:]]*[A-Za-z0-9+/]{43}=[[:space:]]*$ ]]; then
+    echo "FATAL: ESCROW_CONFIDENTIAL_PUBKEY is set but is not a base64 ElGamal pubkey." >&2
+    echo "Copy the ESCROW_CONFIDENTIAL_PUBKEY line confidential_keygen printed." >&2
+    exit 1
+  fi
+  if [[ -z "${confidential_keys//[[:space:]]/}" ]]; then
+    echo "FATAL: ESCROW_CONFIDENTIAL_PUBKEY is set but ESCROW_CONFIDENTIAL_KEYS is blank." >&2
+    echo "The services refuse to start without the matching keys." >&2
+    exit 1
+  fi
+fi
+unset confidential_keys confidential_pubkey
+
 if [[ ${#placeheld[@]} -gt 0 ]]; then
   echo "FATAL: shipped placeholder still in use: ${placeheld[*]}" >&2
   echo "Anyone with the repository knows this value. Replace it, and rotate the" >&2

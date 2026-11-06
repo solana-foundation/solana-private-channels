@@ -174,6 +174,7 @@ async fn test_reconciliation_empty_db_passes() -> Result<(), Box<dyn std::error:
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
+        None,
     )
     .await;
 
@@ -203,6 +204,7 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
+        None,
     )
     .await;
 
@@ -242,6 +244,7 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
+        None,
     )
     .await;
 
@@ -344,6 +347,7 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &pda,
+        None,
     )
     .await;
 
@@ -451,6 +455,7 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &pda,
+        None,
     )
     .await;
 
@@ -563,6 +568,7 @@ async fn test_reconciliation_ignores_an_unapproved_mint() -> Result<(), Box<dyn 
         // Single-validator harness: channel-supply invariant reads the same node.
         Some(&test_validator.rpc_url()),
         &pda,
+        None,
     )
     .await;
 

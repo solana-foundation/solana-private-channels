@@ -13,6 +13,11 @@ pub enum IndexerError {
     #[error("Channel send failed during shutdown")]
     ShutdownChannelSend,
 
+    /// The confidential keys are malformed, missing while a mint is configured, or match
+    /// none of the configured escrow accounts.
+    #[error("confidential keys: {reason}")]
+    ConfidentialKeys { reason: String },
+
     #[error("Checkpoint channel closed; cannot persist slot progress")]
     CheckpointChannelClosed,
 
@@ -128,6 +133,16 @@ pub enum ReconciliationError {
     /// deposits or releases custody already reflects and cannot be compared there.
     #[error("the escrow indexer did not reach the custody slot {snapshot_slot}; the ledger cannot be compared there")]
     LedgerCoverageIncomplete { snapshot_slot: u64 },
+
+    /// A configured mint's AES copy did not open its available balance with matching credit
+    /// counters, or no key was loaded to check it, so its custody is unknown.
+    #[error("confidential custody of mint {mint} is unreadable: {reason}")]
+    ConfidentialCustodyUnreadable { mint: String, reason: String },
+
+    /// Configured mints left out of the comparison (stale AES copy, pending too large, poisoned
+    /// or foreign key); the run vouches for nothing about them.
+    #[error("confidential mint(s) not reconciled: {mints}")]
+    ConfidentialCustodyHeld { mints: String },
 
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },

@@ -50,4 +50,23 @@ pub enum PrivateChannelWithdrawProgramInstruction {
         /// Smallest amount a withdrawal may move, 0 for none
         min_withdraw_amount: u64,
     } = 1,
+
+    /// Same as WithdrawFunds, but the escrow releases into the destination's confidential balance
+    #[codama(account(name = "user", docs = "User initiating the withdrawal", signer))]
+    #[codama(account(name = "mint", docs = "Token mint", writable))]
+    #[codama(account(name = "token_account", docs = "Source token account", writable))]
+    #[codama(account(name = "token_program", docs = "Token program"))]
+    #[codama(account(name = "associated_token_program", docs = "Associated token program"))]
+    #[codama(account(name = "withdraw_config", docs = "Withdraw config PDA for the mint"))]
+    #[codama(account(
+        name = "treasury_token_account",
+        docs = "Treasury token account the fee is paid to",
+        writable
+    ))]
+    ConfidentialWithdrawFunds {
+        /// Amount of tokens to withdraw, at most 2^48 - 1
+        amount: u64,
+        /// Destination public key
+        destination: Option<Pubkey>,
+    } = 2,
 }

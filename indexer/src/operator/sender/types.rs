@@ -253,6 +253,8 @@ pub struct SenderState {
     pub send_tasks: tokio::task::JoinSet<()>,
     /// Channel mints the DB may have forgotten, checked before every remint.
     pub(crate) consumed: Option<super::ConsumedClaims>,
+    /// Confidential releases, applies, repairs and rebalances; withdraw role with keys only.
+    pub(crate) confidential: Option<Box<super::confidential::ConfidentialSender>>,
 }
 
 impl SenderState {

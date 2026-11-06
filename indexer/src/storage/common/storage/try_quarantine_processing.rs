@@ -3,13 +3,14 @@ use crate::{error::StorageError, storage::common::storage::Storage};
 /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
 /// The optional signature arrays are recorded on the row in the same write, so
 /// the evidence outlives the release-signature journal's GC. `None` leaves both
-/// columns untouched.
+/// columns untouched. A confidential park also keeps its label on the row.
 pub async fn try_quarantine_processing(
     storage: &Storage,
     transaction_id: i64,
     expected_updated_at: chrono::DateTime<chrono::Utc>,
     remint_signatures: Option<Vec<String>>,
     remint_last_valid_block_heights: Option<Vec<i64>>,
+    park_label: Option<&str>,
 ) -> Result<bool, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
@@ -18,6 +19,7 @@ pub async fn try_quarantine_processing(
                 expected_updated_at,
                 remint_signatures,
                 remint_last_valid_block_heights,
+                park_label,
             )
             .await?),
         #[cfg(any(test, feature = "test-mock-storage"))]
@@ -28,6 +30,7 @@ pub async fn try_quarantine_processing(
                     expected_updated_at,
                     remint_signatures,
                     remint_last_valid_block_heights,
+                    park_label,
                 )
                 .await
         }

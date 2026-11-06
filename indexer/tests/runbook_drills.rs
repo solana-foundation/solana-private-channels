@@ -2123,3 +2123,93 @@ fn drill_19_freshness_cap_message_dispatches_to_path_j() {
         "the freshness row must outrank Path I: {row}"
     );
 }
+
+// ── Drill 20: confidential custody diagnostics ──────────────────────────────
+//
+// The reconciliation runbook diagnoses a poisoned confidential mint with a SQL query.
+// This drill runs it as written, checks it agrees with what reconciliation reads, and
+// checks every custody state reconciliation can report has a table row and an end.
+
+/// The runbook's SQL block tagged `-- drill: <name>`, with `:mint` as a bind.
+fn runbook_sql(text: &str, name: &str) -> String {
+    let tag = format!("-- drill: {name}\n");
+    let start = text
+        .find(&tag)
+        .unwrap_or_else(|| panic!("runbook has no `{tag}` block"))
+        + tag.len();
+    let end = text[start..].find("```").expect("unterminated sql block") + start;
+    text[start..end]
+        .replace(":mint", "$1")
+        .trim()
+        .trim_end_matches(';')
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_20_confidential_custody_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::storage::common::models::{DbTransactionBuilder, TransactionType};
+    drill_header("reconciliation_halt_runbook.md", "Confidential custody");
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let runbook = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root")
+        .join("docs/runbooks/reconciliation_halt_runbook.md");
+    let text = std::fs::read_to_string(&runbook)?;
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let (healthy, poisoned) = (
+        Pubkey::new_unique().to_string(),
+        Pubkey::new_unique().to_string(),
+    );
+    let deposit = |mint: &str, signature: &str, amount: u64| {
+        DbTransactionBuilder::new(signature.to_string(), 11, mint.to_string(), amount)
+            .initiator("user".into())
+            .recipient("user".into())
+            .transaction_type(TransactionType::Deposit)
+            .confidential(true)
+    };
+    storage
+        .insert_db_transactions_batch(&[
+            deposit(&healthy, "ok", 70_000).build(),
+            deposit(&poisoned, "ok2", 5).build(),
+            deposit(&poisoned, "bad", 0)
+                .undecrypted(vec![1, 2, 3])
+                .build(),
+        ])
+        .await?;
+
+    // The poison query names exactly the poisoned mint, which reconciliation holds.
+    let rows = sqlx::query(&runbook_sql(&text, "poisoned_rows"))
+        .fetch_all(&pool)
+        .await?;
+    let found: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (r.get::<String, _>("mint"), r.get::<String, _>("signature")))
+        .collect();
+    eprintln!("poisoned: {found:?}");
+    assert_eq!(found, vec![(poisoned.clone(), "bad".to_string())]);
+    assert_eq!(
+        storage.get_confidential_poisoned_mints().await?,
+        vec![poisoned]
+    );
+
+    // Every hold reason the code exports, plus mismatch, has a state row and an end.
+    use private_channel_indexer::operator::confidential_custody::ConfidentialHold;
+    let section = &text[text.find("### Confidential custody").expect("section")..];
+    let section = &section[..section[4..].find("\n### ").map_or(section.len(), |e| e + 4)];
+    for state in ConfidentialHold::LABELS.iter().chain(&["mismatch"]) {
+        assert!(
+            section.contains(&format!("\n| {state} |")),
+            "runbook has no state row for `{state}`"
+        );
+        assert!(
+            section.contains(&format!("\n- **{state}**:")),
+            "runbook has no end for `{state}`"
+        );
+    }
+
+    eprintln!("Confidential custody diagnostics verified against the reconciliation read.");
+    Ok(())
+}

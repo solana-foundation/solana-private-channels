@@ -340,6 +340,27 @@ pub async fn allow_mint_for_program(
     mint: Pubkey,
     token_program: Pubkey,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    allow_mint_with_withdraw_fee(
+        client,
+        admin,
+        instance,
+        mint,
+        token_program,
+        TEST_WITHDRAW_FEE,
+    )
+    .await
+}
+
+/// Like [`allow_mint_for_program`] with the withdraw fee the operator writes to the channel.
+#[allow(dead_code)]
+pub async fn allow_mint_with_withdraw_fee(
+    client: &RpcClient,
+    admin: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+    withdraw_fee: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
     let instance_ata =
@@ -358,7 +379,7 @@ pub async fn allow_mint_for_program(
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
-        .withdraw_fee(TEST_WITHDRAW_FEE)
+        .withdraw_fee(withdraw_fee)
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .min_deposit_amount(TEST_MIN_DEPOSIT_AMOUNT)
         .instruction();

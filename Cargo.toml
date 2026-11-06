@@ -6,10 +6,13 @@ members = [
     "private-channel-escrow-program/tests/integration-tests",
     # Test-only hook program; a member so `cargo clippy` covers it.
     "private-channel-escrow-program/tests/transfer-hook-fixture",
+    # Test-only program that forwards escrow instructions by CPI.
+    "private-channel-escrow-program/tests/cpi-forwarder-fixture",
     "private-channel-escrow-program/clients/rust",
     "private-channel-withdraw-program/program",
     "private-channel-withdraw-program/tests/integration-tests",
     "private-channel-withdraw-program/clients/rust",
+    "confidential",
     "core",
     "gateway",
     "indexer",
@@ -153,6 +156,7 @@ uuid = { version = "1", features = ["v4"] }
 # Solana 4.x crates, and the geyser integration suites run both against that plugin.
 yellowstone-grpc-client = "13.5"
 yellowstone-grpc-proto = "12.7"
+private-channel-confidential = { path = "confidential" }
 private-channel-core = { path = "core" }
 private-channel-metrics = { path = "metrics" }
 private-channel-escrow-program-client = { path = "private-channel-escrow-program/clients/rust", features = [
