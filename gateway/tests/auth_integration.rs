@@ -847,7 +847,10 @@ async fn test_previous_key_token_is_accepted_and_an_unknown_key_is_401() {
     let backend = start_mock_backend_with_body(system_account_response()).await;
     let addr = start_gateway_with_previous(pool, format!("http://{}", backend), previous).await;
 
-    for (secret, expected) in [(previous, 200), ("some-unknown-secret", 401)] {
+    for (name, secret, expected) in [
+        ("previous", previous, 200),
+        ("unknown", "some-unknown-secret", 401),
+    ] {
         let res = Client::new()
             .post(format!("http://{}", addr))
             .bearer_auth(generate_token_with_secret(user_id, "user", secret))
@@ -860,7 +863,7 @@ async fn test_previous_key_token_is_accepted_and_an_unknown_key_is_401() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), expected, "{secret}");
+        assert_eq!(res.status(), expected, "{name} key");
     }
 }
 

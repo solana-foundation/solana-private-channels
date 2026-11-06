@@ -42,9 +42,10 @@ release is refused during the swap.
    ```
 
    You do not have to judge this by eye: `remove_operator` in step 5 reads the indexer
-   database and refuses while any withdrawal is `processing` (a release sent and not yet
-   confirmed), printing the count and the oldest row. Withdrawals left `pending` here are
-   released by the new operator after step 4, and `manual_review` rows do not block.
+   database and refuses while any withdrawal is `processing` or `pending_remint` (a
+   release sent that may still land), printing the count and the oldest row. Withdrawals
+   left `pending` here are released by the new operator after step 4, and
+   `manual_review` rows do not block.
 
 3. **Swap the operator signer** in `vars/<env>.yml` (or the `-e @` signer file):
    - memory: point `operator_keypair_path` at the new keypair, or replace Doppler

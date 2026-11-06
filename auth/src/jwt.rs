@@ -166,11 +166,11 @@ mod tests {
 
     #[test]
     fn verify_accepts_current_and_previous_and_rejects_a_third() {
-        for secret in [SECRET, PREVIOUS] {
+        for (name, secret) in [("current", SECRET), ("previous", PREVIOUS)] {
             let token = JwtConfig::new(secret)
                 .sign(Uuid::new_v4(), Role::User)
                 .unwrap();
-            assert!(rotating().verify(&token).is_ok(), "{secret}");
+            assert!(rotating().verify(&token).is_ok(), "{name} key");
         }
         let third = JwtConfig::new("some-third-secret")
             .sign(Uuid::new_v4(), Role::User)

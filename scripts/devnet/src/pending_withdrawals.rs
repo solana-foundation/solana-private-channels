@@ -1,16 +1,22 @@
 //! The withdraw operator's releases in flight, read from the indexer DB, so an operator
 //! is not removed while a release it may have signed is still unconfirmed.
 
-/// The only status with a release transaction in flight. `pending` rows are not sent yet
-/// (the new operator sends them) and `manual_review` rows are parked, so neither blocks.
-pub const IN_FLIGHT_STATUS: &str = "processing";
+/// Statuses whose release may still land: `processing`, and `pending_remint`, which waits
+/// out the release's blockhash before reminting. `pending` rows are not sent yet and
+/// `manual_review` rows come after that window, so neither blocks.
+pub const IN_FLIGHT_STATUSES: [&str; 2] = ["processing", "pending_remint"];
 
 /// One row: the in-flight count and the oldest in-flight withdrawal.
 pub fn pending_query() -> String {
+    let in_flight = IN_FLIGHT_STATUSES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "SELECT count(*) OVER (), id, status::text, withdrawal_nonce, signature, created_at::text \
          FROM transactions WHERE transaction_type = 'withdrawal' \
-         AND status::text = '{IN_FLIGHT_STATUS}' ORDER BY created_at, id LIMIT 1"
+         AND status::text IN ({in_flight}) ORDER BY created_at, id LIMIT 1"
     )
 }
 
@@ -89,7 +95,10 @@ mod tests {
     #[test]
     fn the_query_counts_only_withdrawals_in_flight() {
         let q = pending_query();
-        assert!(q.contains("status::text = 'processing'"), "{q}");
+        assert!(
+            q.contains("status::text IN ('processing', 'pending_remint')"),
+            "{q}"
+        );
         assert!(q.contains("transaction_type = 'withdrawal'"), "{q}");
         assert!(!q.contains("NOT IN"), "{q}");
     }

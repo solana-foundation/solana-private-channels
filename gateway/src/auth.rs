@@ -958,10 +958,10 @@ mod tests {
 
     #[test]
     fn verify_bearer_accepts_current_and_previous() {
-        for secret in [SECRET, PREVIOUS] {
+        for (name, secret) in [("current", SECRET), ("previous", PREVIOUS)] {
             let token = forge_with(secret, Role::User, 3600, JWT_ISSUER, JWT_AUDIENCE);
             let parsed = verify_bearer(Some(&format!("Bearer {token}")), &rotation_keys());
-            assert_eq!(parsed.map(|c| c.role), Some(Role::User), "{secret}");
+            assert_eq!(parsed.map(|c| c.role), Some(Role::User), "{name} key");
         }
     }
 
