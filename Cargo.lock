@@ -2737,11 +2737,14 @@ dependencies = [
  "private-channel-escrow-program-client",
  "private-channel-withdraw-program-client",
  "solana-client",
+ "solana-keychain",
  "solana-sdk",
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
