@@ -41,6 +41,8 @@
     tags: [ always ]
     run_once: true
     delegate_to: localhost
+    # With -v the result lists every loaded value.
+    no_log: true
 
   # Doppler backend: fetch the config's secrets at deploy time and map them onto
   # the same var names the file backend provides, so everything downstream is
@@ -59,9 +61,9 @@
       changed_when: false
 
     - name: Fetch secrets from Doppler
+      # The CLI reads DOPPLER_TOKEN from the inherited env; an environment: block
+      # would print the token at -vvv.
       ansible.builtin.command: doppler secrets download --no-file --format json
-      environment:
-        DOPPLER_TOKEN: "{{ lookup('env', 'DOPPLER_TOKEN') }}"
       register: doppler_download
       changed_when: false
       no_log: true
@@ -78,6 +80,7 @@
         postgres_grafana_password: "{{ _d.POSTGRES_GRAFANA_PASSWORD | default('') }}"
         postgres_indexer_password: "{{ _d.POSTGRES_INDEXER_PASSWORD | default('') }}"
         jwt_secret: "{{ _d.JWT_SECRET | default('') }}"
+        jwt_secret_previous: "{{ _d.JWT_SECRET_PREVIOUS | default('') }}"
         grafana_admin_password: "{{ _d.GRAFANA_ADMIN_PASSWORD | default('') }}"
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
         ghcr_token: "{{ _d.GHCR_TOKEN | default('') }}"
@@ -88,8 +91,23 @@
         # with an empty value falls through to the vars file instead of clobbering it.
         yellowstone_endpoint: "{{ _d.DEVNET_YELLOWSTONE_ENDPOINT | default(yellowstone_endpoint | default(''), true) }}"
         rpc_url: "{{ _d.RPC_URL | default(rpc_url | default(''), true) }}"
-        # env.j2 renders notify_webhook into ALERT_WEBHOOK_URL; accept either name.
+        fallback_rpc_url: "{{ _d.FALLBACK_RPC_URL | default(fallback_rpc_url | default(''), true) }}"
+        gateway_whitelist_rpc_url: "{{ _d.GATEWAY_WHITELIST_RPC_URL | default(gateway_whitelist_rpc_url | default(''), true) }}"
+        # Remote signer secrets, under their container env names.
+        admin_vault_token: "{{ _d.ADMIN_VAULT_TOKEN | default(admin_vault_token | default(''), true) }}"
+        operator_vault_token: "{{ _d.OPERATOR_VAULT_TOKEN | default(operator_vault_token | default(''), true) }}"
+        admin_turnkey_api_private_key: "{{ _d.ADMIN_TURNKEY_API_PRIVATE_KEY | default(admin_turnkey_api_private_key | default(''), true) }}"
+        operator_turnkey_api_private_key: "{{ _d.OPERATOR_TURNKEY_API_PRIVATE_KEY | default(operator_turnkey_api_private_key | default(''), true) }}"
+        admin_privy_app_secret: "{{ _d.ADMIN_PRIVY_APP_SECRET | default(admin_privy_app_secret | default(''), true) }}"
+        operator_privy_app_secret: "{{ _d.OPERATOR_PRIVY_APP_SECRET | default(operator_privy_app_secret | default(''), true) }}"
+        # Memory signer keypairs (JSON byte arrays); refused on mainnet.
+        _doppler_keypairs:
+          admin: "{{ _d.ADMIN_KEYPAIR | default('') }}"
+          operator: "{{ _d.OPERATOR_KEYPAIR | default('') }}"
+        # The runtime webhook secret file is ALERT_WEBHOOK_URL; accept either name.
         notify_webhook: "{{ _d.ALERT_WEBHOOK_URL | default(_d.NOTIFY_WEBHOOK | default(''), true) }}"
+        # Grafana's contact point; an empty or absent key keeps the no-op default.
+        alert_webhook_url: "{{ _d.GRAFANA_ALERT_WEBHOOK_URL | default(alert_webhook_url | default(''), true) }}"
       vars:
         _d: "{{ doppler_download.stdout | from_json }}"
       no_log: true
@@ -101,127 +119,19 @@
       deploy_start_epoch: "{{ ansible_date_time.epoch }}"
     tags: [ always ]
 
-  # Derive admin pubkey + base58 private key from the on-disk keypair so the
-  # operator containers start with real signing creds. solana-keygen is the
-  # source of truth for the pubkey; for the b58 private key we shell out to a
-  # tiny inline Python (no extra deps). Both run on the control node.
-  - name: Resolve admin pubkey + b58 private key
-    when: admin_keypair_path is defined
+  # Signer keys for both roles. A memory signer's private key is derived on the
+  # control node from its keypair, over stdin; a remote signer ships only its pubkey.
+  - name: Resolve the admin and operator signers
+    ansible.builtin.include_tasks:
+      file: tasks/resolve_signer.yml
+      apply:
+        tags: [ always ]
+        delegate_to: localhost
+        run_once: true
+    loop: [ admin, operator ]
+    loop_control:
+      loop_var: _role
     tags: [ always ]
-    delegate_to: localhost
-    run_once: true
-    block:
-    - name: Stat admin keypair file
-      ansible.builtin.stat:
-        path: "{{ admin_keypair_path }}"
-      register: _admin_kp_stat
-
-    # Track presence via a boolean fact so the inner auto-gen block can
-    # update it without re-registering the stat result (a `register:` on a
-    # skipped task would overwrite _admin_kp_stat with a skip dict that has
-    # no `.stat` attribute, breaking the downstream assert).
-    - name: Track admin keypair presence
-      ansible.builtin.set_fact:
-        _admin_kp_present: "{{ _admin_kp_stat.stat.exists }}"
-
-    # On dev (network=localnet AND reset_state=true) the validator boots
-    # fresh every deploy, so the admin pubkey is meaningful only for this
-    # session — auto-generate one if missing. Gated on reset_state so we
-    # never silently rotate an admin key that other state still references.
-    # On any other env (devnet/mainnet/staging) the keypair is operator-
-    # provided (HSM/KMS in prod) and a missing file is a hard fail.
-    - name: Auto-generate admin keypair (localnet + reset_state only)
-      when:
-      - not _admin_kp_present
-      - network == 'localnet'
-      - reset_state | default(false) | bool
-      block:
-      - name: Ensure keypair parent dir exists
-        ansible.builtin.file:
-          path: "{{ admin_keypair_path | dirname }}"
-          state: directory
-          mode: "0700"
-      - name: Generate fresh admin keypair via solana-keygen
-        ansible.builtin.command: "solana-keygen new --no-bip39-passphrase --silent --outfile {{ admin_keypair_path }}"
-      - name: Mark keypair as present after generation
-        ansible.builtin.set_fact:
-          _admin_kp_present: true
-
-    # Without the keypair we'd silently fall through to env.j2's placeholder
-    # ADMIN_PRIVATE_KEY/PRIVATE_CHANNEL_ADMIN_KEYS and the operators would refuse
-    # to start on the unloadable admin signer. Surface the missing file in
-    # preflight, with the exact command to fix it.
-    - name: Assert admin keypair exists
-      ansible.builtin.assert:
-        that: _admin_kp_present
-        fail_msg: |
-          Admin keypair not found at {{ admin_keypair_path }}.
-          Operator services need this to derive ADMIN_PRIVATE_KEY; without it
-          they refuse to start with a signer configuration error. The keypairs/ dir is
-          gitignored so each operator generates their own.
-
-          Auto-generation only runs for network=localnet with reset_state=true
-          (current run: network={{ network }}, reset_state={{ reset_state | default(false) }}).
-
-          Fix: solana-keygen new --no-bip39-passphrase --silent --outfile {{ admin_keypair_path }}
-
-    # The withdraw operator re-checks a Dead finality verdict against this fallback
-    # before reminting and refuses to start without one. localnet reuses the local
-    # validator via the compose file, so the var is only required off localnet.
-    - name: Assert archival fallback RPC is set off localnet
-      ansible.builtin.assert:
-        that: network == 'localnet' or (fallback_rpc_url | default('') | length > 0)
-        fail_msg: |
-          fallback_rpc_url is empty for network={{ network }}.
-          The withdraw operator needs an independent, same-cluster archival Solana
-          RPC to corroborate a Dead finality verdict and refuses to start without
-          one. Set fallback_rpc_url in vars/{{ network }}.yml to a provider
-          independent from rpc_url ({{ rpc_url | default('unset') }}).
-
-    # The node and the operator both need the delegate, with no fallback to the admin key:
-    # deriving it on each deploy would change the policed key whenever the admin key does.
-    - name: Assert the permanent delegate is set
-      ansible.builtin.assert:
-        that: permanent_delegate | default('') | length > 0
-        fail_msg: |
-          permanent_delegate is not set for network={{ network }}.
-          Set it in vars/{{ network }}.yml to the base58 pubkey written into every
-          channel mint as its permanent delegate: a dedicated key in production, or
-          the channel admin pubkey for a dev stack.
-
-    - name: Derive admin pubkey via solana-keygen
-      ansible.builtin.command: "solana-keygen pubkey {{ admin_keypair_path }}"
-      changed_when: false
-      register: _admin_pub
-
-    # Inline base58 encoder — avoids requiring `pip install base58` on the
-    # control node. Bitcoin alphabet, big-endian. Solana wallets accept the
-    # 64-byte secret key (the full Vec<u8> from the JSON keypair) b58-encoded.
-    - name: Derive admin b58 private key
-      ansible.builtin.shell: |
-        python3 - "{{ admin_keypair_path }}" <<'PY'
-        import json, sys
-        ALPHA = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-        data = bytes(json.load(open(sys.argv[1])))
-        n = int.from_bytes(data, 'big'); s = b''
-        while n > 0:
-            n, r = divmod(n, 58); s = ALPHA[r:r+1] + s
-        pad = 0
-        for x in data:
-            if x == 0: pad += 1
-            else: break
-        print((b'1'*pad + s).decode())
-        PY
-      changed_when: false
-      register: _admin_priv
-      no_log: true
-
-    - name: Set admin facts
-      ansible.builtin.set_fact:
-        admin_pubkey: "{{ _admin_pub.stdout | trim }}"
-        admin_private_key: "{{ _admin_priv.stdout | trim }}"
-        private_channel_admin_keys: "{{ _admin_pub.stdout | trim }}"
-      no_log: true
 
   tasks:
   # =========================================================================
@@ -541,6 +451,7 @@
       when: gateway_enforce_jwt | default(true) | bool
 
     - name: Assert GHCR creds present
+      when: _registry_host == 'ghcr.io'
       ansible.builtin.assert:
         that:
         - ghcr_user | default('') | length > 0
@@ -548,6 +459,56 @@
         fail_msg: |
           `ghcr_user`/`ghcr_token` empty in secrets.yml. Deploy needs them to docker-login to GHCR before pulling images.
           Fix: edit secrets.yml — `ghcr_user: <github-username>`, `ghcr_token: <PAT with read:packages>`.
+
+    # The PAT sits on the target during the pull, so it must be unable to push.
+    # PC_TEST_GITHUB_API is a test hook read from the environment, never a var, so
+    # a typo in vars cannot send the PAT anywhere else.
+    - name: Check the GHCR token scopes
+      when: _registry_host == 'ghcr.io'
+      tags: [ preflight, remote_checks ]
+      delegate_to: localhost
+      run_once: true
+      block:
+      - name: Refuse a fine-grained GHCR token
+        ansible.builtin.assert:
+          that: not (ghcr_token | default('')).startswith('github_pat_')
+          fail_msg: |
+            ghcr_token is a fine-grained PAT (github_pat_ prefix). GHCR only accepts a
+            classic PAT. Fix: create a classic PAT with only the read:packages scope.
+
+      - name: Ask GitHub for the GHCR token scopes
+        ansible.builtin.uri:
+          url: "{{ lookup('env', 'PC_TEST_GITHUB_API') | default('https://api.github.com', true) }}/user"
+          headers:
+            Authorization: "token {{ ghcr_token }}"
+            Accept: application/vnd.github+json
+          status_code: [ 200, 401 ]
+          timeout: 10
+        register: _gh_user
+        failed_when: false
+        no_log: true
+
+      - name: Warn when the GHCR token scopes cannot be checked
+        when: _gh_user.status | default(-1) | int not in [200, 401]
+        ansible.builtin.debug:
+          msg: >-
+            WARNING: could not verify the GHCR token scopes (GitHub API status
+            {{ _gh_user.status | default(-1) }}). Continuing; the PAT must be read:packages only.
+
+      - name: Refuse a GHCR token that is not provably read:packages only
+        when: _gh_user.status | default(-1) | int in [200, 401]
+        vars:
+          _scopes: "{{ _gh_user.x_oauth_scopes | default(none) }}"
+        ansible.builtin.assert:
+          that:
+          - _gh_user.status | int == 200
+          - _scopes is not none
+          - (_scopes | string).split(',') | map('trim') | reject('equalto', '') | list == ['read:packages']
+          fail_msg: >-
+            {% if _gh_user.status | int == 401 %}ghcr_token was rejected by GitHub (401): the token is invalid or expired.
+            {% elif _scopes is none %}GitHub returned no X-OAuth-Scopes header, so read-only cannot be proven.
+            {% else %}ghcr_token has scopes: {{ _scopes }}. A deploy token must have exactly read:packages.
+            {% endif %}Fix: use a classic PAT with only read:packages, ideally on an org-scoped bot account.
 
     # Yellowstone gRPC required for indexer-solana on public clusters
     # (localnet uses the bundled validator's Yellowstone, no external endpoint).
@@ -635,6 +596,109 @@
       ansible.builtin.assert:
         that: network in ['localnet', 'devnet', 'mainnet']
         fail_msg: "network={{ network }} must be localnet, devnet or mainnet."
+
+    # The withdraw operator re-checks a Dead finality verdict against this fallback
+    # before reminting and refuses to start without one. localnet reuses the local
+    # validator via the compose file, so the var is only required off localnet.
+    - name: Assert archival fallback RPC is set off localnet
+      ansible.builtin.assert:
+        that: network == 'localnet' or (fallback_rpc_url | default('') | length > 0)
+        fail_msg: |
+          fallback_rpc_url is empty for network={{ network }}.
+          The withdraw operator needs an independent, same-cluster archival Solana
+          RPC to corroborate a Dead finality verdict and refuses to start without
+          one. Set fallback_rpc_url to a provider independent from rpc_url.
+
+    # The node and the operator both need the delegate, with no fallback to the admin key:
+    # deriving it on each deploy would change the policed key whenever the admin key does.
+    - name: Assert the permanent delegate is set
+      ansible.builtin.assert:
+        that: permanent_delegate | default('') | length > 0
+        fail_msg: |
+          permanent_delegate is not set for network={{ network }}.
+          Set it in vars/{{ network }}.yml to the base58 pubkey written into every
+          channel mint as its permanent delegate: a dedicated key in production, or
+          the channel admin pubkey for a dev stack.
+
+    - name: Assert each signer backend is known
+      ansible.builtin.assert:
+        that: lookup('vars', item ~ '_signer', default='memory') in signer_backend_vars
+        fail_msg: "{{ item }}_signer={{ lookup('vars', item ~ '_signer', default='memory') }} must be memory, vault, turnkey or privy."
+      loop: [ admin, operator ]
+
+    # Mirrors signer_util's read_role_spec, so a missing var fails here and not
+    # as a crash-looping operator.
+    - name: Assert every var the selected signer backends need is set
+      vars:
+        _needed: >-
+          {{ (signer_backend_vars.get(admin_signer | default('memory'), []) | map('regex_replace', '^', 'admin_') | list)
+           + (signer_backend_vars.get(operator_signer | default('memory'), []) | map('regex_replace', '^', 'operator_') | list) }}
+      ansible.builtin.assert:
+        that: lookup('vars', item, default='') | default('', true) | string | trim | length > 0
+        fail_msg: >-
+          {{ item }} is empty, but {{ item.split('_')[0] }}_signer={{ lookup('vars', item.split('_')[0] ~ '_signer') }}
+          needs it. Set it in vars (plain values) or secrets.yml / Doppler (tokens and secrets).
+        quiet: true
+      loop: "{{ _needed }}"
+
+    # solana-keychain's Vault client is https-only, so any other address crash-loops the operator.
+    - name: Assert Vault signer addresses use https
+      when: lookup('vars', item ~ '_signer', default='memory') == 'vault'
+      ansible.builtin.assert:
+        that: lookup('vars', item ~ '_vault_addr', default='') is match('https://')
+        fail_msg: "{{ item }}_vault_addr must be an https:// URL: the Vault signer refuses plain http."
+      loop: [ admin, operator ]
+
+    # The operator key alone can release escrow funds, so a hot key is refused
+    # outright on mainnet, wherever it is held.
+    - name: Refuse the memory signer on mainnet
+      when: network == 'mainnet'
+      ansible.builtin.assert:
+        that: lookup('vars', item ~ '_signer', default='memory') != 'memory'
+        fail_msg: >-
+          mainnet refuses the memory signer for {{ item }}: its private key would sit on the
+          host. Set {{ item }}_signer to vault, turnkey or privy.
+      loop: [ admin, operator ]
+
+    - name: Refuse a keypair held in Doppler on mainnet
+      when: network == 'mainnet'
+      ansible.builtin.assert:
+        that: ((_doppler_keypairs | default({}))[item] | default('')) | length == 0
+        fail_msg: "mainnet refuses Doppler {{ item | upper }}_KEYPAIR: remove it and use a remote signer."
+      loop: [ admin, operator ]
+
+    - name: Assert the admin and operator keys differ off localnet
+      when: network != 'localnet'
+      ansible.builtin.assert:
+        that: pc_admin_pubkey | default('') != pc_operator_pubkey | default('')
+        fail_msg: >-
+          The admin and operator keys must differ off localnet (both are {{ pc_admin_pubkey | default('') }}).
+          The withdraw operator signs releases with its own key so each can rotate alone.
+
+    - name: Warn when a memory operator sits beside a remote admin
+      when:
+      - network != 'mainnet'
+      - operator_signer | default('memory') == 'memory'
+      - admin_signer | default('memory') != 'memory'
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: operator_signer is memory while admin_signer is {{ admin_signer }}. The operator
+          key alone can release escrow funds, so protect it at least as well as the admin key.
+
+    # Same rules as the gateway and auth apply at startup. No value is echoed.
+    - name: Assert jwt_secret_previous is usable when set
+      when:
+      - gateway_enforce_jwt | default(true) | bool
+      - jwt_secret_previous | default('', true) | trim | length > 0
+      ansible.builtin.assert:
+        that:
+        - jwt_secret | default('', true) | trim | length > 0
+        - jwt_secret_previous | trim | length >= 32
+        - jwt_secret_previous | trim != jwt_secret | default('', true) | trim
+        fail_msg: >-
+          jwt_secret_previous is refused: it needs a non-blank jwt_secret, at least 32 bytes after
+          trimming, and a value different from jwt_secret. Stage a rotation with
+          scripts/rotate-secret.sh jwt_secret, which sets both.
 
     - name: Assert program IDs equal the compiled ones
       ansible.builtin.assert:
@@ -733,15 +797,78 @@
         msg: >-
           No escrow instance yet, so indexer-solana, operator-solana and
           operator-private-channel are not deployed. Create the instance on the
-          validator, set escrow_instance_id, and redeploy with
+          validator, run add_operator for {{ pc_operator_pubkey | default('the withdraw operator') }},
+          set escrow_instance_id, and redeploy with
           -e reset_state=false -e validator_reset=false.
+
+  # ReleaseFunds checks the Operator PDA, so a withdraw operator whose key was never
+  # added would fail every release while reporting healthy. Refuse only on proof.
+  - name: Check the Operator PDA
+    when: _escrow_instance | default('') | length > 0
+    tags: [ preflight, remote_checks ]
+    delegate_to: localhost
+    run_once: true
+    block:
+    - name: Probe the solana CLI
+      ansible.builtin.command: solana --version
+      register: _solana_cli
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the solana CLI is present
+      ansible.builtin.assert:
+        that: _solana_cli.rc == 0
+        fail_msg: "The solana CLI is needed on the control node to derive the Operator PDA. Install it (make install-toolchain)."
+
+    - name: Derive the Operator PDA
+      ansible.builtin.command:
+        argv: [ solana, find-program-derived-address, "{{ compiled_escrow_program_id }}", "string:operator",
+                "pubkey:{{ _escrow_instance }}", "pubkey:{{ pc_operator_pubkey }}" ]
+      register: _operator_pda
+      changed_when: false
+
+    # rpc_url carries the provider API key. A localnet rpc_url points at the target's validator.
+    - name: Read the Operator PDA
+      delegate_to: "{{ inventory_hostname if network == 'localnet' else 'localhost' }}"
+      ansible.builtin.uri:
+        url: "{{ rpc_url }}"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: getAccountInfo
+          params: [ "{{ _operator_pda.stdout | trim }}", { encoding: base64 } ]
+        timeout: 15
+      register: _pda_info
+      failed_when: false
+      no_log: true
+
+    - name: Warn when the Operator PDA cannot be read
+      when: _pda_info.status | default(-1) | int != 200 or _pda_info.json.result is not defined
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not check the Operator PDA for operator {{ pc_operator_pubkey }}
+          (RPC status {{ _pda_info.status | default(-1) }}). Continuing.
+
+    - name: Refuse an operator that was never added
+      when: _pda_info.status | default(-1) | int == 200 and _pda_info.json.result is defined
+      ansible.builtin.assert:
+        that:
+        - _pda_info.json.result.value is not none
+        - _pda_info.json.result.value.owner == compiled_escrow_program_id
+        fail_msg: >-
+          {% if _pda_info.json.result.value is none %}No Operator PDA for operator {{ pc_operator_pubkey }} on instance {{ _escrow_instance }}:
+          every ReleaseFunds would fail.
+          {% else %}The Operator PDA for {{ pc_operator_pubkey }} is owned by {{ _pda_info.json.result.value.owner }}, not the escrow program.
+          {% endif %}Fix: run add_operator for {{ pc_operator_pubkey }} with the Instance.admin key, then redeploy.
 
   # =========================================================================
   # PHASE 2: BOOTSTRAP — one-time host prep. Skipped via marker on subsequent runs.
   # =========================================================================
   - name: "==== PHASE 2: BOOTSTRAP ===="
     ansible.builtin.debug:
-      msg: "One-time host setup (Docker check, dirs, GHCR auth). Skipped if marker exists."
+      msg: "One-time host setup (Docker check, dirs). Skipped if marker exists."
     tags: [ always, bootstrap ]
 
   - name: Check bootstrap marker
@@ -768,27 +895,6 @@
         state: directory
         mode: "0755"
       loop: [ "", data, logs, config ]
-
-    # GHCR creds → ~/.docker/config.json so `docker compose pull` can fetch images.
-    # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
-    # ship dash as /bin/sh.
-    - name: Write GHCR credentials to docker config
-      ansible.builtin.shell: |
-        set -euo pipefail
-        mkdir -p ~/.docker
-        echo -n '{{ ghcr_user }}:{{ ghcr_token }}' | base64 -w0 > /tmp/.ghcr_b64
-        python3 -c "
-        import json, os, pathlib
-        p = pathlib.Path(os.path.expanduser('~/.docker/config.json'))
-        cfg = json.loads(p.read_text()) if p.exists() else {}
-        cfg.setdefault('auths', {})['ghcr.io'] = {'auth': open('/tmp/.ghcr_b64').read()}
-        p.write_text(json.dumps(cfg, indent=2))
-        "
-        rm -f /tmp/.ghcr_b64
-      args:
-        executable: /bin/bash
-      changed_when: true
-      no_log: true
 
     # Drop the marker last so a partial bootstrap re-runs cleanly.
     - name: Drop bootstrap marker
@@ -908,6 +1014,7 @@
     # — harmless to keep, will be re-rendered) and the marker files so the
     # one-time bootstrap doesn't repeat unnecessarily.
     - name: Wipe host data and logs (preserve config + markers)
+      become: true
       ansible.builtin.shell: |
         set -e
         if [ -d "{{ host_data_dir }}/data" ]; then
@@ -925,6 +1032,113 @@
     ansible.builtin.debug:
       msg: "Rendering compose override and .env into {{ host_data_dir }}/config."
     tags: [ always, render ]
+
+  # Each container reads only its own secrets, from files under
+  # {{ host_data_dir }}/secrets/<service>/ (root 0700 parent, 0755 dirs, 0444 files),
+  # bind-mounted read-only at /run/secrets. Docker resolves the mount as root, so no
+  # per-uid chown is needed and host users cannot traverse the parent.
+  # Also tagged deploy and monitoring, so a single-phase run computes the same labels.
+  - name: Render secret files
+    tags: [ render, secrets_render, deploy, monitoring ]
+    become: true
+    vars:
+      _secrets_dir: "{{ host_data_dir }}/secrets"
+      # Exact set: an empty value gets no file (and no _FILE var in the override).
+      _secret_items: >-
+        {{ secret_files | dict2items | subelements('value') | selectattr('1.value') | list }}
+    block:
+    - name: Stat host_data_dir without following links
+      ansible.builtin.stat:
+        path: "{{ host_data_dir }}"
+        follow: false
+      register: _hdd_stat
+
+    - name: Assert host_data_dir is a real directory owned by root or the deploy user
+      ansible.builtin.assert:
+        that:
+        - _hdd_stat.stat.exists
+        - _hdd_stat.stat.isdir
+        - not _hdd_stat.stat.islnk
+        - _hdd_stat.stat.pw_name in ['root', ansible_user_id]
+        fail_msg: >-
+          {{ host_data_dir }} must be a real directory (not a symlink) owned by root or
+          {{ ansible_user_id }} before secrets are written under it.
+
+    - name: Create the secrets root (root, 0700)
+      ansible.builtin.file:
+        path: "{{ _secrets_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+        follow: false
+
+    # Salts the secrets-rev labels, so a label never confirms a guessed value.
+    - name: Create the secrets-rev salt once
+      ansible.builtin.shell: |
+        umask 077
+        od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "{{ _secrets_dir }}/.salt"
+        chmod 0400 "{{ _secrets_dir }}/.salt"
+      args:
+        creates: "{{ _secrets_dir }}/.salt"
+
+    - name: Read the secrets-rev salt
+      ansible.builtin.slurp:
+        src: "{{ _secrets_dir }}/.salt"
+      register: _secrets_salt
+      no_log: true
+
+    - name: Create one secrets dir per service (root, 0755)
+      ansible.builtin.file:
+        path: "{{ _secrets_dir }}/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+        follow: false
+      loop: "{{ secret_files.keys() | list }}"
+
+    - name: Write the secret files (root, 0444)
+      ansible.builtin.copy:
+        content: "{{ item.1.value }}"
+        dest: "{{ _secrets_dir }}/{{ item.0.key }}/{{ item.1.key }}"
+        owner: root
+        group: root
+        mode: "0444"
+        follow: false
+      loop: "{{ _secret_items }}"
+      loop_control:
+        label: "{{ item.0.key }}/{{ item.1.key }}"
+      no_log: true
+
+    - name: Find the files under the secrets dirs
+      ansible.builtin.find:
+        paths: "{{ _secrets_dir }}"
+        recurse: true
+        file_type: any
+        hidden: false
+        depth: 2
+      register: _secret_found
+
+    # A cleared value must not linger as a file the container still reads.
+    - name: Remove secret files and dirs that are no longer in the set
+      vars:
+        _want_files: "{{ _secret_items | map(attribute='0.key') | zip(_secret_items | map(attribute='1.key')) | map('join', '/') | map('regex_replace', '^', _secrets_dir ~ '/') | list }}"
+        _want_dirs: "{{ secret_files.keys() | map('regex_replace', '^', _secrets_dir ~ '/') | list }}"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ _secret_found.files | map(attribute='path') | reject('in', _want_files + _want_dirs) | list }}"
+      loop_control:
+        label: "{{ item | replace(_secrets_dir ~ '/', '') }}"
+
+    # Changes exactly when a service's secrets change, so compose recreates exactly it.
+    # Derived from state, not task results, so it survives a failed run.
+    - name: Compute the secrets-rev label per service
+      ansible.builtin.set_fact:
+        _secrets_rev: >-
+          {% set d = {} %}{% for svc, items in secret_files.items() %}{% set kv = [] %}{% for i in items if i.value and i.key in secrets_rev_keys.get(svc, [i.key]) %}{% set _ = kv.append(i.key ~ '=' ~ i.value) %}{% endfor %}{% set _ = d.update({svc: ((_secrets_salt.content | b64decode) ~ '\n' ~ (kv | join('\n'))) | hash('sha256')}) %}{% endfor %}{{ d }}
+      no_log: true
 
   - name: Render templates
     tags: [ render ]
@@ -985,11 +1199,28 @@
       - check-required-env.sh
       - env-resolve.sh
 
+    # The .env holds no secret now, so they come from the task env, which
+    # check-required-env.sh resolves first (process env wins over the files).
     - name: Validate required secrets in rendered .env
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
           bash {{ target_config_dir }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
+        # Secret env on stdin: at -vvv an environment: block is printed despite no_log.
+        stdin: |
+          POSTGRES_PASSWORD={{ postgres_password }}
+          POSTGRES_REPLICATION_PASSWORD={{ postgres_replication_password }}
+          POSTGRES_RUNTIME_PASSWORD={{ postgres_runtime_password }}
+          POSTGRES_AUTH_RUNTIME_PASSWORD={{ postgres_auth_runtime_password }}
+          POSTGRES_AUTH_OWNER_PASSWORD={{ postgres_auth_owner_password }}
+          POSTGRES_GATEWAY_PASSWORD={{ postgres_gateway_password }}
+          POSTGRES_MONITORING_PASSWORD={{ postgres_monitoring_password }}
+          POSTGRES_GRAFANA_PASSWORD={{ postgres_grafana_password }}
+          POSTGRES_INDEXER_PASSWORD={{ postgres_indexer_password }}
+          GF_ADMIN_PASSWORD={{ grafana_admin_password }}
+          __PC_END_ENV__
       changed_when: false
+      no_log: true
 
     # The base compose file has bind mounts with relative `./` sources resolved
     # against the compose file's directory ({{ target_config_dir }}). When a
@@ -1237,11 +1468,94 @@
     block:
     # Pull pinned tag. Runs from the target's config dir so the host doesn't
     # need the repo.
+    # The PAT lives only in a throwaway 0700 DOCKER_CONFIG for this pull, never in
+    # the user's ~/.docker/config.json. up and restarts use the local images.
     - name: Pull images from registry
-      ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
-      args:
-        chdir: "{{ target_config_dir }}"
-      changed_when: true
+      block:
+      - name: Create a throwaway docker config dir
+        when: _registry_host == 'ghcr.io'
+        ansible.builtin.tempfile:
+          state: directory
+          suffix: .pc-docker
+        register: _pull_cfg
+
+      # docker looks for CLI plugins (compose) under DOCKER_CONFIG first.
+      - name: Keep the user's docker CLI plugins visible
+        when: _registry_host == 'ghcr.io'
+        ansible.builtin.shell: |
+          if [ -d "$HOME/.docker/cli-plugins" ]; then ln -s "$HOME/.docker/cli-plugins" "{{ _pull_cfg.path }}/cli-plugins"; fi
+        changed_when: false
+
+      - name: Log in to GHCR with the throwaway config
+        when: _registry_host == 'ghcr.io'
+        ansible.builtin.command:
+          argv: [ docker, login, ghcr.io, -u, "{{ ghcr_user }}", --password-stdin ]
+          stdin: "{{ ghcr_token }}"
+        environment:
+          DOCKER_CONFIG: "{{ _pull_cfg.path }}"
+        changed_when: false
+        no_log: true
+
+      - name: Pull the images
+        ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
+        args:
+          chdir: "{{ target_config_dir }}"
+        environment:
+          DOCKER_CONFIG: "{{ _pull_cfg.path if (_registry_host == 'ghcr.io') else (ansible_env.DOCKER_CONFIG | default(ansible_env.HOME ~ '/.docker')) }}"
+        changed_when: true
+      # An image without the wrapper would start every service with blank secrets
+      # (old tags, rollbacks such as v0.1.0), so refuse it before anything starts.
+      - name: Read the app image entrypoint
+        ansible.builtin.command:
+          argv: [ docker, image, inspect, -f, "{{ '{{' }}json .Config.Entrypoint{{ '}}' }}",
+                  "{{ image_registry }}/private-channel-app{{ ('@' ~ pc_app_image_digest) if (verify_image_signature | default(false) | bool) else (':' ~ image_tag) }}" ]
+        register: _app_entrypoint
+        changed_when: false
+
+      - name: Refuse an app image without the with-secrets entrypoint
+        ansible.builtin.assert:
+          that: (_app_entrypoint.stdout | from_json) == ['/usr/local/bin/with-secrets']
+          fail_msg: >-
+            The app image {{ image_tag }} has entrypoint {{ _app_entrypoint.stdout }}, not
+            /usr/local/bin/with-secrets. Secrets are delivered as files, so this image would
+            start with blank secrets. Deploy an image built with the with-secrets entrypoint.
+      always:
+      - name: Remove the throwaway docker config
+        when: _pull_cfg.path is defined
+        ansible.builtin.file:
+          path: "{{ _pull_cfg.path }}"
+          state: absent
+
+    # Older bootstraps wrote the deploy PAT into ~/.docker/config.json. Remove that
+    # entry only when its username is ghcr_user, so a personal login is kept.
+    - name: Remove the old bootstrap GHCR entry from the deploy user's docker config
+      when: ghcr_user | default('') | length > 0
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import base64, json, os
+        p = os.path.expanduser("~/.docker/config.json")
+        try:
+            cfg = json.load(open(p))
+        except (OSError, ValueError):
+            raise SystemExit(0)
+        entry = cfg.get("auths", {}).get("ghcr.io", {})
+        try:
+            user = base64.b64decode(entry.get("auth", "")).decode().split(":", 1)[0]
+        except Exception:
+            raise SystemExit(0)
+        if entry.get("auth") and user == os.environ["PC_GHCR_USER"]:
+            del cfg["auths"]["ghcr.io"]
+            tmp = p + ".pc-tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, os.stat(p).st_mode & 0o777)
+            with os.fdopen(fd, "w") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, p)
+            print("removed")
+        PY
+      environment:
+        PC_GHCR_USER: "{{ ghcr_user }}"
+      register: _ghcr_cleanup
+      changed_when: "'removed' in _ghcr_cleanup.stdout"
 
     # Postgres runs as uid 70, but Docker creates named volumes root-owned, so the
     # archive_command (`cp %p /wal_archive/...`) fails with "Permission denied" and
@@ -1273,20 +1587,61 @@
     - name: Apply service role definitions to the primary
       ansible.builtin.shell:
         cmd: >-
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
           docker exec -i -e PGPASSWORD -e POSTGRES_REPLICATION_USER -e POSTGRES_RUNTIME_PASSWORD
           -e POSTGRES_AUTH_RUNTIME_PASSWORD -e POSTGRES_AUTH_OWNER_PASSWORD
           -e POSTGRES_GATEWAY_PASSWORD -e POSTGRES_MONITORING_PASSWORD
           private-channel-postgres-primary
-          psql -v ON_ERROR_STOP=1 -U {{ postgres_user }} -d {{ postgres_db }} -f -
+          psql -v ON_ERROR_STOP=1 -U {{ postgres_user }} -d {{ postgres_db }}
+          -c 'SET log_min_error_statement = panic' -f -
           < {{ target_config_dir }}/init-auth-roles.sql
-      environment:
-        PGPASSWORD: "{{ postgres_password }}"
-        POSTGRES_REPLICATION_USER: "{{ postgres_replication_user }}"
-        POSTGRES_RUNTIME_PASSWORD: "{{ postgres_runtime_password }}"
-        POSTGRES_AUTH_RUNTIME_PASSWORD: "{{ postgres_auth_runtime_password }}"
-        POSTGRES_AUTH_OWNER_PASSWORD: "{{ postgres_auth_owner_password }}"
-        POSTGRES_GATEWAY_PASSWORD: "{{ postgres_gateway_password }}"
-        POSTGRES_MONITORING_PASSWORD: "{{ postgres_monitoring_password }}"
+        # Secret env on stdin: at -vvv an environment: block is printed despite no_log.
+        stdin: |
+          PGPASSWORD={{ postgres_password }}
+          POSTGRES_REPLICATION_USER={{ postgres_replication_user }}
+          POSTGRES_RUNTIME_PASSWORD={{ postgres_runtime_password }}
+          POSTGRES_AUTH_RUNTIME_PASSWORD={{ postgres_auth_runtime_password }}
+          POSTGRES_AUTH_OWNER_PASSWORD={{ postgres_auth_owner_password }}
+          POSTGRES_GATEWAY_PASSWORD={{ postgres_gateway_password }}
+          POSTGRES_MONITORING_PASSWORD={{ postgres_monitoring_password }}
+          __PC_END_ENV__
+      no_log: true
+      changed_when: true
+
+    # initdb is the only thing that ever set these two, so a rotated value never
+    # took effect and the replica and backups broke. Local socket, which pg_hba
+    # trusts; the values come from exec env and never reach argv or the log.
+    - name: Re-apply the superuser and replicator passwords on the primary
+      ansible.builtin.shell:
+        cmd: >-
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
+          docker exec -i -e PC_SU_USER -e PC_SU_PW -e PC_REPL_USER -e PC_REPL_PW
+          private-channel-postgres-primary
+          psql -v ON_ERROR_STOP=1 -q -U {{ postgres_user }} -d {{ postgres_db }} -f -
+        stdin: |
+          PC_SU_USER={{ postgres_user }}
+          PC_SU_PW={{ postgres_password }}
+          PC_REPL_USER={{ postgres_replication_user }}
+          PC_REPL_PW={{ postgres_replication_password }}
+          __PC_END_ENV__
+          SET log_min_error_statement = panic;
+          SET search_path = pg_catalog, pg_temp;
+          \set su_user `printf '%s' "$PC_SU_USER"`
+          \set su_pw `printf '%s' "$PC_SU_PW"`
+          \set repl_user `printf '%s' "$PC_REPL_USER"`
+          \set repl_pw `printf '%s' "$PC_REPL_PW"`
+          \o /dev/null
+          SELECT set_config('init.su_user', :'su_user', false), set_config('init.su_pw', :'su_pw', false),
+                 set_config('init.repl_user', :'repl_user', false), set_config('init.repl_pw', :'repl_pw', false);
+          \o
+          DO $$
+          BEGIN
+              IF coalesce(current_setting('init.su_pw'), '') = '' OR coalesce(current_setting('init.repl_pw'), '') = '' THEN
+                  RAISE EXCEPTION 'no superuser or replicator password supplied';
+              END IF;
+              EXECUTE format('ALTER ROLE %I PASSWORD %L', current_setting('init.su_user'), current_setting('init.su_pw'));
+              EXECUTE format('ALTER ROLE %I PASSWORD %L', current_setting('init.repl_user'), current_setting('init.repl_pw'));
+          END $$;
       no_log: true
       changed_when: true
 
@@ -1308,12 +1663,20 @@
     - name: Find a working login for the indexer cluster
       ansible.builtin.shell:
         cmd: >-
-          for candidate in "{{ postgres_indexer_user }}:{{ postgres_indexer_password }}"
-          "{{ postgres_user }}:{{ postgres_password }}"; do
-          user="${candidate%%:*}"; pass="${candidate#*:}";
-          if docker exec -e PGPASSWORD="$pass" private-channel-postgres-indexer
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
+          for n in 1 2; do
+          if [ $n = 1 ]; then user="$PC_IDX_USER"; PGPASSWORD="$PC_IDX_PW";
+          else user="$PC_SU_USER"; PGPASSWORD="$PC_SU_PW"; fi; export PGPASSWORD;
+          if docker exec -e PGPASSWORD private-channel-postgres-indexer
           psql -U "$user" -d {{ postgres_indexer_db }} -tAc 'SELECT 1' >/dev/null 2>&1;
           then echo "$user"; exit 0; fi; done; exit 1
+        # Secret env on stdin: at -vvv an environment: block is printed despite no_log.
+        stdin: |
+          PC_IDX_USER={{ postgres_indexer_user }}
+          PC_IDX_PW={{ postgres_indexer_password }}
+          PC_SU_USER={{ postgres_user }}
+          PC_SU_PW={{ postgres_password }}
+          __PC_END_ENV__
       register: _indexer_login
       changed_when: false
       no_log: true
@@ -1324,15 +1687,19 @@
     - name: Ensure the indexer login exists and the prior one cannot log in
       ansible.builtin.shell:
         cmd: >-
-          docker exec -i -e PGPASSWORD private-channel-postgres-indexer
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
+          docker exec -i -e PGPASSWORD -e TARGET_PW private-channel-postgres-indexer
           psql -v ON_ERROR_STOP=1 -q -U {{ _indexer_login.stdout | trim }}
           -d {{ postgres_indexer_db }}
+          -c 'SET log_min_error_statement = panic'
           -v target_user={{ postgres_indexer_user | quote }}
-          -v target_pw={{ postgres_indexer_password | quote }}
           -v prior_user={{ postgres_user | quote }}
           -f - < {{ target_config_dir }}/init-indexer-login.sql
-      environment:
-        PGPASSWORD: "{{ postgres_indexer_password if (_indexer_login.stdout | trim) == postgres_indexer_user else postgres_password }}"
+        # Secret env on stdin: at -vvv an environment: block is printed despite no_log.
+        stdin: |
+          PGPASSWORD={{ postgres_indexer_password if (_indexer_login.stdout | trim) == postgres_indexer_user else postgres_password }}
+          TARGET_PW={{ postgres_indexer_password }}
+          __PC_END_ENV__
       no_log: true
       changed_when: true
 
@@ -1341,13 +1708,17 @@
     - name: Apply the Grafana role definition to the indexer cluster
       ansible.builtin.shell:
         cmd: >-
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done;
           docker exec -i -e PGPASSWORD -e POSTGRES_GRAFANA_PASSWORD
           private-channel-postgres-indexer
-          psql -v ON_ERROR_STOP=1 -U {{ postgres_indexer_user }} -d {{ postgres_indexer_db }} -f -
+          psql -v ON_ERROR_STOP=1 -U {{ postgres_indexer_user }} -d {{ postgres_indexer_db }}
+          -c 'SET log_min_error_statement = panic' -f -
           < {{ target_config_dir }}/init-indexer-roles.sql
-      environment:
-        PGPASSWORD: "{{ postgres_indexer_password }}"
-        POSTGRES_GRAFANA_PASSWORD: "{{ postgres_grafana_password }}"
+        # Secret env on stdin: at -vvv an environment: block is printed despite no_log.
+        stdin: |
+          PGPASSWORD={{ postgres_indexer_password }}
+          POSTGRES_GRAFANA_PASSWORD={{ postgres_grafana_password }}
+          __PC_END_ENV__
       no_log: true
       changed_when: true
 
@@ -1369,6 +1740,52 @@
         chdir: "{{ target_config_dir }}"
       changed_when: true
       register: _up_out
+
+    # pg_basebackup -R left the replication password in primary_conninfo, and Postgres
+    # logs that value whenever it changes. So the password lives in a 0600 passfile in
+    # PGDATA instead; a rotation rewrites the file and restarts the walreceiver.
+    - name: Check whether the replica is running
+      ansible.builtin.command: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' private-channel-postgres-replica
+      register: _replica_running
+      changed_when: false
+      failed_when: false
+
+    - name: Point the replica's replication login at the current replicator password
+      when: _replica_running.stdout | default('') | trim == 'true'
+      ansible.builtin.shell:
+        cmd: |
+          while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done
+          c=private-channel-postgres-replica f=/var/lib/postgresql/data/pc-replication.pgpass
+          # libpq passfile syntax: escape ':' and '\' in the password.
+          printf '*:*:*:%s:%s\n' "$PC_REPL_USER" "$(printf '%s' "$PC_REPL_PW" | sed 's/[\\:]/\\&/g')" \
+            | docker exec -i "$c" sh -c "umask 077; cat > $f.new"
+          if docker exec "$c" cmp -s "$f.new" "$f"; then docker exec "$c" rm -f "$f.new"; pw=0
+          else docker exec "$c" mv "$f.new" "$f"; pw=1; fi
+          docker exec -i "$c" psql -v ON_ERROR_STOP=1 -q -U {{ postgres_user }} -d postgres -v pw_changed=$pw -f -
+        executable: /bin/bash
+        stdin: |
+          PC_REPL_USER={{ postgres_replication_user }}
+          PC_REPL_PW={{ postgres_replication_password }}
+          __PC_END_ENV__
+          SET log_min_error_statement = panic;
+          SELECT c <> '' AND n <> c AS changed, n AS new_conninfo FROM (
+            SELECT c, trim(regexp_replace(regexp_replace(c,
+                '(^|\s)password=(''([^''\\]|\\.)*''|\S+)', '', 'g'),
+                '(^|\s)passfile=(''([^''\\]|\\.)*''|\S+)', '', 'g'))
+              || ' passfile=''/var/lib/postgresql/data/pc-replication.pgpass''' AS n
+            FROM (SELECT current_setting('primary_conninfo') AS c) s
+          ) t \gset
+          \if :changed
+          ALTER SYSTEM SET primary_conninfo = :'new_conninfo';
+          SELECT pg_reload_conf();
+          \echo PC_CONNINFO_UPDATED
+          \elif :pw_changed
+          SELECT pg_terminate_backend(pid) FROM pg_stat_wal_receiver;
+          \echo PC_CONNINFO_UPDATED
+          \endif
+      register: _replica_conninfo
+      no_log: true
+      changed_when: "'PC_CONNINFO_UPDATED' in _replica_conninfo.stdout"
 
     - name: Record deployed tag
       ansible.builtin.copy:
@@ -1546,7 +1963,7 @@
       ansible.builtin.template:
         src: "{{ repo_root }}/monitoring/monitoring.compose.yml.j2"
         dest: "{{ monitoring_dir }}/monitoring.compose.yml"
-        mode: "0644"
+        mode: "0600"
 
     - name: Render prometheus.yml
       ansible.builtin.template:
@@ -1570,6 +1987,16 @@
         mode: "0644"
         directory_mode: "0755"
 
+    # The shared tree reads these two from container env; here they read secret files.
+    - name: Render the Grafana datasource and contact point over the shared copy
+      ansible.builtin.template:
+        src: "templates/grafana/{{ item.src }}"
+        dest: "{{ monitoring_dir }}/grafana/provisioning/{{ item.dest }}"
+        mode: "0644"
+      loop:
+      - { src: postgres.yml.j2, dest: datasources/postgres.yml }
+      - { src: contact-points.yml.j2, dest: alerting/contact-points.yml }
+
     - name: Copy bundled dashboard JSONs
       ansible.builtin.copy:
         src: "{{ repo_root }}/monitoring/dashboards/"
@@ -1586,12 +2013,12 @@
     # admin user, so on an existing grafana volume a rotated
     # `grafana_admin_password` would otherwise never take effect.
     - name: Reset the stored Grafana admin password
-      ansible.builtin.shell:
+      # The password goes on stdin, so it is on no argv, host or container.
+      ansible.builtin.command:
         cmd: >-
-          docker exec private-channel-mon-grafana
-          grafana-cli --homepath /usr/share/grafana admin reset-admin-password "$GF_PASSWORD"
-      environment:
-        GF_PASSWORD: "{{ grafana_admin_password }}"
+          docker exec -i private-channel-mon-grafana
+          grafana cli --homepath /usr/share/grafana admin reset-admin-password --password-from-stdin
+        stdin: "{{ grafana_admin_password }}"
       no_log: true
       changed_when: true
 
@@ -1652,6 +2079,7 @@
         status_code: [ 200 ]
         return_content: true
       register: _graf_search
+      no_log: true
       until: (_graf_search.json | default([]) | length) > 0
       retries: 15
       delay: 2
@@ -1752,3 +2180,5 @@
         text: "{{ _report }}"
       status_code: [ 200, 201, 202, 204 ]
     failed_when: false
+    # The webhook URL is a credential.
+    no_log: true

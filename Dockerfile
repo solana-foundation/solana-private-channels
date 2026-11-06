@@ -201,11 +201,15 @@ COPY --from=builder /out/auth-admin /usr/local/bin/auth-admin
 # Copy indexer/operator config files
 COPY indexer/config /etc/private_channel/config
 
+# Entrypoint: turns NAME_FILE=/run/secrets/NAME into NAME, then execs the command,
+# so secrets reach the binaries without sitting in the container config.
+COPY --chmod=0755 scripts/with-secrets.sh /usr/local/bin/with-secrets
+
 # Create data directory for RocksDB
 RUN mkdir -p /data && chown private_channel:private_channel /data
 
 # Switch to non-root user
 USER private_channel
 
-# No default entrypoint - let docker-compose specify the command
-# This ensures proper signal handling for graceful shutdown
+# The wrapper execs the compose command, so it keeps the PID and signal handling.
+ENTRYPOINT ["/usr/local/bin/with-secrets"]

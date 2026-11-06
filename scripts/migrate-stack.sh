@@ -69,17 +69,24 @@ if [[ "$SCOPE" == "all" || "$SCOPE" == "databases" ]]; then
   require_running private-channel-postgres-indexer
 
   echo "Applying init-auth-roles.sql to postgres-primary..."
-  docker exec -i \
-    -e PGPASSWORD="${V_POSTGRES_PASSWORD}" \
-    -e POSTGRES_REPLICATION_USER="${V_POSTGRES_REPLICATION_USER}" \
-    -e POSTGRES_RUNTIME_PASSWORD="${V_POSTGRES_RUNTIME_PASSWORD}" \
-    -e POSTGRES_AUTH_RUNTIME_PASSWORD="${V_POSTGRES_AUTH_RUNTIME_PASSWORD}" \
-    -e POSTGRES_AUTH_OWNER_PASSWORD="${V_POSTGRES_AUTH_OWNER_PASSWORD}" \
-    -e POSTGRES_GATEWAY_PASSWORD="${V_POSTGRES_GATEWAY_PASSWORD}" \
-    -e POSTGRES_MONITORING_PASSWORD="${V_POSTGRES_MONITORING_PASSWORD}" \
-    -e POSTGRES_DB="${V_POSTGRES_DB}" \
-    private-channel-postgres-primary \
-    psql -v ON_ERROR_STOP=1 -q -U "${V_POSTGRES_USER}" -d "${V_POSTGRES_DB}" -f - < init-auth-roles.sql
+  # Bare `-e NAME` forwards each value from this subshell's env, so none sits on argv.
+  (
+    export PGPASSWORD="${V_POSTGRES_PASSWORD}" \
+      POSTGRES_REPLICATION_USER="${V_POSTGRES_REPLICATION_USER}" \
+      POSTGRES_RUNTIME_PASSWORD="${V_POSTGRES_RUNTIME_PASSWORD}" \
+      POSTGRES_AUTH_RUNTIME_PASSWORD="${V_POSTGRES_AUTH_RUNTIME_PASSWORD}" \
+      POSTGRES_AUTH_OWNER_PASSWORD="${V_POSTGRES_AUTH_OWNER_PASSWORD}" \
+      POSTGRES_GATEWAY_PASSWORD="${V_POSTGRES_GATEWAY_PASSWORD}" \
+      POSTGRES_MONITORING_PASSWORD="${V_POSTGRES_MONITORING_PASSWORD}" \
+      POSTGRES_DB="${V_POSTGRES_DB}"
+    docker exec -i \
+      -e PGPASSWORD -e POSTGRES_REPLICATION_USER -e POSTGRES_RUNTIME_PASSWORD \
+      -e POSTGRES_AUTH_RUNTIME_PASSWORD -e POSTGRES_AUTH_OWNER_PASSWORD \
+      -e POSTGRES_GATEWAY_PASSWORD -e POSTGRES_MONITORING_PASSWORD -e POSTGRES_DB \
+      private-channel-postgres-primary \
+      psql -v ON_ERROR_STOP=1 -q -U "${V_POSTGRES_USER}" -d "${V_POSTGRES_DB}" \
+        -c 'SET log_min_error_statement = panic' -f - < init-auth-roles.sql
+  )
 
   # The indexer cluster's superuser is created at initdb and nowhere else, so on
   # a volume that predates the split it is still POSTGRES_USER. Find whichever
@@ -95,7 +102,7 @@ if [[ "$SCOPE" == "all" || "$SCOPE" == "databases" ]]; then
       "${V_POSTGRES_INDEXER_USER}") candidate_pw="${V_POSTGRES_INDEXER_PASSWORD}" ;;
       *) candidate_pw="${V_POSTGRES_PASSWORD}" ;;
     esac
-    if docker exec -e PGPASSWORD="$candidate_pw" private-channel-postgres-indexer \
+    if PGPASSWORD="$candidate_pw" docker exec -e PGPASSWORD private-channel-postgres-indexer \
          psql -U "$candidate" -d "${V_POSTGRES_INDEXER_DB}" -tAc 'SELECT 1' >/dev/null 2>&1; then
       indexer_login="$candidate"
       indexer_pw="$candidate_pw"
@@ -114,21 +121,20 @@ if [[ "$SCOPE" == "all" || "$SCOPE" == "databases" ]]; then
   fi
 
   # Same SQL the Ansible deploy runs, so both upgrade paths behave identically.
-  docker exec -i \
-    -e PGPASSWORD="$indexer_pw" \
+  PGPASSWORD="$indexer_pw" TARGET_PW="${V_POSTGRES_INDEXER_PASSWORD}" \
+    docker exec -i -e PGPASSWORD -e TARGET_PW \
     private-channel-postgres-indexer \
     psql -v ON_ERROR_STOP=1 -q -U "$indexer_login" -d "${V_POSTGRES_INDEXER_DB}" \
-      -v target_user="${V_POSTGRES_INDEXER_USER}" \
-      -v target_pw="${V_POSTGRES_INDEXER_PASSWORD}" \
+      -c 'SET log_min_error_statement = panic' -v target_user="${V_POSTGRES_INDEXER_USER}" \
       -v prior_user="${V_POSTGRES_USER}" -f - < init-indexer-login.sql
 
   echo "Applying init-indexer-roles.sql to postgres-indexer..."
-  docker exec -i \
-    -e PGPASSWORD="${V_POSTGRES_INDEXER_PASSWORD}" \
-    -e POSTGRES_GRAFANA_PASSWORD="${V_POSTGRES_GRAFANA_PASSWORD}" \
-    -e POSTGRES_DB="${V_POSTGRES_INDEXER_DB}" \
+  PGPASSWORD="${V_POSTGRES_INDEXER_PASSWORD}" POSTGRES_GRAFANA_PASSWORD="${V_POSTGRES_GRAFANA_PASSWORD}" \
+    POSTGRES_DB="${V_POSTGRES_INDEXER_DB}" \
+    docker exec -i -e PGPASSWORD -e POSTGRES_GRAFANA_PASSWORD -e POSTGRES_DB \
     private-channel-postgres-indexer \
-    psql -v ON_ERROR_STOP=1 -q -U "${V_POSTGRES_INDEXER_USER}" -d "${V_POSTGRES_INDEXER_DB}" -f - < init-indexer-roles.sql
+    psql -v ON_ERROR_STOP=1 -q -U "${V_POSTGRES_INDEXER_USER}" -d "${V_POSTGRES_INDEXER_DB}" \
+      -c 'SET log_min_error_statement = panic' -f - < init-indexer-roles.sql
 fi
 
 if [[ "$SCOPE" == "all" || "$SCOPE" == "grafana" ]]; then
@@ -146,8 +152,9 @@ if [[ "$SCOPE" == "all" || "$SCOPE" == "grafana" ]]; then
   fi
 
   echo "Resetting the stored Grafana admin password..."
-  docker exec private-channel-grafana \
-    grafana-cli --homepath /usr/share/grafana admin reset-admin-password "${V_GF_ADMIN_PASSWORD}" >/dev/null
+  # On stdin, so the password is on no argv, host or container.
+  printf '%s' "${V_GF_ADMIN_PASSWORD}" | docker exec -i private-channel-grafana \
+    grafana cli --homepath /usr/share/grafana admin reset-admin-password --password-from-stdin >/dev/null
 fi
 
 echo "Migration complete (scope: ${SCOPE})."

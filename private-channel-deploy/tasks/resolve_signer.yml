@@ -1,0 +1,122 @@
+---
+# Resolves one signer role (_role: admin or operator) into pc_<role>_pubkey and,
+# for the memory backend only, pc_<role>_private_key. Runs on the control node.
+# A memory key comes from <role>_keypair_path or Doppler <ROLE>_KEYPAIR and only
+# ever travels on stdin; a remote backend ships no private key at all.
+- name: "Read the {{ _role }} signer settings"
+  ansible.builtin.set_fact:
+    _sig: "{{ lookup('vars', _role ~ '_signer', default='memory') | string | trim }}"
+    _given_pub: "{{ lookup('vars', _role ~ '_pubkey', default='') | default('', true) | string | trim }}"
+    _kp_path: "{{ lookup('vars', _role ~ '_keypair_path', default='') }}"
+    _kp_doppler: "{{ (_doppler_keypairs | default({}))[_role] | default('') }}"
+  no_log: true
+
+- name: "Use the configured {{ _role }} pubkey for a remote signer"
+  when: _sig != 'memory'
+  ansible.builtin.set_fact:
+    "pc_{{ _role }}_pubkey": "{{ _given_pub }}"
+    "pc_{{ _role }}_private_key": ""
+
+- name: "Derive the {{ _role }} memory signer from its keypair"
+  when: _sig == 'memory'
+  block:
+  - name: "Stat the {{ _role }} keypair file"
+    when: _kp_doppler | length == 0
+    ansible.builtin.stat:
+      path: "{{ _kp_path }}"
+    register: _kp_stat
+
+  - name: "Track {{ _role }} keypair presence"
+    ansible.builtin.set_fact:
+      _kp_present: "{{ _kp_doppler | length > 0 or (_kp_path | length > 0 and _kp_stat.stat.exists | default(false)) }}"
+
+  # On dev (network=localnet AND reset_state=true) the validator boots fresh
+  # every deploy, so the key is meaningful only for this session. Gated on
+  # reset_state so we never silently rotate a key other state still references.
+  - name: "Auto-generate the {{ _role }} keypair (localnet + reset_state only)"
+    when:
+    - not (_kp_present | bool)
+    - _kp_path | length > 0
+    - network == 'localnet'
+    - reset_state | default(false) | bool
+    block:
+    - name: Ensure keypair parent dir exists
+      ansible.builtin.file:
+        path: "{{ _kp_path | dirname }}"
+        state: directory
+        mode: "0700"
+    - name: "Generate a fresh {{ _role }} keypair via solana-keygen"
+      ansible.builtin.command:
+        argv: [ solana-keygen, new, --no-bip39-passphrase, --silent, --outfile, "{{ _kp_path }}" ]
+    - name: Mark keypair as present after generation
+      ansible.builtin.set_fact:
+        _kp_present: true
+
+  - name: "Assert the {{ _role }} keypair exists"
+    ansible.builtin.assert:
+      that: _kp_present | bool
+      fail_msg: |
+        {{ _role }}_signer is memory but no keypair was found at {{ _kp_path | default('(unset)', true) }}
+        and Doppler has no {{ _role | upper }}_KEYPAIR. The withdraw operator needs it to sign.
+
+        Auto-generation only runs for network=localnet with reset_state=true
+        (current run: network={{ network }}, reset_state={{ reset_state | default(false) }}).
+
+        Fix: solana-keygen new --no-bip39-passphrase --silent --outfile {{ _kp_path | default('<path>', true) }}
+        (set {{ _role }}_keypair_path), or pick a remote signer with {{ _role }}_signer.
+
+  - name: "Load the {{ _role }} keypair"
+    ansible.builtin.set_fact:
+      _kp_json: "{{ _kp_doppler if (_kp_doppler | length > 0) else lookup('file', _kp_path) }}"
+    no_log: true
+
+  # The secret goes over stdin, never argv; the pubkey is derived from the secret
+  # itself so it cannot name a key the containers never load.
+  - name: "Derive the {{ _role }} pubkey via solana-keygen"
+    ansible.builtin.command:
+      argv: [ solana-keygen, pubkey, "-" ]
+      stdin: "{{ _kp_json }}"
+    register: _pub
+    changed_when: false
+    failed_when: false
+    no_log: true
+
+  - name: "Assert the {{ _role }} keypair is a Solana keypair"
+    ansible.builtin.assert:
+      that: _pub.rc == 0
+      fail_msg: >-
+        The {{ _role }} keypair ({{ 'Doppler ' ~ (_role | upper) ~ '_KEYPAIR' if (_kp_doppler | length > 0) else _kp_path }})
+        is not a 64-byte Solana keypair JSON array.
+
+  # Inline base58 encoder (Bitcoin alphabet) so the control node needs no extra
+  # Python package. Solana's memory signer takes the 64-byte secret b58-encoded.
+  - name: "Derive the {{ _role }} b58 private key"
+    ansible.builtin.command:
+      argv:
+      - python3
+      - -c
+      - |
+        import json, sys
+        A = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+        d = bytes(json.load(sys.stdin)); n = int.from_bytes(d, 'big'); s = b''
+        while n > 0:
+            n, r = divmod(n, 58); s = A[r:r+1] + s
+        print((b'1' * (len(d) - len(d.lstrip(b'\0'))) + s).decode())
+      stdin: "{{ _kp_json }}"
+    register: _priv
+    changed_when: false
+    no_log: true
+
+  - name: "Assert a given {{ _role }}_pubkey matches the keypair"
+    ansible.builtin.assert:
+      that: _given_pub | length == 0 or _given_pub == (_pub.stdout | trim)
+      fail_msg: >-
+        {{ _role }}_pubkey={{ _given_pub }} does not match the pubkey derived from the
+        {{ _role }} keypair ({{ _pub.stdout | trim }}). Fix the var or the keypair.
+
+  - name: "Set the {{ _role }} signer facts"
+    ansible.builtin.set_fact:
+      "pc_{{ _role }}_pubkey": "{{ _pub.stdout | trim }}"
+      "pc_{{ _role }}_private_key": "{{ _priv.stdout | trim }}"
+      _kp_json: ""
+    no_log: true

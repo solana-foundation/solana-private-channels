@@ -109,4 +109,23 @@ run_script "$tracked_env" "$other_keypair" "$runtime_env"
 grep -qx "PRIVATE_CHANNEL_PERMANENT_DELEGATE=$admin_pubkey" "$tracked_env" \
   || fail "a set delegate was overwritten by a new admin key"
 
+# 9. A separate withdraw operator key goes to the runtime file only, off every argv.
+operator_keypair="$workdir/withdraw-operator.json"
+solana-keygen new -o "$operator_keypair" -s --no-bip39-passphrase >/dev/null
+: > "$argv_log"
+run_script --operator-keypair "$operator_keypair" "$tracked_env" "$admin_keypair" "$runtime_env"
+operator_key_bytes="$(tr -d '\n' < "$operator_keypair")"
+[[ "$(grep -c '^OPERATOR_PRIVATE_KEY=' "$runtime_env")" == 1 ]] \
+  || fail "runtime file must hold exactly one OPERATOR_PRIVATE_KEY line"
+[[ "$(grep '^OPERATOR_PRIVATE_KEY=' "$runtime_env" | cut -d= -f2-)" == "$operator_key_bytes" ]] \
+  || fail "OPERATOR_PRIVATE_KEY does not match the operator keypair"
+grep -qE '^OPERATOR_PRIVATE_KEY=.+' "$tracked_env" && fail "tracked file leaked the operator private key"
+grep -qF "$operator_key_bytes" "$argv_log" && fail "operator private key appeared in a child process argv"
+assert_private "$runtime_env"
+
+# 10. The same key for both roles is refused: the split would buy nothing.
+if run_script --operator-keypair "$admin_keypair" "$tracked_env" "$admin_keypair" "$runtime_env" 2>/dev/null; then
+  fail "an operator keypair equal to the admin keypair was accepted"
+fi
+
 echo "PASS: the admin private key stays out of the tracked template and off every PATH command line, in a private runtime file"

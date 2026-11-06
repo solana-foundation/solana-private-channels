@@ -1,0 +1,12 @@
+# Rendered by Ansible over the shared provisioning copy. Same contact point as
+# monitoring/provisioning/alerting/contact-points.yml, but the webhook URL (a
+# credential) comes from a secret file instead of the container env.
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: default
+    receivers:
+      - uid: default
+        type: ${ALERT_CONTACT_TYPE}
+        settings:
+          url: $__file{/run/secrets/ALERT_WEBHOOK_URL}

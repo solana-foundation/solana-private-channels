@@ -1,0 +1,82 @@
+# Example vars for a Solana devnet stack. Copy to vars/devnet.yml and fill in the
+# <placeholders>; the [devnet] inventory group loads it (`-l devnet`).
+#   cp vars/devnet.example.yml vars/devnet.yml
+# Every key is explained in vars/dev.yml; this file only notes what differs on devnet.
+# Secrets (passwords, tokens, webhooks, keyed RPC URLs) go in secrets.yml or Doppler.
+
+# === What to deploy =========================================================
+
+image_registry: ghcr.io/<owner>
+# Must be built with the with-secrets entrypoint: the deploy refuses older images
+# such as v0.1.0, which would start with blank secrets.
+image_tag: <tag>
+
+# Recommended: refuse an image the publish workflow did not sign (needs cosign).
+verify_image_signature: false
+
+# === Network ================================================================
+
+network: devnet
+
+# A public devnet URL can stay here. A provider URL with an API key in it is a
+# secret: set rpc_url in secrets.yml (Doppler RPC_URL) instead and delete this line.
+rpc_url: https://api.devnet.solana.com
+
+# Required off localnet: an independent archival devnet RPC. Usually keyed, so set
+# it in secrets.yml (Doppler FALLBACK_RPC_URL).
+# fallback_rpc_url: ""
+
+# Required off localnet; pair with yellowstone_token in secrets.yml.
+yellowstone_endpoint: "https://<provider-yellowstone-host>"
+
+# === On-host layout ========================================================
+
+host_data_dir: /opt/private-channel
+
+# === Gateway auth & port ===================================================
+
+gateway_enforce_jwt: true
+# gateway_port: 8899
+# gateway_whitelist_instance: <escrow instance PDA>   (with gateway_whitelist_rpc_url in secrets.yml)
+
+# === Escrow instance =======================================================
+# Required off localnet: create it first (create_instance in scripts/devnet).
+escrow_instance_id: "<your_instance_address>"
+
+# === Signers ================================================================
+# Memory signers with two separate keys. The deploy refuses equal keys off localnet,
+# and refuses an operator with no Operator PDA: run add_operator for the operator
+# pubkey with the escrow Instance.admin key before the first deploy.
+# For a remote signer, pass -e @examples/signers/<backend>.yml instead.
+admin_signer: memory
+operator_signer: memory
+
+# Channel admin: fee payer, mint and freeze authority, withdraw fee treasury.
+admin_keypair_path: "{{ repo_root }}/keypairs/devnet-admin.json"
+# Withdraw operator: signs ReleaseFunds.
+operator_keypair_path: "{{ repo_root }}/keypairs/devnet-withdraw-operator.json"
+
+# Extra channel admin pubkeys the node accepts, only during a channel admin rotation.
+extra_admin_keys: []
+
+# === Seize keys =============================================================
+permanent_delegate: "<delegate_pubkey>"
+# compliance_owner: "<compliance_owner_pubkey>"
+
+# === Public surface ========================================================
+
+domain: <devnet.example.com>
+
+# === Reset-state binding ===================================================
+# Never wipe state on a shared network.
+reset_state: false
+
+# === Monitoring ports (host-side) ==========================================
+monitoring_dir: "{{ host_data_dir }}/monitoring"
+monitoring_grafana_port: 3001
+monitoring_prometheus_port: 9090
+monitoring_blackbox_port: 9115
+monitoring_cadvisor_port: 8081
+monitoring_node_exporter_port: 9101
+monitoring_postgres_exporter_port: 9187
+monitoring_postgres_exporter_indexer_port: 9188

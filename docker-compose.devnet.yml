@@ -168,9 +168,11 @@ services:
     volumes:
       - postgres-replica-data:/var/lib/postgresql/data
     user: postgres
+    # Passwords are read at runtime, from the secret file when the deploy mounts one,
+    # so no value is interpolated into this command, which docker inspect shows.
     command: |
       bash -c "
-        until PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' > /dev/null 2>&1; do
+        until PGPASSWORD=\"$$(if [ -n \"$$POSTGRES_PASSWORD_FILE\" ]; then cat \"$$POSTGRES_PASSWORD_FILE\"; else printf %s \"$$POSTGRES_PASSWORD\"; fi)\" psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' > /dev/null 2>&1; do
           echo 'Waiting for primary to be ready...'
           sleep 2
         done
@@ -179,8 +181,8 @@ services:
           echo 'Setting up replica...'
           rm -rf /var/lib/postgresql/data/*
           # Slots are not in base backups, so a restored primary has none; recreate it.
-          PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c \"SELECT pg_create_physical_replication_slot('replica_slot', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot')\"
-          PGPASSWORD=${POSTGRES_REPLICATION_PASSWORD} pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U ${POSTGRES_REPLICATION_USER} -v -P -R -S replica_slot
+          PGPASSWORD=\"$$(if [ -n \"$$POSTGRES_PASSWORD_FILE\" ]; then cat \"$$POSTGRES_PASSWORD_FILE\"; else printf %s \"$$POSTGRES_PASSWORD\"; fi)\" psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c \"SELECT pg_create_physical_replication_slot('replica_slot', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot')\"
+          PGPASSWORD=\"$$(if [ -n \"$$POSTGRES_REPLICATION_PASSWORD_FILE\" ]; then cat \"$$POSTGRES_REPLICATION_PASSWORD_FILE\"; else printf %s \"$$POSTGRES_REPLICATION_PASSWORD\"; fi)\" pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U ${POSTGRES_REPLICATION_USER} -v -P -R -S replica_slot
 
           chmod 700 /var/lib/postgresql/data
           touch /var/lib/postgresql/data/standby.signal
@@ -268,6 +270,10 @@ services:
       - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
       # Optional — omit or leave blank to disable RBAC enforcement.
       - JWT_SECRET=${JWT_SECRET:-}
+      # Optional: the previous secret during a rotation, verified after JWT_SECRET.
+      - JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS:-}
+      # 1 refuses to start on a blank JWT_SECRET rather than run with RBAC off.
+      - GATEWAY_REQUIRE_JWT=${GATEWAY_REQUIRE_JWT:-}
       # A SELECT-only login: the two auth tables it checks roles and wallets
       # against, and the two ledger tables core grants it. No writes anywhere.
       - AUTH_DATABASE_URL=postgres://private_channel_gateway:${POSTGRES_GATEWAY_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
@@ -331,6 +337,7 @@ services:
       - AUTH_PORT=${AUTH_PORT}
       - AUTH_DATABASE_URL=postgres://private_channel_auth_runtime:${POSTGRES_AUTH_RUNTIME_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - JWT_SECRET=${JWT_SECRET}
+      - JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS:-}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
       - AUTH_ARGON2_MAX_CONCURRENCY=${AUTH_ARGON2_MAX_CONCURRENCY:-4}
@@ -496,16 +503,12 @@ services:
       - COMMON_SOURCE_RPC_URL=${DEVNET_RPC_URL}
       - COMMON_ESCROW_INSTANCE_ID=${COMMON_ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
-      # never reaches this stack). The operator alias is deliberate: both roles are
-      # the same hot service identity. Both operator services must share this key:
-      # it pays Solana releases, signs channel remints as mint authority, and
-      # deposits make it the withdraw fee treasury.
+      # never reaches this stack). The deposit operator signs mints as the channel
+      # admin only, so it gets no OPERATOR_* key: it never holds a release key.
       # Backend from the env file, no default; presets and Ansible set memory. Other
-      # backends also need their ADMIN_*/OPERATOR_* vars passed in an override.
+      # backends also need their ADMIN_* vars passed in an override.
       - ADMIN_SIGNER=${ADMIN_SIGNER:?ADMIN_SIGNER must be set (memory, vault, turnkey or privy)}
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
-      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       # Delegate for new channel mints; required. Must match the node's.
       - OPERATOR_PERMANENT_DELEGATE=${OPERATOR_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-}}
       - METRICS_PORT=9102
@@ -558,16 +561,15 @@ services:
       - COMMON_SOURCE_RPC_URL=${GATEWAY_INTERNAL_URL:-http://gateway:8904}
       - COMMON_ESCROW_INSTANCE_ID=${COMMON_ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
-      # never reaches this stack). The operator alias is deliberate: both roles are
-      # the same hot service identity. Both operator services must share this key:
-      # it pays Solana releases, signs channel remints as mint authority, and
-      # deposits make it the withdraw fee treasury.
+      # never reaches this stack): fee payer, remint mint authority and withdraw fee
+      # treasury. OPERATOR_* is the release key, which needs an Operator PDA. It
+      # falls back to the admin key, so a single-key dev env keeps working.
       # Backend from the env file, no default; presets and Ansible set memory. Other
       # backends also need their ADMIN_*/OPERATOR_* vars passed in an override.
       - ADMIN_SIGNER=${ADMIN_SIGNER:?ADMIN_SIGNER must be set (memory, vault, turnkey or privy)}
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
-      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - OPERATOR_PRIVATE_KEY=${OPERATOR_PRIVATE_KEY:-${ADMIN_PRIVATE_KEY}}
       # Delegate for new channel mints; required. Must match the node's.
       - OPERATOR_PERMANENT_DELEGATE=${OPERATOR_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-}}
       - METRICS_PORT=9103
