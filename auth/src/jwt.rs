@@ -24,14 +24,24 @@ pub struct Claims {
 
 pub struct JwtConfig {
     encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+    /// Current key, then the previous one during a rotation.
+    decoding_keys: Vec<DecodingKey>,
 }
 
 impl JwtConfig {
     pub fn new(secret: &str) -> Self {
+        Self::with_previous(secret, None)
+    }
+
+    /// Signs with `secret` only; verifies with `secret`, then `previous` when given.
+    pub fn with_previous(secret: &str, previous: Option<&str>) -> Self {
+        let decoding_keys = std::iter::once(secret)
+            .chain(previous)
+            .map(|s| DecodingKey::from_secret(s.as_bytes()))
+            .collect();
         Self {
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
-            decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+            decoding_keys,
         }
     }
 
@@ -58,8 +68,14 @@ impl JwtConfig {
         let mut validation = Validation::default();
         validation.set_issuer(&[JWT_ISSUER]);
         validation.set_audience(&[JWT_AUDIENCE]);
-        let data = decode::<Claims>(token, &self.decoding_key, &validation)?;
-        Ok(data.claims)
+        let mut result = Err(jsonwebtoken::errors::ErrorKind::InvalidSignature.into());
+        for key in &self.decoding_keys {
+            result = decode::<Claims>(token, key, &validation);
+            if result.is_ok() {
+                break;
+            }
+        }
+        Ok(result?.claims)
     }
 }
 
@@ -133,6 +149,59 @@ mod tests {
     fn wrong_secret_is_rejected() {
         let token = config().sign(Uuid::new_v4(), Role::User).unwrap();
         assert!(JwtConfig::new("different-secret").verify(&token).is_err());
+    }
+
+    const PREVIOUS: &str = "test-previous-secret";
+
+    fn rotating() -> JwtConfig {
+        JwtConfig::with_previous(SECRET, Some(PREVIOUS))
+    }
+
+    #[test]
+    fn sign_uses_the_current_key_only() {
+        let token = rotating().sign(Uuid::new_v4(), Role::User).unwrap();
+        assert!(JwtConfig::new(SECRET).verify(&token).is_ok());
+        assert!(JwtConfig::new(PREVIOUS).verify(&token).is_err());
+    }
+
+    #[test]
+    fn verify_accepts_current_and_previous_and_rejects_a_third() {
+        for secret in [SECRET, PREVIOUS] {
+            let token = JwtConfig::new(secret)
+                .sign(Uuid::new_v4(), Role::User)
+                .unwrap();
+            assert!(rotating().verify(&token).is_ok(), "{secret}");
+        }
+        let third = JwtConfig::new("some-third-secret")
+            .sign(Uuid::new_v4(), Role::User)
+            .unwrap();
+        assert!(rotating().verify(&third).is_err());
+    }
+
+    /// Expiry, issuer and audience apply to the previous key exactly as to the current.
+    #[test]
+    fn previous_key_tokens_keep_every_check() {
+        let now = Utc::now().timestamp();
+        let claims = |exp: i64, iss: &str, aud: &str| Claims {
+            sub: Uuid::new_v4(),
+            role: Role::User,
+            exp: exp as usize,
+            iss: iss.to_string(),
+            aud: aud.to_string(),
+        };
+        for bad in [
+            claims(now - 3600, JWT_ISSUER, JWT_AUDIENCE),
+            claims(now + 3600, "wrong-issuer", JWT_AUDIENCE),
+            claims(now + 3600, JWT_ISSUER, "wrong-audience"),
+        ] {
+            let token = encode(
+                &Header::default(),
+                &bad,
+                &EncodingKey::from_secret(PREVIOUS.as_bytes()),
+            )
+            .unwrap();
+            assert!(rotating().verify(&token).is_err());
+        }
     }
 
     #[test]
