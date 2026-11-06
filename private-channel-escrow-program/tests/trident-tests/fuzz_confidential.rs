@@ -960,8 +960,8 @@ impl FuzzTest {
     }
 
     /// ConfigureConfidentialAccount at any point, as on a deployed escrow that
-    /// already holds public deposits and withheld fees. It lands once, on a
-    /// supported mint, and leaves the public side alone. A repeat brings new keys,
+    /// already holds public deposits and withheld fees. It lands once and leaves
+    /// the public side alone. A repeat brings new keys,
     /// which must not replace the configured ones.
     #[flow]
     fn fuzz_configure(&mut self) {

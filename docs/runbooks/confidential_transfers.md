@@ -237,6 +237,12 @@ pending. Public funds of the mint may cover it.
    blockhash expired and the signature is absent from history; until then it stays `sent`.
 2. Re-arm the row. Or release publicly if the public balance covers it.
 
+On a confidential-only mint the public balance is always 0, so neither step works: all
+custody is confidential, and this label means a shortfall or a pending balance not yet
+applied. Check that the last apply landed and that
+`private_channel_reconciliation_confidential_mismatch{mint}` is 0, then re-arm. Otherwise
+remint and [escalate](_escalation.md).
+
 ### public_balance_low
 
 A public release on a confidential-configured mint has more than the escrow's

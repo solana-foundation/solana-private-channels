@@ -223,4 +223,18 @@ mod tests {
 
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
     }
+
+    // The pre-flag layout ended at the minimum.
+    #[test]
+    fn test_parse_instruction_data_missing_flag() {
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&1_000u64.to_le_bytes());
+        instruction_data.extend_from_slice(&1u64.to_le_bytes());
+        instruction_data.extend_from_slice(Address::new_from_array([7u8; 32]).as_ref());
+        instruction_data.extend_from_slice(&100u64.to_le_bytes());
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
 }

@@ -15,7 +15,8 @@ use crate::{
         RECIPIENT_CREDITS_DISABLED_ERROR, RECIPIENT_FROZEN_ERROR, RECIPIENT_KEY_CHANGED_ERROR,
         RECIPIENT_NOT_APPROVED_ERROR, RECIPIENT_NOT_CONFIDENTIAL_ERROR,
         RECIPIENT_PENDING_FULL_ERROR, STALE_AUDITOR_KEY_ERROR, STALE_CONFIDENTIAL_BALANCE_ERROR,
-        TOKEN_2022_PROGRAM_ID, TOKEN_ACCOUNT_FROZEN_ERROR, WALLET_NOT_ALLOWED_ERROR,
+        TOKEN_2022_PROGRAM_ID, TOKEN_ACCOUNT_FROZEN_ERROR,
+        TOKEN_ILLEGAL_MINT_BURN_CONVERSION_ERROR, WALLET_NOT_ALLOWED_ERROR,
         WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
@@ -2664,7 +2665,8 @@ fn test_confidential_release_funds_transfer_fee_hook_inline_proofs() {
 
 // Token-2022 refuses the public mint, burn and conversions of a ConfidentialMintBurn
 // mint, but not configure, confidential transfers or apply, so the whole confidential
-// path works. The user's balance is written directly: public mint and Deposit are refused.
+// path works and MoveToPublic does not. The user's balance is written directly: public
+// mint and Deposit are refused.
 #[test]
 fn test_confidential_mint_burn_mint_deposits_applies_and_releases() {
     let mut context = TestContext::new();
@@ -2731,6 +2733,37 @@ fn test_confidential_mint_burn_mint_deposits_applies_and_releases() {
 
     apply_escrow_pending(&mut context, &escrow)
         .expect("ApplyPendingBalance should succeed on a mint-burn mint");
+    assert_eq!(
+        decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
+        ESCROW_BALANCE
+    );
+
+    // No public escape hatch: a release blocked here can only be reminted.
+    let withdraw = prepare_withdraw(
+        &mut context,
+        &escrow.escrow_ata,
+        &escrow.keys,
+        RELEASE_AMOUNT,
+        ProofPlacement::Inline,
+    );
+    let move_to_public = MoveToPublicBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .instance_ata(escrow.escrow_ata)
+        .amount(RELEASE_AMOUNT)
+        .new_decryptable_available_balance(withdraw.new_decryptable_available_balance)
+        .equality_proof_instruction_offset(withdraw.equality_proof_instruction_offset)
+        .range_proof_instruction_offset(withdraw.range_proof_instruction_offset)
+        .instruction();
+    let result = context.send_v1(&withdraw.proofs.with(move_to_public), &[&escrow.operator]);
+    assert_failed_first(
+        result,
+        &TOKEN_2022_PROGRAM_ID,
+        &custom_error(TOKEN_ILLEGAL_MINT_BURN_CONVERSION_ERROR),
+    );
     assert_eq!(
         decrypt_available(&mut context, &escrow.escrow_ata, &escrow.keys),
         ESCROW_BALANCE

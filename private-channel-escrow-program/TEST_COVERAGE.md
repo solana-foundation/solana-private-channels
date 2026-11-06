@@ -293,7 +293,7 @@ The whitelist tests below turn on only the withdrawal flag, except where noted.
 - `test_confidential_release_funds_mixed_proofs` — equality inline, validity in the first context account: the event amount is read from it by position
 - `test_confidential_release_funds_transfer_fee_hook_context_account_proofs` — the most accounts: fee, five context accounts and the 32 hook accounts the escrow allows, the most its CPI can carry (41 of the 42 it allows)
 - `test_confidential_release_funds_transfer_fee_hook_inline_proofs` — fee, a 3-account hook and five inline proofs: 3,844 of 4,096 bytes, room for about 7 more hook accounts
-- `test_confidential_mint_burn_mint_deposits_applies_and_releases` — a ConfidentialMintBurn escrow configures, takes a confidential deposit, applies and releases; the user's balance is written directly, since public mint and Deposit are refused
+- `test_confidential_mint_burn_mint_deposits_applies_and_releases` — a ConfidentialMintBurn escrow configures, takes a confidential deposit, applies and releases, while Token-2022 refuses its `MoveToPublic` (IllegalMintBurnConversion); the user's balance is written directly, since public mint and Deposit are refused
 
 ### ApplyPendingBalance (6 integration tests)
 
