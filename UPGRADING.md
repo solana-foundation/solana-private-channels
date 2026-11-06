@@ -93,6 +93,67 @@ image swap:
 - **Rollback.** Before the reset, redeploy the previous `image_tag`. After it, restore
   the pre-reset base backups as the runbook describes.
 
+## Secrets management upgrade
+
+For stacks deployed with `private-channel-deploy`. Raw compose is unchanged: `make
+docker-up` on `.env.local` still signs both roles with the one admin key and reads
+secrets from env. Check that by hand after pulling this release (`make docker-up`, then a
+deposit and a withdrawal).
+
+1. **Register the new withdraw operator key first.** The withdraw operator now signs
+   `ReleaseFunds` with its own key, not the channel admin's. Create it (or set up a remote
+   signer, see `private-channel-deploy/examples/signers/`), then add it with the escrow
+   `Instance.admin` key before deploying:
+
+   ```bash
+   cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> <operator-pubkey>
+   ```
+
+   Preflight refuses an operator with no Operator PDA whenever an escrow instance is
+   set (localnet included), and off localnet refuses an operator key equal to the
+   admin key. Set `operator_keypair_path` (memory) or
+   `operator_signer` and its vars in `vars/<env>.yml`. Mainnet refuses the memory
+   signer for either role.
+2. **Deploy an image with `with-secrets`.** Secrets now reach containers as files, and the
+   app image entrypoint `/usr/local/bin/with-secrets` turns them back into env. The deploy
+   checks the pulled image and refuses one without it, so `v0.1.0` and older tags cannot be
+   deployed or rolled back to by this playbook.
+3. **Downgrade the GHCR PAT.** `ghcr_token` must be a classic PAT with exactly
+   `read:packages`; preflight refuses any other scope set and fine-grained `github_pat_`
+   tokens. Create the new token, put it in `secrets.yml` or Doppler, deploy, then revoke
+   the old one. Keep a `write:packages` PAT only where you push images.
+4. **Expect the first deploy to re-apply Postgres passwords.** Every deploy now sets the
+   primary's superuser and replicator passwords from the secrets and rewrites the
+   replica's `primary_conninfo`. If the stored passwords drifted from `secrets.yml`, the
+   first deploy brings them back in line rather than leaving the replica broken.
+5. **The old GHCR login is removed.** Older bootstraps wrote the deploy PAT into the deploy
+   user's `~/.docker/config.json` on the target. The deploy deletes that `ghcr.io` entry
+   when its username equals `ghcr_user`, and keeps a personal login under any other name.
+   Pulls use a throwaway docker config from then on.
+6. **Move secrets out of vars files.** `notify_webhook` and `alert_webhook_url` are secrets
+   now: move them from `vars/<env>.yml` to `secrets.yml` or Doppler (`ALERT_WEBHOOK_URL`,
+   `GRAFANA_ALERT_WEBHOOK_URL`). Move a keyed `rpc_url`, `fallback_rpc_url` or
+   `gateway_whitelist_rpc_url` too (Doppler `RPC_URL`, `FALLBACK_RPC_URL`,
+   `GATEWAY_WHITELIST_RPC_URL`).
+7. **Retire the admin's Operator PDA.** If the channel admin key held the Operator PDA
+   before (the old single-key setup), remove it once withdrawals work with the new key:
+
+   ```bash
+   export DATABASE_URL="postgres://<postgres_indexer_user>:$(sudo cat {{ host_data_dir }}/secrets/postgres-indexer/POSTGRES_PASSWORD)@127.0.0.1:5434/<postgres_indexer_db>"
+   cargo run --bin remove_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> <channel-admin-pubkey>
+   unset DATABASE_URL
+   ```
+
+   It reads the indexer database and refuses while a withdrawal is not settled.
+
+A separate operator key also lowers how many transfer-hook accounts a release fits, from
+15 to 12; see the CHANGELOG note before upgrading a stack that allows hook mints.
+
+The secret files live under `{{ host_data_dir }}/secrets/<service>/`, root-owned. Read
+them with `sudo`; the rendered `.env` keeps their keys empty. Rotation:
+[docs/runbooks/secret_rotation.md](docs/runbooks/secret_rotation.md) and
+[docs/runbooks/key_rotation.md](docs/runbooks/key_rotation.md).
+
 ## Rehearsal
 
 Before the first upgrade on a shared environment, rehearse on devnet: deploy N, run a
