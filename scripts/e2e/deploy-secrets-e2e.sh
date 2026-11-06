@@ -18,6 +18,21 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/e2e/e2e-lib.sh
 . "$REPO/scripts/e2e/e2e-lib.sh"
 
+# Grafana reads its DB password and webhook URL from secret files ($__file{...}):
+# the datasource must reach Postgres and the contact point must hold the current URL.
+grafana_checks() {
+  local g="${E2E_GRAFANA_URL:-http://127.0.0.1:3001}" auth
+  auth="$(printf 'user = "admin:%s"\n' "$(secret grafana_admin_password)")"
+  wait_for 120 "Grafana Postgres datasource healthy ($1)" bash -c "curl -s -K - '$g/api/datasources/uid/postgres-indexer/health' \
+    <<<'$auth' | grep -q '\"status\":\"OK\"'"
+  check "Grafana contact point holds the current webhook URL ($1)" bash -c "curl -s -K - \
+    '$g/api/v1/provisioning/contact-points/export?decrypt=true&format=json' <<<'$auth' | python3 -c '
+import json, sys, yaml
+want = yaml.safe_load(open(sys.argv[1]))[\"alert_webhook_url\"]
+cps = json.load(sys.stdin)[\"contactPoints\"]
+sys.exit(not any(r[\"settings\"].get(\"url\") == want for c in cps for r in c[\"receivers\"]))' '$E2E_WORK/deploy/secrets.yml'"
+}
+
 step1() {
   say "step 1: deploy with separate admin and operator keys"
   prepare_deploy_copy
@@ -40,6 +55,7 @@ step1() {
     || die "second deploy failed (logs/deploy2.log)"
   # After the workers run, so the indexer records the AllowMint.
   setup_mint
+  grafana_checks "first deploy"
   assert_no_secret_in "deploy output (-vvv --diff) and ansible.log" "$E2E_WORK/logs"
 }
 
@@ -87,13 +103,16 @@ step4() {
 }
 
 step5() {
-  say "step 5: rotate postgres_runtime_password and postgres_gateway_password"
+  say "step 5: rotate the runtime, gateway and Grafana DB passwords and the Grafana webhook"
   local old oldgw w r g p t0
   old="$(secret postgres_runtime_password)" oldgw="$(secret postgres_gateway_password)"
   w="$(cid private-channel-write-node)" r="$(cid private-channel-read-node)"
   g="$(cid private-channel-gateway)" p="$(cid private-channel-postgres-primary)"
   "$REPO/scripts/rotate-secret.sh" postgres_runtime_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   "$REPO/scripts/rotate-secret.sh" postgres_gateway_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
+  "$REPO/scripts/rotate-secret.sh" postgres_grafana_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
+  printf 'http://e2e-grafana-hook-%s.invalid/hook' "$(openssl rand -hex 12)" \
+    | "$REPO/scripts/rotate-secret.sh" alert_webhook_url --value-stdin --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   t0="$(psql_primary -c 'SELECT now()')"
   deploy deploy5 -e "escrow_instance_id=$INSTANCE" -e validator_reset=false -e reset_state=false || die "redeploy failed (logs/deploy5.log)"
   check "write-node recreated" test "$(cid private-channel-write-node)" != "$w"
@@ -111,16 +130,19 @@ step5() {
     -e PGPASSWORD private-channel-postgres-primary psql -h 127.0.0.1 -U private_channel_gateway -d private_channel -c 'SELECT 1' >/dev/null"
   check "the old gateway password is refused" bash -c "! PGPASSWORD='$oldgw' docker exec -e PGPASSWORD private-channel-postgres-primary \
     psql -h 127.0.0.1 -U private_channel_gateway -d private_channel -c 'SELECT 1' >/dev/null 2>&1"
+  grafana_checks "after rotation"
 }
 
 step6() {
-  say "step 6: rotate the superuser and replicator passwords"
+  say "step 6: rotate the superuser, replicator and runtime passwords together"
   local pid b p rp
   pid="$(psql_replica -c 'SELECT pid FROM pg_stat_wal_receiver')"
   b="$(cid private-channel-pg-backup-primary)"
   p="$(cid private-channel-postgres-primary)" rp="$(cid private-channel-postgres-replica)"
   "$REPO/scripts/rotate-secret.sh" postgres_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   "$REPO/scripts/rotate-secret.sh" postgres_replication_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
+  # With the runtime role too: the read node can log in only once the replica streams again.
+  "$REPO/scripts/rotate-secret.sh" postgres_runtime_password --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   deploy deploy6 -e "escrow_instance_id=$INSTANCE" -e validator_reset=false -e reset_state=false || die "redeploy failed (logs/deploy6.log)"
   wait_for 90 "replica streaming with a new walreceiver" bash -c \
     "[[ \"\$(docker exec private-channel-postgres-replica psql -U private_channel -d postgres -tAq -c \"SELECT pid || ' ' || status FROM pg_stat_wal_receiver\")\" =~ ^[0-9]+\ streaming$ ]] && \
@@ -137,6 +159,8 @@ step6() {
   wait_for 300 "pg-backup-primary first base backup" bash -c "docker logs private-channel-pg-backup-primary 2>&1 | grep -q 'Backup complete'"
   check "superuser logs in with the new password" bash -c "PGPASSWORD='$(secret postgres_password)' docker exec -e PGPASSWORD \
     private-channel-postgres-primary psql -h 127.0.0.1 -U private_channel -d private_channel -c 'SELECT 1' >/dev/null"
+  check "a read through the replica succeeds" bash -c "curl -s -X POST $READ -H 'Content-Type: application/json' \
+    -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$MINT\"]}' | grep -q '\"result\"'"
 }
 
 auth_token() {

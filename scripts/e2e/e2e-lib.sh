@@ -62,6 +62,7 @@ write_secrets() {
   done
   printf 'jwt_secret: %s\n' "$(openssl rand -hex 32)" >>"$f"
   printf 'notify_webhook: http://e2e-hook-%s.invalid/notify\n' "$(openssl rand -hex 12)" >>"$f"
+  printf 'alert_webhook_url: http://e2e-grafana-hook-%s.invalid/hook\n' "$(openssl rand -hex 12)" >>"$f"
   printf 'ghcr_user: ""\nghcr_token: ""\n' >>"$f"
   chmod 600 "$f"
 }

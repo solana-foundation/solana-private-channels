@@ -1,0 +1,46 @@
+---
+# Points the running replica at the current replicator password (see deploy.yml).
+# pg_basebackup -R left the replication password in primary_conninfo, and Postgres
+# logs that value whenever it changes. So the password lives in a 0600 passfile in
+# PGDATA instead; a rotation rewrites the file and restarts the walreceiver.
+- name: Check whether the replica is running
+  ansible.builtin.command: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' private-channel-postgres-replica
+  register: _replica_running
+  changed_when: false
+  failed_when: false
+- name: Point the replica's replication login at the current replicator password
+  when: _replica_running.stdout | default('') | trim == 'true'
+  ansible.builtin.shell:
+    cmd: |
+      while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done
+      c=private-channel-postgres-replica f=/var/lib/postgresql/data/pc-replication.pgpass
+      # libpq passfile syntax: escape ':' and '\' in the password.
+      printf '*:*:*:%s:%s\n' "$PC_REPL_USER" "$(printf '%s' "$PC_REPL_PW" | sed 's/[\\:]/\\&/g')" \
+        | docker exec -i "$c" sh -c "umask 077; cat > $f.new"
+      if docker exec "$c" cmp -s "$f.new" "$f"; then docker exec "$c" rm -f "$f.new"; pw=0
+      else docker exec "$c" mv "$f.new" "$f"; pw=1; fi
+      docker exec -i "$c" psql -v ON_ERROR_STOP=1 -q -U {{ postgres_user }} -d postgres -v pw_changed=$pw -f -
+    executable: /bin/bash
+    stdin: |
+      PC_REPL_USER={{ postgres_replication_user }}
+      PC_REPL_PW={{ postgres_replication_password }}
+      __PC_END_ENV__
+      SET log_min_error_statement = panic;
+      SELECT c <> '' AND n <> c AS changed, n AS new_conninfo FROM (
+        SELECT c, trim(regexp_replace(regexp_replace(c,
+            '(^|\s)password=(''([^''\\]|\\.)*''|\S+)', '', 'g'),
+            '(^|\s)passfile=(''([^''\\]|\\.)*''|\S+)', '', 'g'))
+          || ' passfile=''/var/lib/postgresql/data/pc-replication.pgpass''' AS n
+        FROM (SELECT current_setting('primary_conninfo') AS c) s
+      ) t \gset
+      \if :changed
+      ALTER SYSTEM SET primary_conninfo = :'new_conninfo';
+      SELECT pg_reload_conf();
+      \echo PC_CONNINFO_UPDATED
+      \elif :pw_changed
+      SELECT pg_terminate_backend(pid) FROM pg_stat_wal_receiver;
+      \echo PC_CONNINFO_UPDATED
+      \endif
+  register: _replica_conninfo
+  no_log: true
+  changed_when: "'PC_CONNINFO_UPDATED' in _replica_conninfo.stdout"

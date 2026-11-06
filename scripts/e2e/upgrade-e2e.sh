@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Upgrade path on localnet: a stack deployed by the pre-change playbook (admin key is
 # the operator, bootstrap wrote a GHCR entry) moves to the secrets-managed deploy.
-#   1. deploy the old playbook (E2E_OLD_REPO_ROOT, default: `git archive HEAD`);
+#   1. deploy the old playbook (E2E_OLD_REPO_ROOT, or `git archive` of E2E_OLD_REF,
+#      default: the merge-base with origin/main);
 #   2. the Operator PDA check refuses a new operator key before add_operator;
 #   3. add_operator, then the new playbook succeeds;
 #   4. data survives, the old GHCR entry is removed, a personal entry is kept;
@@ -19,9 +20,15 @@ export HOME="$E2E_WORK/home"
 
 OLD="${E2E_OLD_REPO_ROOT:-}"
 if [[ -z "$OLD" ]]; then
+  # The pre-change playbook: where this branch left main, unless E2E_OLD_REF says otherwise.
+  ref="${E2E_OLD_REF:-$(git -C "$REPO" merge-base HEAD origin/main)}"
+  if [[ "$(git -C "$REPO" rev-parse "$ref^{commit}")" == "$(git -C "$REPO" rev-parse HEAD)" ]]; then
+    echo "ERROR: $ref is HEAD, so the old phase would deploy the new playbook. Set E2E_OLD_REF or E2E_OLD_REPO_ROOT." >&2
+    exit 2
+  fi
   OLD="$E2E_WORK/old-repo"
   mkdir -p "$OLD"
-  git -C "$REPO" archive HEAD | tar -x -C "$OLD"
+  git -C "$REPO" archive "$ref" | tar -x -C "$OLD"
   mkdir -p "$OLD/target/deploy"
   cp "$E2E_REPO_ROOT"/target/deploy/*.so "$OLD/target/deploy/"
 fi
