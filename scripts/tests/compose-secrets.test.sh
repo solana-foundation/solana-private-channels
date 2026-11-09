@@ -126,8 +126,10 @@ echo "ok: rendered compose (1, 2, 3, 5)"
 
 # 4. Raw compose dual mode against the golden config from before secret files.
 # The intended changes are dropped from both sides and checked on their own.
+# Compose versions differ on printing bind create_host_path, so it is dropped too.
 normalize() {
-  jq -S 'del(.services["postgres-replica"].command)
+  jq -S 'walk(if type == "object" then del(.create_host_path) else . end)
+    | del(.services["postgres-replica"].command)
     | del(.services["operator-solana"].environment.OPERATOR_SIGNER, .services["operator-solana"].environment.OPERATOR_PRIVATE_KEY)
     | del(.services.gateway.environment.JWT_SECRET_PREVIOUS, .services.gateway.environment.GATEWAY_REQUIRE_JWT)
     | del(.services.auth.environment.JWT_SECRET_PREVIOUS)' "$1"
