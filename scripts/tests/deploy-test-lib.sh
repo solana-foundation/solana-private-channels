@@ -21,7 +21,8 @@ STUB_PIDS=()
 deploy_test_cleanup() {
   local pid
   for pid in "${STUB_PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
-  [[ -n "${TMP:-}" ]] && rm -rf "$TMP"
+  # The secrets render leaves a root-owned tree under TMP, so fall back to sudo.
+  [[ -n "${TMP:-}" ]] && { rm -rf "$TMP" 2>/dev/null || sudo -n rm -rf "$TMP"; }
 }
 
 # Creates $TMP and the private deploy copy $D.

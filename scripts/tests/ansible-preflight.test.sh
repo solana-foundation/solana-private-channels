@@ -557,7 +557,7 @@ if missing:
 PY
 
   # The override names exactly the files that exist, per service.
-  python3 - "$host" <<'PY' || fail "override _FILE set differs from the tree"
+  asroot python3 - "$host" <<'PY' || fail "override _FILE set differs from the tree"
 import os, sys, yaml
 host = sys.argv[1]
 svcs = yaml.safe_load(open(f"{host}/config/compose.override.yml"))["services"]
