@@ -76,6 +76,7 @@ COPY auth/Cargo.toml ./auth/
 COPY private-channel-escrow-program/program/Cargo.toml ./private-channel-escrow-program/program/
 COPY private-channel-escrow-program/tests/integration-tests/Cargo.toml ./private-channel-escrow-program/tests/integration-tests/
 COPY private-channel-escrow-program/tests/transfer-hook-fixture/Cargo.toml ./private-channel-escrow-program/tests/transfer-hook-fixture/
+COPY private-channel-escrow-program/tests/cpi-forwarder-fixture/Cargo.toml ./private-channel-escrow-program/tests/cpi-forwarder-fixture/
 COPY private-channel-escrow-program/clients/rust/Cargo.toml ./private-channel-escrow-program/clients/rust/
 COPY private-channel-withdraw-program/program/Cargo.toml ./private-channel-withdraw-program/program/
 COPY private-channel-withdraw-program/tests/integration-tests/Cargo.toml ./private-channel-withdraw-program/tests/integration-tests/
@@ -87,26 +88,29 @@ COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
 COPY scripts/devnet/Cargo.toml ./scripts/devnet/
 COPY metrics/Cargo.toml ./metrics/
+COPY confidential/Cargo.toml ./confidential/
 COPY bench-tps/Cargo.toml ./bench-tps/
 
 # Create dummy lib.rs files for workspace members we're not building
 RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-program/tests/integration-tests/src \
     private-channel-escrow-program/tests/transfer-hook-fixture/src \
+    private-channel-escrow-program/tests/cpi-forwarder-fixture/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/program/src \
     private-channel-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/clients/rust/src \
     dvp-swap-program/clients/rust/src \
-    core/src metrics/src auth/src auth/src/bin bench-tps/src
+    core/src metrics/src auth/src auth/src/bin bench-tps/src confidential/src
 RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
     private-channel-escrow-program/tests/transfer-hook-fixture/src/lib.rs \
+    private-channel-escrow-program/tests/cpi-forwarder-fixture/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
     private-channel-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/clients/rust/src/lib.rs \
     dvp-swap-program/clients/rust/src/lib.rs \
-    core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs && \
+    core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs confidential/src/lib.rs && \
     printf 'fn main() {}\n' > bench-tps/src/main.rs && \
     printf 'fn main() {}\n' > auth/src/main.rs && \
     printf 'fn main() {}\n' > auth/src/bin/admin.rs
@@ -139,6 +143,7 @@ COPY core ./core
 COPY gateway ./gateway
 COPY indexer ./indexer
 COPY metrics ./metrics
+COPY confidential ./confidential
 COPY auth ./auth
 
 # core/precompiles/private_channel_withdraw_program.so is a symlink into target/deploy/ (used by

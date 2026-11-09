@@ -1708,7 +1708,7 @@ mod tests {
         handle_nonce_outside_generation(
             &mut state,
             &ctx,
-            Signature::new_unique(),
+            Some(Signature::new_unique()),
             1,
             instruction,
             &tx,
@@ -1727,6 +1727,38 @@ mod tests {
             "the rejection path refreshed the stale cache"
         );
         assert!(!state.in_flight_withdrawals.contains(&0));
+    }
+
+    /// A generation refusal seen only in simulation (nothing sent, nothing journaled) on a
+    /// closed window is refunded without a signature, never sent to manual review.
+    #[tokio::test]
+    async fn a_closed_window_refusal_seen_only_in_simulation_is_refunded() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
+        let (_bitmap, _reads) = mock_bitmap_sequence(&mut server, vec![(1, Vec::new())]);
+        let mock = mock_with_processing_row(1);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.cached_generation = Some(0);
+        state.remint_cache.insert(0, make_test_remint_info(1, "t"));
+        let instruction = build_release(&mut state, 0).await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(0),
+            trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
+        };
+        handle_nonce_outside_generation(&mut state, &ctx, None, 0, instruction, &tx).await;
+
+        assert!(rx.try_recv().is_err(), "no manual review");
+        assert_eq!(state.pending_remints.len(), 1);
+        assert!(state.pending_remints[0].signatures.is_empty());
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::PendingRemint);
+        assert!(rows[0].release_refused_on_chain);
     }
 
     /// An unknown cache is not a refusal. It has to be resolved against the
@@ -1895,7 +1927,7 @@ mod tests {
             handle_nonce_outside_generation(
                 &mut state,
                 &ctx,
-                Signature::new_unique(),
+                Some(Signature::new_unique()),
                 1,
                 instruction.clone(),
                 &tx,

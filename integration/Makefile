@@ -87,6 +87,7 @@ integration-test:
 	@cargo test --test sender_channel_close -- --nocapture
 	@cargo test --test sender_cancellation_drain -- --nocapture
 	@cargo test --test rotation_driver_e2e -- --nocapture
+	@cargo test --test confidential_e2e -- --nocapture --test-threads=4
 
 # Format and lint code
 fmt:
@@ -331,6 +332,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_cancellation_drain -- --nocapture
 	@echo "Running rotation-driver E2E tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test rotation_driver_e2e -- --nocapture
+	@echo "Running confidential deposit and release E2E tests with coverage instrumentation..."
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --test confidential_e2e -- --nocapture --test-threads=4
 
 integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."

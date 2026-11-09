@@ -123,6 +123,18 @@ pub struct DbTransaction {
     /// the finality window still lets the refund skip the bitmap gate. Rows that
     /// were never refused carry false (column DEFAULT).
     pub release_refused_on_chain: bool,
+    /// A confidential deposit, or a withdrawal to be released confidentially.
+    pub confidential: bool,
+    /// The sender leaves the row alone until this time. Set while a confidential
+    /// release waits for a balance it can prove.
+    pub not_before: Option<DateTime<Utc>>,
+    /// When the current wait began, kept across retries so the backoff can grow.
+    pub wait_started_at: Option<DateTime<Utc>>,
+    /// A confidential deposit our key could not decrypt. Its amount is 0 and it is never
+    /// minted; while one exists its mint is poisoned. Cleared by `confidential-recover`.
+    pub confidential_undecrypted: bool,
+    /// The deposit event exactly as emitted, kept on undecrypted rows for recovery.
+    pub confidential_raw: Option<Vec<u8>>,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -230,6 +242,9 @@ pub struct DbMint {
     /// Smallest channel withdrawal amount from the latest AllowMint, 0 for
     /// none. Read and written with `withdraw_fee`.
     pub min_withdraw_amount: TokenAmount,
+    /// The latest AllowMint's mint has ConfidentialMintBurn, so the channel
+    /// refuses its public withdrawals. Read and written with `withdraw_fee`.
+    pub confidential_only: bool,
     /// Slot of the AllowMint this row came from. An upsert from an older slot
     /// is ignored, so a replay or gap repair cannot restore older values.
     pub allow_mint_slot: i64,
@@ -253,6 +268,7 @@ impl DbMint {
             withdraw_fee,
             // The AllowMint path sets the real one; other callers want none.
             min_withdraw_amount: TokenAmount(0),
+            confidential_only: false,
             // The indexer sets the AllowMint's slot; 0 loses to any real one.
             allow_mint_slot: 0,
             created_at: Utc::now(),
@@ -330,6 +346,8 @@ pub struct DbTransactionBuilder {
     trace_id: Option<String>,
     instruction_index: i32,
     inner_index: Option<i32>,
+    confidential: bool,
+    confidential_raw: Option<Vec<u8>>,
 }
 
 impl DbTransactionBuilder {
@@ -346,7 +364,20 @@ impl DbTransactionBuilder {
             trace_id: None,
             instruction_index: 0,
             inner_index: None,
+            confidential: false,
+            confidential_raw: None,
         }
+    }
+
+    /// A confidential deposit our key could not read; `raw` is its event for recovery.
+    pub fn undecrypted(mut self, raw: Vec<u8>) -> Self {
+        self.confidential_raw = Some(raw);
+        self
+    }
+
+    pub fn confidential(mut self, confidential: bool) -> Self {
+        self.confidential = confidential;
+        self
     }
 
     pub fn initiator(mut self, initiator: String) -> Self {
@@ -412,6 +443,11 @@ impl DbTransactionBuilder {
             inner_index: self.inner_index,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: self.confidential,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: self.confidential_raw.is_some(),
+            confidential_raw: self.confidential_raw,
         }
     }
 }

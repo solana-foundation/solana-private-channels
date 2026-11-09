@@ -1021,7 +1021,13 @@ async fn process_pending_remints_within(
         // Classify the stored signatures against on-chain state. This runs on
         // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
         // not source_rpc_client which only the remint MintTo uses.
-        match classify_signatures(&state.dest_finality(), &entry.signatures).await {
+        // No signature only for a refusal before any send: there is nothing to classify.
+        let finality = if entry.signatures.is_empty() && entry.release_refused_on_chain {
+            SigFinality::Dead
+        } else {
+            classify_signatures(&state.dest_finality(), &entry.signatures).await
+        };
+        match finality {
             // Case 1: a sig finalized successfully, the withdrawal landed.
             // Nothing local to repair: the chain is the only record of consumption.
             SigFinality::Landed(sig) => {
@@ -1038,7 +1044,7 @@ async fn process_pending_remints_within(
                     entry,
                     &nonce_label,
                     &reason,
-                    &state.storage,
+                    state,
                     storage_tx,
                 )
                 .await;
@@ -1065,7 +1071,7 @@ async fn process_pending_remints_within(
                             entry,
                             &nonce_label,
                             &reason,
-                            &state.storage,
+                            state,
                             storage_tx,
                         )
                         .await;
@@ -1084,7 +1090,7 @@ async fn process_pending_remints_within(
                             entry,
                             &nonce_label,
                             &reason,
-                            &state.storage,
+                            state,
                             storage_tx,
                         )
                         .await;
@@ -1113,11 +1119,22 @@ async fn process_pending_remints_within(
                                     entry,
                                     &nonce_label,
                                     &reason,
-                                    &state.storage,
+                                    state,
                                     storage_tx,
                                 )
                                 .await;
                             }
+                            // A confidential park waited on the same proof; it parks instead.
+                            ReleaseRecord::ProvenAbsent
+                                if super::confidential::finish_gated_park(
+                                    state,
+                                    entry.ctx.transaction_id.unwrap_or_default(),
+                                    entry.ctx.trace_id.clone(),
+                                    &entry.original_error,
+                                    super::confidential::PROVEN_ABSENT,
+                                    storage_tx,
+                                )
+                                .await => {}
                             ReleaseRecord::ProvenAbsent => {
                                 info!(
                                 "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
@@ -1133,7 +1150,7 @@ async fn process_pending_remints_within(
                                             *entry,
                                             &nonce_label,
                                             &reason,
-                                            &state.storage,
+                                            state,
                                             storage_tx,
                                         )
                                         .await;
@@ -1496,7 +1513,7 @@ async fn defer_or_escalate(
     entry: PendingRemint,
     nonce_label: &str,
     reason: &str,
-    storage: &crate::storage::Storage,
+    state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     let attempt = entry.finality_check_attempts + 1;
@@ -1506,6 +1523,20 @@ async fn defer_or_escalate(
             "Pending remint for nonce {} reached attempt cap ({}); escalating to ManualReview: {}",
             nonce_label, attempt, reason
         );
+        let escalated = format!("escalated to ManualReview after {attempt} attempts: {reason}");
+        // A confidential park waiting on this gate ends as that park.
+        if super::confidential::finish_gated_park(
+            state,
+            entry.ctx.transaction_id.unwrap_or_default(),
+            entry.ctx.trace_id.clone(),
+            &entry.original_error,
+            &escalated,
+            storage_tx,
+        )
+        .await
+        {
+            return;
+        }
         if let Some(transaction_id) = entry.ctx.transaction_id {
             send_guaranteed(
                 storage_tx,
@@ -1537,7 +1568,8 @@ async fn defer_or_escalate(
     // ambiguity. Escalate to ManualReview rather than continue deferring with
     // a counter we can't trust to survive a restart.
     if let Some(transaction_id) = entry.ctx.transaction_id {
-        if let Err(persist_err) = storage
+        if let Err(persist_err) = state
+            .storage
             .bump_pending_remint_finality_attempt(transaction_id, attempt as i32, new_deadline)
             .await
         {
@@ -1706,6 +1738,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }
@@ -1745,6 +1778,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -1794,6 +1832,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: true,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -1912,6 +1955,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }
@@ -2020,6 +2064,7 @@ mod tests {
             solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         };
         (state, mock)
     }
@@ -2941,6 +2986,37 @@ mod tests {
             1,
             "an on-chain refusal is proof enough to return the tokens"
         );
+    }
+
+    /// A refund for a release refused before any send has no signature: the gate goes straight
+    /// to the bitmap and the payout record, with no signature status read.
+    #[tokio::test]
+    async fn a_refusal_before_any_send_is_reminted_without_a_signature_read() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSignatureStatuses"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        cover_release_window(&mock).await;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].signatures.clear();
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert_eq!(journaled_attempts(&mock, 99), 1, "the remint was sent");
+        statuses.assert_async().await;
     }
 
     /// Record a release for `nonce` the way the indexer does when it indexes one.

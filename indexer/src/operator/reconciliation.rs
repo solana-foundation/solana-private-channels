@@ -12,6 +12,7 @@ use crate::metrics::{
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
     OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
+use crate::operator::confidential_custody::{publish_hold_age, resolve_custody, ResolvedCustody};
 use crate::operator::escrow_sweep::{
     allowed_mint_token_programs, channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply,
     EscrowCustody, SUPPLY_REREAD_BUDGET,
@@ -21,6 +22,7 @@ use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::common::models::MintDbBalance;
 use crate::storage::Storage;
+use private_channel_confidential::Keys;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
@@ -86,6 +88,8 @@ struct BreachCounters {
     announced_mints: HashSet<Pubkey>,
     /// An insolvency halt is in force; only that suppresses a new breach trip.
     insolvency_halted: bool,
+    /// When each configured mint's current alert-only hold began, and its reason, for the age alert.
+    held_since: HashMap<Pubkey, (&'static str, tokio::time::Instant)>,
 }
 
 /// Why the pipelines are frozen. An insolvency outranks an outage and is never replaced by one.
@@ -125,6 +129,7 @@ pub async fn run_reconciliation(
     rpc_client: Arc<RpcClientWithRetry>,
     channel_rpc: Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    confidential_keys: Option<Arc<Keys>>,
     health: Option<Arc<HealthState>>,
     cancellation_token: CancellationToken,
     fence: SolvencyFence,
@@ -190,6 +195,7 @@ pub async fn run_reconciliation(
             &rpc_client,
             &channel_rpc,
             escrow_instance_id,
+            confidential_keys.as_deref(),
             &webhook_client,
             if probe { &quiet_alerts } else { &masked_alerts },
             &health,
@@ -309,7 +315,7 @@ fn evaluate_liability_shortfall(
 
 /// A ledger row's liabilities (deposits minus released withdrawals) as u64.
 /// Negative means missing deposit history and reads as 0 (surplus); above u64::MAX fails closed.
-fn ledger_liability(row: &MintDbBalance) -> u64 {
+pub(crate) fn ledger_liability(row: &MintDbBalance) -> u64 {
     let net = &row.total_deposits - &row.total_withdrawals;
     match net_to_u64(&net) {
         NetBalance::Exact(v) => v,
@@ -374,6 +380,7 @@ async fn perform_reconciliation_check(
     rpc_client: &Arc<RpcClientWithRetry>,
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    confidential_keys: Option<&Keys>,
     webhook_client: &WebhookClient,
     masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
@@ -399,6 +406,7 @@ async fn perform_reconciliation_check(
         rpc_client,
         channel_rpc,
         escrow_instance_id,
+        confidential_keys,
         webhook_client,
         masked_alerts,
         health,
@@ -529,6 +537,7 @@ async fn check_invariants(
     rpc_client: &Arc<RpcClientWithRetry>,
     channel_rpc: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    confidential_keys: Option<&Keys>,
     webhook_client: &WebhookClient,
     masked_alerts: &MaskedAlerts,
     health: &Option<Arc<HealthState>>,
@@ -612,11 +621,33 @@ async fn check_invariants(
     let (ledger_mints, liabilities) =
         fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
-    // The ledger values an unresolved mint too, but its custody was never read and would count
-    // as 0, so both arms skip it and the tick is reported missing. The counters are rebuilt
-    // from the set each tick, so its streaks are carried over by hand: no verdict, no reset.
-    let held: Vec<(Pubkey, Option<u32>, Option<u32>)> = universe
+    // Configured mints count public + pending + verified available from the same account read.
+    let resolved = resolve_custody(
+        storage,
+        confidential_keys,
+        &custody.balances,
+        &custody.confidential,
+    )
+    .await
+    .map_err(OperatorError::Storage)?;
+    report_confidential_holds(&resolved, breach_counters);
+    // An unresolved mint's custody was never read, and a held or mismatched confidential mint's
+    // is not known (a foreign-key mint's is its public balance), so both arms skip them rather than count 0. The counters are rebuilt from
+    // the set each tick, so their streaks are carried over by hand: no verdict, no reset.
+    let skipped: Vec<Pubkey> = universe
         .unresolved
+        .iter()
+        .copied()
+        .chain(
+            resolved
+                .held
+                .iter()
+                .filter(|(_, hold)| !hold.reconciled_on_public())
+                .map(|(mint, _)| *mint),
+        )
+        .chain(resolved.mismatched.iter().map(|(mint, _)| *mint))
+        .collect();
+    let held: Vec<(Pubkey, Option<u32>, Option<u32>)> = skipped
         .iter()
         .map(|mint| {
             (
@@ -626,7 +657,7 @@ async fn check_invariants(
             )
         })
         .collect();
-    for mint in &universe.unresolved {
+    for mint in &skipped {
         mints.remove(mint);
     }
     let unresolved_missing = (!universe.unresolved.is_empty()).then(|| {
@@ -635,13 +666,19 @@ async fn check_invariants(
             universe.unresolved
         )
     });
+    let confidential_missing = (!resolved.mismatched.is_empty()).then(|| {
+        format!(
+            "confidential custody not proven for {:?}",
+            resolved.mismatched
+        )
+    });
 
     let masked = evaluate_and_maybe_halt(
         storage,
         config,
         health,
         webhook_client,
-        &custody.balances,
+        &resolved.balances,
         custody.slot,
         &custody.slots,
         &mints,
@@ -667,13 +704,66 @@ async fn check_invariants(
     }
 
     Ok(
-        match supply_missing.or(ledger_missing).or(unresolved_missing) {
+        match supply_missing
+            .or(ledger_missing)
+            .or(unresolved_missing)
+            .or(confidential_missing)
+        {
             Some(reason) => TickInputs::Missing(reason),
             None => TickInputs::Complete {
                 ledger_covered: covered,
             },
         },
     )
+}
+
+/// Log each configured mint left out this tick and export how long it has been held.
+fn report_confidential_holds(resolved: &ResolvedCustody, counters: &mut BreachCounters) {
+    let now = tokio::time::Instant::now();
+    let mut aging = HashSet::new();
+    for (mint, hold) in &resolved.held {
+        // A new reason starts a new hold, so its age is not inherited.
+        let entry = counters
+            .held_since
+            .entry(*mint)
+            .or_insert((hold.label(), now));
+        if entry.0 != hold.label() {
+            *entry = (hold.label(), now);
+        }
+        let since = entry.1;
+        let age = now.duration_since(since).as_secs_f64();
+        if hold.is_transient() {
+            warn!(mint = %mint, reason = hold.label(), held_secs = age, "Confidential custody lagging; this mint is not reconciled until the sender catches up");
+        } else if hold.reconciled_on_public() {
+            error!(
+                reconciliation_alert = true,
+                mint = %mint,
+                reason = hold.label(),
+                held_secs = age,
+                "Confidential custody held; this mint is reconciled on its public balance only"
+            );
+        } else {
+            error!(
+                reconciliation_alert = true,
+                mint = %mint,
+                reason = hold.label(),
+                held_secs = age,
+                "Confidential custody held; this mint is not reconciled until it clears"
+            );
+        }
+        publish_hold_age(mint, Some(hold.label()), age);
+        aging.insert(*mint);
+    }
+    for (mint, reason) in &resolved.mismatched {
+        error!(mint = %mint, reason = %reason, "Confidential custody does not match its escrow account");
+    }
+    counters.held_since.retain(|mint, _| {
+        let keep = aging.contains(mint);
+        if !keep {
+            publish_hold_age(mint, None, 0.0);
+        }
+        keep
+    });
 }
 
 /// The mints a tick checks. Unlisted mints (status history or deposits, no `mints` row) take
@@ -998,6 +1088,7 @@ async fn evaluate_and_maybe_halt(
         announced_outage: breach_counters.announced_outage,
         announced_mints: std::mem::take(&mut breach_counters.announced_mints),
         insolvency_halted: breach_counters.insolvency_halted,
+        held_since: std::mem::take(&mut breach_counters.held_since),
         ..Default::default()
     };
     for &mint in mints {
@@ -1705,6 +1796,7 @@ mod tests {
             channel_rpc,
             solana_sdk::pubkey::Pubkey::new_unique(),
             None,
+            None,
             ct,
             SolvencyFence::closed(),
         )
@@ -1874,6 +1966,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
     }
 
@@ -3000,6 +3097,7 @@ mod tests {
         mock: MockStorage,
         storage: Arc<Storage>,
         fence: SolvencyFence,
+        keys: Option<Arc<private_channel_confidential::Keys>>,
     }
 
     async fn tick_env(mint: Pubkey, custody: u64, supply: u64) -> TickEnv {
@@ -3017,6 +3115,7 @@ mod tests {
             mock,
             storage,
             fence: SolvencyFence::closed(),
+            keys: None,
         }
     }
 
@@ -3057,6 +3156,7 @@ mod tests {
             &fast_rpc(env.custody.url()),
             &fast_rpc(env.channel.url()),
             test_instance(),
+            env.keys.as_deref(),
             &test_webhook_client(),
             &MaskedAlerts::default(),
             &None,
@@ -3389,6 +3489,7 @@ mod tests {
             mock,
             storage,
             fence: SolvencyFence::closed(),
+            keys: None,
         };
 
         run_tick(
@@ -3774,6 +3875,7 @@ mod tests {
             &custody_rpc,
             &channel_rpc,
             test_instance(),
+            None,
             &webhook_client,
             &MaskedAlerts::default(),
             &None,
@@ -3832,6 +3934,7 @@ mod tests {
             &rpc,
             &rpc,
             test_instance(),
+            None,
             &webhook,
             &MaskedAlerts::default(),
             &None,
@@ -3856,6 +3959,7 @@ mod tests {
             &rpc,
             &rpc,
             test_instance(),
+            None,
             &webhook,
             &MaskedAlerts::default(),
             &None,
@@ -4442,14 +4546,17 @@ mod tests {
         Envelope,
         ChannelSupply,
         Ledger,
+        /// A configured mint whose AES copy does not open available with matching counters.
+        ConfidentialCustody,
     }
 
-    const ALL_INPUTS: [Input; 5] = [
+    const ALL_INPUTS: [Input; 6] = [
         Input::MintSet,
         Input::Custody,
         Input::Envelope,
         Input::ChannelSupply,
         Input::Ledger,
+        Input::ConfidentialCustody,
     ];
 
     /// Make `input` unreadable (or readable again) for the ticks that follow.
@@ -4462,6 +4569,16 @@ mod tests {
             Input::Ledger => env
                 .mock
                 .set_should_fail("get_mint_balances_for_reconciliation", failing),
+            Input::ConfidentialCustody => {
+                assert!(failing, "a mismatched account is only ever injected here");
+                let mint: Pubkey = env.mock.pending_transactions.lock().unwrap()[0]
+                    .mint
+                    .parse()
+                    .unwrap();
+                let keys = private_channel_confidential::test_support::keys();
+                let balances = crate::operator::confidential_custody::tests::mismatched(&keys);
+                configure_confidential(env, mint, 100, &balances).await;
+            }
             Input::Custody | Input::ChannelSupply => {
                 assert!(failing, "RPC inputs are only ever broken in these tests");
                 let server = match input {
@@ -4556,6 +4673,239 @@ mod tests {
             );
             alert.assert_async().await;
         }
+    }
+
+    // ── confidential custody ──────────────────────────────────────────
+
+    /// Make `mint` a Token-2022 mint whose escrow ATA holds `public` plus `balances`, and load
+    /// the instance keys, so the next ticks judge its confidential custody.
+    async fn configure_confidential(
+        env: &mut TickEnv,
+        mint: Pubkey,
+        public: u64,
+        balances: &crate::operator::escrow_sweep::ConfidentialBalances,
+    ) {
+        use crate::operator::escrow_sweep::tests::{
+            account_with_confidential, ata, mock_channel_clock, mock_multiple_accounts, ui_account,
+        };
+        env.mock
+            .upsert_mints_batch(&[crate::storage::common::storage::DbMint::new(
+                mint.to_string(),
+                6,
+                spl_token_2022::id().to_string(),
+                TokenAmount(1),
+            )])
+            .await
+            .unwrap();
+        env.custody.reset();
+        mock_channel_clock(&mut env.custody, 1, vec![1], Some(1)).await;
+        mock_multiple_accounts(
+            &mut env.custody,
+            HashMap::from([(
+                ata(&test_instance(), &mint, &spl_token_2022::id()),
+                ui_account(
+                    spl_token_2022::id(),
+                    &account_with_confidential(mint, public, balances),
+                ),
+            )]),
+            vec![1],
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+        .await;
+        env.keys = Some(Arc::new(private_channel_confidential::test_support::keys()));
+    }
+
+    /// A tick env for one configured mint with `public` plus `balances` in custody.
+    async fn confidential_env(
+        public: u64,
+        balances: &crate::operator::escrow_sweep::ConfidentialBalances,
+        supply: u64,
+    ) -> (TickEnv, Pubkey) {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 0, supply).await;
+        seed_checkpoint(&env.mock, 1);
+        configure_confidential(&mut env, mint, public, balances).await;
+        (env, mint)
+    }
+
+    /// Run `ticks` ticks and return the input-dark streak and whether the run halted.
+    async fn run_confidential_ticks(
+        env: &TickEnv,
+        counters: &mut BreachCounters,
+        ticks: u32,
+    ) -> (u32, bool) {
+        let (mut halted, mut input_dark) = (false, 0);
+        for _ in 0..ticks {
+            let _ = run_tick_full(
+                env,
+                &recon_config_zero_tolerance(),
+                counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        (input_dark, halted)
+    }
+
+    /// A verified account counts public + pending + available against supply: exact supply
+    /// passes, one unit more is a supply breach on that mint.
+    #[tokio::test]
+    async fn a_verified_confidential_mint_counts_its_full_custody() {
+        use crate::operator::confidential_custody::tests::{healthy, HEALTHY_CONFIDENTIAL};
+        let keys = private_channel_confidential::test_support::keys();
+        let exact = 900 + HEALTHY_CONFIDENTIAL;
+
+        let (env, mint) = confidential_env(900, &healthy(&keys), exact).await;
+        let mut counters = BreachCounters::default();
+        assert_eq!(
+            run_confidential_ticks(&env, &mut counters, 1).await,
+            (0, false)
+        );
+        assert_eq!(counters.supply.get(&mint).copied().unwrap_or(0), 0);
+
+        let (env, mint) = confidential_env(900, &healthy(&keys), exact + 1).await;
+        let mut counters = BreachCounters::default();
+        assert_eq!(
+            run_confidential_ticks(&env, &mut counters, 1).await,
+            (0, false)
+        );
+        assert_eq!(counters.supply.get(&mint).copied(), Some(1));
+    }
+
+    /// A raced AES copy counts exactly from its gap: exact supply passes, one unit more
+    /// breaches, and the mint is never held.
+    #[tokio::test]
+    async fn a_raced_aes_copy_counts_its_exact_custody() {
+        use crate::operator::confidential_custody::tests::stale_aes;
+        let keys = private_channel_confidential::test_support::keys();
+        for (supply, streak) in [(900 + 5_000, 0), (900 + 5_001, 1)] {
+            let (env, mint) = confidential_env(900, &stale_aes(&keys), supply).await;
+            let mut counters = BreachCounters::default();
+            assert_eq!(
+                run_confidential_ticks(&env, &mut counters, 1).await,
+                (0, false)
+            );
+            assert_eq!(counters.supply.get(&mint).copied().unwrap_or(0), streak);
+            assert!(!counters.held_since.contains_key(&mint));
+        }
+    }
+
+    /// A stale AES copy whose gap cannot be decrypted is lag: alert only, never a dark tick,
+    /// and the mint's streaks are neither advanced nor reset.
+    #[tokio::test]
+    async fn a_stale_aes_copy_with_differing_counters_never_goes_dark() {
+        use crate::operator::confidential_custody::tests::stale_aes_unreadable_gap;
+        let keys = private_channel_confidential::test_support::keys();
+        // Supply far above custody: if the mint were compared it would breach.
+        let (env, mint) = confidential_env(900, &stale_aes_unreadable_gap(&keys), 1_000_000).await;
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(mint, 1)]),
+            ..Default::default()
+        };
+        let (dark, halted) =
+            run_confidential_ticks(&env, &mut counters, INPUT_DARK_HALT_TICKS + 1).await;
+        assert_eq!((dark, halted), (0, false));
+        assert_eq!(
+            counters.supply.get(&mint).copied(),
+            Some(1),
+            "streak carried over"
+        );
+        assert_eq!(counters.held_since[&mint].0, "stale_aes");
+        assert!(env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A poisoned mint is held alert-only, however many ticks pass.
+    #[tokio::test]
+    async fn a_poisoned_confidential_mint_is_held_without_halting() {
+        use crate::operator::confidential_custody::tests::healthy;
+        use crate::storage::common::models::{DbTransactionBuilder, TransactionType};
+        let keys = private_channel_confidential::test_support::keys();
+        let (env, mint) = confidential_env(900, &healthy(&keys), 1_000_000).await;
+        env.mock.pending_transactions.lock().unwrap().push(
+            DbTransactionBuilder::new("s".into(), 1, mint.to_string(), 0)
+                .initiator("user".into())
+                .recipient("user".into())
+                .transaction_type(TransactionType::Deposit)
+                .confidential(true)
+                .undecrypted(vec![1])
+                .build(),
+        );
+        let mut counters = BreachCounters::default();
+        let (dark, halted) =
+            run_confidential_ticks(&env, &mut counters, INPUT_DARK_HALT_TICKS + 1).await;
+        assert_eq!((dark, halted), (0, false));
+        assert_eq!(counters.held_since[&mint].0, "poisoned");
+        assert!(!counters.supply.contains_key(&mint));
+    }
+
+    /// A mint under a foreign key is still compared on its public balance: exact supply
+    /// passes with the hold reported, and a drained public balance halts like any mint.
+    #[tokio::test]
+    async fn a_foreign_key_mint_is_reconciled_on_its_public_balance() {
+        use crate::operator::confidential_custody::tests::healthy;
+        let keys = private_channel_confidential::test_support::keys();
+        let mut foreign = healthy(&keys);
+        foreign.elgamal_pubkey = private_channel_confidential::test_support::other_keys().pubkey();
+
+        let (env, mint) = confidential_env(900, &foreign, 900).await;
+        let mut counters = BreachCounters::default();
+        assert_eq!(
+            run_confidential_ticks(&env, &mut counters, 1).await,
+            (0, false)
+        );
+        assert_eq!(counters.held_since[&mint].0, "key_mismatch");
+        assert_eq!(counters.supply.get(&mint).copied().unwrap_or(0), 0);
+
+        // The delegate drained 100 from the public balance the channel still owes.
+        let (env, mint) = confidential_env(800, &foreign, 900).await;
+        let mut counters = BreachCounters::default();
+        let (_, halted) = run_confidential_ticks(&env, &mut counters, HALT_CONFIRM_TICKS + 1).await;
+        assert!(halted, "{counters:?}");
+        assert!(counters.supply.get(&mint).copied().unwrap_or(0) >= HALT_CONFIRM_TICKS);
+    }
+
+    /// The age gauge reports how long the current hold has lasted, restarts when the reason
+    /// changes, and drops to 0 once the mint counts again.
+    #[tokio::test]
+    async fn the_hold_age_gauge_tracks_the_current_hold() {
+        use crate::metrics::RECONCILIATION_CONFIDENTIAL_HOLD_AGE;
+        use crate::operator::confidential_custody::{
+            tests::healthy, tests::stale_aes_unreadable_gap, ConfidentialHold,
+        };
+        let keys = private_channel_confidential::test_support::keys();
+        let (mut env, mint) =
+            confidential_env(900, &stale_aes_unreadable_gap(&keys), 1_000_000).await;
+        let age = |reason: &str| {
+            RECONCILIATION_CONFIDENTIAL_HOLD_AGE
+                .with_label_values(&[&mint.to_string(), reason])
+                .get()
+        };
+        let earlier = tokio::time::Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        let mut counters = BreachCounters {
+            held_since: HashMap::from([(mint, (ConfidentialHold::StaleAes.label(), earlier))]),
+            ..Default::default()
+        };
+        run_confidential_ticks(&env, &mut counters, 1).await;
+        assert!(age("stale_aes") >= 120.0, "{}", age("stale_aes"));
+
+        counters.held_since.insert(mint, ("poisoned", earlier));
+        run_confidential_ticks(&env, &mut counters, 1).await;
+        assert!(age("stale_aes") < 120.0, "a new reason restarts the clock");
+
+        configure_confidential(&mut env, mint, 900, &healthy(&keys)).await;
+        run_confidential_ticks(&env, &mut counters, 1).await;
+        assert_eq!(age("stale_aes"), 0.0);
+        assert!(counters.held_since.is_empty());
     }
 
     /// One tick that reads everything clears the streak, so scattered failures never halt.
@@ -5055,6 +5405,7 @@ mod tests {
             &fast_rpc(env.custody.url()),
             &fast_rpc(env.channel.url()),
             test_instance(),
+            None,
             &test_webhook_client(),
             &MaskedAlerts::default(),
             &Some(health.clone()),
@@ -5239,6 +5590,7 @@ mod tests {
             storage: Arc::new(Storage::Mock(mock.clone())),
             mock,
             fence: SolvencyFence::closed(),
+            keys: None,
         };
         let mut input_dark = 0;
         run_tick_full(
@@ -5356,6 +5708,7 @@ mod tests {
             fast_rpc(env.custody.url()),
             fast_rpc(env.channel.url()),
             test_instance(),
+            None,
             None,
             token.clone(),
             fence.clone(),
@@ -5599,6 +5952,7 @@ mod tests {
             storage: Arc::new(Storage::Mock(mock.clone())),
             mock,
             fence: SolvencyFence::closed(),
+            keys: None,
         };
         (env, requested)
     }
@@ -5645,6 +5999,7 @@ mod tests {
             &fast_rpc(env.custody.url()),
             &fast_rpc(env.channel.url()),
             test_instance(),
+            None,
             &test_webhook_client(),
             &MaskedAlerts::default(),
             &None,
@@ -6342,6 +6697,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         });
         id
     }

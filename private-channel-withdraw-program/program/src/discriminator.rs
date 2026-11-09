@@ -3,6 +3,7 @@
 pub enum PrivateChannelWithdrawInstructionDiscriminators {
     WithdrawFunds = 0,
     SetWithdrawConfig = 1,
+    ConfidentialWithdrawFunds = 2,
 }
 
 impl TryFrom<u8> for PrivateChannelWithdrawInstructionDiscriminators {
@@ -12,6 +13,7 @@ impl TryFrom<u8> for PrivateChannelWithdrawInstructionDiscriminators {
         match discriminator {
             0 => Ok(Self::WithdrawFunds),
             1 => Ok(Self::SetWithdrawConfig),
+            2 => Ok(Self::ConfidentialWithdrawFunds),
             _ => Err(()),
         }
     }
@@ -33,8 +35,16 @@ mod tests {
     }
 
     #[test]
+    fn test_discriminator_confidential_withdraw_funds() {
+        assert_eq!(
+            PrivateChannelWithdrawInstructionDiscriminators::try_from(2u8),
+            Ok(PrivateChannelWithdrawInstructionDiscriminators::ConfidentialWithdrawFunds)
+        );
+    }
+
+    #[test]
     fn test_discriminator_invalid() {
-        let result = PrivateChannelWithdrawInstructionDiscriminators::try_from(2u8);
+        let result = PrivateChannelWithdrawInstructionDiscriminators::try_from(3u8);
 
         assert!(result.is_err());
     }

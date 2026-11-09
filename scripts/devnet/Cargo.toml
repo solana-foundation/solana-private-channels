@@ -8,6 +8,9 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+base64.workspace = true
+private-channel-confidential.workspace = true
+serde_json.workspace = true
 private-channel-escrow-program-client.workspace = true
 private-channel-withdraw-program-client.workspace = true
 solana-client = { workspace = true }
@@ -25,3 +28,15 @@ spl-token.workspace = true
 spl-token-2022.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+# Confidential transfer tools: the same proof stack the escrow tests and the shared crate use.
+solana-zk-sdk = "7.0.1"
+solana-zk-elgamal-proof-interface = "0.1.3"
+spl-token-2022-interface = "3.1.1"
+spl-token-confidential-transfer-proof-extraction = "0.6.1"
+spl-token-confidential-transfer-proof-generation = "0.6.1"
+zeroize = "1.8"
+
+[dev-dependencies]
+bytemuck = "1"
+private-channel-confidential = { workspace = true, features = ["test-support"] }
+solana-program-pack.workspace = true

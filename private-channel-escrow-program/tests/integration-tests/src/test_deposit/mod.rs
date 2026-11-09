@@ -1285,9 +1285,9 @@ fn test_deposit_token_2022_transfer_hook_without_extras_fails() {
 
 // A hostile mint names the fee payer, which signs this transaction, as a
 // signer-bearing hook extra, and the fixture tries to move lamports out of
-// it. A client resolver forwards that account faithfully, so the only thing
-// between the payer and a drained wallet is the program stripping the
-// signer bit off every forwarded extra.
+// it. The program strips the signer bit off every forwarded extra, and
+// Token-2022 withholds it from the hook as well, so this pins the outcome,
+// not which layer stops it.
 //
 // The payer is the victim because it is the one account here that is both
 // writable and signing: a readonly signer like `user` reaches the hook

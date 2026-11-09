@@ -16,13 +16,26 @@ private-channel-escrow-program-client = { path = "../../clients/rust" }
 solana-pubkey = "4"
 solana-instruction = "3"
 
+# Confidential transfers. The ZK ElGamal proof program here is agave 2.3's builtin,
+# so proofs come from the zk-sdk 2.3 stack, not the 7.x one the integration tests use.
+spl-token-2022-interface = "1.0.0"
+spl-token-confidential-transfer-proof-generation = "0.4.1"
+spl-token-confidential-transfer-proof-extraction = "0.4.1"
+solana-zk-sdk = "2.3"
+bytemuck = "1"
+
 [dependencies.trident-fuzz]
 version = "0.12.0"
 features = ["token"]
 
-# Patch Trident to work with the syscalls necessary for Pinocchio
+# Patch Trident to work with the syscalls necessary for Pinocchio, and the
+# curve25519 syscalls Token-2022 needs for confidential balances.
 [patch.crates-io]
-trident-svm = { git = "https://github.com/exo-tech-xyz/trident-svm", branch = "fix-syscalls" }
+trident-svm = { git = "https://github.com/exo-tech-xyz/trident-svm", rev = "7fa9e0f46ed6f0e0e7e2cd1357e26f6066633f1f" }
+
+# Proof generation is curve arithmetic, far too slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 3
 
 [[bin]]
 name = "fuzz_escrow"
@@ -31,3 +44,7 @@ path = "fuzz_escrow.rs"
 [[bin]]
 name = "fuzz_rotate_bitmap"
 path = "fuzz_rotate_bitmap.rs"
+
+[[bin]]
+name = "fuzz_confidential"
+path = "fuzz_confidential.rs"

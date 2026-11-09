@@ -31,6 +31,11 @@ path = "tests/private-channel/test_v1_transaction_e2e.rs"
 name = "settle_retry_recovery"
 path = "tests/private-channel/test_settle_retry_recovery.rs"
 
+# Confidential deposits and releases end to end, with real proofs on Token-2022 11.1.0.
+[[test]]
+name = "confidential_e2e"
+path = "tests/indexer/confidential_e2e.rs"
+
 [[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
@@ -289,6 +294,9 @@ private-channel-indexer = { path = "../indexer", features = [
 ] }
 private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
 dvp-swap-program-client = { path = "../dvp-swap-program/clients/rust" }
+private-channel-confidential = { workspace = true }
+# Confidential mint builders; spl-token-2022 11 deprecates its copies.
+spl-token-2022-interface = "3.1.1"
 # The seize command's transaction builder, exercised end to end on the channel.
 devnet-scripts = { path = "../scripts/devnet" }
 http-body-util = { workspace = true }

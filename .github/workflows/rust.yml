@@ -2,18 +2,9 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    branches: [main, feat/confidential-transfers]
   pull_request:
-    branches:
-      [
-        main,
-        hardening/pre-release-audit,
-        hardening/cantina-reaudit,
-        audit/apex-audit-scan-remediation,
-        cantina-audit,
-        ottersec-audit,
-        feature/smt-to-bitmap-migration,
-      ]
+    branches: [main, feat/confidential-transfers, feature/smt-to-bitmap-migration]
 
 permissions:
   contents: read
@@ -127,6 +118,7 @@ jobs:
               - '.github/actions/setup-solana/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'integration/**'
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
@@ -141,6 +133,7 @@ jobs:
               - '.github/actions/setup-solana/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'integration/**'
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
@@ -153,6 +146,7 @@ jobs:
               - '.github/actions/setup-environment/**'
               - 'core/**'
               - 'indexer/**'
+              - 'confidential/**'
               - 'gateway/**'
               - 'auth/**'
               # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
@@ -167,6 +161,8 @@ jobs:
               - '.github/workflows/rust.yml'
               - '.github/actions/setup-environment/**'
               - 'private-channel-escrow-program/**'
+              # Trident.toml loads it in place of Trident's bundled Token-2022.
+              - 'core/precompiles/spl_token_2022-11.1.0.so'
             dvp_precompile:
               # Anything that can change the DvP provenance check or its answer.
               - 'Makefile'
@@ -288,11 +284,13 @@ jobs:
             -p private-channel-escrow-program \
             -p tests-private-channel-escrow-program \
             -p transfer-hook-fixture \
+            -p cpi-forwarder-fixture \
             -p private-channel-withdraw-program \
             -p tests-private-channel-withdraw-program \
             -p private-channel-core \
             -p private-channel-gateway \
             -p private-channel-indexer \
+            -p private-channel-confidential \
             -p private-channel-integration \
             -p test_utils \
             -p devnet-scripts \

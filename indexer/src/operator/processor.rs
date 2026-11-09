@@ -1,18 +1,28 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
+use crate::operator::confidential_custody::{judge_confidential_custody, ConfidentialCustody};
+use crate::operator::constants::confidential_constants::DRAIN_CHECK_WAIT_CEILING;
+use crate::operator::escrow_sweep::ConfidentialBalances;
+use crate::operator::instruction_util::ConfidentialReleaseRequest;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawConfigSetup,
     WithdrawalRemintInfo,
 };
+use crate::operator::reconciliation::ledger_liability;
 use crate::operator::recovery::{
-    check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS, PREBROADCAST_CAP_REACHED,
+    check_deposit, expired_journal_height, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS,
+    PREBROADCAST_CAP_REACHED,
 };
+use crate::operator::sender::confidential::next_wait;
 use crate::operator::sender::types::InstructionWithSigners;
 use crate::operator::sender::{
     ConsumedClaims, ConsumedLookup, FinalityRpc, TransactionStatusUpdate,
 };
-use crate::operator::utils::mint_util::{HookExtras, MintCache};
+use crate::operator::utils::mint_util::{
+    destination_readiness, ConfidentialAccountRead, ConfidentialAccountView, DestinationReadiness,
+    HookExtras, MintCache,
+};
 use crate::operator::utils::storage_util::{
     fenced_terminal_write, with_storage_backoff, FencedWrite,
 };
@@ -27,7 +37,9 @@ use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
 use private_channel_core::rpc::constants::PACKET_DATA_SIZE;
-use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+use private_channel_escrow_program_client::instructions::{
+    ConfidentialReleaseFundsBuilder, ReleaseFundsBuilder,
+};
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_escrow_program_client::AllowedMint;
 use private_channel_metrics::MetricLabel;
@@ -45,6 +57,8 @@ pub struct ProcessorState {
     pub mint_cache: MintCache,
     /// Channel mints the DB may have forgotten, checked before every mint and release.
     pub(crate) consumed: Option<ConsumedClaims>,
+    /// Instance keys for confidential withdrawals; `None` parks them.
+    pub confidential_keys: Option<Arc<private_channel_confidential::Keys>>,
 }
 
 pub struct ReleaseFundsState {
@@ -77,6 +91,7 @@ impl ProcessorState {
             }),
             mint_cache: MintCache::with_rpc(storage, rpc_client),
             consumed: None,
+            confidential_keys: None,
         }
     }
 
@@ -89,6 +104,7 @@ impl ProcessorState {
             release_funds_state: None,
             mint_cache: MintCache::with_rpc(storage, mint_rpc_client),
             consumed: None,
+            confidential_keys: None,
         }
     }
 }
@@ -164,11 +180,20 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
 struct BailReason {
     label: &'static str,
     message: String,
+    /// The row cannot be judged yet: it waits in `Pending` with the backoff instead.
+    wait: bool,
+    /// For a waiting row with a journal, the confirmed height every signature expired below.
+    expired_below: Option<u64>,
 }
 
 impl BailReason {
     fn new(label: &'static str, message: String) -> Self {
-        Self { label, message }
+        Self {
+            label,
+            message,
+            wait: false,
+            expired_below: None,
+        }
     }
 }
 
@@ -186,6 +211,26 @@ async fn quarantine_single(
     transaction: &DbTransaction,
     error_message: String,
 ) -> bool {
+    quarantine_labelled(
+        storage,
+        storage_tx,
+        pt_label,
+        transaction,
+        error_message,
+        None,
+    )
+    .await
+}
+
+/// `quarantine_single`, keeping `park_label` on a confidential row.
+async fn quarantine_labelled(
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+    error_message: String,
+    park_label: Option<&str>,
+) -> bool {
     let outcome = fenced_terminal_write(
         storage,
         pt_label,
@@ -193,7 +238,15 @@ async fn quarantine_single(
         transaction.id,
         TransactionStatus::ManualReview,
         &error_message,
-        || storage.try_quarantine_processing(transaction.id, transaction.updated_at, None, None),
+        || {
+            storage.try_quarantine_processing(
+                transaction.id,
+                transaction.updated_at,
+                None,
+                None,
+                park_label,
+            )
+        },
     )
     .await;
     if outcome == FencedWrite::Stale {
@@ -232,10 +285,56 @@ async fn park_row(
     transaction: &DbTransaction,
     bail: BailReason,
 ) {
-    if quarantine_single(storage, storage_tx, pt_label, transaction, bail.message).await {
+    if bail.wait {
+        requeue_to_wait(storage, transaction, bail.expired_below, &bail.message).await;
+        return;
+    }
+    // The label leads the alert so it maps straight to its runbook entry.
+    let message = format!("{}: {}", bail.label, bail.message);
+    if quarantine_labelled(
+        storage,
+        storage_tx,
+        pt_label,
+        transaction,
+        message,
+        Some(bail.label),
+    )
+    .await
+    {
         metrics::OPERATOR_TRANSACTION_QUARANTINED
             .with_label_values(&[pt_label, bail.label])
             .inc();
+    }
+}
+
+/// Hand the row back to the fetcher after the persisted backoff. A row that is no longer
+/// ours, one whose journal may still land, or a failed write, is left `Processing`.
+async fn requeue_to_wait(
+    storage: &Storage,
+    transaction: &DbTransaction,
+    expired_below: Option<u64>,
+    reason: &str,
+) {
+    let (not_before, started) = next_wait(Utc::now(), transaction.wait_started_at);
+    match storage
+        .requeue_withdrawal_wait(
+            transaction.id,
+            transaction.updated_at,
+            not_before,
+            started,
+            expired_below,
+        )
+        .await
+    {
+        Ok(true) => info!(txn_id = transaction.id, %not_before, "Withdrawal waits: {reason}"),
+        Ok(false) => warn!(
+            txn_id = transaction.id,
+            "Withdrawal not requeued: no longer ours or its journal may still land; leaving it"
+        ),
+        Err(e) => warn!(
+            txn_id = transaction.id,
+            "Could not requeue the waiting withdrawal; recovery will: {e}"
+        ),
     }
 }
 
@@ -535,6 +634,11 @@ pub async fn run_processor(
                 rpc_client,
             );
             processor_state.consumed = consumed;
+            // Malformed keys are refused at sender start; here they only mean "none".
+            processor_state.confidential_keys = private_channel_confidential::Keys::from_env()
+                .ok()
+                .flatten()
+                .map(Arc::new);
 
             if let Err(e) = process_release_funds(
                 &mut processor_state,
@@ -700,6 +804,85 @@ fn build_release_funds(
             remint_info: Some(remint_info),
             // The post-lock token the sender proves ownership against.
             fetched_updated_at: transaction.updated_at,
+        },
+    )))
+}
+
+/// Build the request the sender turns into a confidential release. Same accounts and
+/// remint info as a public release; the proofs are added at send time.
+fn build_confidential_release(
+    processor_state: &ProcessorState,
+    transaction: &DbTransaction,
+    allowed_mint: &AllowedMint,
+    ready: ConfidentialReady,
+) -> Result<TransactionBuilder, OperatorError> {
+    let TransactionBuilder::ReleaseFunds(public) =
+        build_release_funds(processor_state, transaction, allowed_mint)?
+    else {
+        return Err(OperatorError::MissingBuilder);
+    };
+    let release_funds_state = processor_state
+        .release_funds_state
+        .as_ref()
+        .ok_or(OperatorError::MissingBuilder)?;
+    // Parsed again only because the public builder's fields are private.
+    let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+        pubkey: transaction.mint.clone(),
+        reason: e.to_string(),
+    })?;
+    let recipient =
+        Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.recipient.clone(),
+            reason: e.to_string(),
+        })?;
+    let initiator =
+        Pubkey::from_str(&transaction.initiator).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.initiator.clone(),
+            reason: e.to_string(),
+        })?;
+    let token_program = allowed_mint.token_program;
+    let instance = release_funds_state.instance_pda;
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance, &mint, &token_program);
+
+    let mut builder = ConfidentialReleaseFundsBuilder::new();
+    builder
+        .payer(processor_state.admin_pubkey)
+        .operator(release_funds_state.operator_pubkey)
+        .instance(instance)
+        .withdrawal_bitmap(release_funds_state.withdrawal_bitmap_pda)
+        .operator_pda(release_funds_state.operator_pda)
+        .mint(mint)
+        .allowed_mint(find_allowed_mint_pda(&instance, &mint))
+        .user_ata(get_associated_token_address_with_program_id(
+            &recipient,
+            &mint,
+            &token_program,
+        ))
+        .instance_ata(instance_ata)
+        .token_program(token_program)
+        .event_authority(release_funds_state.event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .user_allowed_wallet_pda(find_allowed_wallet_pda(&instance, &recipient))
+        .withdrawer_allowed_wallet_pda(find_allowed_wallet_pda(&instance, &initiator))
+        .user(recipient)
+        .withdrawer(initiator)
+        .transaction_nonce(public.nonce);
+
+    Ok(TransactionBuilder::ConfidentialReleaseFunds(Box::new(
+        ConfidentialReleaseRequest {
+            builder,
+            nonce: public.nonce,
+            transaction_id: public.transaction_id,
+            trace_id: public.trace_id,
+            remint_info: public.remint_info,
+            fetched_updated_at: public.fetched_updated_at,
+            mint,
+            instance_ata,
+            amount: transaction.amount.value(),
+            destination: ready.destination,
+            hook_extras: Vec::new(),
+            wait_started_at: transaction.wait_started_at,
         },
     )))
 }
@@ -937,19 +1120,10 @@ async fn check_withdrawal_preflights_inner(
         )));
     }
 
-    if has_permanent_delegate {
-        let amount = transaction.amount.value();
-
-        let on_chain = processor_state
-            .mint_cache
-            .get_ata_balance(&instance_ata)
-            .await?;
-        if on_chain < amount {
-            return Ok(Some(BailReason::new(
-                metrics::BAIL_REASON_ESCROW_DRAINED,
-                format!("insufficient escrow balance: on_chain={on_chain}, needed={amount}"),
-            )));
-        }
+    // A confidential release moves neither the public balance nor an ordinary credit,
+    // so the public pre-flights below do not apply; its own run in the caller.
+    if transaction.confidential {
+        return Ok(None);
     }
 
     // Only a confidential-transfer mint's accounts can turn off ordinary credits,
@@ -975,9 +1149,239 @@ async fn check_withdrawal_preflights_inner(
                 format!("destination {recipient_ata} refuses non-confidential credits"),
             )));
         }
+
+        // Custody can sit in the confidential balance, so the public one may be short.
+        let amount = transaction.amount.value();
+        let (escrow, slot) = processor_state
+            .mint_cache
+            .read_confidential_account(&instance_ata, gate_slot)
+            .await?;
+        if let ConfidentialAccountRead::Configured(view) = escrow {
+            if view.public_amount < amount {
+                return short_public_balance(processor_state, transaction, &mint, &view, slot)
+                    .await
+                    .map(Some);
+            }
+            return Ok(None);
+        }
+    }
+
+    if has_permanent_delegate {
+        let amount = transaction.amount.value();
+
+        let on_chain = processor_state
+            .mint_cache
+            .get_ata_balance(&instance_ata)
+            .await?;
+        if on_chain < amount {
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+                format!("insufficient escrow balance: on_chain={on_chain}, needed={amount}"),
+            )));
+        }
     }
 
     Ok(None)
+}
+
+/// A short public balance on a configured mint parks as a drain only when the whole custody
+/// is proven short of what the ledger owes. While a release is unrecorded or the custody is
+/// held by lag the sender clears, the row waits, up to a ceiling; anything else unproven
+/// parks `public_balance_low`, whose runbook starts by ruling out a drain.
+async fn short_public_balance(
+    processor_state: &ProcessorState,
+    transaction: &DbTransaction,
+    mint: &Pubkey,
+    view: &ConfidentialAccountView,
+    slot: u64,
+) -> Result<BailReason, OperatorError> {
+    let amount = transaction.amount.value();
+    let public = view.public_amount;
+    let storage = processor_state.mint_cache.storage();
+    let mint_address = mint.to_string();
+    let low = |why: String| {
+        BailReason::new(
+            metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            format!("escrow public balance {public} below release {amount} for mint {mint}; {why}"),
+        )
+    };
+    let waited_out = transaction.wait_started_at.is_some_and(|started| {
+        (Utc::now() - started).to_std().unwrap_or_default() >= DRAIN_CHECK_WAIT_CEILING
+    });
+    let wait = |why: String| async move {
+        if waited_out {
+            return low(format!(
+                "{why} after {} min; rule out a drain",
+                DRAIN_CHECK_WAIT_CEILING.as_secs() / 60
+            ));
+        }
+        BailReason {
+            label: metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            message: format!(
+                "escrow public balance {public} below release {amount} for mint {mint}; waiting: {why}"
+            ),
+            wait: true,
+            expired_below: match processor_state.mint_cache.rpc_client() {
+                Some(rpc) => expired_journal_height(storage, rpc, transaction.id).await,
+                None => None,
+            },
+        }
+    };
+    // A release that paid out but is not yet recorded would count as owed and look like a drain.
+    if storage
+        .has_unrecorded_release(&mint_address, slot, transaction.id)
+        .await
+        .map_err(OperatorError::Storage)?
+    {
+        return Ok(wait("releases of the mint in flight are not recorded yet".into()).await);
+    }
+    let custody = judge_confidential_custody(
+        storage,
+        processor_state.confidential_keys.as_deref(),
+        mint,
+        public,
+        &ConfidentialBalances::from(view),
+    )
+    .await
+    .map_err(OperatorError::Storage)?;
+    let counted = match custody {
+        ConfidentialCustody::Counted(total) => total,
+        // No confidential deposit is ever credited under a foreign key.
+        ConfidentialCustody::Held(hold) if hold.reconciled_on_public() => public,
+        ConfidentialCustody::Held(hold) if hold.is_transient() => {
+            return Ok(wait(format!("confidential custody is held ({})", hold.label())).await);
+        }
+        ConfidentialCustody::Held(hold) => {
+            return Ok(low(format!(
+                "confidential custody is held ({}); rule out a drain",
+                hold.label()
+            )));
+        }
+        ConfidentialCustody::Mismatch(reason) => {
+            return Ok(low(format!(
+                "confidential custody is not proven ({reason}); rule out a drain"
+            )));
+        }
+    };
+    let owed = storage
+        .get_mint_balances_for_unpinned_reconciliation(slot)
+        .await
+        .map_err(OperatorError::Storage)?
+        .iter()
+        .find(|row| row.mint_address == mint_address)
+        .map_or(0, ledger_liability);
+    Ok(if counted >= owed {
+        low(format!(
+            "custody {counted} covers liabilities {owed}; rebalance to public"
+        ))
+    } else {
+        BailReason::new(
+            metrics::BAIL_REASON_ESCROW_DRAINED,
+            format!(
+                "insufficient escrow balance: public {public} below release {amount} for mint {mint} and custody {counted} below liabilities {owed}; \
+                 possible drain, do not re-arm"
+            ),
+        )
+    })
+}
+
+/// What a confidential release needs from its pre-flight. The destination's key and the
+/// mint's auditor and fee are not kept: the sender reads them for every proof build.
+struct ConfidentialReady {
+    destination: Pubkey,
+}
+
+/// Pre-flights only a confidential release has. Every bail is a release that could
+/// only fail on-chain, so the row parks before anything is sent.
+async fn confidential_preflights(
+    processor_state: &ProcessorState,
+    storage: &Storage,
+    transaction: &DbTransaction,
+    allowed_mint: &AllowedMint,
+    gate_slot: u64,
+) -> Result<Result<ConfidentialReady, BailReason>, OperatorError> {
+    let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+        pubkey: transaction.mint.clone(),
+        reason: e.to_string(),
+    })?;
+    let not_configured = |why: &str| {
+        Ok(Err(BailReason::new(
+            metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+            format!("confidential release for mint {mint}: {why}"),
+        )))
+    };
+    if allowed_mint.token_program != spl_token_2022::ID
+        || !has_extension(allowed_mint.extensions, EXTENSION_BIT_CONFIDENTIAL_TRANSFER)
+    {
+        return not_configured("the mint has no confidential transfer extension");
+    }
+    let Some(keys) = processor_state.confidential_keys.as_deref() else {
+        return not_configured("no instance confidential keys are loaded");
+    };
+
+    let poisoned = with_storage_backoff("confidential poison read", transaction.id, || {
+        storage.get_confidential_poisoned_mints()
+    })
+    .await?;
+    if poisoned.contains(&transaction.mint) {
+        return Ok(Err(BailReason::new(
+            metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            format!("mint {mint} has confidential deposits the key could not decrypt"),
+        )));
+    }
+
+    let instance_pda = processor_state
+        .release_funds_state
+        .as_ref()
+        .ok_or(OperatorError::MissingBuilder)?
+        .instance_pda;
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_pda, &mint, &spl_token_2022::ID);
+    let (escrow, _) = processor_state
+        .mint_cache
+        .read_confidential_account(&instance_ata, gate_slot)
+        .await?;
+    match escrow {
+        ConfidentialAccountRead::Configured(view) if view.elgamal_pubkey == keys.pubkey() => {}
+        // Configured under a key we do not hold: nothing it holds can be proven or spent.
+        ConfidentialAccountRead::Configured(_) => {
+            return Ok(Err(BailReason::new(
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+                format!("escrow account for mint {mint} is configured with a foreign key"),
+            )))
+        }
+        _ => return not_configured("the escrow account is not configured"),
+    }
+
+    let recipient =
+        Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.recipient.clone(),
+            reason: e.to_string(),
+        })?;
+    let recipient_ata =
+        get_associated_token_address_with_program_id(&recipient, &mint, &spl_token_2022::ID);
+    let (destination, _) = processor_state
+        .mint_cache
+        .read_confidential_account(&recipient_ata, gate_slot)
+        .await?;
+    if let DestinationReadiness::NotReady(reason) = destination_readiness(&destination) {
+        return Ok(Err(BailReason::new(
+            metrics::BAIL_REASON_DESTINATION_NOT_READY,
+            format!("destination {recipient_ata}: {reason}"),
+        )));
+    }
+
+    if processor_state
+        .mint_cache
+        .confidential_mint_params(&mint, gate_slot)
+        .await?
+        .is_none()
+    {
+        return not_configured("the mint does not decode as confidential");
+    }
+    Ok(Ok(ConfidentialReady {
+        destination: recipient_ata,
+    }))
 }
 
 /// The program's cap on extras (`MAX_HOOK_REMAINING_ACCOUNTS` in its `token_utils`,
@@ -1007,8 +1411,11 @@ async fn attach_hook_extras(
 ) -> Result<Option<BailReason>, OperatorError> {
     let compute_unit_price = release_funds_tx.compute_unit_price();
     let compute_budget = release_funds_tx.compute_budget();
-    let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
-        return Ok(None);
+    // Token-2022 calls the hook with u64::MAX for a confidential transfer.
+    let hook_amount = match release_funds_tx {
+        TransactionBuilder::ReleaseFunds(_) => transaction.amount.value(),
+        TransactionBuilder::ConfidentialReleaseFunds(_) => u64::MAX,
+        _ => return Ok(None),
     };
 
     // Hook presence comes from the reviewed profile rather than a resolved-once
@@ -1049,7 +1456,7 @@ async fn attach_hook_extras(
             &instance_ata,
             &recipient_ata,
             &instance_pda,
-            transaction.amount.value(),
+            hook_amount,
             MAX_HOOK_EXTRAS,
             gate_slot,
         )
@@ -1072,6 +1479,15 @@ async fn attach_hook_extras(
         }
     };
 
+    let release = match release_funds_tx {
+        TransactionBuilder::ReleaseFunds(release) => release,
+        // A v1 release has room for every extra; the sender checks the v1 size.
+        TransactionBuilder::ConfidentialReleaseFunds(request) => {
+            request.hook_extras = hook_extras;
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    };
     if !hook_extras.is_empty() {
         release.builder.add_remaining_accounts(&hook_extras);
     }
@@ -1113,83 +1529,122 @@ pub async fn process_release_funds(
     while let Some(transaction) = fetcher_rx.recv().await {
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
-        let outcome: Result<(), OperatorError> = async {
-            // A withdrawal whose remint already landed must not also be released.
-            if settle_if_consumed(
-                processor_state.consumed.as_ref(),
-                &storage,
-                &storage_tx,
-                pt_label,
-                &transaction,
-            )
-            .await?
-            {
-                return Ok(());
-            }
+        let outcome: Result<(), OperatorError> =
+            async {
+                // A withdrawal whose remint already landed must not also be released.
+                if settle_if_consumed(
+                    processor_state.consumed.as_ref(),
+                    &storage,
+                    &storage_tx,
+                    pt_label,
+                    &transaction,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
 
-            // Settle whether the escrow will accept a release for this mint before
-            // building one, so a mint it would reject costs no further work and no
-            // target-chain lookup that would read as an infrastructure failure.
-            // The account also carries the reviewed mint profile, which the steps
-            // below read instead of resolving the mint themselves.
-            let (allowed_mint, gate_slot) = match read_withdrawal_allowed_mint(
-                processor_state,
-                &storage,
-                &transaction,
-            )
-            .await?
-            {
-                Ok(gate_read) => gate_read,
-                Err(bail) => {
+                // Settle whether the escrow will accept a release for this mint before
+                // building one, so a mint it would reject costs no further work and no
+                // target-chain lookup that would read as an infrastructure failure.
+                // The account also carries the reviewed mint profile, which the steps
+                // below read instead of resolving the mint themselves.
+                let (allowed_mint, gate_slot) =
+                    match read_withdrawal_allowed_mint(processor_state, &storage, &transaction)
+                        .await?
+                    {
+                        Ok(gate_read) => gate_read,
+                        Err(bail) => {
+                            park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
+                            return Ok(());
+                        }
+                    };
+
+                // Build first so row-data poison, such as a NULL nonce or an
+                // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
+                // classifier to halt the pipeline on.
+                let mut release_funds_tx = if transaction.confidential {
+                    build_release_funds(processor_state, &transaction, &allowed_mint)?;
+                    // Shared pre-flights first: a frozen escrow or paused mint parks either kind.
+                    if let Some(bail) = check_withdrawal_preflights(
+                        processor_state,
+                        &transaction,
+                        &allowed_mint,
+                        gate_slot,
+                    )
+                    .await?
+                    {
+                        park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
+                        return Ok(());
+                    }
+                    match confidential_preflights(
+                        processor_state,
+                        &storage,
+                        &transaction,
+                        &allowed_mint,
+                        gate_slot,
+                    )
+                    .await?
+                    {
+                        Ok(ready) => build_confidential_release(
+                            processor_state,
+                            &transaction,
+                            &allowed_mint,
+                            ready,
+                        )?,
+                        Err(bail) => {
+                            park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    build_release_funds(processor_state, &transaction, &allowed_mint)?
+                };
+
+                // Pre-flight for Token-2022 pause / permanent-delegate drain. These
+                // are row-specific, so bails route to ManualReview and continue the
+                // loop rather than halting the pipeline (reserved for poison rows).
+                // It is best-effort: a delegate can still drain between this read and
+                // the on-chain CPI, leaving that to the sender retry path. RPC errors
+                // bubble up as Transient and restart the task.
+                if !transaction.confidential {
+                    if let Some(bail) = check_withdrawal_preflights(
+                        processor_state,
+                        &transaction,
+                        &allowed_mint,
+                        gate_slot,
+                    )
+                    .await?
+                    {
+                        park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
+                        return Ok(());
+                    }
+                }
+
+                // Runs after the pre-flights so a mint that is not payable anyway
+                // never pays for hook resolution.
+                if let Some(bail) = attach_hook_extras(
+                    processor_state,
+                    &transaction,
+                    &mut release_funds_tx,
+                    &allowed_mint,
+                    gate_slot,
+                )
+                .await?
+                {
                     park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
                     return Ok(());
                 }
-            };
 
-            // Build first so row-data poison, such as a NULL nonce or an
-            // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
-            // classifier to halt the pipeline on.
-            let mut release_funds_tx =
-                build_release_funds(processor_state, &transaction, &allowed_mint)?;
+                info!("Processing withdrawal");
+                send_guaranteed(&sender_tx, release_funds_tx, "processed release funds")
+                    .await
+                    .map_err(OperatorError::ChannelSend)?;
 
-            // Pre-flight for Token-2022 pause / permanent-delegate drain. These
-            // are row-specific, so bails route to ManualReview and continue the
-            // loop rather than halting the pipeline (reserved for poison rows).
-            // It is best-effort: a delegate can still drain between this read and
-            // the on-chain CPI, leaving that to the sender retry path. RPC errors
-            // bubble up as Transient and restart the task.
-            if let Some(bail) =
-                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint, gate_slot)
-                    .await?
-            {
-                park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
-                return Ok(());
+                Ok(())
             }
-
-            // Runs after the pre-flights so a mint that is not payable anyway
-            // never pays for hook resolution.
-            if let Some(bail) = attach_hook_extras(
-                processor_state,
-                &transaction,
-                &mut release_funds_tx,
-                &allowed_mint,
-                gate_slot,
-            )
-            .await?
-            {
-                park_row(&storage, &storage_tx, pt_label, &transaction, bail).await;
-                return Ok(());
-            }
-
-            info!("Processing withdrawal");
-            send_guaranteed(&sender_tx, release_funds_tx, "processed release funds")
-                .await
-                .map_err(OperatorError::ChannelSend)?;
-
-            Ok(())
-        }
-        .instrument(span.clone())
-        .await;
+            .instrument(span.clone())
+            .await;
 
         // A per-row error is classified.  For a deterministic poison-pill
         // we quarantine the row, halt the whole withdrawal pipeline, and
@@ -1456,6 +1911,7 @@ pub async fn process_deposit_funds(
                     allow_mint_slot: mint_row.allow_mint_slot as u64,
                     treasury: processor_state.admin_pubkey,
                     min_withdraw_amount: mint_row.min_withdraw_amount.value(),
+                    confidential_only: mint_row.confidential_only,
                 });
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
@@ -1587,6 +2043,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
@@ -1641,6 +2098,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -1699,6 +2157,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         }
     }
 
@@ -1824,6 +2287,7 @@ mod tests {
                 )),
             ),
             consumed: None,
+            confidential_keys: None,
         };
         (processor_state, server)
     }
@@ -2012,6 +2476,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed,
+            confidential_keys: None,
         };
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2166,6 +2631,7 @@ mod tests {
                 Arc::new(RpcClientWithRetry::new_mocked(mocks)),
             ),
             consumed: None,
+            confidential_keys: None,
         }
     }
 
@@ -2500,6 +2966,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
         // Recorded when this process last served the mint, before the block.
         ps.mint_cache.record_existence_floor(&mint, floor_slot);
@@ -2564,6 +3031,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (outcome, update, builder) =
@@ -2614,6 +3082,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (_, first_update, _) =
@@ -2712,6 +3181,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
         // Recorded when this process last served the mint, before the pause.
         ps.mint_cache.record_existence_floor(&mint, floor_slot);
@@ -2779,6 +3249,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (outcome, update, builder) =
@@ -2840,6 +3311,7 @@ mod tests {
                 Arc::new(rpc_at(&server.url())),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage.clone(), txn).await;
@@ -2928,6 +3400,7 @@ mod tests {
                 )),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (outcome, update, builder) =
@@ -3001,6 +3474,7 @@ mod tests {
                 )),
             ),
             consumed: None,
+            confidential_keys: None,
         };
         ps.mint_cache.record_existence_floor(&mint, 1);
 
@@ -3210,6 +3684,16 @@ mod tests {
             &spl_token_2022::id(),
             confidential_account_bytes(true),
         );
+        // A public release on a confidential mint also reads the escrow's public balance.
+        let instance = ps.release_funds_state.as_ref().unwrap().instance_pda;
+        let escrow_ata =
+            get_associated_token_address_with_program_id(&instance, &mint, &spl_token_2022::id());
+        let _escrow = mock_account_read(
+            &mut server,
+            &escrow_ata,
+            &spl_token_2022::id(),
+            confidential_preflight::create_mock_token_2022_account_data(),
+        );
         assume_mint_allowlisted(&mut ps, &mint);
 
         let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
@@ -3363,6 +3847,7 @@ mod tests {
             release_funds_state: Some(release_funds_state),
             mint_cache: crate::operator::MintCache::new(storage),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mut txn = make_db_transaction(
@@ -3434,6 +3919,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mut txn = make_db_transaction(
@@ -3470,6 +3956,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
         let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(1);
@@ -3505,6 +3992,7 @@ mod tests {
                 Arc::new(allowlist_only_rpc()),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -3521,6 +4009,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3611,6 +4100,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3678,6 +4168,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -3754,6 +4245,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -3819,6 +4311,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
             consumed: None,
+            confidential_keys: None,
         };
         let txn = make_db_transaction(
             1,
@@ -3905,6 +4398,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(2);
@@ -4219,6 +4713,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4273,6 +4768,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4283,6 +4779,7 @@ mod tests {
             let mint_row = mints.get_mut(&mint_pubkey.to_string()).unwrap();
             mint_row.allow_mint_slot = allow_mint_slot as i64;
             mint_row.min_withdraw_amount = TokenAmount(min_withdraw_amount);
+            mint_row.confidential_only = true;
         }
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4320,10 +4817,10 @@ mod tests {
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
 
-        // The deposit writes the withdraw config: the fee, minimum and their
+        // The deposit writes the withdraw config: the fee, minimum, flag and their
         // AllowMint slot from the mints row, and the operator admin as treasury.
         // Data is [discriminator][fee u64 LE][allow_mint_slot u64 LE][treasury]
-        // [min_withdraw_amount u64 LE].
+        // [min_withdraw_amount u64 LE][confidential_only u8].
         let instructions = b.builder.instructions().unwrap();
         let set_withdraw_config = &instructions[1];
         assert_eq!(
@@ -4343,6 +4840,7 @@ mod tests {
             &set_withdraw_config.data[49..57],
             &min_withdraw_amount.to_le_bytes()
         );
+        assert_eq!(set_withdraw_config.data[57], 1);
     }
 
     /// The deposit mint's on-chain memo must key on the event's chain coordinates,
@@ -4357,6 +4855,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4452,6 +4951,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
         let mint_pubkey = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
@@ -4512,6 +5012,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
         let mint_pubkey = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
@@ -4578,6 +5079,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4629,6 +5131,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4668,6 +5171,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -4721,6 +5225,7 @@ mod tests {
                 Arc::new(allowlist_only_rpc()),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -4736,6 +5241,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -4799,6 +5305,7 @@ mod tests {
                 Arc::new(allowlist_only_rpc()),
             ),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -5385,6 +5892,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -5458,6 +5966,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -5509,6 +6018,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -5524,6 +6034,7 @@ mod tests {
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     allow_mint_slot: 0,
                     min_withdraw_amount: TokenAmount(0),
+                    confidential_only: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -5588,6 +6099,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -5646,6 +6158,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -5779,6 +6292,7 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         // fetcher_rx capacity 4 so we can buffer three rows: the poison,
@@ -5890,6 +6404,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -5944,6 +6459,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         };
 
         seed_processing_row(&storage, &txn);
@@ -5994,6 +6514,7 @@ mod tests {
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 allow_mint_slot: 0,
                 min_withdraw_amount: TokenAmount(0),
+                confidential_only: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -6047,6 +6568,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         };
 
         // Seeded so a wrong park would land and send, letting the check below fail.
@@ -6088,6 +6614,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         // Mint pubkey is valid base58 but is NOT inserted into `mints`.
@@ -6161,6 +6688,7 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
             consumed: None,
+            confidential_keys: None,
         };
 
         let unknown_fee_mint = Pubkey::new_unique();
@@ -6237,5 +6765,866 @@ mod tests {
             sender_rx.try_recv().is_err(),
             "the parked row must never reach the sender"
         );
+    }
+
+    // ── confidential withdrawals (pre-flights) ─────────────────────
+
+    mod confidential_preflight {
+        use super::*;
+        use crate::operator::utils::mint_util::confidential_fixtures::{
+            account_with_confidential, confidential_mint, AccountSpec,
+        };
+        use crate::storage::common::models::MintDbBalance;
+        use private_channel_confidential::test_support::{self as cts, SimAccount};
+
+        const CT_BIT: u64 = 1 << EXTENSION_BIT_CONFIDENTIAL_TRANSFER;
+
+        fn mock_absent(server: &mut mockito::ServerGuard, address: &Pubkey) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::AllOf(vec![
+                    mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                    mockito::Matcher::Regex(address.to_string()),
+                ]))
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":500},"value":null}}"#,
+                )
+                .create()
+        }
+
+        fn mock_epoch(server: &mut mockito::ServerGuard) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(r#""method"\s*:\s*"getEpochInfo""#.into()))
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"absoluteSlot":500,"blockHeight":400,"epoch":3,"slotIndex":1,"slotsInEpoch":432000,"transactionCount":null}}"#,
+                )
+                .create()
+        }
+
+        /// Escrow and destination specs for a healthy confidential release of `withdrawal_for`.
+        fn healthy() -> (AccountSpec, AccountSpec) {
+            let keys = cts::keys();
+            let mut sim = SimAccount::new(&keys);
+            sim.credit(&keys, 10_000, 0);
+            sim.apply();
+            let escrow = AccountSpec::healthy(&keys, &sim, 0, 10_000);
+            let other = cts::other_keys();
+            let destination = AccountSpec::healthy(&other, &SimAccount::new(&other), 0, 0);
+            (escrow, destination)
+        }
+
+        struct Case {
+            extensions: u64,
+            keys: bool,
+            escrow: Option<Vec<u8>>,
+            destination: Option<Vec<u8>>,
+            poisoned: bool,
+            confidential: bool,
+            /// Ledger liabilities of the mint (deposits minus released withdrawals).
+            owed: u64,
+            /// An earlier journaled 500 release of the mint: its status and whether the
+            /// escrow indexer observed it.
+            earlier: Option<(TransactionStatus, bool)>,
+            /// The row's own journal from an attempt before recovery re-armed it: its
+            /// last valid block height, and the confirmed block height the chain reports.
+            own_journal: Option<(i64, u64)>,
+            /// When the row's wait began, as a requeued row carries it.
+            wait_started_at: Option<chrono::DateTime<Utc>>,
+            /// The status of the row's own journaled signature; it never landed by default.
+            own_status: serde_json::Value,
+        }
+
+        impl Case {
+            fn healthy() -> Self {
+                let (escrow, destination) = healthy();
+                Self {
+                    extensions: CT_BIT,
+                    keys: true,
+                    escrow: Some(account_with_confidential(&escrow)),
+                    destination: Some(account_with_confidential(&destination)),
+                    poisoned: false,
+                    confidential: true,
+                    owed: 0,
+                    earlier: None,
+                    own_journal: None,
+                    wait_started_at: None,
+                    own_status: serde_json::Value::Null,
+                }
+            }
+
+            async fn run(
+                self,
+            ) -> (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ) {
+                self.run_on(Arc::new(Storage::Mock(MockStorage::new())))
+                    .await
+            }
+
+            async fn run_on(
+                self,
+                storage: Arc<Storage>,
+            ) -> (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ) {
+                let mint = Pubkey::new_unique();
+                insert_token_2022_mint_row(&storage, &mint);
+                let (mut ps, mut server) = processor_state_for(
+                    &storage,
+                    &mint,
+                    allowed_mint_bytes_token_2022(self.extensions),
+                )
+                .await;
+                if self.keys {
+                    ps.confidential_keys = Some(Arc::new(cts::keys()));
+                }
+                let mut txn = withdrawal_for(&mint, 5);
+                txn.confidential = self.confidential;
+                txn.wait_started_at = self.wait_started_at;
+                let instance = ps.release_funds_state.as_ref().unwrap().instance_pda;
+                let escrow_ata = get_associated_token_address_with_program_id(
+                    &instance,
+                    &mint,
+                    &spl_token_2022::id(),
+                );
+                let recipient_ata = get_associated_token_address_with_program_id(
+                    &Pubkey::from_str(&txn.recipient).unwrap(),
+                    &mint,
+                    &spl_token_2022::id(),
+                );
+                let mut mocks = vec![mock_epoch(&mut server)];
+                for (address, data) in
+                    [(escrow_ata, self.escrow), (recipient_ata, self.destination)]
+                {
+                    mocks.push(match data {
+                        Some(data) => {
+                            mock_account_read(&mut server, &address, &spl_token_2022::id(), data)
+                        }
+                        None => mock_absent(&mut server, &address),
+                    });
+                }
+                mocks.push(mock_account_read(
+                    &mut server,
+                    &mint,
+                    &spl_token_2022::id(),
+                    confidential_mint(Some(cts::other_keys().pubkey()), None),
+                ));
+                let (mut deposits, mut released) = (self.owed, 0u64);
+                if let (Some((status, observed)), Storage::Mock(ref mock)) =
+                    (self.earlier, &*storage)
+                {
+                    let mut earlier = withdrawal_for(&mint, 4);
+                    earlier.id = 78;
+                    earlier.amount = TokenAmount(500);
+                    earlier.status = status;
+                    mock.pending_transactions.lock().unwrap().push(earlier);
+                    deposits += 500;
+                    mock.release_signatures.lock().unwrap().insert(
+                        78,
+                        vec![crate::storage::common::models::StoredSig {
+                            signature: solana_sdk::signature::Signature::new_unique().to_string(),
+                            last_valid_block_height: 100,
+                            blockhash_slot: Some(9),
+                        }],
+                    );
+                    if observed {
+                        mock.observed_releases.lock().unwrap().insert(
+                            4,
+                            crate::storage::common::models::DbObservedRelease {
+                                withdrawal_nonce: 4,
+                                signature: solana_sdk::signature::Signature::new_unique()
+                                    .to_string(),
+                                slot: 0,
+                                amount: Some(TokenAmount(500)),
+                            },
+                        );
+                    }
+                    // What the ledger query counts as paid out.
+                    if observed || status == TransactionStatus::Completed {
+                        released = 500;
+                    }
+                }
+                if let (Some((lvbh, height)), Storage::Mock(ref mock)) =
+                    (self.own_journal, &*storage)
+                {
+                    mock.release_signatures.lock().unwrap().insert(
+                        txn.id,
+                        vec![crate::storage::common::models::StoredSig {
+                            signature: solana_sdk::signature::Signature::new_unique().to_string(),
+                            last_valid_block_height: lvbh,
+                            blockhash_slot: Some(8),
+                        }],
+                    );
+                    mocks.push(
+                        server
+                            .mock("POST", "/")
+                            .match_body(mockito::Matcher::Regex(
+                                r#""getBlockHeight".*"confirmed""#.into(),
+                            ))
+                            .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{height}}}"#))
+                            .create(),
+                    );
+                    mocks.push(
+                        server
+                            .mock("POST", "/")
+                            .match_body(mockito::Matcher::Regex(r#""getSignatureStatuses""#.into()))
+                            .with_body(
+                                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                                    "context": {"slot": 500}, "value": [self.own_status]
+                                }})
+                                .to_string(),
+                            )
+                            .create(),
+                    );
+                }
+                if let Storage::Mock(ref mock) = *storage {
+                    mock.mint_balances.lock().unwrap().push(MintDbBalance {
+                        mint_address: mint.to_string(),
+                        token_program: spl_token_2022::id().to_string(),
+                        total_deposits: bigdecimal::BigDecimal::from(deposits),
+                        total_withdrawals: bigdecimal::BigDecimal::from(released),
+                    });
+                }
+                if self.poisoned {
+                    let mut poison = withdrawal_for(&mint, 6);
+                    poison.id = 77;
+                    poison.transaction_type = TransactionType::Deposit;
+                    poison.confidential_undecrypted = true;
+                    if let Storage::Mock(ref mock) = *storage {
+                        mock.pending_transactions.lock().unwrap().push(poison);
+                    }
+                }
+                assume_mint_allowlisted(&mut ps, &mint);
+                let result = run_one_withdrawal(&mut ps, storage, txn).await;
+                drop(mocks);
+                result
+            }
+        }
+
+        fn assert_parked(
+            result: (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ),
+            label: &str,
+        ) {
+            let (outcome, update, builder) = result;
+            assert!(outcome.is_ok(), "a park must not end the loop: {outcome:?}");
+            let update = update.unwrap_or_else(|| panic!("{label}: row must be parked"));
+            assert_eq!(update.status, TransactionStatus::ManualReview);
+            assert!(builder.is_none(), "{label}: nothing may be dispatched");
+            let expected = match label {
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED => {
+                    "confidential release for mint"
+                }
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED => "mint",
+                metrics::BAIL_REASON_DESTINATION_NOT_READY => "destination",
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW => "escrow public balance",
+                metrics::BAIL_REASON_ESCROW_DRAINED => "do not re-arm",
+                other => panic!("no message for {other}"),
+            };
+            let message = update.error_message.unwrap_or_default();
+            assert!(message.contains(expected), "{label}: {message}");
+            if label == metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED {
+                assert!(
+                    message.contains("could not decrypt") || message.contains("foreign key"),
+                    "{message}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_ready_release_reaches_the_sender_with_its_preflight_reads() {
+            let (_, builder) = {
+                let (outcome, update, builder) = Case::healthy().run().await;
+                assert!(outcome.is_ok());
+                assert!(
+                    update.is_none(),
+                    "{:?}",
+                    update.and_then(|u| u.error_message)
+                );
+                (outcome, builder)
+            };
+            let Some(TransactionBuilder::ConfidentialReleaseFunds(request)) = builder else {
+                panic!("a confidential row must become a confidential release");
+            };
+            assert_ne!(request.destination, Pubkey::default());
+            assert_eq!(request.amount, 1000);
+            assert!(request.remint_info.is_some());
+
+            // The escrow refuses proofs built against another available balance, so the
+            // instruction carries the one they were built from.
+            let keys = cts::keys();
+            let available = cts::encrypt(&keys, 5_000);
+            let proofs = keys
+                .prove_release(
+                    &available,
+                    5_000,
+                    1000,
+                    &cts::other_keys().pubkey(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let release = &request.instructions(&proofs)[0];
+            assert_eq!(&release.data[73..137], &available[..]);
+        }
+
+        #[tokio::test]
+        async fn an_unconfigured_mint_parks() {
+            let mut no_extension = Case::healthy();
+            no_extension.extensions = 0;
+            assert_parked(
+                no_extension.run().await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+            );
+            let mut no_keys = Case::healthy();
+            no_keys.keys = false;
+            assert_parked(
+                no_keys.run().await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+            );
+            let mut plain_escrow = Case::healthy();
+            plain_escrow.escrow = Some(create_mock_token_2022_account_data());
+            assert_parked(
+                plain_escrow.run().await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_NOT_CONFIGURED,
+            );
+        }
+
+        #[tokio::test]
+        async fn a_poisoned_or_foreign_keyed_mint_parks() {
+            let mut poisoned = Case::healthy();
+            poisoned.poisoned = true;
+            assert_parked(
+                poisoned.run().await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            );
+            let mut foreign = Case::healthy();
+            let (mut escrow, _) = healthy();
+            escrow.elgamal_pubkey = cts::other_keys().pubkey();
+            foreign.escrow = Some(account_with_confidential(&escrow));
+            assert_parked(
+                foreign.run().await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            );
+        }
+
+        /// A pre-flight park keeps its label on the row, where the runbook reads it.
+        #[tokio::test]
+        async fn a_confidential_preflight_park_keeps_its_label() {
+            let mock = MockStorage::new();
+            let mut poisoned = Case::healthy();
+            poisoned.poisoned = true;
+            assert_parked(
+                poisoned.run_on(Arc::new(Storage::Mock(mock.clone()))).await,
+                metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED,
+            );
+            let labels = mock.confidential_sender.lock().unwrap().park_labels.clone();
+            assert_eq!(
+                labels.get(&9).map(String::as_str),
+                Some(metrics::BAIL_REASON_CONFIDENTIAL_MINT_POISONED)
+            );
+        }
+
+        #[tokio::test]
+        async fn every_unready_destination_parks() {
+            let mutations: Vec<fn(&mut AccountSpec)> = vec![
+                (|d: &mut AccountSpec| d.frozen = true),
+                (|d: &mut AccountSpec| d.approved = false),
+                (|d: &mut AccountSpec| d.allow_confidential_credits = false),
+                (|d: &mut AccountSpec| d.pending_credit_counter = d.maximum_pending_credit_counter),
+            ];
+            for mutate in mutations {
+                let mut case = Case::healthy();
+                let (_, mut destination) = healthy();
+                mutate(&mut destination);
+                case.destination = Some(account_with_confidential(&destination));
+                assert_parked(case.run().await, metrics::BAIL_REASON_DESTINATION_NOT_READY);
+            }
+            let mut missing = Case::healthy();
+            missing.destination = None;
+            assert_parked(
+                missing.run().await,
+                metrics::BAIL_REASON_DESTINATION_NOT_READY,
+            );
+            let mut unconfigured = Case::healthy();
+            unconfigured.destination = Some(create_mock_token_2022_account_data());
+            assert_parked(
+                unconfigured.run().await,
+                metrics::BAIL_REASON_DESTINATION_NOT_READY,
+            );
+        }
+
+        #[tokio::test]
+        async fn public_preflights_skip_confidential_rows() {
+            // An empty public balance with a permanent delegate and a destination refusing
+            // ordinary credits would park a public release twice over.
+            let mut case = Case::healthy();
+            case.extensions = CT_BIT | (1 << EXTENSION_BIT_PERMANENT_DELEGATE);
+            let (_, mut destination) = healthy();
+            destination.allow_non_confidential_credits = false;
+            case.destination = Some(account_with_confidential(&destination));
+            let (outcome, update, builder) = case.run().await;
+            assert!(outcome.is_ok());
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(matches!(
+                builder,
+                Some(TransactionBuilder::ConfidentialReleaseFunds(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_public_release_checks_the_public_balance_only_on_configured_mints() {
+            // Configured escrow with 999 public, release 1000: parks.
+            let mut short = Case::healthy();
+            short.confidential = false;
+            let (mut escrow, destination) = healthy();
+            escrow.public = 999;
+            short.escrow = Some(account_with_confidential(&escrow));
+            short.destination = Some(create_mock_token_2022_account_data());
+            let _ = destination;
+            let mock = MockStorage::new();
+            assert_parked(
+                short.run_on(Arc::new(Storage::Mock(mock.clone()))).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+            // The public row keeps its label too, so the runbook query finds it.
+            let labels = mock.confidential_sender.lock().unwrap().park_labels.clone();
+            assert_eq!(
+                labels.get(&9).map(String::as_str),
+                Some(metrics::BAIL_REASON_PUBLIC_BALANCE_LOW)
+            );
+
+            // Enough public balance: released publicly.
+            let mut enough = Case::healthy();
+            enough.confidential = false;
+            let (mut escrow, _) = healthy();
+            escrow.public = 1000;
+            enough.escrow = Some(account_with_confidential(&escrow));
+            enough.destination = Some(create_mock_token_2022_account_data());
+            let (_, update, builder) = enough.run().await;
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))));
+
+            // Unconfigured escrow: no check at all.
+            let mut unconfigured = Case::healthy();
+            unconfigured.confidential = false;
+            unconfigured.escrow = Some(create_mock_token_2022_account_data());
+            unconfigured.destination = Some(create_mock_token_2022_account_data());
+            let (_, update, builder) = unconfigured.run().await;
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))));
+        }
+
+        /// A public release of `owed` liabilities against an escrow with 999 public and
+        /// 10,000 confidential, under `keys`.
+        async fn short_public_release(
+            owed: u64,
+            foreign_key: bool,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = owed;
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            if foreign_key {
+                escrow.elgamal_pubkey = cts::other_keys().pubkey();
+            }
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run().await
+        }
+
+        /// The reviewer's case: the delegate drained the public balance, so custody no longer
+        /// covers the liabilities. That is a drain, not a balance to move to public.
+        #[tokio::test]
+        async fn a_drained_public_balance_on_a_configured_mint_parks_as_a_drain() {
+            assert_parked(
+                short_public_release(50_000, false).await,
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+            );
+            // Custody exactly covers the liabilities: the funds are only in confidential.
+            assert_parked(
+                short_public_release(10_999, false).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A foreign-key mint is judged on its public balance alone: a drain only when that
+        /// balance is proven short of the liabilities.
+        #[tokio::test]
+        async fn a_foreign_key_mint_is_judged_on_its_public_balance() {
+            assert_parked(
+                short_public_release(10_999, true).await,
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+            );
+            assert_parked(
+                short_public_release(999, true).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A public release of 1,000 against 999 public and 10,000 confidential, after an
+        /// earlier 500 release of the mint; `owed` is what the ledger owes once that one is paid.
+        async fn short_public_release_after(
+            owed: u64,
+            earlier: (TransactionStatus, bool),
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = owed;
+            case.earlier = Some(earlier);
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        /// The reviewer's case: an earlier release paid out but its row is still `Processing`,
+        /// so the ledger still owes it. The next short withdrawal waits in `Pending` with the
+        /// backoff, and once that release settles it parks as a low public balance.
+        #[tokio::test]
+        async fn a_short_public_balance_waits_while_a_release_of_the_mint_is_in_flight() {
+            let mock = MockStorage::new();
+            let (outcome, update, builder) =
+                short_public_release_after(10_999, (TransactionStatus::Processing, false), &mock)
+                    .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "must not park: {:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none(), "nothing may be dispatched");
+            let row = mock
+                .pending_transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == 9)
+                .cloned()
+                .unwrap();
+            assert_eq!(row.status, TransactionStatus::Pending);
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+            assert!(row.wait_started_at.is_some());
+
+            assert_parked(
+                short_public_release_after(
+                    10_999,
+                    (TransactionStatus::Completed, false),
+                    &MockStorage::new(),
+                )
+                .await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A short public release re-armed by recovery, with its own journal and an optional
+        /// earlier release of the mint.
+        async fn rearmed_short_release(
+            own_journal: (i64, u64),
+            earlier: Option<(TransactionStatus, bool)>,
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.earlier = earlier;
+            case.own_journal = Some(own_journal);
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        fn row_9(mock: &MockStorage) -> DbTransaction {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == 9)
+                .cloned()
+                .unwrap()
+        }
+
+        /// The reviewer's case: a row re-armed with an expired journal does not wait on
+        /// itself. Behind another release it waits in `Pending`, then parks once that settles.
+        #[tokio::test]
+        async fn a_rearmed_withdrawal_waits_without_blocking_on_its_own_expired_journal() {
+            assert_parked(
+                rearmed_short_release((100, 400), None, &MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+
+            let mock = MockStorage::new();
+            let (outcome, update, builder) = rearmed_short_release(
+                (100, 400),
+                Some((TransactionStatus::Processing, false)),
+                &mock,
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(
+                row.status,
+                TransactionStatus::Pending,
+                "not left for recovery"
+            );
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+
+            assert_parked(
+                rearmed_short_release(
+                    (100, 400),
+                    Some((TransactionStatus::Completed, false)),
+                    &MockStorage::new(),
+                )
+                .await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// An expired attempt that landed is left to recovery rather than requeued.
+        #[tokio::test]
+        async fn a_rearmed_withdrawal_whose_expired_attempt_landed_is_not_requeued() {
+            let mock = MockStorage::new();
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.earlier = Some((TransactionStatus::Processing, false));
+            case.own_journal = Some((100, 400));
+            case.own_status = serde_json::json!({"slot": 90, "confirmations": null, "err": null,
+                "status": {"Ok": null}, "confirmationStatus": "finalized"});
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            let (outcome, update, builder) =
+                case.run_on(Arc::new(Storage::Mock(mock.clone()))).await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(update.is_none());
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(row.status, TransactionStatus::Processing);
+            assert!(row.not_before.is_none());
+        }
+
+        /// A journaled signature that can still land keeps the row `Processing`.
+        #[tokio::test]
+        async fn a_journaled_withdrawal_with_a_live_signature_is_not_requeued() {
+            let mock = MockStorage::new();
+            let (outcome, update, builder) = rearmed_short_release(
+                (500, 400),
+                Some((TransactionStatus::Processing, false)),
+                &mock,
+            )
+            .await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "{:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none());
+            let row = row_9(&mock);
+            assert_eq!(row.status, TransactionStatus::Processing);
+            assert!(row.not_before.is_none());
+        }
+
+        /// Once the release records cover the read, a real drain still parks as one.
+        #[tokio::test]
+        async fn a_drain_parks_once_the_releases_of_the_mint_are_recorded() {
+            for earlier in [
+                (TransactionStatus::Completed, false),
+                (TransactionStatus::Processing, true),
+            ] {
+                assert_parked(
+                    short_public_release_after(50_000, earlier, &MockStorage::new()).await,
+                    metrics::BAIL_REASON_ESCROW_DRAINED,
+                );
+            }
+        }
+
+        fn assert_waits(
+            result: (
+                Result<(), OperatorError>,
+                Option<TransactionStatusUpdate>,
+                Option<TransactionBuilder>,
+            ),
+            mock: &MockStorage,
+        ) {
+            let (outcome, update, builder) = result;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(
+                update.is_none(),
+                "must not park: {:?}",
+                update.and_then(|u| u.error_message)
+            );
+            assert!(builder.is_none(), "nothing may be dispatched");
+            let row = row_9(mock);
+            assert_eq!(row.status, TransactionStatus::Pending);
+            assert!(row.not_before.is_some_and(|at| at > Utc::now()));
+        }
+
+        fn waited(minutes: i64) -> Option<chrono::DateTime<Utc>> {
+            Some(Utc::now() - chrono::Duration::minutes(minutes))
+        }
+
+        /// The reviewer's case: releases of the mint keep landing unrecorded. The row waits
+        /// until the ceiling, then parks as a low public balance instead of waiting forever.
+        #[tokio::test]
+        async fn a_short_public_balance_stops_waiting_for_releases_after_the_ceiling() {
+            let in_flight = (TransactionStatus::Processing, false);
+            let run = |started: Option<chrono::DateTime<Utc>>, mock: MockStorage| async move {
+                let mut case = Case::healthy();
+                case.confidential = false;
+                case.owed = 10_999;
+                case.earlier = Some(in_flight);
+                case.wait_started_at = started;
+                let (mut escrow, _) = healthy();
+                escrow.public = 999;
+                case.escrow = Some(account_with_confidential(&escrow));
+                case.destination = Some(create_mock_token_2022_account_data());
+                case.run_on(Arc::new(Storage::Mock(mock))).await
+            };
+            let mock = MockStorage::new();
+            assert_waits(run(waited(29), mock.clone()).await, &mock);
+            assert_parked(
+                run(waited(31), MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A public release of 1,000 against 999 public, whose confidential custody is held
+        /// by `escrow`, after waiting since `started`.
+        async fn short_release_with_custody(
+            escrow: AccountSpec,
+            poisoned: bool,
+            started: Option<chrono::DateTime<Utc>>,
+            mock: &MockStorage,
+        ) -> (
+            Result<(), OperatorError>,
+            Option<TransactionStatusUpdate>,
+            Option<TransactionBuilder>,
+        ) {
+            let mut case = Case::healthy();
+            case.confidential = false;
+            case.owed = 10_999;
+            case.poisoned = poisoned;
+            case.wait_started_at = started;
+            case.escrow = Some(account_with_confidential(&escrow));
+            case.destination = Some(create_mock_token_2022_account_data());
+            case.run_on(Arc::new(Storage::Mock(mock.clone()))).await
+        }
+
+        /// The reviewer's case: a 2,000-token deposit on a 9-decimal mint raced the last
+        /// apply, so the AES copy is stale past the gap search. Custody covers everything.
+        fn stale_aes_escrow() -> AccountSpec {
+            let keys = cts::keys();
+            let mut sim = SimAccount::new(&keys);
+            sim.credit(&keys, 10_000, 0);
+            sim.apply();
+            sim.credit(&keys, 2_000_000_000_000, 0);
+            sim.apply();
+            let mut escrow = AccountSpec::healthy(&keys, &sim, 999, 10_000);
+            escrow.expected_pending_credit_counter = 1;
+            escrow.actual_pending_credit_counter = 2;
+            escrow
+        }
+
+        fn pending_too_large_escrow() -> AccountSpec {
+            let keys = cts::keys();
+            let mut sim = SimAccount::new(&keys);
+            sim.credit(&keys, 10_000, 0);
+            sim.apply();
+            sim.credit(&keys, 1 << 57, 0);
+            AccountSpec::healthy(&keys, &sim, 999, 10_000)
+        }
+
+        /// Holds the sender clears on its own wait like an unrecorded release, then park as
+        /// a low public balance at the ceiling; neither is proof of a drain.
+        #[tokio::test]
+        async fn a_short_public_balance_waits_out_a_lagging_custody_hold() {
+            for escrow in [stale_aes_escrow(), pending_too_large_escrow()] {
+                let mock = MockStorage::new();
+                assert_waits(
+                    short_release_with_custody(escrow.clone(), false, None, &mock).await,
+                    &mock,
+                );
+                let mock = MockStorage::new();
+                assert_waits(
+                    short_release_with_custody(escrow.clone(), false, waited(29), &mock).await,
+                    &mock,
+                );
+                assert_parked(
+                    short_release_with_custody(escrow, false, waited(31), &MockStorage::new())
+                        .await,
+                    metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+                );
+            }
+        }
+
+        /// A poisoned mint's custody cannot be counted, which proves no shortfall.
+        #[tokio::test]
+        async fn a_short_public_balance_on_a_poisoned_mint_parks_as_low_balance() {
+            let (mut escrow, _) = healthy();
+            escrow.public = 999;
+            assert_parked(
+                short_release_with_custody(escrow, true, None, &MockStorage::new()).await,
+                metrics::BAIL_REASON_PUBLIC_BALANCE_LOW,
+            );
+        }
+
+        /// A Token-2022 account with no extensions and an empty public balance.
+        pub(super) fn create_mock_token_2022_account_data() -> Vec<u8> {
+            let mut data = vec![0u8; spl_token_2022::state::Account::LEN];
+            spl_token_2022::state::Account {
+                mint: Pubkey::new_unique(),
+                owner: Pubkey::new_unique(),
+                state: spl_token_2022::state::AccountState::Initialized,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut data);
+            data
+        }
     }
 }

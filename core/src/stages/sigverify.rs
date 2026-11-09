@@ -569,6 +569,7 @@ mod tests {
                         .allow_mint_slot(u64::MAX)
                         .treasury(authority)
                         .min_withdraw_amount(0)
+                        .confidential_only(false)
                         .instruction(),
                 ),
             ];

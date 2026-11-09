@@ -26,6 +26,7 @@ use pinocchio::{
     sysvars::{rent::Rent, Sysvar},
     Address, ProgramResult,
 };
+use spl_token_2022::extension::ExtensionType;
 
 /// Processes the AllowMint instruction.
 ///
@@ -161,6 +162,7 @@ pub fn process_allow_mint(
         args.withdraw_fee,
         args.min_withdraw_amount,
         args.min_deposit_amount,
+        allowed_mint.has_extension(ExtensionType::ConfidentialMintBurn),
     );
     emit_event(
         program_id,

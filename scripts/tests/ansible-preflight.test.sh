@@ -24,6 +24,8 @@ WITHDRAW_ID=J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 INSTANCE=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz
 PLACEHOLDER=11111111111111111111111111111111
 WORKERS="indexer-solana operator-solana operator-private-channel"
+CONFIDENTIAL_KEYS='{"elgamal_secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","aes_key":"AAAAAAAAAAAAAAAAAAAAAA=="}'
+CONFIDENTIAL_PUBKEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 
 cat >"$D/secrets.yml" <<'EOF'
 postgres_password: p1
@@ -100,6 +102,20 @@ test_preflight_cases() {
   expect_refused custom_program_id "must equal the compiled" "${common[@]}" -e escrow_program_id=$INSTANCE
   expect_refused custom_withdraw_id "must equal the compiled" "${common[@]}" -e withdraw_program_id=$INSTANCE
   expect_refused shared_password "share a password" "${common[@]}" -e postgres_gateway_password=p1
+  # Optional, but a set value must have the shape the services load.
+  expect_refused malformed_confidential_keys "escrow_confidential_keys is not" "${common[@]}" \
+    -e escrow_confidential_keys=not-json-secret-material
+  grep -q 'secret-material' "$TMP/malformed_confidential_keys.log" && fail "malformed_confidential_keys: value leaked"
+  expect_services confidential_keys_accepted no "${common[@]}" \
+    -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
+  # The pinned pubkey needs its keys and the base64 shape.
+  expect_refused confidential_pubkey_without_keys "escrow_confidential_pubkey must be" "${common[@]}" \
+    -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY
+  expect_refused malformed_confidential_pubkey "escrow_confidential_pubkey must be" "${common[@]}" \
+    -e escrow_confidential_pubkey=not-a-pubkey \
+    -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
+  expect_services confidential_pubkey_accepted no "${common[@]}" -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY \
+    -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}"
 
   expect_services localnet_no_instance no "${common[@]}"
   local kept=(-e reset_state=false -e validator_reset=false)
@@ -152,6 +168,9 @@ test_env_render() {
   render "$TMP/pda.env" -e escrow_instance_id_pda=$INSTANCE
   render "$TMP/both.env" -e escrow_instance_id=$INSTANCE -e escrow_instance_id_pda=$PLACEHOLDER
   render "$TMP/hook.env" -e notify_webhook=https://hooks.invalid/x
+  # JSON extra vars, so the quotes inside the value survive.
+  render "$TMP/keys.env" -e "{\"escrow_confidential_keys\": \"${CONFIDENTIAL_KEYS//\"/\\\"}\"}" \
+    -e escrow_confidential_pubkey=$CONFIDENTIAL_PUBKEY
 
   [[ "$(instance_line "$TMP/none.env")" == "COMMON_ESCROW_INSTANCE_ID=" ]] || fail "unset instance must render blank"
   [[ "$(instance_line "$TMP/var.env")" == "COMMON_ESCROW_INSTANCE_ID=$INSTANCE" ]] || fail "escrow_instance_id not rendered"
@@ -171,6 +190,12 @@ test_env_render() {
     grep -qx 'ALERT_WEBHOOK_URL=' "$f" || fail "$f: ALERT_WEBHOOK_URL must render blank"
   done
   grep -q 'hooks.invalid' "$TMP/hook.env" && fail "the webhook URL reached the .env"
+  # The confidential keys are a secret file too; only the (public) pubkey stays in the .env.
+  grep -qx "ESCROW_CONFIDENTIAL_KEYS=" "$TMP/keys.env" || fail "escrow_confidential_keys must render blank"
+  grep -q 'elgamal_secret' "$TMP/keys.env" && fail "the escrow confidential keys reached the .env"
+  grep -qx "ESCROW_CONFIDENTIAL_KEYS=" "$TMP/none.env" || fail "unset escrow_confidential_keys must render blank"
+  grep -qx "ESCROW_CONFIDENTIAL_PUBKEY=$CONFIDENTIAL_PUBKEY" "$TMP/keys.env" || fail "escrow_confidential_pubkey not rendered"
+  grep -qx "ESCROW_CONFIDENTIAL_PUBKEY=" "$TMP/none.env" || fail "unset escrow_confidential_pubkey must render blank"
   echo "ok: env.j2 render"
 }
 
@@ -495,6 +520,8 @@ test_secrets_render() {
      "postgres://private_channel_runtime:$(sv postgres_runtime_password)@postgres-primary:5432/private_channel" ]] || fail "write-node DB URL"
   [[ -s "$host/secrets/operator-private-channel/OPERATOR_PRIVATE_KEY" ]] || fail "operator key file missing"
   [[ -e "$host/secrets/operator-solana/OPERATOR_PRIVATE_KEY" ]] && fail "operator-solana got the release key"
+  [[ "$(cat "$host/secrets/operator-solana/ESCROW_CONFIDENTIAL_KEYS")" == "$(sv escrow_confidential_keys)" ]] \
+    || fail "operator-solana ESCROW_CONFIDENTIAL_KEYS value"
 
   [[ "$(stat -c '%a %U' "$host/secrets")" == "700 root" ]] || fail "secrets root mode/owner: $(stat -c '%a %U' "$host/secrets")"
   local bad
@@ -507,7 +534,7 @@ test_secrets_render() {
   # Completeness: every secret the base compose interpolates for a service has a file.
   python3 - "$REPO/docker-compose.devnet.yml" "$host" <<'PY' || fail "secret_files is incomplete (see above)"
 import os, re, sys, yaml
-SECRET = re.compile(r'\$\{(POSTGRES_PASSWORD|POSTGRES_\w*_PASSWORD|JWT_SECRET\w*|ADMIN_PRIVATE_KEY|OPERATOR_PRIVATE_KEY|INDEXER_YELLOWSTONE_TOKEN|ALERT_WEBHOOK_URL|RECONCILIATION_WEBHOOK_URL|GF_ADMIN_PASSWORD|LOCAL_VALIDATOR_RPC_URL|DEVNET_RPC_URL|DEVNET_FALLBACK_RPC_URL|GATEWAY_WHITELIST_RPC_URL)')
+SECRET = re.compile(r'\$\{(POSTGRES_PASSWORD|POSTGRES_\w*_PASSWORD|JWT_SECRET\w*|ADMIN_PRIVATE_KEY|OPERATOR_PRIVATE_KEY|INDEXER_YELLOWSTONE_TOKEN|ALERT_WEBHOOK_URL|RECONCILIATION_WEBHOOK_URL|GF_ADMIN_PASSWORD|LOCAL_VALIDATOR_RPC_URL|DEVNET_RPC_URL|DEVNET_FALLBACK_RPC_URL|GATEWAY_WHITELIST_RPC_URL|ESCROW_CONFIDENTIAL_KEYS)')
 compose, host = sys.argv[1], sys.argv[2]
 missing = []
 for svc, c in yaml.safe_load(open(compose))["services"].items():

@@ -16,8 +16,20 @@ const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID = '9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27Kn
 const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const EVENT_AUTHORITY_PDA = 'FngERuuhrF13VUpEVuTgVrBH9TM861Wwzr9d6qMSVjMd';
 const MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+const INSTRUCTIONS_SYSVAR_ID = 'Sysvar1nstructions1111111111111111111111111';
+
+// Confidential transfers exist only in Token-2022.
+const CONFIDENTIAL_INSTRUCTIONS = [
+    'configureConfidentialAccount',
+    'confidentialDeposit',
+    'confidentialReleaseFunds',
+    'applyPendingBalance',
+    'moveToConfidential',
+    'moveToPublic',
+];
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
     return pdaValueNode(
@@ -53,6 +65,15 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
             {
                 account: 'tokenProgram',
                 defaultValue: publicKeyValueNode(TOKEN_PROGRAM_ID),
+            },
+            ...CONFIDENTIAL_INSTRUCTIONS.map(instruction => ({
+                account: 'tokenProgram',
+                instruction,
+                defaultValue: publicKeyValueNode(TOKEN_2022_PROGRAM_ID),
+            })),
+            {
+                account: 'instructionsSysvar',
+                defaultValue: publicKeyValueNode(INSTRUCTIONS_SYSVAR_ID),
             },
             {
                 account: 'associatedTokenProgram',
@@ -98,30 +119,32 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                 ]),
             },
             // No default for recipientAllowedWalletPda: it follows the optional recipient argument.
-            {
+            ...['deposit', 'confidentialDeposit'].map(instruction => ({
                 account: 'userAllowedWalletPda',
-                instruction: 'deposit',
+                instruction,
                 defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
                     pdaSeedValueNode('instance', accountValueNode('instance')),
                     pdaSeedValueNode('wallet', accountValueNode('user')),
                 ]),
-            },
-            {
-                account: 'userAllowedWalletPda',
-                instruction: 'releaseFunds',
-                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
-                    pdaSeedValueNode('instance', accountValueNode('instance')),
-                    pdaSeedValueNode('wallet', argumentValueNode('user')),
-                ]),
-            },
-            {
-                account: 'withdrawerAllowedWalletPda',
-                instruction: 'releaseFunds',
-                defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
-                    pdaSeedValueNode('instance', accountValueNode('instance')),
-                    pdaSeedValueNode('wallet', argumentValueNode('withdrawer')),
-                ]),
-            },
+            })),
+            ...['releaseFunds', 'confidentialReleaseFunds'].flatMap(instruction => [
+                {
+                    account: 'userAllowedWalletPda',
+                    instruction,
+                    defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                        pdaSeedValueNode('instance', accountValueNode('instance')),
+                        pdaSeedValueNode('wallet', argumentValueNode('user')),
+                    ]),
+                },
+                {
+                    account: 'withdrawerAllowedWalletPda',
+                    instruction,
+                    defaultValue: pdaValueNode(pdaLinkNode('allowedWallet'), [
+                        pdaSeedValueNode('instance', accountValueNode('instance')),
+                        pdaSeedValueNode('wallet', argumentValueNode('withdrawer')),
+                    ]),
+                },
+            ]),
 
             // CreateInstance instruction
             {

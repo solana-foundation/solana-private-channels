@@ -1,3 +1,4 @@
+pub mod confidential;
 mod mint;
 mod proof;
 mod remint;
@@ -316,6 +317,27 @@ pub async fn run_sender(
     // rest load page by page in process_pending_remints as the queue drains.
     state.recover_pending_remints(&storage_tx).await?;
 
+    // Confidential releases need the instance keys; without them they park at the pre-flight.
+    if let (ProgramType::Withdraw, Some(instance)) = (config.program_type, state.instance_pda) {
+        match confidential::ConfidentialSender::from_env(instance) {
+            Ok(Some(mut conf)) => {
+                confidential::seed_min_context_slot(&mut conf, &state.storage).await;
+                confidential::seed_parks(&mut conf, &state.storage).await;
+                confidential::seed_mint_states(&mut conf, &state.storage).await;
+                confidential::seed_last_applies(&mut conf, &state.storage).await;
+                state.confidential = Some(Box::new(conf));
+                // Undecided ones keep blocking their mint; every write settles them first.
+                match confidential::settle_operator_attempts(&mut state, None).await {
+                    Ok(0) => {}
+                    Ok(open) => warn!(open, "Journaled confidential applies still undecided"),
+                    Err(e) => warn!("Could not settle journaled confidential applies: {e}"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return Err(OperatorError::RpcError(format!("confidential keys: {e}"))),
+        }
+    }
+
     let mut rotation_check_interval = interval(ROTATION_CHECK_INTERVAL);
 
     // Rotation is needed once per generation of nonces, so the check that starts
@@ -417,6 +439,11 @@ pub async fn run_sender(
                 remint::process_pending_remints(&mut state, &storage_tx).await;
 
                 drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+                confidential::retry_held(&mut state, &storage_tx).await;
+
+                // Paced inside to once a minute; the first pass also repairs after a crash.
+                confidential::background_check(&mut state, &storage_tx).await;
             }
 
             // Back-pressure: stop consuming new transactions when in_flight is full.
@@ -554,6 +581,11 @@ pub(super) async fn drain_rotation_retry_queue(
             trace_id = ctx.trace_id.as_deref().unwrap_or("none"),
             "Retrying blocked nonce {} after rotation", nonce
         );
+        // A confidential release is rebuilt from a fresh read: its proofs may be stale.
+        if confidential::resubmit_after_rotation(state, nonce, storage_tx).await {
+            continue;
+        }
+
         // Back in flight from here, so a queued rotation waits on it.
         state.in_flight_withdrawals.insert(nonce);
         let compute_unit_price = instruction.compute_unit_price;

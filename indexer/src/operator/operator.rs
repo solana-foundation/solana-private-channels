@@ -25,6 +25,24 @@ use tracing::{error, info, warn};
 /// Metric label for the live-state lock this role holds.
 const OPERATOR_LOCK_ROLE: &str = "operator";
 
+/// The escrow indexer's boot key check, for both operators: `keys` must match `pinned` when
+/// set, and once any escrow account is configured, be set and match one of them.
+pub(crate) async fn check_confidential_keys(
+    storage: &Storage,
+    keys: Option<&private_channel_confidential::Keys>,
+    pinned: Option<[u8; 32]>,
+    solana_rpc: &Arc<RpcClientWithRetry>,
+    escrow_instance: &solana_sdk::pubkey::Pubkey,
+) -> Result<(), OperatorError> {
+    use crate::indexer::confidential::{check_keys_at_boot, RpcEscrowKeySource};
+    let source = RpcEscrowKeySource {
+        rpc: solana_rpc.clone(),
+    };
+    check_keys_at_boot(storage, keys, pinned, &source, escrow_instance)
+        .await
+        .map_err(|e| OperatorError::InvalidConfig(e.to_string()))
+}
+
 pub async fn run(
     storage: Arc<Storage>,
     common_config: PrivateChannelIndexerConfig,
@@ -177,6 +195,24 @@ pub async fn run(
             })
     })
     .await?;
+
+    // A missing or foreign key refuses here, not later as a reconciliation halt or parks.
+    let confidential_keys = crate::indexer::confidential::load_keys()
+        .map_err(|e| OperatorError::InvalidConfig(e.to_string()))?;
+    let pinned = crate::indexer::confidential::load_pinned_pubkey()
+        .map_err(|e| OperatorError::InvalidConfig(e.to_string()))?;
+    under_live_lock(
+        &live_lock_lost,
+        check_confidential_keys(
+            &storage,
+            confidential_keys.as_deref(),
+            pinned,
+            solana_rpc,
+            &escrow_instance,
+        ),
+    )
+    .await
+    .inspect_err(|e| error!("Operator refusing to start: {e}"))?;
 
     // The chain the receipt mints live on: the escrow role mints there, the withdraw role
     // burns there. The fence and the consumed set are both read from it.
@@ -365,6 +401,10 @@ pub async fn run(
         // skip reconciliation if that ever regresses.
         match (common_config.escrow_instance_id, source_rpc_client.clone()) {
             (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
+                // Needed once an escrow account is configured; a malformed value refuses to start.
+                let confidential_keys = private_channel_confidential::Keys::from_env()
+                    .map_err(|e| OperatorError::InvalidConfig(e.to_string()))?
+                    .map(Arc::new);
                 let reconciliation_storage = storage.clone();
                 let reconciliation_config = config.clone();
                 // Custody (Solana escrow ATAs) is read from source_rpc_client;
@@ -383,6 +423,7 @@ pub async fn run(
                         reconciliation_rpc,
                         reconciliation_channel_rpc,
                         reconciliation_escrow,
+                        confidential_keys,
                         reconciliation_health,
                         reconciliation_token,
                         reconciliation_fence,
@@ -1644,6 +1685,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
         mock
     }
@@ -1821,6 +1867,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         };
         let mock = MockStorage::new();
         mock.pending_transactions.lock().unwrap().push(row);
@@ -2170,6 +2221,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
         let common_config = PrivateChannelIndexerConfig {
             program_type: ProgramType::Withdraw,
@@ -2392,6 +2448,7 @@ mod tests {
             )
             .create_async()
             .await;
+        // The database knows no mint, so the boot key check reads nothing.
         let mut source = mockito::Server::new_async().await;
         let source_balance = source
             .mock("POST", "/")
@@ -2488,5 +2545,159 @@ mod tests {
             );
             assert!(calls.is_empty(), "storage was touched: {calls:?}");
         }
+    }
+
+    // ---- Confidential keys at boot: the same check as the escrow indexer ----
+
+    /// A database knowing one Token-2022 mint the admin allowed with confidential transfers,
+    /// and a Solana RPC serving its escrow account, configured under `configured` (no
+    /// confidential extension when `None`).
+    async fn configured_escrow(
+        configured: Option<[u8; 32]>,
+        instance: &solana_sdk::pubkey::Pubkey,
+    ) -> (Storage, Arc<RpcClientWithRetry>, mockito::ServerGuard) {
+        use crate::operator::utils::account_util::find_allowed_mint_pda;
+        use crate::operator::utils::mint_util::confidential_fixtures::{
+            account_with_confidential, AccountSpec,
+        };
+        use crate::storage::common::models::DbMint;
+        use crate::storage::common::storage::mock::MockStorage;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use private_channel_confidential::test_support::{self as cts, SimAccount};
+        use private_channel_escrow_program_client::{
+            AllowedMint, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        };
+
+        let keys = cts::keys();
+        let mut spec = AccountSpec::healthy(&keys, &SimAccount::new(&keys), 0, 0);
+        spec.owner = *instance;
+        let escrow = match configured {
+            Some(elgamal) => {
+                spec.elgamal_pubkey = elgamal;
+                serde_json::json!({
+                    "data": [STANDARD.encode(account_with_confidential(&spec)), "base64"],
+                    "owner": spl_token_2022::ID.to_string(),
+                    "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+                })
+            }
+            None => serde_json::Value::Null,
+        };
+        let allowed = AllowedMint {
+            discriminator: 2,
+            bump: 255,
+            deposits_blocked: false,
+            withdrawals_blocked: false,
+            decimals: 6,
+            token_program: spl_token_2022::ID,
+            extensions: 1
+                << (spl_token_2022::extension::ExtensionType::ConfidentialTransferMint as u8),
+            has_freeze_authority: false,
+            min_deposit_amount: 0,
+        };
+        let allowed = serde_json::json!({
+            "data": [STANDARD.encode(borsh::to_vec(&allowed).unwrap()), "base64"],
+            "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+            "lamports": 1, "executable": false, "rentEpoch": 0, "space": 0
+        });
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            instance,
+            &spec.mint,
+            &spl_token_2022::ID,
+        );
+        let mut server = mockito::Server::new_async().await;
+        for (key, value) in [
+            (find_allowed_mint_pda(instance, &spec.mint), allowed),
+            (ata, escrow),
+        ] {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::AllOf(vec![
+                    mockito::Matcher::Regex(r#""getMultipleAccounts""#.into()),
+                    mockito::Matcher::Regex(key.to_string()),
+                ]))
+                .with_body(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {
+                        "context": {"slot": 10}, "value": [value]
+                    }})
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+        }
+        let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            spec.mint.to_string(),
+            DbMint::new(
+                spec.mint.to_string(),
+                6,
+                spl_token_2022::ID.to_string(),
+                crate::storage::common::amount::TokenAmount(0),
+            ),
+        );
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        ));
+        (Storage::Mock(mock), rpc, server)
+    }
+
+    #[tokio::test]
+    async fn operators_refuse_to_boot_without_the_key_of_a_configured_escrow_account() {
+        use private_channel_confidential::test_support as cts;
+        let instance = solana_sdk::pubkey::Pubkey::new_unique();
+        let (storage, rpc, _server) =
+            configured_escrow(Some(cts::keys().pubkey()), &instance).await;
+
+        for keys in [None, Some(cts::other_keys())] {
+            let err = check_confidential_keys(&storage, keys.as_ref(), None, &rpc, &instance)
+                .await
+                .expect_err("a missing or foreign key refuses to boot");
+            assert!(matches!(err, OperatorError::InvalidConfig(_)), "{err}");
+            assert!(
+                err.to_string()
+                    .contains(private_channel_confidential::KEYS_ENV),
+                "the error names the variable: {err}"
+            );
+        }
+        check_confidential_keys(&storage, Some(&cts::keys()), None, &rpc, &instance)
+            .await
+            .expect("the instance key boots");
+    }
+
+    #[tokio::test]
+    async fn operators_boot_without_a_key_until_an_escrow_account_is_configured() {
+        let instance = solana_sdk::pubkey::Pubkey::new_unique();
+        let (storage, rpc, _server) = configured_escrow(None, &instance).await;
+        check_confidential_keys(&storage, None, None, &rpc, &instance)
+            .await
+            .expect("nothing configured, nothing required");
+    }
+
+    /// On a database that knows no mint, the pinned pubkey still requires its key.
+    #[tokio::test]
+    async fn operators_on_an_empty_database_require_the_pinned_key() {
+        use private_channel_confidential::{test_support as cts, PUBKEY_ENV};
+        let instance = solana_sdk::pubkey::Pubkey::new_unique();
+        let storage = Storage::Mock(MockStorage::new());
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://127.0.0.1:1".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        ));
+        let pinned = Some(cts::keys().pubkey());
+        for keys in [None, Some(cts::other_keys())] {
+            let err = check_confidential_keys(&storage, keys.as_ref(), pinned, &rpc, &instance)
+                .await
+                .expect_err("a missing or foreign key refuses under a pin");
+            assert!(err.to_string().contains(PUBKEY_ENV), "{err}");
+        }
+        check_confidential_keys(&storage, Some(&cts::keys()), pinned, &rpc, &instance)
+            .await
+            .expect("the pinned key boots");
     }
 }

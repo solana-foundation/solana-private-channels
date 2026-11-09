@@ -267,6 +267,22 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// The block height at confirmed or the client's stricter commitment, for proving a
+    /// journaled signature expired: a processed height may sit on a fork that is dropped.
+    pub async fn get_confirmed_block_height(&self) -> Result<u64, Box<client_error::Error>> {
+        let commitment = if self.rpc_client.commitment().is_at_least_confirmed() {
+            self.rpc_client.commitment()
+        } else {
+            CommitmentConfig::confirmed()
+        };
+        self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
+            self.rpc_client
+                .get_block_height_with_commitment(commitment)
+                .await
+        })
+        .await
+    }
+
     /// Get the current slot with retry. Unanchored: a lagging node reports its own
     /// old slot, so it must not bound anything a refund or a verdict depends on.
     pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
@@ -442,6 +458,56 @@ impl RpcClientWithRetry {
         self.with_retry("send_transaction", retry_policy, || async {
             self.rpc_client.send_transaction(transaction).await
         })
+        .await
+    }
+
+    /// Send a signed v1 transaction base64, with preflight at confirmed and no older than
+    /// `min_context_slot`, so the simulation sees the state the confidential proofs were built from.
+    pub async fn send_versioned_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::VersionedTransaction,
+        retry_policy: RetryPolicy,
+        min_context_slot: Option<u64>,
+    ) -> Result<solana_sdk::signature::Signature, Box<client_error::Error>> {
+        let config = solana_rpc_client_api::config::RpcSendTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            preflight_commitment: Some(solana_commitment_config::CommitmentLevel::Confirmed),
+            min_context_slot,
+            ..Default::default()
+        };
+        self.with_retry("send_versioned_transaction", retry_policy, || async {
+            self.rpc_client
+                .send_transaction_with_config(transaction, config)
+                .await
+        })
+        .await
+    }
+
+    /// Simulate a signed v1 transaction at confirmed, no older than `min_context_slot`.
+    pub async fn simulate_versioned_transaction(
+        &self,
+        transaction: &solana_sdk::transaction::VersionedTransaction,
+        min_context_slot: Option<u64>,
+    ) -> Result<
+        solana_rpc_client_api::response::RpcSimulateTransactionResult,
+        Box<client_error::Error>,
+    > {
+        let config = solana_rpc_client_api::config::RpcSimulateTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot,
+            ..Default::default()
+        };
+        self.with_retry(
+            "simulate_versioned_transaction",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .simulate_transaction_with_config(transaction, config.clone())
+                    .await
+                    .map(|response| response.value)
+            },
+        )
         .await
     }
 

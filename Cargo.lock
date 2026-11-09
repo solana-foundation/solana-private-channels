@@ -2275,6 +2275,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpi-forwarder-fixture"
+version = "0.1.0"
+dependencies = [
+ "pinocchio",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2734,17 +2741,28 @@ dependencies = [
 name = "devnet-scripts"
 version = "0.1.0"
 dependencies = [
+ "base64 0.21.7",
+ "bytemuck",
+ "private-channel-confidential",
  "private-channel-escrow-program-client",
  "private-channel-withdraw-program-client",
+ "serde_json",
  "solana-client",
  "solana-keychain",
+ "solana-program-pack 3.1.0",
  "solana-sdk",
  "solana-system-interface 3.2.0",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
  "spl-associated-token-account",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-token-2022-interface 3.1.1",
+ "spl-token-confidential-transfer-proof-extraction 0.6.1",
+ "spl-token-confidential-transfer-proof-generation 0.6.1",
  "sqlx",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -4945,9 +4963,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.22"
+version = "1.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b70e7a7df205e92a1a4cd9aaae7898dac0aa555503cc0a649494d0d60e7651d"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
 dependencies = [
  "cc",
  "pkg-config",
@@ -6168,6 +6186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "private-channel-confidential"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "bytemuck",
+ "curve25519-dalek 4.1.3",
+ "serde",
+ "serde_json",
+ "solana-instruction 3.4.1",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
+ "spl-token-confidential-transfer-proof-generation 0.6.1",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "private-channel-core"
 version = "0.1.0"
 dependencies = [
@@ -6339,6 +6374,7 @@ dependencies = [
  "figment",
  "futures 0.3.34",
  "mockito",
+ "private-channel-confidential",
  "private-channel-core",
  "private-channel-escrow-program-client",
  "private-channel-metrics",
@@ -6401,6 +6437,7 @@ dependencies = [
  "hyper-util",
  "jsonrpsee",
  "mockito",
+ "private-channel-confidential",
  "private-channel-core",
  "private-channel-escrow-program-client",
  "private-channel-indexer",
@@ -6424,6 +6461,7 @@ dependencies = [
  "spl-tlv-account-resolution 0.11.1",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-token-2022-interface 3.1.1",
  "spl-transfer-hook-interface 2.1.0",
  "sqlx",
  "test_utils",
@@ -6710,9 +6748,9 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.0"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e8bbe1a966bd2f362681a44f6edce3c2310ac21e4d5067a6e7ec396297a6ea0"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",
@@ -12712,6 +12750,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-zk-sdk"
+version = "7.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cd8535d2f40d43a1d47af2849e1c86706a597a2ad84207441f51a50f09d8fd"
+dependencies = [
+ "aes-gcm-siv",
+ "base64 0.22.1",
+ "bincode",
+ "bytemuck",
+ "curve25519-dalek 4.1.3",
+ "hkdf",
+ "itertools 0.14.0",
+ "merlin",
+ "rand 0.8.8",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "solana-address 2.6.1",
+ "solana-derivation-path 3.0.0",
+ "solana-seed-derivable 3.0.0",
+ "solana-seed-phrase 3.0.0",
+ "solana-signature 3.4.1",
+ "solana-signer 3.0.1",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk-pod",
+ "subtle",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "solana-zk-sdk-pod"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13380,6 +13451,19 @@ checksum = "f63a2b41095945dc15274b924b21ccae9b3ec9dc2fdd43dbc08de8c33bbcd915"
 dependencies = [
  "curve25519-dalek 4.1.3",
  "solana-zk-sdk 4.0.0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "spl-token-confidential-transfer-proof-generation"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03d81c8000b53c6a398a2173d5009e2b7248a450e152b4e4d03dfe423ffafa9c"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
+ "solana-zk-sdk-pod",
  "thiserror 2.0.20",
 ]
 
@@ -14092,6 +14176,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.11.1",
  "hyper-util",
+ "private-channel-confidential",
  "private-channel-escrow-program-client",
  "private-channel-indexer",
  "private-channel-withdraw-program-client",
@@ -14161,6 +14246,7 @@ dependencies = [
 name = "tests-private-channel-escrow-program"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "const-crypto",
  "litesvm",
  "private-channel-escrow-program-client",
@@ -14171,11 +14257,16 @@ dependencies = [
  "solana-sdk",
  "solana-sdk-ids 3.1.0",
  "solana-system-interface 3.2.0",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
  "spl-associated-token-account",
  "spl-memo 7.0.0",
  "spl-tlv-account-resolution 0.11.1",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-token-2022-interface 3.1.1",
+ "spl-token-confidential-transfer-proof-extraction 0.6.1",
+ "spl-token-confidential-transfer-proof-generation 0.6.1",
  "spl-token-metadata-interface 1.0.1",
  "spl-transfer-hook-interface 2.1.0",
 ]

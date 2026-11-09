@@ -1,14 +1,18 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    transaction::Transaction,
 };
 use solana_system_interface::instruction::create_account;
+use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
+use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token::{
     instruction::{initialize_mint, mint_to},
     state::Mint as TokenMint,
@@ -16,6 +20,10 @@ use spl_token::{
 use spl_token_2022::extension::ExtensionType;
 use spl_token_2022::state::Mint as Token2022Mint;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
+use spl_transfer_hook_interface::{
+    get_extra_account_metas_address, instruction::ExecuteInstruction,
+};
+use test_utils::validator_helper::HOOK_FIXTURE_PROGRAM_ID;
 
 use super::transactions::send_and_confirm_instructions;
 
@@ -313,4 +321,64 @@ pub async fn get_token_2022_balance(
         Ok(balance) => Ok(balance.amount.parse::<u64>()?),
         Err(_) => Ok(0),
     }
+}
+
+/// Selects the fixture's `ExtraAccountMetaList` initializer. Must match
+/// `INIT_EXTRA_ACCOUNT_METAS_TAG` in the fixture.
+const INIT_EXTRA_ACCOUNT_METAS_TAG: u8 = 0;
+
+/// Create the mint's validation account, declaring one extra account (the
+/// system program). Serialized here and copied in by the fixture, because the
+/// address is a PDA of the fixture and nothing else can create it.
+#[allow(dead_code)]
+pub async fn init_extra_account_meta_list(
+    client: &RpcClient,
+    payer: &Keypair,
+    mint: &Pubkey,
+) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    let extras = [ExtraAccountMeta::new_with_pubkey(
+        &SYSTEM_PROGRAM_ID,
+        false,
+        false,
+    )?];
+    init_extra_account_meta_list_with(client, payer, mint, &extras).await
+}
+
+/// Like [`init_extra_account_meta_list`] with `extras` declared. With none, the fixture
+/// refuses `u64::MAX`, the amount of every confidential transfer.
+#[allow(dead_code)]
+pub async fn init_extra_account_meta_list_with(
+    client: &RpcClient,
+    payer: &Keypair,
+    mint: &Pubkey,
+    extras: &[ExtraAccountMeta],
+) -> Result<Pubkey, Box<dyn std::error::Error>> {
+    let mut metas = vec![0u8; ExtraAccountMetaList::size_of(extras.len())?];
+    ExtraAccountMetaList::init::<ExecuteInstruction>(&mut metas, extras)?;
+
+    let mut data = vec![INIT_EXTRA_ACCOUNT_METAS_TAG];
+    data.extend_from_slice(&metas);
+
+    let validation_pda = get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID);
+    let ix = Instruction {
+        program_id: HOOK_FIXTURE_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(validation_pda, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    };
+
+    let recent_blockhash = client.get_latest_blockhash().await?;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        recent_blockhash,
+    );
+    client.send_and_confirm_transaction(&tx).await?;
+
+    Ok(validation_pda)
 }

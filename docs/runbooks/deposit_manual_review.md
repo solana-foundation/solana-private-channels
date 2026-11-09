@@ -366,17 +366,20 @@ match the on-chain mint. `withdraw_fee` and `min_withdraw_amount` are that
 `AllowMint`'s arguments (bytes 2..10 and 10..18 of its instruction data, u64 LE),
 recorded with the same `:allow_mint_slot` so a replayed older AllowMint cannot
 restore older values. Set `min_withdraw_amount` explicitly: its column defaults
-to 0, which would leave the mint with no minimum. `status` and
+to 0, which would leave the mint with no minimum. Set `confidential_only`
+explicitly too: true when byte 98 of the AllowMint's `AllowMintEvent` is 1 (the
+mint has `ConfidentialMintBurn`). It defaults to false, which lets the channel
+burn public withdrawals the escrow can never release. `status` and
 `withdrawals_blocked` are left to their defaults (`allowed`, open), which is
 what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
   (mint_address, decimals, token_program, withdraw_fee, min_withdraw_amount,
-   allow_mint_slot, created_at)
+   confidential_only, allow_mint_slot, created_at)
 VALUES
   (:mint, :decimals, :token_program, :withdraw_fee, :min_withdraw_amount,
-   :allow_mint_slot, NOW());
+   :confidential_only, :allow_mint_slot, NOW());
 
 -- Clears the slot-aware gate. Every value comes from the AllowMint:
 --   :allow_mint_tx_index    its transaction's position in getBlock(slot).transactions,

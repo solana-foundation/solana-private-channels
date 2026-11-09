@@ -125,6 +125,7 @@ secret_files:
   - { key: INDEXER_BACKFILL_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
   - { key: INDEXER_YELLOWSTONE_TOKEN, value: "{{ yellowstone_token | default('') if (_pc_remote_rpc | bool) else '' }}" }
   - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
   indexer-private-channel:
   - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
   - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
@@ -161,11 +162,13 @@ _pc_operator_solana_secrets:
   - { key: COMMON_SOURCE_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
   - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
   - { key: OPERATOR_RECONCILIATION_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
 _pc_operator_pc_secrets:
   - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
   - { key: COMMON_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
   - { key: COMMON_FALLBACK_RPC_URL, value: "{{ fallback_rpc_url | default('') if (_pc_remote_rpc | bool) else '' }}" }
   - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
 _pc_signer_secrets_admin:
   - key: "ADMIN_{{ _pc_signer_secret[admin_signer | default('memory')].key }}"
     value: "{{ lookup('vars', _pc_signer_secret[admin_signer | default('memory')].var | replace('ROLE', 'admin'), default='') }}"

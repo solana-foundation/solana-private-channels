@@ -155,6 +155,55 @@ cargo run --bin remove_allowed_wallet -- \
 ```
 See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) before turning on withdrawals or removing a wallet.
 
+## Confidential transfers (Token-2022 mints with confidential transfers)
+
+Setup, once per instance, then once per mint (see
+[confidential_transfers.md](../../docs/runbooks/confidential_transfers.md#setup-ceremony)):
+```bash
+# Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json.
+cargo run --bin confidential_keygen -- ./keypairs/escrow-confidential.json
+# Put its content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS, and the
+# ESCROW_CONFIDENTIAL_PUBKEY=... line it prints as is, then restart indexer-solana
+# and both operators. Then, with the mint's deposits blocked:
+cargo run --bin configure_confidential -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <MINT_ADDRESS> \
+  ./keypairs/escrow-confidential.json
+# Check indexer-solana logged at INFO the line it prints:
+#   escrow account configured under the instance key mint=<MINT_ADDRESS> elgamal_pubkey=<pubkey>
+# then allow_mint again.
+```
+
+Deposit a hidden amount. The user keys file is the user's own (`confidential_keygen`
+again), never the escrow's. On its first run the tool configures the user's account;
+when the available balance is short it moves public tokens in and applies. It sends a
+v1 transaction with the proofs inline. Transfer-hook mints are not supported.
+```bash
+cargo run --bin confidential_deposit -- \
+  https://api.devnet.solana.com \
+  ./keypairs/user.json \
+  ./keypairs/user-confidential.json \
+  <INSTANCE_ID> \
+  <MINT_ADDRESS> \
+  <AMOUNT> \
+  [RECIPIENT]
+```
+
+Withdraw into the destination's confidential balance (`ConfidentialWithdrawFunds`,
+at most 2^48 - 1). Same arguments as `withdraw`. With `SOLANA_RPC_URL` set it first
+checks the destination's Token-2022 account on Solana can take the release, which
+otherwise parks as `destination_not_ready`.
+```bash
+SOLANA_RPC_URL=https://api.devnet.solana.com cargo run --bin confidential_withdraw -- \
+  http://localhost:8899 \
+  ./keypairs/user.json \
+  <MINT_ADDRESS> \
+  <AMOUNT>
+```
+The release lands in the pending balance; apply it with Token-2022 `ApplyPendingBalance`.
+
 ## Monitor
 ```bash
 # Watch deposit processing

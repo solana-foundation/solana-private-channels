@@ -32,6 +32,24 @@ pub fn validate_ata(
     mint_info: &AccountView,
     token_program_info: &AccountView,
 ) -> ProgramResult {
+    validate_ata_address(ata_info, wallet_key, mint_info, token_program_info)?;
+
+    if ata_info.is_data_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    Ok(())
+}
+
+/// The ATA address check alone, for a caller that types an account that doesn't
+/// exist.
+#[inline(always)]
+pub fn validate_ata_address(
+    ata_info: &AccountView,
+    wallet_key: &Address,
+    mint_info: &AccountView,
+    token_program_info: &AccountView,
+) -> ProgramResult {
     // Validate ATA address is correct for this wallet + mint
     let expected_ata = Address::find_program_address(
         &[
@@ -43,7 +61,7 @@ pub fn validate_ata(
     )
     .0;
 
-    if ata_info.address() != &expected_ata || ata_info.is_data_empty() {
+    if ata_info.address() != &expected_ata {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -211,7 +229,7 @@ const MEMO_TEXT: &[u8] = b"escrow release";
 /// True when `to` carries Token-2022's `MemoTransfer` extension, so an incoming
 /// transfer has to be preceded by a memo.
 #[inline(always)]
-fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
+pub fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
     if !to.owned_by(&TOKEN_2022_PROGRAM_ID) {
         return Ok(false);
     }
@@ -229,7 +247,7 @@ fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
 ///
 /// Memo handling ported from <https://github.com/solana-foundation/dvp>.
 #[inline(always)]
-fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
+pub fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
     if memo_program.address() != &MEMO_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }

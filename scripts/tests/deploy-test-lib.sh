@@ -164,6 +164,10 @@ sentinel_secrets() {
     printf '%s: %s\n' "$key" "$val" >>"$out"
     printf '%s\n' "$val" >>"$TMP/sentinels.txt"
   done
+  # JSON with base64-alphabet values, the shape the escrow_confidential_keys assert expects.
+  printf "escrow_confidential_keys: '{\"elgamal_secret\":\"SNTL%sxelgamal\",\"aes_key\":\"SNTL%sxaes\"}'\n" \
+    "$tag" "$tag" >>"$out"
+  printf 'SNTL%sxelgamal\nSNTL%sxaes\n' "$tag" "$tag" >>"$TMP/sentinels.txt"
   for key in notify_webhook alert_webhook_url rpc_url fallback_rpc_url gateway_whitelist_rpc_url; do
     val="https://sntl${tag}x${key//_/-}.invalid/k/SNTL${tag}x${key}"
     printf "%s: '%s'\n" "$key" "$val" >>"$out"

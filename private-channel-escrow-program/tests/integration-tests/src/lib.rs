@@ -10,13 +10,25 @@ mod test_add_or_update_allowed_wallet;
 #[cfg(test)]
 mod test_allow_mint;
 #[cfg(test)]
+mod test_apply_pending_balance;
+#[cfg(test)]
 mod test_block_mint;
+#[cfg(test)]
+mod test_confidential_deposit;
+#[cfg(test)]
+mod test_confidential_release_funds;
+#[cfg(test)]
+mod test_configure_confidential_account;
 #[cfg(test)]
 mod test_create_instance;
 #[cfg(test)]
 mod test_deposit;
 #[cfg(test)]
 mod test_emit_event;
+#[cfg(test)]
+mod test_move_to_confidential;
+#[cfg(test)]
+mod test_move_to_public;
 #[cfg(test)]
 mod test_release_funds;
 #[cfg(test)]

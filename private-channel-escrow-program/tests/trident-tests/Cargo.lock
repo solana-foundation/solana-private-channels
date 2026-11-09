@@ -1254,11 +1254,16 @@ dependencies = [
 name = "fuzz_tests"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "private-channel-escrow-program-client",
  "solana-instruction 3.5.1",
  "solana-pubkey 4.3.0",
  "solana-sdk",
+ "solana-zk-sdk",
  "spl-associated-token-account",
+ "spl-token-2022-interface",
+ "spl-token-confidential-transfer-proof-extraction",
+ "spl-token-confidential-transfer-proof-generation",
  "trident-fuzz",
 ]
 
@@ -6093,7 +6098,7 @@ dependencies = [
 [[package]]
 name = "trident-svm"
 version = "0.2.0"
-source = "git+https://github.com/exo-tech-xyz/trident-svm?branch=fix-syscalls#297b5acf23cf371046ded1ad39f03a21c7c12a30"
+source = "git+https://github.com/exo-tech-xyz/trident-svm?rev=7fa9e0f46ed6f0e0e7e2cd1357e26f6066633f1f#7fa9e0f46ed6f0e0e7e2cd1357e26f6066633f1f"
 dependencies = [
  "bincode",
  "log",

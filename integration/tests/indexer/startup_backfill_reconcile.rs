@@ -24,6 +24,7 @@ use mockito::{Matcher, Server as MockitoServer};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 // The indexer decides what counts as an escrow instruction by this constant, so a
 // synthetic block has to carry the same id or the fill sees nothing to import.
+use base64::Engine as _;
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::operator::find_allowed_wallet_pda;
 use private_channel_indexer::{
@@ -39,6 +40,7 @@ use serde_json::json;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
+use solana_sdk::program_pack::Pack;
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
@@ -322,6 +324,17 @@ async fn mock_escrow_custody_at(
                 &mint.parse::<Pubkey>().unwrap(),
                 &TOKEN_PROGRAM_ID,
             );
+            // Token-2022 custody is read in base64: the sweep decodes the raw account so it
+            // also sees the confidential extension.
+            let mut data = vec![0u8; spl_token_2022::state::Account::LEN];
+            spl_token_2022::state::Account {
+                mint: mint.parse().unwrap(),
+                owner: instance,
+                amount: *amount as u64,
+                state: spl_token_2022::state::AccountState::Initialized,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut data);
             json!({
                 "pubkey": ata.to_string(),
                 "account": {
@@ -330,17 +343,7 @@ async fn mock_escrow_custody_at(
                     "executable": false,
                     "rentEpoch": 0,
                     "space": 165,
-                    "data": {
-                        "program": "spl-token",
-                        "space": 165,
-                        "parsed": {
-                            "type": "account",
-                            "info": {
-                                "mint": mint,
-                                "tokenAmount": { "amount": amount.to_string() }
-                            }
-                        }
-                    }
+                    "data": [base64::engine::general_purpose::STANDARD.encode(&data), "base64"]
                 }
             })
         })

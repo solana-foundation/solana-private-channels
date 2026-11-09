@@ -15,7 +15,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: unit-test integration-test all-test drills drill dvp-client-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
-.PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage
+.PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage confidential-unit-coverage devnet-scripts-test
 .PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean ensure-geyser-plugin
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
@@ -147,6 +147,8 @@ ci-unit-test:
 	@echo "Running CI unit tests for core + indexer..."
 	@$(MAKE) -C core unit-test
 	@$(MAKE) -C indexer unit-test
+	@cargo test -p private-channel-confidential --lib --features test-support
+	@$(MAKE) devnet-scripts-test
 
 ci-integration-test:
 	@echo "Running CI integration tests (non-program suites)..."
@@ -224,6 +226,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test mint_builder_validation -- --nocapture
 	@cd integration && cargo test --test sender_channel_close -- --nocapture
 	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
+	@cd integration && PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600 cargo test --test confidential_e2e -- --nocapture --test-threads=4
 
 # CI-focused integration target that runs indexer integration tests only.
 # Same group-ordering invariant as integration/Makefile:integration-coverage-indexer:
@@ -275,6 +278,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test mint_builder_validation -- --nocapture
 	@cd integration && cargo test --test sender_channel_close -- --nocapture
 	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
+	@cd integration && PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600 cargo test --test confidential_e2e -- --nocapture --test-threads=4
 	@cd integration && cargo test --test rotation_driver_e2e -- --nocapture
 
 # Backward-compatible aliases.
@@ -332,7 +336,20 @@ ci-unit-coverage:
 	@$(MAKE) -C indexer unit-coverage
 	@$(MAKE) -C gateway unit-coverage
 	@$(MAKE) -C auth unit-coverage
+	@$(MAKE) confidential-unit-coverage
 	@$(MAKE) dvp-client-test
+	@$(MAKE) devnet-scripts-test
+
+# The shared confidential crate has no per-dir Makefile; test it by crate.
+confidential-unit-coverage:
+	@echo "Running unit tests with coverage for private-channel-confidential..."
+	@mkdir -p coverage
+	@cargo llvm-cov -p private-channel-confidential --lib --features test-support --lcov --output-path coverage/coverage-confidential-unit.lcov
+
+# Pure helpers of the devnet tools (confidential configure checks, seize builder).
+devnet-scripts-test:
+	@echo "Running devnet-scripts unit tests..."
+	@cargo test -p devnet-scripts --lib
 
 ci-e2e-coverage:
 	@echo "Running E2E integration tests with coverage..."

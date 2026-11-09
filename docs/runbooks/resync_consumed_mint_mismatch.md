@@ -105,6 +105,23 @@ take every row of that source transaction out of reach:
 
 Resync stays blocked until engineering resolves the contradiction.
 
+## Confidential mints
+
+A resync decrypts confidential deposits with the instance key
+(`ESCROW_CONFIDENTIAL_KEYS`) only, so it requires every escrow account to be
+configured under that key. A mint poisoned by a deposit the instance key cannot read
+(a mint configured under a foreign key) is rebuilt poisoned: the row comes back with
+amount 0 and `confidential_undecrypted`, and is never minted. No channel mint pays it,
+so the consumed-set check accepts it and the resync completes; the mint stays held,
+as before. Follow the poisoned-mint section of
+[confidential_transfers.md](confidential_transfers.md#confidential_mint_poisoned).
+
+A refusal whose `<reason>` is `amount: channel X, row 0` on a confidential deposit
+means the channel credited a deposit the instance key cannot decrypt. That cannot
+come from `confidential-recover`, which refuses any mint not configured under the
+instance key: check that the resync runs with the same `ESCROW_CONFIDENTIAL_KEYS` as
+the live indexer, then [escalate](_escalation.md) (Tier 1).
+
 ## Related refusals: incomplete channel history
 
 Three more `ConsumedSetUnavailable` refusals mean the channel history the

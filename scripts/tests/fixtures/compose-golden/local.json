@@ -2,20 +2,23 @@
   "name": "private-channel",
   "networks": {
     "private-channel-network": {
+      "name": "private-channel_private-channel-network",
       "driver": "bridge",
-      "ipam": {},
-      "name": "private-channel_private-channel-network"
+      "ipam": {}
     }
   },
   "services": {
     "auth": {
+      "profiles": [
+        "auth"
+      ],
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/auth"
@@ -51,14 +54,14 @@
         "RUST_LOG": "info"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:8903/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "logging": {
@@ -74,30 +77,30 @@
       "ports": [
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 8903,
           "published": "8903",
-          "target": 8903
+          "protocol": "tcp"
         }
-      ],
-      "profiles": [
-        "auth"
       ],
       "restart": "unless-stopped",
       "ulimits": {
         "nofile": {
-          "hard": 65536,
-          "soft": 65536
+          "soft": 65536,
+          "hard": 65536
         }
       }
     },
     "auth-migrate": {
+      "profiles": [
+        "auth"
+      ],
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/auth-admin",
@@ -126,9 +129,6 @@
       "networks": {
         "private-channel-network": null
       },
-      "profiles": [
-        "auth"
-      ],
       "restart": "no"
     },
     "blackbox-exporter": {
@@ -136,14 +136,14 @@
       "container_name": "private-channel-blackbox-exporter",
       "entrypoint": null,
       "healthcheck": {
-        "interval": "30s",
-        "retries": 5,
-        "start_period": "10s",
         "test": [
           "CMD-SHELL",
           "wget --spider -q http://localhost:9115/-/healthy || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "30s",
+        "retries": 5,
+        "start_period": "10s"
       },
       "image": "prom/blackbox-exporter:v0.25.0",
       "logging": {
@@ -175,61 +175,61 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 8080,
           "published": "8080",
-          "target": 8080
+          "protocol": "tcp"
         }
       ],
       "privileged": true,
       "restart": "unless-stopped",
       "volumes": [
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "/",
           "target": "/rootfs",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "/var/run",
           "target": "/var/run",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "/sys",
           "target": "/sys",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "/var/lib/docker/",
           "target": "/var/lib/docker",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "/dev/disk/",
           "target": "/dev/disk",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "gateway": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/gateway"
@@ -268,14 +268,14 @@
         "RUST_LOG": "info"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:8899/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "logging": {
@@ -291,26 +291,26 @@
       "ports": [
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 8899,
           "published": "8899",
-          "target": 8899
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "ulimits": {
         "nofile": {
-          "hard": 65536,
-          "soft": 65536
+          "soft": 65536,
+          "hard": 65536
         }
       }
     },
     "grafana": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile.grafana",
         "args": {
           "GRAFANA_VERSION": "11.4.0"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile.grafana"
+        }
       },
       "command": null,
       "container_name": "private-channel-grafana",
@@ -327,14 +327,14 @@
         "PROMETHEUS_URL": "http://prometheus:9090"
       },
       "healthcheck": {
-        "interval": "30s",
-        "retries": 5,
-        "start_period": "20s",
         "test": [
           "CMD-SHELL",
           "wget --spider -q http://localhost:3000/api/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "30s",
+        "retries": 5,
+        "start_period": "20s"
       },
       "logging": {
         "driver": "json-file",
@@ -348,45 +348,45 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 3000,
           "published": "37429",
-          "target": 3000
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "grafana-data",
           "target": "/var/lib/grafana",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/monitoring/provisioning",
           "target": "/etc/grafana/provisioning",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/monitoring/dashboards",
           "target": "/var/lib/grafana/dashboards",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "indexer-private-channel": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/bin/sh",
@@ -405,9 +405,9 @@
         }
       },
       "deploy": {
-        "placement": {},
         "replicas": 1,
-        "resources": {}
+        "resources": {},
+        "placement": {}
       },
       "entrypoint": null,
       "environment": {
@@ -418,14 +418,14 @@
         "RUST_LOG": "info,private_channel_indexer=debug"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:9100/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "init": true,
@@ -442,22 +442,22 @@
       "restart": "unless-stopped",
       "volumes": [
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/indexer/config",
           "target": "/config",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "indexer-solana": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/bin/sh",
@@ -476,9 +476,9 @@
         }
       },
       "deploy": {
-        "placement": {},
         "replicas": 1,
-        "resources": {}
+        "resources": {},
+        "placement": {}
       },
       "entrypoint": null,
       "environment": {
@@ -487,19 +487,21 @@
         "COMMON_RPC_URL": "http://validator:8899",
         "COMMON_SOURCE_RPC_URL": "http://read-node:8901",
         "DATABASE_URL": "postgres://private_channel_indexer:@postgres-indexer:5432/indexer",
+        "ESCROW_CONFIDENTIAL_KEYS": "",
+        "ESCROW_CONFIDENTIAL_PUBKEY": "",
         "INDEXER_YELLOWSTONE_ENDPOINT": "http://validator:10000",
         "METRICS_PORT": "9100",
         "RUST_LOG": "info,private_channel_indexer=debug"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:9100/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "init": true,
@@ -516,22 +518,22 @@
       "restart": "unless-stopped",
       "volumes": [
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/indexer/config",
           "target": "/config",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "operator-private-channel": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/bin/sh",
@@ -555,6 +557,8 @@
         "COMMON_RPC_URL": "http://validator:8899",
         "COMMON_SOURCE_RPC_URL": "http://gateway:8904",
         "DATABASE_URL": "postgres://private_channel_indexer:@postgres-indexer:5432/indexer",
+        "ESCROW_CONFIDENTIAL_KEYS": "",
+        "ESCROW_CONFIDENTIAL_PUBKEY": "",
         "METRICS_PORT": "9103",
         "OPERATOR_PERMANENT_DELEGATE": "",
         "OPERATOR_PRIVATE_KEY": "GOLDENadminkey",
@@ -562,14 +566,14 @@
         "RUST_LOG": "info,private_channel_indexer=debug"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:9103/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "init": true,
@@ -585,32 +589,32 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 9103,
           "published": "9103",
-          "target": 9103
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/indexer/config",
           "target": "/config",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "operator-solana": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/bin/sh",
@@ -637,6 +641,8 @@
         "COMMON_RPC_URL": "http://gateway:8904",
         "COMMON_SOURCE_RPC_URL": "http://validator:8899",
         "DATABASE_URL": "postgres://private_channel_indexer:@postgres-indexer:5432/indexer",
+        "ESCROW_CONFIDENTIAL_KEYS": "",
+        "ESCROW_CONFIDENTIAL_PUBKEY": "",
         "METRICS_PORT": "9102",
         "OPERATOR_PERMANENT_DELEGATE": "",
         "OPERATOR_PRIVATE_KEY": "GOLDENadminkey",
@@ -645,14 +651,14 @@
         "RUST_LOG": "info,private_channel_indexer=debug"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:9102/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "init": true,
@@ -668,21 +674,21 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 9102,
           "published": "9102",
-          "target": 9102
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/indexer/config",
           "target": "/config",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
@@ -719,23 +725,23 @@
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "postgres-indexer-basebackups",
           "target": "/backups",
-          "type": "volume",
           "volume": {}
         },
         {
+          "type": "volume",
           "source": "postgres-indexer-wal-archive",
           "target": "/wal_archive",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/scripts/pg-backup.sh",
           "target": "/usr/local/bin/pg-backup.sh",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
@@ -772,23 +778,23 @@
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "postgres-primary-basebackups",
           "target": "/backups",
-          "type": "volume",
           "volume": {}
         },
         {
+          "type": "volume",
           "source": "postgres-primary-wal-archive",
           "target": "/wal_archive",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/scripts/pg-backup.sh",
           "target": "/usr/local/bin/pg-backup.sh",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
@@ -800,7 +806,7 @@
         "-c",
         "archive_mode=on",
         "-c",
-        "archive_command=cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f",
+        "archive_command=cp %p /wal_archive/%f.tmp \u0026\u0026 mv /wal_archive/%f.tmp /wal_archive/%f",
         "-c",
         "listen_addresses=*"
       ],
@@ -808,7 +814,7 @@
       "entrypoint": [
         "sh",
         "-c",
-        "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' >&2; exec docker-entrypoint.sh \"$$@\"",
+        "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' \u003e\u00262; exec docker-entrypoint.sh \"$$@\"",
         "--"
       ],
       "environment": {
@@ -818,13 +824,13 @@
         "POSTGRES_USER": "private_channel_indexer"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
         "test": [
           "CMD-SHELL",
           "pg_isready -U private_channel_indexer -d indexer"
         ],
-        "timeout": "5s"
+        "timeout": "5s",
+        "interval": "10s",
+        "retries": 5
       },
       "image": "postgres:16-alpine",
       "logging": {
@@ -839,40 +845,40 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 5432,
           "published": "5434",
-          "target": 5432
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "postgres-indexer-data",
           "target": "/var/lib/postgresql/data",
-          "type": "volume",
           "volume": {}
         },
         {
+          "type": "volume",
           "source": "postgres-indexer-wal-archive",
           "target": "/wal_archive",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/init-indexer-roles.sql",
           "target": "/docker-entrypoint-initdb.d/01-roles.sql",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/init-indexer-hba.sh",
           "target": "/docker-entrypoint-initdb.d/02-hba.sh",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
@@ -894,7 +900,7 @@
         "-c",
         "archive_mode=on",
         "-c",
-        "archive_command=cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f",
+        "archive_command=cp %p /wal_archive/%f.tmp \u0026\u0026 mv /wal_archive/%f.tmp /wal_archive/%f",
         "-c",
         "listen_addresses=*",
         "-c",
@@ -910,7 +916,7 @@
       "entrypoint": [
         "sh",
         "-c",
-        "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' >&2; exec docker-entrypoint.sh \"$$@\"",
+        "chown postgres:postgres /wal_archive || echo 'WARNING: could not chown /wal_archive' \u003e\u00262; exec docker-entrypoint.sh \"$$@\"",
         "--"
       ],
       "environment": {
@@ -929,13 +935,13 @@
         "POSTGRES_USER": "private_channel"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
         "test": [
           "CMD-SHELL",
           "pg_isready -U private_channel"
         ],
-        "timeout": "5s"
+        "timeout": "5s",
+        "interval": "10s",
+        "retries": 5
       },
       "image": "postgres:16-alpine",
       "logging": {
@@ -950,47 +956,47 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 5432,
           "published": "5432",
-          "target": 5432
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "postgres-primary-data",
           "target": "/var/lib/postgresql/data",
-          "type": "volume",
           "volume": {}
         },
         {
+          "type": "volume",
           "source": "postgres-primary-wal-archive",
           "target": "/wal_archive",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/init-primary.sql",
           "target": "/docker-entrypoint-initdb.d/01-init.sql",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/init-primary-hba.sh",
           "target": "/docker-entrypoint-initdb.d/02-hba.sh",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/init-auth-roles.sql",
           "target": "/docker-entrypoint-initdb.d/03-roles.sql",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
@@ -998,7 +1004,7 @@
       "command": [
         "bash",
         "-c",
-        "\n  until PGPASSWORD= psql -h postgres-primary -U private_channel -d private_channel -c 'SELECT 1' > /dev/null 2>&1; do\n    echo 'Waiting for primary to be ready...'\n    sleep 2\n  done\n\n  if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then\n    echo 'Setting up replica...'\n    rm -rf /var/lib/postgresql/data/*\n    # Slots are not in base backups, so a restored primary has none; recreate it.\n    PGPASSWORD= psql -h postgres-primary -U private_channel -d private_channel -c \"SELECT pg_create_physical_replication_slot('replica_slot', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot')\"\n    PGPASSWORD= pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U replicator -v -P -R -S replica_slot\n\n    chmod 700 /var/lib/postgresql/data\n    touch /var/lib/postgresql/data/standby.signal\n  fi\n\n  postgres\n"
+        "\n  until PGPASSWORD= psql -h postgres-primary -U private_channel -d private_channel -c 'SELECT 1' \u003e /dev/null 2\u003e\u00261; do\n    echo 'Waiting for primary to be ready...'\n    sleep 2\n  done\n\n  if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then\n    echo 'Setting up replica...'\n    rm -rf /var/lib/postgresql/data/*\n    # Slots are not in base backups, so a restored primary has none; recreate it.\n    PGPASSWORD= psql -h postgres-primary -U private_channel -d private_channel -c \"SELECT pg_create_physical_replication_slot('replica_slot', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot')\"\n    PGPASSWORD= pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U replicator -v -P -R -S replica_slot\n\n    chmod 700 /var/lib/postgresql/data\n    touch /var/lib/postgresql/data/standby.signal\n  fi\n\n  postgres\n"
       ],
       "container_name": "private-channel-postgres-replica",
       "depends_on": {
@@ -1020,13 +1026,13 @@
         "POSTGRES_USER": "private_channel"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
         "test": [
           "CMD-SHELL",
           "pg_isready -U private_channel"
         ],
-        "timeout": "5s"
+        "timeout": "5s",
+        "interval": "10s",
+        "retries": 5
       },
       "image": "postgres:16-alpine",
       "logging": {
@@ -1041,31 +1047,31 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 5432,
           "published": "5433",
-          "target": 5432
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "user": "postgres",
       "volumes": [
         {
+          "type": "volume",
           "source": "postgres-replica-data",
           "target": "/var/lib/postgresql/data",
-          "type": "volume",
           "volume": {}
         }
       ]
     },
     "prometheus": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile.prometheus",
         "args": {
           "PROMETHEUS_VERSION": "v3.0.1"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile.prometheus"
+        }
       },
       "command": null,
       "container_name": "private-channel-prometheus",
@@ -1079,14 +1085,14 @@
         "host.docker.internal=host-gateway"
       ],
       "healthcheck": {
-        "interval": "30s",
-        "retries": 5,
-        "start_period": "15s",
         "test": [
           "CMD-SHELL",
           "wget --spider -q http://localhost:9090/-/healthy || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "30s",
+        "retries": 5,
+        "start_period": "15s"
       },
       "logging": {
         "driver": "json-file",
@@ -1100,31 +1106,31 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 9090,
           "published": "9090",
-          "target": 9090
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "volumes": [
         {
+          "type": "volume",
           "source": "prometheus-data",
           "target": "/prometheus",
-          "type": "volume",
           "volume": {}
         }
       ]
     },
     "read-node": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/private-channel-node"
@@ -1155,14 +1161,14 @@
         "RUST_LOG": "info"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:8901/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "logging": {
@@ -1177,29 +1183,29 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 8901,
           "published": "8901",
-          "target": 8901
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "ulimits": {
         "nofile": {
-          "hard": 65536,
-          "soft": 65536
+          "soft": 65536,
+          "hard": 65536
         }
       }
     },
     "streamer": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/streamer"
@@ -1232,14 +1238,14 @@
         "8902"
       ],
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:8902/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "logging": {
@@ -1256,12 +1262,12 @@
     },
     "validator": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "validator.Dockerfile",
         "args": {
           "SOLANA_VERSION": "4.2.2",
           "YELLOWSTONE_TAG": "v15.2.1+solana.4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "validator.Dockerfile"
+        }
       },
       "command": [
         "solana-test-validator",
@@ -1287,9 +1293,9 @@
       ],
       "container_name": "private-channel-validator",
       "deploy": {
-        "placement": {},
         "replicas": 1,
-        "resources": {}
+        "resources": {},
+        "placement": {}
       },
       "entrypoint": null,
       "environment": {
@@ -1298,14 +1304,14 @@
         "WITHDRAW_PROGRAM_ID": "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "solana cluster-version || exit 1"
         ],
-        "timeout": "5s"
+        "timeout": "5s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "logging": {
         "driver": "json-file",
@@ -1324,27 +1330,27 @@
       "ports": [
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 8899,
           "published": "18899",
-          "target": 8899
+          "protocol": "tcp"
         },
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 8900,
           "published": "18900",
-          "target": 8900
+          "protocol": "tcp"
         },
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 10000,
           "published": "10000",
-          "target": 10000
+          "protocol": "tcp"
         },
         {
           "mode": "ingress",
-          "protocol": "tcp",
+          "target": 8999,
           "published": "18999",
-          "target": 8999
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
@@ -1353,35 +1359,35 @@
       ],
       "volumes": [
         {
+          "type": "volume",
           "source": "validator-data",
           "target": "/validator-data",
-          "type": "volume",
           "volume": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/yellowstone-config.json",
           "target": "/config/yellowstone-config.json",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         },
         {
-          "bind": {},
-          "read_only": true,
+          "type": "bind",
           "source": "REPO/target/deploy",
           "target": "/programs",
-          "type": "bind"
+          "read_only": true,
+          "bind": {}
         }
       ]
     },
     "write-node": {
       "build": {
+        "context": "REPO",
+        "dockerfile": "Dockerfile",
         "args": {
           "PNPM_VERSION": "10.15.1",
           "SOLANA_VERSION": "4.2.2"
-        },
-        "context": "REPO",
-        "dockerfile": "Dockerfile"
+        }
       },
       "command": [
         "/usr/local/bin/private-channel-node"
@@ -1416,14 +1422,14 @@
         "RUST_LOG": "info"
       },
       "healthcheck": {
-        "interval": "10s",
-        "retries": 5,
-        "start_period": "30s",
         "test": [
           "CMD-SHELL",
           "curl -fsS http://localhost:8900/health || exit 1"
         ],
-        "timeout": "3s"
+        "timeout": "3s",
+        "interval": "10s",
+        "retries": 5,
+        "start_period": "30s"
       },
       "image": "private-channel-app:latest",
       "logging": {
@@ -1438,18 +1444,18 @@
       },
       "ports": [
         {
-          "host_ip": "127.0.0.1",
           "mode": "ingress",
-          "protocol": "tcp",
+          "host_ip": "127.0.0.1",
+          "target": 8900,
           "published": "8900",
-          "target": 8900
+          "protocol": "tcp"
         }
       ],
       "restart": "unless-stopped",
       "ulimits": {
         "nofile": {
-          "hard": 65536,
-          "soft": 65536
+          "soft": 65536,
+          "hard": 65536
         }
       }
     }

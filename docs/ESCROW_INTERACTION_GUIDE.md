@@ -35,7 +35,8 @@ pnpm add private-channel-escrow-program @solana/kit
 8. [Whitelist](#whitelist) - Restrict who can deposit and who can withdraw (AddOrUpdateAllowedWallet, RemoveAllowedWallet, SetWhitelistEnabled)
 9. [Channel Seize Authority](#channel-seize-authority) - The permanent delegate on channel mints, the compliance wallet, and rotating the delegate
 10. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
-11. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
+11. [Confidential deposits](#confidential-deposits) - Deposit a hidden amount, and the admin setup it needs
+12. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
 ## CreateInstance
 
@@ -139,6 +140,8 @@ The escrow program rejects no extension on-chain. Several mint authorities and T
 | `PausableConfig` (Token-2022) | The pause authority can pause the mint, halting all transfers; while paused, `ReleaseFunds` fails and withdrawals for that mint cannot settle until it is unpaused. The operator checks pause state in the withdrawal preflight, but cannot prevent or override a pause. | Only whitelist if you trust the pause authority; treat the off-chain check as detection, not a mitigation. |
 | `TransferHook` (Token-2022) | The hook program runs inside every deposit and release and can revert either, halting transfers for that mint until its authority relents. The hook authority can also swap the hook program, or grow the `ExtraAccountMetaList` past what fits a transfer; neither diverts funds. A list that no longer parses or fits parks withdrawals under `hook_unresolvable`; a swapped hook that rejects the release reverts it, and the burn is reminted. Forwarded hook accounts never carry a signer bit, so a hook cannot sign for an account that signed the transaction; a mint that genuinely requires a signer extra is untransferable here. | Only whitelist mints whose hook program you have reviewed and whose hook authority you trust. The extension set is pinned at `AllowMint`, so a recreate that adds or drops `TransferHook` stops deposits — but the hook *program id* is not, so a swap to a different hook leaves the profile identical. |
 | `TransferFeeConfig` (Token-2022) | The escrow is never short: both legs account by measured balance delta, so a deposit credits the channel net of the fee. On withdrawal the fee falls on the **user** — the escrow is debited the full release amount and the user's ATA receives it minus the fee, while the channel balance burned is the gross amount. The fee authority can raise the fee after users deposit, and neither the program nor the preflight caps it. | Only whitelist if you trust the fee authority not to raise the fee, and disclose to users that withdrawals settle net of the mint's transfer fee. |
+| `ConfidentialTransferMint` (Token-2022) | The mint's auditor, if the issuer sets one, can decrypt every confidential deposit and release amount. On a mint that requires approval, the issuer's confidential authority decides whether the escrow account can take confidential transfers at all. A destination that turns off public credits refuses a public release, which the preflight parks. Confidential transfers are off for the escrow until `ConfigureConfidentialAccount`, see [the program reference](ESCROW_PROGRAM.md#configureconfidentialaccount). | Whitelisting the mint for public deposits needs nothing more. Configure confidential transfers only once the indexer supports them, and only if the auditor setup is acceptable. |
+| `ConfidentialMintBurn` (Token-2022) | The mint has no public balance: Token-2022 refuses its public mint and burn and its moves between public and confidential, so only confidential deposits and withdrawals work and the channel refuses public withdrawals (`ConfidentialOnlyMint`). There is no public fallback: a confidential release blocked for good, by a hook that refuses `u64::MAX` or a destination never configured, can only be reminted. With such a hook, no withdrawal of the mint can ever be paid. | Only whitelist with no hook, or a hook you have checked accepts `u64::MAX`. Run the per-mint ceremony in the [confidential runbook](runbooks/confidential_transfers.md#setup-ceremony), including the treasury's confidential account. |
 
 In every case the safe posture is the same: only whitelist mints whose close/freeze/delegate authorities are disabled or held by a party you trust, since the protocol cannot retain custody once an external authority can act on the escrow ATA.
 
@@ -395,6 +398,18 @@ const depositIx = await getDepositInstructionAsync({
 **Use Case**: Third-party deposits (e.g., CEX depositing on behalf of end users OR user's depositing to CEX managed-wallet)
 
 Check out the [Architecture Overview](./ARCHITECTURE.md) for more details on how deposits are processed on Solana Private Channels.
+
+## Confidential deposits
+
+On a Token-2022 mint with confidential transfers, a deposit can hide its amount on Solana. The channel still mints it publicly, net of any transfer fee.
+
+**Admin setup, once.** Generate the instance keys (`confidential_keygen`), set them as `ESCROW_CONFIDENTIAL_KEYS` and the printed pubkey as `ESCROW_CONFIDENTIAL_PUBKEY` for `indexer-solana` and both operators and restart them, then per mint: `BlockMint` its deposits, run `ConfigureConfidentialAccount` (`configure_confidential`), confirm the indexer logged the instance's ElGamal key for the mint, and `AllowMint` again. The keys can never be rotated once an account is configured, and losing them strands the confidential balance. Details: [confidential_transfers.md](runbooks/confidential_transfers.md#setup-ceremony).
+
+**User side.** The user needs a Token-2022 account for the mint configured for confidential transfers under their own keys, with enough in its available balance. They build the transfer proofs against the escrow account's ElGamal key (read it from the escrow account's `ConfidentialTransferAccount`), the mint's auditor key and, on fee mints, the current fee, and send `ConfidentialDeposit` with the proofs either inline after it in one v1 transaction, or in context accounts verified earlier (offset 0). Account order, proof order and the fields are in [ESCROW_PROGRAM.md](ESCROW_PROGRAM.md#confidentialdeposit). Whitelisting and the recipient work as for `Deposit`; there is no minimum deposit, since the amount is hidden.
+
+`scripts/devnet/src/bin/confidential_deposit.rs` does all of it from the command line: it configures the user's account if needed, moves public tokens into the confidential balance when short, applies, and sends the deposit with inline proofs. It does not support transfer-hook mints.
+
+A confidential deposit made with proofs built for a different escrow key fails on-chain; one indexed under a key the indexer does not hold poisons the mint until an operator recovers it, so no deposit is ever lost, only delayed.
 
 ## PDA Reference
 

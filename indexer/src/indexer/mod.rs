@@ -1,6 +1,7 @@
 #[cfg(feature = "datasource-rpc")]
 pub mod backfill;
 pub mod checkpoint;
+pub mod confidential;
 pub mod datasource;
 #[allow(clippy::module_inception)]
 pub mod indexer;
