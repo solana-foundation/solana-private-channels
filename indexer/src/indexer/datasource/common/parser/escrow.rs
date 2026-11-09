@@ -20,6 +20,12 @@ const BLOCK_MINT: u8 = 2;
 pub(crate) const DEPOSIT: u8 = 6;
 pub(crate) const RELEASE_FUNDS: u8 = 7;
 const ROTATE_BITMAP: u8 = 8;
+pub(crate) const CONFIGURE_CONFIDENTIAL_ACCOUNT: u8 = 12;
+pub(crate) const CONFIDENTIAL_DEPOSIT: u8 = 13;
+pub(crate) const CONFIDENTIAL_RELEASE_FUNDS: u8 = 14;
+pub(crate) const APPLY_PENDING_BALANCE: u8 = 15;
+pub(crate) const MOVE_TO_CONFIDENTIAL: u8 = 16;
+pub(crate) const MOVE_TO_PUBLIC: u8 = 17;
 
 // Only the post-bitmap layouts are decoded. A pre-bitmap release can only name
 // the instance this design abandons, and every escrow instruction whose instance
@@ -31,6 +37,14 @@ const BLOCK_MINT_ACCOUNTS: usize = 7;
 // indexer must read means parsing both layouts, as BlockMint does, not raising this.
 const RELEASE_FUNDS_MIN_ACCOUNTS: usize = 13;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
+// Fixed accounts of the confidential instructions; trailing proof and hook accounts are ignored.
+const CONFIGURE_CONFIDENTIAL_ACCOUNTS: usize = 11;
+const CONFIDENTIAL_DEPOSIT_ACCOUNTS: usize = 13;
+const CONFIDENTIAL_RELEASE_ACCOUNTS: usize = 16;
+const CONFIDENTIAL_OPERATOR_ACCOUNTS: usize = 9;
+const MOVE_TO_PUBLIC_ACCOUNTS: usize = 10;
+// ConfidentialReleaseFunds data starts with user (32), nonce (8) and withdrawer (32).
+const CONFIDENTIAL_RELEASE_FIXED_DATA: usize = 72;
 
 // BlockMint before the gates: no args, and a system_program at index 5. Removing
 // it pulled event_authority and the program id back one slot, so reading a legacy
@@ -47,6 +61,9 @@ const EVENT_DISCRIMINATOR_INDEX: usize = 8;
 const ALLOW_MINT_EVENT_MINT_INDEX: usize = 41;
 // AllowMintEvent: tag(8)+disc(1)+instance_seed(32)+mint(32) = 73
 const EVENT_DECIMALS_INDEX: usize = 73;
+// AllowMintEvent: decimals(73)+1, then withdraw_fee, min_withdraw_amount and
+// min_deposit_amount (8 each) = 98. Events from before the flag end here.
+const ALLOW_MINT_EVENT_CONFIDENTIAL_ONLY_INDEX: usize = 98;
 // DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
 // (same offset, different event)
 const EVENT_AMOUNT_INDEX: usize = 73;
@@ -89,6 +106,188 @@ pub enum EscrowInstruction {
     RotateBitmap {
         accounts: RotateBitmapAccounts,
     },
+    /// Any of the six confidential instructions, with the event it emitted.
+    Confidential {
+        accounts: ConfidentialAccounts,
+        /// Set only for ConfidentialReleaseFunds.
+        release: Option<ConfidentialReleaseData>,
+        event: ConfidentialEvent,
+    },
+}
+
+/// The accounts every confidential instruction has. `signer` is the admin, the
+/// depositing user or the operator, by instruction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidentialAccounts {
+    pub signer: Pubkey,
+    pub instance: Pubkey,
+    pub mint: Pubkey,
+    pub instance_ata: Pubkey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidentialReleaseData {
+    pub user: Pubkey,
+    pub transaction_nonce: u64,
+    pub withdrawer: Pubkey,
+}
+
+/// A decoded confidential event. `raw` is the whole event as emitted, kept so an
+/// undecryptable deposit can be re-decrypted later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidentialEvent {
+    pub instance_seed: Pubkey,
+    pub mint: Pubkey,
+    pub body: ConfidentialEventBody,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfidentialEventBody {
+    Configure {
+        elgamal_pubkey: [u8; 32],
+    },
+    Deposit {
+        user: Pubkey,
+        recipient: Pubkey,
+    },
+    Release {
+        operator: Pubkey,
+        user: Pubkey,
+    },
+    Apply {
+        operator: Pubkey,
+        applied_credit_counter: u64,
+    },
+    MoveToConfidential {
+        operator: Pubkey,
+        amount: u64,
+    },
+    MoveToPublic {
+        operator: Pubkey,
+        amount: u64,
+    },
+}
+
+pub type Ciphertext = [u8; 64];
+
+// Byte offsets inside the events: tag (8) + discriminator (1), then 32-byte keys.
+const EVENT_BODY: usize = 9;
+const CONFIGURE_EVENT_LEN: usize = 105;
+const CONFIDENTIAL_DEPOSIT_EVENT_LEN: usize = 401;
+const CONFIDENTIAL_RELEASE_EVENT_LEN: usize = 265;
+const APPLY_EVENT_LEN: usize = 241;
+const MOVE_EVENT_LEN: usize = 113;
+
+impl ConfidentialEvent {
+    fn ciphertext_at(&self, offset: usize) -> Ciphertext {
+        self.raw[offset..offset + 64]
+            .try_into()
+            .expect("length checked at decode")
+    }
+
+    /// Pending lo and hi before, then after, for a deposit event.
+    pub fn deposit_ciphertexts(&self) -> Option<[Ciphertext; 4]> {
+        matches!(self.body, ConfidentialEventBody::Deposit { .. }).then(|| {
+            let base = EVENT_BODY + 4 * 32;
+            [0, 1, 2, 3].map(|i| self.ciphertext_at(base + i * 64))
+        })
+    }
+
+    /// Amount lo and hi for a release event.
+    pub fn release_ciphertexts(&self) -> Option<[Ciphertext; 2]> {
+        matches!(self.body, ConfidentialEventBody::Release { .. }).then(|| {
+            let base = EVENT_BODY + 4 * 32;
+            [0, 1].map(|i| self.ciphertext_at(base + i * 64))
+        })
+    }
+}
+
+/// Decode a confidential event emitted for instruction `discriminator`. Event and
+/// instruction discriminators are the same number for these six.
+pub fn decode_confidential_event(discriminator: u8, data: &[u8]) -> Option<ConfidentialEvent> {
+    let expected_len = match discriminator {
+        CONFIGURE_CONFIDENTIAL_ACCOUNT => CONFIGURE_EVENT_LEN,
+        CONFIDENTIAL_DEPOSIT => CONFIDENTIAL_DEPOSIT_EVENT_LEN,
+        CONFIDENTIAL_RELEASE_FUNDS => CONFIDENTIAL_RELEASE_EVENT_LEN,
+        APPLY_PENDING_BALANCE => APPLY_EVENT_LEN,
+        MOVE_TO_CONFIDENTIAL | MOVE_TO_PUBLIC => MOVE_EVENT_LEN,
+        _ => return None,
+    };
+    if data.len() != expected_len
+        || !data.starts_with(EVENT_IX_TAG_LE)
+        || data[EVENT_DISCRIMINATOR_INDEX] != discriminator
+    {
+        return None;
+    }
+    let key = |n: usize| {
+        let start = EVENT_BODY + n * 32;
+        Pubkey::try_from(&data[start..start + 32]).ok()
+    };
+    let u64_at = |n: usize| {
+        let start = EVENT_BODY + n * 32;
+        data[start..start + 8]
+            .try_into()
+            .ok()
+            .map(u64::from_le_bytes)
+    };
+    let instance_seed = key(0)?;
+    let (mint, body) = match discriminator {
+        CONFIGURE_CONFIDENTIAL_ACCOUNT => (
+            key(1)?,
+            ConfidentialEventBody::Configure {
+                elgamal_pubkey: key(2)?.to_bytes(),
+            },
+        ),
+        CONFIDENTIAL_DEPOSIT => (
+            key(3)?,
+            ConfidentialEventBody::Deposit {
+                user: key(1)?,
+                recipient: key(2)?,
+            },
+        ),
+        CONFIDENTIAL_RELEASE_FUNDS => (
+            key(3)?,
+            ConfidentialEventBody::Release {
+                operator: key(1)?,
+                user: key(2)?,
+            },
+        ),
+        APPLY_PENDING_BALANCE => {
+            let counter_at = EVENT_BODY + 3 * 32 + 2 * 64;
+            let counter = data[counter_at..counter_at + 8]
+                .try_into()
+                .ok()
+                .map(u64::from_le_bytes)?;
+            (
+                key(2)?,
+                ConfidentialEventBody::Apply {
+                    operator: key(1)?,
+                    applied_credit_counter: counter,
+                },
+            )
+        }
+        MOVE_TO_CONFIDENTIAL => (
+            key(2)?,
+            ConfidentialEventBody::MoveToConfidential {
+                operator: key(1)?,
+                amount: u64_at(3)?,
+            },
+        ),
+        _ => (
+            key(2)?,
+            ConfidentialEventBody::MoveToPublic {
+                operator: key(1)?,
+                amount: u64_at(3)?,
+            },
+        ),
+    };
+    Some(ConfidentialEvent {
+        instance_seed,
+        mint,
+        body,
+        raw: data.to_vec(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +448,8 @@ impl ReleaseFundsData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintEvent {
     pub decimals: u8,
+    /// The mint has ConfidentialMintBurn; false on an event from before the flag.
+    pub confidential_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -264,10 +465,20 @@ pub struct DepositEvent {
 /// `CreateInstance`/`AllowMint`/`BlockMint` (a foreign CPI of them is
 /// implausible). Only the user-initiated `Deposit` is indexed via CPI. Kept next
 /// to the discriminator constants as the one source of truth both decoders share.
+/// Of the confidential instructions only the configure (admins may use a multisig) and
+/// the user deposit are indexed as CPI; the operator-gated ones are excluded.
 pub fn escrow_inner_discriminator_excluded(discriminator: u8) -> bool {
     matches!(
         discriminator,
-        CREATE_INSTANCE | ALLOW_MINT | BLOCK_MINT | RELEASE_FUNDS | ROTATE_BITMAP
+        CREATE_INSTANCE
+            | ALLOW_MINT
+            | BLOCK_MINT
+            | RELEASE_FUNDS
+            | ROTATE_BITMAP
+            | CONFIDENTIAL_RELEASE_FUNDS
+            | APPLY_PENDING_BALANCE
+            | MOVE_TO_CONFIDENTIAL
+            | MOVE_TO_PUBLIC
     )
 }
 
@@ -280,6 +491,7 @@ pub fn escrow_instance_of(ix: &EscrowInstruction) -> Pubkey {
         EscrowInstruction::Deposit { accounts, .. } => accounts.instance,
         EscrowInstruction::ReleaseFunds { accounts, .. } => accounts.instance,
         EscrowInstruction::RotateBitmap { accounts, .. } => accounts.instance,
+        EscrowInstruction::Confidential { accounts, .. } => accounts.instance,
     }
 }
 
@@ -319,6 +531,19 @@ pub fn parse_escrow_instruction(
         ),
         RELEASE_FUNDS => parse_release_funds(ix_data, instruction, account_keys),
         ROTATE_BITMAP => parse_rotate_bitmap(instruction, account_keys),
+        CONFIGURE_CONFIDENTIAL_ACCOUNT
+        | CONFIDENTIAL_DEPOSIT
+        | CONFIDENTIAL_RELEASE_FUNDS
+        | APPLY_PENDING_BALANCE
+        | MOVE_TO_CONFIDENTIAL
+        | MOVE_TO_PUBLIC => parse_confidential(
+            discriminator,
+            ix_data,
+            instruction,
+            account_keys,
+            inner_instructions,
+            location,
+        ),
         _ => Ok(None), // Unsupported instruction type
     }
 }
@@ -402,12 +627,12 @@ fn check_event_matches_deposit(
     }
 }
 
-/// Decode an inner instruction and return its decimals only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the decimals.
-fn allow_mint_event_decimals(
+/// Decode an inner instruction and return its event only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the values.
+fn allow_mint_event(
     inner: &InnerInstruction,
     account_keys: &[Pubkey],
     mint: &Pubkey,
-) -> Option<u8> {
+) -> Option<AllowMintEvent> {
     let program_id = account_keys.get(inner.instruction.program_id_index as usize)?;
     if program_id.to_string() != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
         return None;
@@ -418,7 +643,10 @@ fn allow_mint_event_decimals(
         && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
         && event_data[ALLOW_MINT_EVENT_MINT_INDEX..EVENT_DECIMALS_INDEX] == *mint.as_ref()
     {
-        Some(event_data[EVENT_DECIMALS_INDEX])
+        Some(AllowMintEvent {
+            decimals: event_data[EVENT_DECIMALS_INDEX],
+            confidential_only: event_data.get(ALLOW_MINT_EVENT_CONFIDENTIAL_ONLY_INDEX) == Some(&1),
+        })
     } else {
         None
     }
@@ -494,20 +722,20 @@ fn parse_allow_mint(
 
     // AllowMint is only indexed top-level (see `escrow_inner_discriminator_excluded`),
     // so the inner set at its own index is its whole subtree.
-    let decimals = inner_instructions
+    let event = inner_instructions
         .iter()
         .find(|set| set.index as u32 == location.top_level_index)
         .and_then(|set| {
             set.instructions
                 .iter()
-                .find_map(|inner| allow_mint_event_decimals(inner, account_keys, &accounts.mint))
+                .find_map(|inner| allow_mint_event(inner, account_keys, &accounts.mint))
         });
 
-    match decimals {
-        Some(decimals) => Ok(Some(EscrowInstruction::AllowMint {
+    match event {
+        Some(event) => Ok(Some(EscrowInstruction::AllowMint {
             accounts,
             data: ix_data,
-            event: AllowMintEvent { decimals },
+            event,
         })),
         None => Err(ParserError::InstructionParseFailed {
             reason: "No allow mint event found".to_string(),
@@ -753,6 +981,145 @@ fn parse_rotate_bitmap(
     Ok(Some(EscrowInstruction::RotateBitmap { accounts }))
 }
 
+fn confidential_error(reason: String) -> ParserError {
+    ParserError::InstructionParseFailed { reason }
+}
+
+/// The raw bytes of the escrow event a confidential instruction emitted, read from its own
+/// subtree the same way `parse_deposit` scopes a DepositEvent.
+fn scoped_confidential_event(
+    discriminator: u8,
+    account_keys: &[Pubkey],
+    inner_instructions: &[InnerInstructions],
+    location: InstructionLocation,
+) -> Result<Option<ConfidentialEvent>, ParserError> {
+    let decode = |inner: &InnerInstruction| {
+        if !is_escrow_program(inner, account_keys) {
+            return None;
+        }
+        let data = bs58::decode(&inner.instruction.data).into_vec().ok()?;
+        decode_confidential_event(discriminator, &data)
+    };
+    let Some(set) = inner_instructions
+        .iter()
+        .find(|set| set.index as u32 == location.top_level_index)
+    else {
+        return Ok(None);
+    };
+    Ok(match location.inner {
+        None => set.instructions.iter().find_map(decode),
+        Some(inner_loc) => {
+            let start = inner_loc.inner_index as usize + 1;
+            match inner_loc.stack_height {
+                Some(own_height) => set
+                    .instructions
+                    .iter()
+                    .skip(start)
+                    .take_while(|inner| inner.stack_height.is_some_and(|h| h > own_height))
+                    .find_map(decode),
+                // No depth: the first escrow entry after it must be its event, as for Deposit.
+                None => set
+                    .instructions
+                    .iter()
+                    .skip(start)
+                    .find(|inner| is_escrow_program(inner, account_keys))
+                    .and_then(decode),
+            }
+        }
+    })
+}
+
+/// Parse one of the six confidential instructions and its event. The event must name the
+/// instruction's own instance and mint; anything else fails the slot.
+fn parse_confidential(
+    discriminator: u8,
+    data: &[u8],
+    instruction: &CompiledInstruction,
+    account_keys: &[Pubkey],
+    inner_instructions: &[InnerInstructions],
+    location: InstructionLocation,
+) -> Result<Option<EscrowInstruction>, ParserError> {
+    // (fixed accounts, signer, instance, mint, instance_ata) positions per instruction.
+    let (required, signer, instance, mint, instance_ata) = match discriminator {
+        CONFIGURE_CONFIDENTIAL_ACCOUNT => (CONFIGURE_CONFIDENTIAL_ACCOUNTS, 1, 2, 3, 5),
+        CONFIDENTIAL_DEPOSIT => (CONFIDENTIAL_DEPOSIT_ACCOUNTS, 1, 2, 3, 6),
+        CONFIDENTIAL_RELEASE_FUNDS => (CONFIDENTIAL_RELEASE_ACCOUNTS, 1, 2, 5, 8),
+        MOVE_TO_PUBLIC => (MOVE_TO_PUBLIC_ACCOUNTS, 1, 2, 4, 5),
+        _ => (CONFIDENTIAL_OPERATOR_ACCOUNTS, 1, 2, 4, 5),
+    };
+    if instruction.accounts.len() < required {
+        return Err(AccountError::InsufficientAccounts {
+            required,
+            actual: instruction.accounts.len(),
+        }
+        .into());
+    }
+    let accounts = ConfidentialAccounts {
+        signer: resolve_account(instruction, account_keys, signer)?,
+        instance: resolve_account(instruction, account_keys, instance)?,
+        mint: resolve_account(instruction, account_keys, mint)?,
+        instance_ata: resolve_account(instruction, account_keys, instance_ata)?,
+    };
+
+    let release = if discriminator == CONFIDENTIAL_RELEASE_FUNDS {
+        if data.len() < CONFIDENTIAL_RELEASE_FIXED_DATA {
+            return Err(confidential_error(format!(
+                "ConfidentialReleaseFunds data too short: {} < {CONFIDENTIAL_RELEASE_FIXED_DATA}",
+                data.len()
+            )));
+        }
+        let key = |start: usize| {
+            Pubkey::try_from(&data[start..start + 32]).map_err(|e| ParserError::InvalidPubkey {
+                reason: e.to_string(),
+            })
+        };
+        Some(ConfidentialReleaseData {
+            user: key(0)?,
+            transaction_nonce: u64::from_le_bytes(data[32..40].try_into().expect("8 bytes")),
+            withdrawer: key(40)?,
+        })
+    } else {
+        None
+    };
+
+    let event =
+        scoped_confidential_event(discriminator, account_keys, inner_instructions, location)?
+            .ok_or_else(|| {
+                confidential_error(format!(
+                    "No confidential event {discriminator} found for its instruction"
+                ))
+            })?;
+
+    let mismatched = if find_instance_pda(&event.instance_seed) != accounts.instance {
+        Some("instance")
+    } else if event.mint != accounts.mint {
+        Some("mint")
+    } else {
+        match (&event.body, &release) {
+            (ConfidentialEventBody::Deposit { user, .. }, _) if *user != accounts.signer => {
+                Some("user")
+            }
+            (ConfidentialEventBody::Release { user, .. }, Some(release))
+                if *user != release.user =>
+            {
+                Some("user")
+            }
+            _ => None,
+        }
+    };
+    if let Some(field) = mismatched {
+        return Err(confidential_error(format!(
+            "confidential event {discriminator} {field} does not match its instruction"
+        )));
+    }
+
+    Ok(Some(EscrowInstruction::Confidential {
+        accounts,
+        release,
+        event,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,13 +1315,59 @@ mod tests {
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert!(parsed.is_some());
-        if let Some(EscrowInstruction::AllowMint { data, .. }) = parsed {
+        if let Some(EscrowInstruction::AllowMint { data, event, .. }) = parsed {
             assert_eq!(data.bump, 123);
             assert_eq!(data.withdraw_fee, ALLOW_MINT_WITHDRAW_FEE);
             assert_eq!(data.min_withdraw_amount, ALLOW_MINT_MIN_WITHDRAW_AMOUNT);
+            assert!(
+                !event.confidential_only,
+                "an event without the flag byte reads false"
+            );
         } else {
             panic!("Expected AllowMint instruction");
         }
+    }
+
+    /// The flag is the event's last byte, after the AllowMint values.
+    #[test]
+    fn allow_mint_event_reads_the_confidential_only_flag() {
+        let borsh_data = create_allow_mint_borsh_data();
+        let instruction = create_instruction_with_accounts(11, "dummy".to_string());
+        let account_keys = create_n_account_keys(11);
+        let mut event = vec![];
+        event.extend_from_slice(EVENT_IX_TAG_LE);
+        event.push(ALLOW_MINT_EVENT_DISCRIMINATOR);
+        event.extend_from_slice(&[0u8; 32]); // instance_seed
+        event.extend_from_slice(account_keys[3].as_ref());
+        event.push(2); // decimals
+        event.extend_from_slice(&[0u8; 24]); // withdraw fee and both minimums
+        event.push(1); // confidential_only
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![InnerInstruction {
+                instruction: CompiledInstruction {
+                    program_id_index: ESCROW_PROGRAM_KEY_INDEX,
+                    accounts: vec![],
+                    data: bs58::encode(&event).into_string(),
+                },
+                stack_height: Some(2),
+            }],
+        }];
+
+        let parsed = parse_allow_mint(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap();
+
+        let Some(EscrowInstruction::AllowMint { event, .. }) = parsed else {
+            panic!("Expected AllowMint instruction");
+        };
+        assert_eq!(event.decimals, 2);
+        assert!(event.confidential_only);
     }
 
     #[test]
@@ -2010,5 +2423,339 @@ mod tests {
             err.contains("No deposit event found"),
             "foreign-program event lookalike must be ignored: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod confidential_tests {
+    use super::*;
+    use private_channel_confidential::test_support as cts;
+    use std::str::FromStr;
+
+    const ESCROW_KEY_INDEX: u8 = 20;
+    const FOREIGN_KEY_INDEX: u8 = 19;
+    const NONCE: u64 = 4242;
+
+    fn seed() -> Pubkey {
+        Pubkey::new_from_array([9; 32])
+    }
+
+    fn user() -> Pubkey {
+        Pubkey::new_from_array([7; 32])
+    }
+
+    /// Account keys with the instance PDA of `seed()` at index 2 and the escrow program at 20.
+    fn account_keys() -> Vec<Pubkey> {
+        let mut keys: Vec<Pubkey> = (0..=ESCROW_KEY_INDEX)
+            .map(|i| Pubkey::new_from_array([i + 100; 32]))
+            .collect();
+        keys[2] = find_instance_pda(&seed());
+        keys[1] = user();
+        keys[ESCROW_KEY_INDEX as usize] =
+            Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
+        keys
+    }
+
+    fn mint_index(discriminator: u8) -> usize {
+        match discriminator {
+            CONFIGURE_CONFIDENTIAL_ACCOUNT | CONFIDENTIAL_DEPOSIT => 3,
+            CONFIDENTIAL_RELEASE_FUNDS => 5,
+            _ => 4,
+        }
+    }
+
+    fn account_count(discriminator: u8) -> usize {
+        match discriminator {
+            CONFIGURE_CONFIDENTIAL_ACCOUNT => 11,
+            CONFIDENTIAL_DEPOSIT => 13,
+            CONFIDENTIAL_RELEASE_FUNDS => 16,
+            MOVE_TO_PUBLIC => 10,
+            _ => 9,
+        }
+    }
+
+    const ALL: [u8; 6] = [
+        CONFIGURE_CONFIDENTIAL_ACCOUNT,
+        CONFIDENTIAL_DEPOSIT,
+        CONFIDENTIAL_RELEASE_FUNDS,
+        APPLY_PENDING_BALANCE,
+        MOVE_TO_CONFIDENTIAL,
+        MOVE_TO_PUBLIC,
+    ];
+
+    /// A well-formed event for `discriminator` naming `seed`, the fixture mint and `user()`.
+    fn event_bytes(discriminator: u8, seed: Pubkey) -> Vec<u8> {
+        let keys = account_keys();
+        let s = seed.to_bytes();
+        let mint = keys[mint_index(discriminator)].to_bytes();
+        let u = user().to_bytes();
+        let op = [5u8; 32];
+        let c = cts::encrypt(&cts::keys(), 1);
+        match discriminator {
+            CONFIGURE_CONFIDENTIAL_ACCOUNT => cts::configure_event(s, mint, cts::keys().pubkey()),
+            CONFIDENTIAL_DEPOSIT => cts::deposit_event(s, u, [8; 32], mint, &c, &c, &c, &c),
+            CONFIDENTIAL_RELEASE_FUNDS => cts::release_event(s, op, u, mint, &c, &c),
+            APPLY_PENDING_BALANCE => cts::apply_event(s, op, mint, &c, &c, 3),
+            MOVE_TO_CONFIDENTIAL => cts::move_to_confidential_event(s, op, mint, 500),
+            _ => cts::move_to_public_event(s, op, mint, 600),
+        }
+    }
+
+    fn ix_data(discriminator: u8) -> Vec<u8> {
+        let mut data = vec![discriminator];
+        if discriminator == CONFIDENTIAL_RELEASE_FUNDS {
+            data.extend_from_slice(user().as_ref());
+            data.extend_from_slice(&NONCE.to_le_bytes());
+            data.extend_from_slice(&[6u8; 32]);
+        }
+        data.extend_from_slice(&[0u8; 170]);
+        data
+    }
+
+    fn instruction(discriminator: u8, accounts: usize) -> CompiledInstruction {
+        CompiledInstruction {
+            program_id_index: ESCROW_KEY_INDEX,
+            accounts: (0..accounts as u8).collect(),
+            data: bs58::encode(ix_data(discriminator)).into_string(),
+        }
+    }
+
+    fn event_inner(program_index: u8, event: &[u8], stack_height: Option<u32>) -> InnerInstruction {
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: program_index,
+                accounts: vec![],
+                data: bs58::encode(event).into_string(),
+            },
+            stack_height,
+        }
+    }
+
+    fn top_level() -> InstructionLocation {
+        InstructionLocation {
+            top_level_index: 0,
+            inner: None,
+        }
+    }
+
+    fn parse_top_level(
+        discriminator: u8,
+        program_index: u8,
+        event: &[u8],
+    ) -> Result<Option<EscrowInstruction>, ParserError> {
+        let inner = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![event_inner(program_index, event, Some(2))],
+        }];
+        parse_escrow_instruction(
+            &instruction(discriminator, account_count(discriminator)),
+            &account_keys(),
+            &inner,
+            top_level(),
+        )
+    }
+
+    #[test]
+    fn each_confidential_instruction_decodes_with_its_event() {
+        for discriminator in ALL {
+            let event = event_bytes(discriminator, seed());
+            let parsed = parse_top_level(discriminator, ESCROW_KEY_INDEX, &event)
+                .unwrap_or_else(|e| panic!("{discriminator}: {e}"))
+                .unwrap();
+            let EscrowInstruction::Confidential {
+                accounts,
+                release,
+                event: decoded,
+            } = parsed
+            else {
+                panic!("{discriminator} did not decode as confidential");
+            };
+            assert_eq!(accounts.instance, find_instance_pda(&seed()));
+            assert_eq!(accounts.mint, account_keys()[mint_index(discriminator)]);
+            assert_eq!(decoded.raw, event);
+            assert_eq!(decoded.instance_seed, seed());
+            assert_eq!(decoded.mint, accounts.mint);
+            let expected = match discriminator {
+                CONFIGURE_CONFIDENTIAL_ACCOUNT => ConfidentialEventBody::Configure {
+                    elgamal_pubkey: cts::keys().pubkey(),
+                },
+                CONFIDENTIAL_DEPOSIT => ConfidentialEventBody::Deposit {
+                    user: user(),
+                    recipient: Pubkey::new_from_array([8; 32]),
+                },
+                CONFIDENTIAL_RELEASE_FUNDS => ConfidentialEventBody::Release {
+                    operator: Pubkey::new_from_array([5; 32]),
+                    user: user(),
+                },
+                APPLY_PENDING_BALANCE => ConfidentialEventBody::Apply {
+                    operator: Pubkey::new_from_array([5; 32]),
+                    applied_credit_counter: 3,
+                },
+                MOVE_TO_CONFIDENTIAL => ConfidentialEventBody::MoveToConfidential {
+                    operator: Pubkey::new_from_array([5; 32]),
+                    amount: 500,
+                },
+                _ => ConfidentialEventBody::MoveToPublic {
+                    operator: Pubkey::new_from_array([5; 32]),
+                    amount: 600,
+                },
+            };
+            assert_eq!(decoded.body, expected, "{discriminator}");
+            assert_eq!(
+                release.map(|r| r.transaction_nonce),
+                (discriminator == CONFIDENTIAL_RELEASE_FUNDS).then_some(NONCE)
+            );
+        }
+    }
+
+    #[test]
+    fn deposit_and_release_ciphertexts_read_from_their_offsets() {
+        let keys = cts::keys();
+        let parts: Vec<_> = (0..4).map(|i| cts::encrypt(&keys, i)).collect();
+        let m = [3u8; 32];
+        let raw = cts::deposit_event(
+            [0; 32], [1; 32], [2; 32], m, &parts[0], &parts[1], &parts[2], &parts[3],
+        );
+        let event = decode_confidential_event(CONFIDENTIAL_DEPOSIT, &raw).unwrap();
+        assert_eq!(event.deposit_ciphertexts().unwrap().to_vec(), parts);
+        assert!(event.release_ciphertexts().is_none());
+        let raw = cts::release_event([0; 32], [1; 32], [2; 32], m, &parts[0], &parts[1]);
+        let event = decode_confidential_event(CONFIDENTIAL_RELEASE_FUNDS, &raw).unwrap();
+        assert_eq!(
+            event.release_ciphertexts().unwrap().to_vec(),
+            parts[..2].to_vec()
+        );
+    }
+
+    #[test]
+    fn wrong_length_is_rejected() {
+        for discriminator in ALL {
+            let mut event = event_bytes(discriminator, seed());
+            event.push(0);
+            assert!(decode_confidential_event(discriminator, &event).is_none());
+            event.truncate(event.len() - 2);
+            assert!(decode_confidential_event(discriminator, &event).is_none());
+            let err = parse_top_level(discriminator, ESCROW_KEY_INDEX, &event).unwrap_err();
+            assert!(err.to_string().contains("No confidential event"), "{err}");
+        }
+    }
+
+    #[test]
+    fn wrong_tag_or_discriminator_is_rejected() {
+        for discriminator in ALL {
+            let mut event = event_bytes(discriminator, seed());
+            event[0] ^= 1;
+            assert!(decode_confidential_event(discriminator, &event).is_none());
+            assert!(parse_top_level(discriminator, ESCROW_KEY_INDEX, &event).is_err());
+            let event = event_bytes(discriminator, seed());
+            let other = if discriminator == MOVE_TO_PUBLIC {
+                MOVE_TO_CONFIDENTIAL
+            } else {
+                MOVE_TO_PUBLIC
+            };
+            assert!(decode_confidential_event(other, &event).is_none());
+        }
+    }
+
+    #[test]
+    fn event_from_a_foreign_program_is_ignored() {
+        for discriminator in ALL {
+            let event = event_bytes(discriminator, seed());
+            let err = parse_top_level(discriminator, FOREIGN_KEY_INDEX, &event).unwrap_err();
+            assert!(err.to_string().contains("No confidential event"), "{err}");
+        }
+    }
+
+    #[test]
+    fn event_naming_another_instance_fails() {
+        for discriminator in ALL {
+            let event = event_bytes(discriminator, Pubkey::new_from_array([1; 32]));
+            let err = parse_top_level(discriminator, ESCROW_KEY_INDEX, &event).unwrap_err();
+            assert!(err.to_string().contains("instance does not match"), "{err}");
+        }
+    }
+
+    #[test]
+    fn too_few_accounts_fails() {
+        for discriminator in ALL {
+            let event = event_bytes(discriminator, seed());
+            let inner = vec![InnerInstructions {
+                index: 0,
+                instructions: vec![event_inner(ESCROW_KEY_INDEX, &event, Some(2))],
+            }];
+            let result = parse_escrow_instruction(
+                &instruction(discriminator, account_count(discriminator) - 1),
+                &account_keys(),
+                &inner,
+                top_level(),
+            );
+            assert!(result.is_err(), "{discriminator}");
+        }
+    }
+
+    #[test]
+    fn only_configure_and_deposit_are_indexed_as_cpi() {
+        assert!(!escrow_inner_discriminator_excluded(
+            CONFIGURE_CONFIDENTIAL_ACCOUNT
+        ));
+        assert!(!escrow_inner_discriminator_excluded(CONFIDENTIAL_DEPOSIT));
+        for discriminator in [
+            CONFIDENTIAL_RELEASE_FUNDS,
+            APPLY_PENDING_BALANCE,
+            MOVE_TO_CONFIDENTIAL,
+            MOVE_TO_PUBLIC,
+        ] {
+            assert!(escrow_inner_discriminator_excluded(discriminator));
+        }
+    }
+
+    #[test]
+    fn cpi_configure_and_deposit_read_their_own_subtree() {
+        for discriminator in [CONFIGURE_CONFIDENTIAL_ACCOUNT, CONFIDENTIAL_DEPOSIT] {
+            let event = event_bytes(discriminator, seed());
+            let ix = instruction(discriminator, account_count(discriminator));
+            // Wrapper at height 1 calls the escrow (height 2), which emits its event (height 3).
+            let inner = vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    InnerInstruction {
+                        instruction: ix.clone(),
+                        stack_height: Some(2),
+                    },
+                    event_inner(ESCROW_KEY_INDEX, &event, Some(3)),
+                ],
+            }];
+            let location = InstructionLocation {
+                top_level_index: 0,
+                inner: Some(InnerLocation {
+                    inner_index: 0,
+                    stack_height: Some(2),
+                }),
+            };
+            let parsed = parse_escrow_instruction(&ix, &account_keys(), &inner, location).unwrap();
+            assert!(matches!(
+                parsed,
+                Some(EscrowInstruction::Confidential { .. })
+            ));
+
+            // Without stack heights the first escrow entry after it is its event.
+            let mut no_height = inner.clone();
+            for entry in &mut no_height[0].instructions {
+                entry.stack_height = None;
+            }
+            let location = InstructionLocation {
+                top_level_index: 0,
+                inner: Some(InnerLocation {
+                    inner_index: 0,
+                    stack_height: None,
+                }),
+            };
+            let parsed =
+                parse_escrow_instruction(&ix, &account_keys(), &no_height, location).unwrap();
+            assert!(matches!(
+                parsed,
+                Some(EscrowInstruction::Confidential { .. })
+            ));
+        }
     }
 }

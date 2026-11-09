@@ -89,6 +89,11 @@ impl SenderState {
                 )
                 .await
             }
+            // Routed to the confidential path before this point.
+            TransactionBuilder::ConfidentialReleaseFunds(_) => Err(ProgramError::InvalidBuilder {
+                reason: "confidential release reached the public builder path".to_string(),
+            }
+            .into()),
             // InitializeMint transaction: creates mint account via AdminVm
             TransactionBuilder::InitializeMint(_) => Ok(InstructionWithSigners {
                 instructions: tx_builder.instructions()?,
@@ -168,6 +173,19 @@ pub async fn handle_transaction_submission(
         kind: tx_builder.kind(),
         deposit_claim_lease: None,
     };
+
+    // Built per attempt from a fresh balance read, so it takes its own path.
+    if let TransactionBuilder::ConfidentialReleaseFunds(request) = tx_builder {
+        super::confidential::submit_release(
+            state,
+            *request,
+            storage_tx,
+            super::confidential::AttemptCause::First,
+            true,
+        )
+        .await;
+        return;
+    }
 
     // A submitted builder always carries the token for the incarnation it owns,
     // so arming the lease from it is correct on a first arrival and on a re-entry
@@ -824,7 +842,7 @@ pub(super) fn handle_confirmation_result<'a>(
                 handle_nonce_outside_generation(
                     state,
                     ctx,
-                    signature,
+                    Some(signature),
                     slot,
                     instruction,
                     storage_tx,
@@ -913,6 +931,7 @@ pub(super) fn handle_confirmation_result<'a>(
                             ctx.deposit_claim_lease,
                             TransactionStatus::ManualReview,
                             &reason,
+                            None,
                         )
                         .await;
                         // A verdict that did not apply, or may not have, leaves the
@@ -1088,12 +1107,13 @@ pub(super) async fn handle_success(
 /// is nothing to wait out: the only open question is which of our broadcasts did
 /// it. The existing signature classifier answers that, and skipping the finality
 /// delay is safe precisely because the bit already settled the outcome.
+/// Returns the broadcast of ours that consumed the nonce, if one did.
 pub(super) async fn handle_nonce_already_used(
     state: &mut SenderState,
     ctx: &TransactionContext,
     signature: Signature,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-) {
+) -> Option<Signature> {
     let mut signatures = ctx
         .withdrawal_nonce
         .and_then(|nonce| state.pending_signatures.get(&nonce).cloned())
@@ -1117,7 +1137,7 @@ pub(super) async fn handle_nonce_already_used(
                         &signature,
                         &format!("nonce already used and the journal could not be read: {reason}"),
                     );
-                    return;
+                    return None;
                 }
             };
         }
@@ -1135,7 +1155,7 @@ pub(super) async fn handle_nonce_already_used(
             "nonce already consumed on-chain with no broadcast signature of ours to account for it",
         )
         .await;
-        return;
+        return None;
     }
 
     match classify_signatures(&state.dest_finality(), &signatures).await {
@@ -1145,6 +1165,7 @@ pub(super) async fn handle_nonce_already_used(
                 "Nonce already consumed by our own earlier broadcast; recording it as complete"
             );
             handle_success(state, ctx, landed, storage_tx).await;
+            Some(landed)
         }
         // One of ours may still be the one that landed, so re-check after finality.
         SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
@@ -1159,6 +1180,7 @@ pub(super) async fn handle_nonce_already_used(
                 &format!("nonce already consumed on-chain; awaiting finality: {reason}"),
             )
             .await;
+            None
         }
         // Every broadcast of ours failed yet the nonce is spent, so a human decides.
         SigFinality::Dead => {
@@ -1174,6 +1196,7 @@ pub(super) async fn handle_nonce_already_used(
                 "nonce consumed on-chain but none of our broadcast signatures landed",
             )
             .await;
+            None
         }
     }
 }
@@ -1249,7 +1272,7 @@ pub(super) async fn park_release_for_rotation(
 pub(super) async fn handle_nonce_outside_generation(
     state: &mut SenderState,
     ctx: &TransactionContext,
-    signature: Signature,
+    signature: Option<Signature>,
     refused_at: u64,
     instruction: InstructionWithSigners,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -1292,7 +1315,9 @@ pub(super) async fn handle_nonce_outside_generation(
             }
             refund_predictable_refusal(state, nonce);
             // Out of the stash so a pre-broadcast failure can still requeue; the journal keeps it.
-            forget_stashed_signature(state, nonce, &signature);
+            if let Some(signature) = &signature {
+                forget_stashed_signature(state, nonce, signature);
+            }
             state.rotation_retry_queue.push((ctx.clone(), instruction));
             return;
         }
@@ -1326,7 +1351,9 @@ pub(super) async fn handle_nonce_outside_generation(
             nonce_generation, chain_generation, "Rotation has not landed yet; queuing for retry"
         );
         refund_predictable_refusal(state, nonce);
-        forget_rejected_signature(state, nonce, ctx.transaction_id, &signature).await;
+        if let Some(signature) = &signature {
+            forget_rejected_signature(state, nonce, ctx.transaction_id, signature).await;
+        }
         state.rotation_retry_queue.push((ctx.clone(), instruction));
         return;
     }
@@ -1342,18 +1369,17 @@ pub(super) async fn handle_nonce_outside_generation(
     // from the program itself, which is proof this transaction moved no funds;
     // the deferred path still classifies every signature we broadcast, so an
     // earlier attempt that did land is completed instead of paid twice.
-    remint_after_onchain_refusal(
-        state,
-        ctx,
-        storage_tx,
-        &ProgramError::GenerationMismatch {
-            nonce,
-            nonce_generation,
-            chain_generation,
-        }
-        .to_string(),
-    )
-    .await;
+    let reason = ProgramError::GenerationMismatch {
+        nonce,
+        nonce_generation,
+        chain_generation,
+    }
+    .to_string();
+    match signature {
+        Some(_) => remint_after_onchain_refusal(state, ctx, storage_tx, &reason).await,
+        // Seen only in a simulation: that attempt was never journaled or sent.
+        None => refund_failure_journaled_first(state, ctx, storage_tx, &reason, true).await,
+    }
 }
 
 /// Give back the attempt a generation refusal was charged. It was predictable and says
@@ -1448,6 +1474,7 @@ pub(super) async fn send_manual_review(
         incarnation_lease(state, ctx),
         TransactionStatus::ManualReview,
         reason,
+        None,
     )
     .await;
 }
@@ -1676,12 +1703,51 @@ pub(super) async fn handle_permanent_failure(
 /// release. The refusal is written in the same storage call that queues the
 /// refund and restored with it, so it decides the bitmap gate on this run and
 /// on every run after a restart.
-async fn defer_remint_after_failure(
+pub(super) async fn defer_remint_after_failure(
     state: &mut SenderState,
     ctx: &TransactionContext,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     error_msg: &str,
     release_refused_on_chain: bool,
+) {
+    defer_remint(
+        state,
+        ctx,
+        storage_tx,
+        error_msg,
+        release_refused_on_chain,
+        false,
+    )
+    .await;
+}
+
+/// `handle_permanent_failure` for a caller that sends nothing it has not journaled first:
+/// there an empty journal proves nothing was broadcast, so the refund needs no signature.
+pub(super) async fn refund_failure_journaled_first(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    error_msg: &str,
+    release_refused_on_chain: bool,
+) {
+    defer_remint(
+        state,
+        ctx,
+        storage_tx,
+        error_msg,
+        release_refused_on_chain,
+        true,
+    )
+    .await;
+}
+
+async fn defer_remint(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    error_msg: &str,
+    release_refused_on_chain: bool,
+    journaled_first: bool,
 ) {
     clear_rotation_retry_state(state, ctx);
 
@@ -1750,7 +1816,8 @@ async fn defer_remint_after_failure(
     // positive evidence that no payout occurred: an absent release record only
     // ever refuses a refund, it never permits one, and a bitmap that has rotated
     // cannot answer for the nonce at all. So a human settles it.
-    if signatures.is_empty() {
+    let never_sent = signatures.is_empty() && journaled_first;
+    if signatures.is_empty() && !journaled_first {
         error!(
             "No signatures to verify for nonce {:?}, cannot safely remint, sending to ManualReview",
             ctx.withdrawal_nonce,
@@ -1765,7 +1832,16 @@ async fn defer_remint_after_failure(
         return;
     }
 
-    let deadline = Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+    // Nothing can land, so there is no finality to wait out. The refusal flag is what lets a
+    // restart load the entry with an empty journal; the bitmap and payout record still gate it.
+    let (deadline, release_refused_on_chain) = if never_sent {
+        (Utc::now(), true)
+    } else {
+        (
+            Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
+            release_refused_on_chain,
+        )
+    };
 
     // Atomically transition to PendingRemint, persisting the withdrawal signatures
     // needed for the finality check. This replaces the previous Failed write —
@@ -2613,6 +2689,7 @@ pub(super) async fn send_fatal_error(
         lease,
         TransactionStatus::Failed,
         error_msg,
+        None,
     )
     .await;
 }
@@ -2632,7 +2709,7 @@ fn incarnation_lease(state: &SenderState, ctx: &TransactionContext) -> Option<Da
 /// routes late cannot terminalize a later incarnation, and the update sent
 /// afterwards only alerts. Without a lease the writer's own write is the outcome.
 #[allow(clippy::too_many_arguments)]
-async fn send_fenced_outcome(
+pub(super) async fn send_fenced_outcome(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     pt: &str,
@@ -2641,6 +2718,7 @@ async fn send_fenced_outcome(
     lease: Option<DateTime<Utc>>,
     status: TransactionStatus,
     reason: &str,
+    park_label: Option<&str>,
 ) -> FencedWrite {
     let outcome = match lease {
         None => FencedWrite::Applied,
@@ -2664,7 +2742,7 @@ async fn send_fenced_outcome(
                 transaction_id,
                 status,
                 reason,
-                || storage.try_quarantine_processing(transaction_id, lease, None, None),
+                || storage.try_quarantine_processing(transaction_id, lease, None, None, park_label),
             )
             .await
         }

@@ -188,6 +188,27 @@ async fn primary_pitr_below_fence_refuses_boot() {
 
 /// Serve the escrow instance the operator's startup check reads from Solana.
 async fn mock_instance(server: &mut ServerGuard) -> mockito::Mock {
+    // The boot key check reads the AllowedMint of each known mint; none is allowed.
+    std::mem::forget(
+        server
+            .mock("POST", "/")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({"method": "getMultipleAccounts"})),
+                Matcher::Regex(r#""commitment"\s*:\s*"confirmed""#.into()),
+            ]))
+            .with_body_from_request(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().unwrap()).unwrap();
+                let keys = body["params"][0].as_array().map_or(0, Vec::len);
+                json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "context": {"slot": 1}, "value": vec![serde_json::Value::Null; keys]
+                }})
+                .to_string()
+                .into()
+            })
+            .create_async()
+            .await,
+    );
     server
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(json!({"method": "getAccountInfo"})))

@@ -135,6 +135,11 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         });
 }
 

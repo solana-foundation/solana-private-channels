@@ -37,6 +37,7 @@ fn test_set_withdraw_config_creates_config() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(true)
         .instruction();
 
     context
@@ -47,6 +48,7 @@ fn test_set_withdraw_config_creates_config() {
     assert_eq!(config.bump, bump);
     assert_eq!(config.fee, TEST_WITHDRAW_FEE);
     assert_eq!(config.min_withdraw_amount, TEST_MIN_WITHDRAW_AMOUNT);
+    assert!(config.confidential_only);
     assert_eq!(config.treasury, admin.pubkey());
     assert_eq!(
         config.treasury_token_account,
@@ -81,6 +83,7 @@ fn test_set_withdraw_config_overwrites() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(true)
         .instruction();
     context
         .send_transaction_with_signers(instruction, &[&admin])
@@ -95,6 +98,7 @@ fn test_set_withdraw_config_overwrites() {
         .allow_mint_slot(0)
         .treasury(new_treasury)
         .min_withdraw_amount(new_min_withdraw_amount)
+        .confidential_only(false)
         .instruction();
     context
         .send_transaction_with_signers(instruction, &[&admin])
@@ -103,6 +107,7 @@ fn test_set_withdraw_config_overwrites() {
     let config = get_withdraw_config(&mut context, &withdraw_config);
     assert_eq!(config.fee, new_fee);
     assert_eq!(config.min_withdraw_amount, new_min_withdraw_amount);
+    assert!(!config.confidential_only);
     assert_eq!(config.treasury, new_treasury);
     assert_eq!(
         config.treasury_token_account,
@@ -140,6 +145,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
         .allow_mint_slot(100)
         .treasury(admin.pubkey())
         .min_withdraw_amount(repriced_min_withdraw_amount)
+        .confidential_only(false)
         .instruction();
     context
         .send_transaction_with_signers(instruction, &[&admin])
@@ -154,6 +160,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
         .allow_mint_slot(90)
         .treasury(stale_treasury)
         .min_withdraw_amount(1)
+        .confidential_only(false)
         .instruction();
     context
         .send_transaction_with_signers(instruction, &[&admin])
@@ -178,6 +185,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
         .allow_mint_slot(110)
         .treasury(admin.pubkey())
         .min_withdraw_amount(later_min_withdraw_amount)
+        .confidential_only(false)
         .instruction();
     context
         .send_transaction_with_signers(instruction, &[&admin])
@@ -213,6 +221,7 @@ fn test_set_withdraw_config_zero_fee_and_minimum() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(0)
+        .confidential_only(false)
         .instruction();
 
     context
@@ -249,6 +258,7 @@ fn test_set_withdraw_config_prefunded_pda() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(false)
         .instruction();
 
     context
@@ -283,6 +293,7 @@ fn test_set_withdraw_config_not_mint_authority() {
         .allow_mint_slot(0)
         .treasury(attacker.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(false)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&attacker]);
@@ -313,6 +324,7 @@ fn test_set_withdraw_config_wrong_address() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(false)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -345,6 +357,7 @@ fn test_set_withdraw_config_wrong_system_program() {
         .allow_mint_slot(0)
         .treasury(admin.pubkey())
         .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
+        .confidential_only(false)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);

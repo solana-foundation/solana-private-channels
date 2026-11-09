@@ -19,7 +19,8 @@ use crate::{
 /// destination that refuses the transfer cost the user every time. A zero-fee
 /// mint charges nothing and leaves `treasury_token_account` unread. An `amount`
 /// below the mint's minimum is rejected before anything moves. The treasury
-/// pays no fee and has no minimum.
+/// pays no fee and has no minimum. A confidential-only mint is refused, the
+/// treasury included.
 ///
 /// # Account Layout
 /// 0. `[signer]` user - User initiating the withdrawal
@@ -38,10 +39,40 @@ pub fn process_withdraw_funds(
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    withdraw(program_id, accounts, instruction_data, false)
+}
+
+/// Largest amount a confidential release can carry: the escrow splits it into a
+/// 16-bit low part and a 32-bit high part.
+pub const MAX_CONFIDENTIAL_WITHDRAW_AMOUNT: u64 = (1 << 48) - 1;
+
+/// Processes the ConfidentialWithdrawFunds instruction.
+///
+/// Same accounts, data and checks as WithdrawFunds, except that it accepts a
+/// confidential-only mint, with `amount` capped at 2^48 - 1. The burn is the
+/// same; only the indexer treats it differently and has the escrow release
+/// into the destination's confidential balance.
+pub fn process_confidential_withdraw_funds(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    withdraw(program_id, accounts, instruction_data, true)
+}
+
+fn withdraw(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+    confidential: bool,
+) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
     if args.amount == 0 {
         return Err(PrivateChannelWithdrawProgramError::ZeroAmount.into());
+    }
+    if confidential && args.amount > MAX_CONFIDENTIAL_WITHDRAW_AMOUNT {
+        return Err(PrivateChannelWithdrawProgramError::AmountAboveConfidentialMaximum.into());
     }
 
     let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info, withdraw_config_info, treasury_token_account_info] =
@@ -77,6 +108,11 @@ pub fn process_withdraw_funds(
     .map_err(|_| PrivateChannelWithdrawProgramError::InvalidWithdrawConfig)?;
     if withdraw_config_info.address() != &expected_withdraw_config {
         return Err(PrivateChannelWithdrawProgramError::InvalidWithdrawConfig.into());
+    }
+
+    // The Solana mint has no public balance, so a public release could never land.
+    if withdraw_config.confidential_only && !confidential {
+        return Err(PrivateChannelWithdrawProgramError::ConfidentialOnlyMint.into());
     }
 
     // The treasury moves out the fees it collected, which can sit below the
@@ -255,6 +291,32 @@ mod tests {
         let result = parse_instruction_data(&instruction_data);
 
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_confidential_withdraw_funds_cap_is_checked_before_accounts() {
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&(MAX_CONFIDENTIAL_WITHDRAW_AMOUNT + 1).to_le_bytes());
+        instruction_data.push(0);
+
+        let result = process_confidential_withdraw_funds(
+            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            &[],
+            &instruction_data,
+        );
+        assert_eq!(
+            result.err(),
+            Some(PrivateChannelWithdrawProgramError::AmountAboveConfidentialMaximum.into())
+        );
+
+        // At the cap the amount passes and the missing accounts are what fails.
+        instruction_data[..8].copy_from_slice(&MAX_CONFIDENTIAL_WITHDRAW_AMOUNT.to_le_bytes());
+        let result = process_confidential_withdraw_funds(
+            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            &[],
+            &instruction_data,
+        );
+        assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }
 
     #[test]

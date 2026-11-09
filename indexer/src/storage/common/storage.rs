@@ -6,6 +6,8 @@ pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
 pub mod close;
+pub mod confidential_deposits;
+pub mod confidential_sender;
 pub mod count_pending_remint_transactions;
 pub mod count_pending_transactions;
 pub mod delete_release_signature;
@@ -317,6 +319,28 @@ impl Storage {
         insert_observed_releases_batch::insert_observed_releases_batch(self, releases).await
     }
 
+    /// Mints with an undecrypted confidential deposit.
+    pub async fn get_confidential_poisoned_mints(&self) -> Result<Vec<String>, StorageError> {
+        confidential_deposits::get_confidential_poisoned_mints(self).await
+    }
+
+    /// A mint's undecrypted confidential deposits as `(id, raw event)`.
+    pub async fn get_confidential_undecrypted(
+        &self,
+        mint: &str,
+    ) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
+        confidential_deposits::get_confidential_undecrypted(self, mint).await
+    }
+
+    /// Fill recovered deposit amounts and clear their flags atomically under `lock`.
+    pub async fn recover_confidential_fenced(
+        &self,
+        lock: &live_lock::LiveLockGuard,
+        recovered: Vec<(i64, crate::storage::common::amount::TokenAmount)>,
+    ) -> Result<(), StorageError> {
+        confidential_deposits::recover_confidential_fenced(self, lock, recovered).await
+    }
+
     /// The release recorded for `nonce`, if the indexer has seen one.
     pub async fn get_observed_release(
         &self,
@@ -449,7 +473,7 @@ impl Storage {
     pub async fn count_pending_transactions(
         &self,
         transaction_type: TransactionType,
-    ) -> Result<i64, StorageError> {
+    ) -> Result<count_pending_transactions::PendingBacklog, StorageError> {
         count_pending_transactions::count_pending_transactions(self, transaction_type).await
     }
 
@@ -786,13 +810,14 @@ impl Storage {
 
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
     /// The optional signature arrays are recorded on the row in the same write;
-    /// `None` leaves both columns untouched.
+    /// `None` leaves both columns untouched. `park_label` is kept on a confidential row.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         remint_signatures: Option<Vec<String>>,
         remint_last_valid_block_heights: Option<Vec<i64>>,
+        park_label: Option<&str>,
     ) -> Result<bool, StorageError> {
         try_quarantine_processing::try_quarantine_processing(
             self,
@@ -800,6 +825,7 @@ impl Storage {
             expected_updated_at,
             remint_signatures,
             remint_last_valid_block_heights,
+            park_label,
         )
         .await
     }
@@ -980,6 +1006,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         }
     }
 
@@ -1466,14 +1497,14 @@ mod tests {
             .count_pending_transactions(TransactionType::Deposit)
             .await
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count.claimable, 3);
 
         // Count withdrawals only
         let count = storage
             .count_pending_transactions(TransactionType::Withdrawal)
             .await
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count.claimable, 1);
     }
 
     #[tokio::test]
@@ -2570,6 +2601,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         });
     }
 

@@ -1107,6 +1107,142 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: reconciliation-confidential-mismatch
+        title: "Confidential custody does not match its escrow account"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} confidential custody cannot be proven from its escrow account (AES copy does not open available with matching credit counters, pending does not decrypt, or no ESCROW_CONFIDENTIAL_KEYS is loaded). Each such tick is an inputs-dark tick and three in a row halt both pipelines. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_reconciliation_confidential_mismatch)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: reconciliation-confidential-lagging
+        title: "Confidential custody lagging"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} has been left out of reconciliation for 5 minutes (reason {{ $labels.reason }}). A stale AES copy should be repaired by the withdraw sender within seconds and large pending applied by it; applies and repairs run in operator-private-channel, so check it is running and not halted. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint, reason) (private_channel_reconciliation_confidential_lagging{reason=~"stale_aes|pending_too_large"})
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: reconciliation-confidential-held
+        title: "Confidential mint held out of reconciliation"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} is held out of reconciliation (reason {{ $labels.reason }}). Nothing about its custody is checked until it clears; no automatic action is taken. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint, reason) (private_channel_reconciliation_confidential_lagging{reason=~"poisoned|key_mismatch"})
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: reconciliation-confidential-held-long
+        title: "Confidential mint held out of reconciliation for over an hour"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: mint {{ $labels.mint }} has been held out of reconciliation for {{ $values.A }}s (reason {{ $labels.reason }}). Resolve it per the runbook end for that reason. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Confidential custody."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint, reason) (private_channel_reconciliation_confidential_hold_age_seconds)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [3600]
+              refId: C
+
       - uid: solvency-fence-tripped
         title: "Escrow solvency fence tripped; value movement is halted"
         condition: C
@@ -1255,4 +1391,356 @@ groups:
                 - evaluator:
                     type: lt
                     params: [10]
+              refId: C
+
+  # Confidential withdrawals: the withdraw operator's applies, AES repairs and parks.
+  - orgId: 1
+    name: confidential-sender-alerts
+    folder: Solana Private Channels Alerts
+    interval: 30s
+    rules:
+      - uid: confidential-aes-repair-deferred
+        title: "Escrow AES copy repair is backing off"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the AES copy of mint {{ $labels.mint }} is still stale after 5 back-to-back repairs because deposits keep racing them. Repairs continue once per background check with backoff; reconciliation reports the mint lagging meanwhile. Runbook: docs/runbooks/confidential_transfers.md, section AES repair deferred."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_operator_confidential_aes_repair_deferred)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-pending-unverified
+        title: "Escrow pending too large to verify"
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the pending balance of mint {{ $labels.mint }} is past the decryption search and the indexed confidential deposits do not add up to it, so no apply is sent. Usually the escrow indexer is behind. Runbook: docs/runbooks/confidential_transfers.md, section Pending not verified."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_operator_confidential_pending_unverified)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-pending-counter-high
+        title: "Escrow pending credit counter stays high"
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: mint {{ $labels.mint }} pending credits are at {{ $values.A }} of the cap. The sender applies at 0.5, so a value staying above 0.75 means applies are failing; at the cap confidential deposits stop. Runbook: docs/runbooks/confidential_transfers.md, section Pending credit counter high."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_operator_confidential_pending_credit_counter_ratio)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0.75]
+              refId: C
+
+      - uid: confidential-park-age
+        title: "A confidential withdrawal has been parked over an hour"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the oldest parked confidential withdrawal is {{ $values.A }}s old. Each park label has an end in the runbook (re-arm, release publicly, or remint); nothing resolves it automatically. Runbook: docs/runbooks/confidential_transfers.md, section Confidential park age."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job) (private_channel_operator_confidential_oldest_park_seconds)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [3600]
+              refId: C
+
+      - uid: public-withdrawal-wait-age
+        title: "A public withdrawal has waited over 15 minutes for its custody check"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: the oldest public withdrawal on a configured mint has waited {{ $values.A }}s for its custody to be provable (a release of the mint not yet recorded, or a lagging confidential balance). At 30 minutes it parks public_balance_low. Runbook: docs/runbooks/confidential_transfers.md, section public_balance_low."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job) (private_channel_operator_public_withdrawal_oldest_wait_seconds)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [900]
+              refId: C
+
+      - uid: bitmap-generation-near-full-with-parks
+        title: "Bitmap generation nearly used while withdrawals are parked"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: over 90% of the current bitmap generation is issued while a confidential withdrawal is parked. A parked nonce holds the rotation, so withdrawals stop when the generation fills. Resolve the parks first. Runbook: docs/runbooks/confidential_transfers.md, section Bitmap generation near full."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (max by (job) (private_channel_operator_bitmap_generation_used_ratio) > 0.9) and on(job) (max by (job) (private_channel_operator_confidential_oldest_park_seconds) > 0)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-release-waiting
+        title: "Confidential releases keep waiting for a verified balance"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Withdraw operator {{ $labels.job }}: confidential releases for mint {{ $labels.mint }} were sent back to Pending {{ $values.A }} times in 30 minutes because no balance candidate opened the escrow's available balance. Check the AES repair alert and the operator log. Runbook: docs/runbooks/confidential_transfers.md, section Confidential release waiting."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by (job, mint) (increase(private_channel_operator_confidential_waits_total[30m]))
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [10]
+              refId: C
+
+  # Confidential deposits the instance key cannot read: the mint is poisoned until recovery.
+  - orgId: 1
+    name: confidential-key-alerts
+    folder: Solana Private Channels Alerts
+    interval: 30s
+    rules:
+      - uid: confidential-mint-poisoned
+        title: "Confidential mint poisoned"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.job }}: mint {{ $labels.mint }} has a confidential deposit the instance key could not decrypt, or its escrow account is configured with another key. Its deposits stay pending and its confidential withdrawals park until confidential-recover clears it. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, mint) (private_channel_confidential_mint_poisoned)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-decrypt-failures
+        title: "Confidential events failed to decrypt"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $labels.job }}: {{ $values.A }} confidential events (kind {{ $labels.kind }}) could not be decrypted or named another key in the last 10 minutes. Check ESCROW_CONFIDENTIAL_KEYS against the configured escrow accounts. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: sum by (job, kind) (increase(private_channel_confidential_decrypt_failures_total[10m]))
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: confidential-undecrypted-deposits-held
+        title: "Undecryptable confidential deposits held"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }}: {{ $values.A }} pending confidential deposits could not be decrypted and are held out of the backlog until confidential-recover. Runbook: docs/runbooks/confidential_transfers.md, section Mint poisoned."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job) (private_channel_operator_undecrypted_deposits_held)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
               refId: C

@@ -38,6 +38,8 @@ This document defines the safety and correctness invariants that Solana Private 
 | P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
 | P3 | Escrow program MUST require an authorized operator to release funds AND that the withdrawal's nonce is unconsumed in the current bitmap generation | MUST | Done | #9, #10, #29 |
 | P4 | Escrow program MUST NOT allow the spl-token native mint | MUST | Done | - |
+| P5 | A configured escrow account MUST take confidential credits only inside `ConfidentialDeposit` and `MoveToConfidential`, so every confidential deposit passes the deposit gates and emits its event | MUST | Done | - |
+| P6 | `ConfidentialWithdrawFunds` MUST refuse an amount above 2^48 - 1 and otherwise apply `WithdrawFunds`'s accounts and checks | MUST | Done | - |
 
 ## Indexer
 
@@ -46,6 +48,8 @@ This document defines the safety and correctness invariants that Solana Private 
 | I1 | Solana Private Channels indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent Solana Private Channels block | SHOULD | Done | #55 |
 | I2 | Mainnet indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent mainnet block | SHOULD | Done | #55 |
 | I3 | After downtime, indexers MUST backfill missed slots | MUST | Done | #48 |
+| I4 | A confidential deposit the key cannot decrypt MUST be stored with its raw event and MUST NOT be minted; its mint MUST stay poisoned until recovered, and other mints and public deposits MUST keep flowing | MUST | Done | - |
+| I5 | The withdraw indexer MUST fail the slot on a withdraw-program instruction it does not know, never skip it | MUST | Done | - |
 
 ## Operator
 
@@ -56,9 +60,12 @@ This document defines the safety and correctness invariants that Solana Private 
 | O3 | Failed withdrawals/issuances MUST fire an alert | MUST | Done | #40 |
 | O4 | Operator MUST NOT send a withdrawal bitmap rotation while any nonce in the current generation still owes a release, a release is in flight, or a remint still depends on a current-generation bit | MUST | Done | #256, #277, #111 |
 | O5 | A withdrawal the operator finds in a generation the bitmap has rotated past MUST be routed to remint or manual review, not retried as a release | MUST | Done | #256, #111 |
+| O6 | A confidential release MUST be proven from an available balance verified against the escrow's on-chain ciphertext, never from an unchecked AES copy | MUST | Done | - |
+| O7 | A confidential withdrawal parked after a send MUST pass the journal and finality gate first, so a late-landing release is seen before any remint | MUST | Done | - |
 
 ## Global
 
 | ID | Invariant | Level | Status | Ref |
 |----|-----------|-------|--------|-----|
 | G1 | On-chain escrow holdings MUST equal total user liabilities in Solana Private Channels | MUST | Done | #12, #39, #14 |
+| G2 | Confidential custody MUST be counted as public + pending + verified available, never as zero when unreadable: an unreadable mint is held or a dark tick | MUST | Done | - |

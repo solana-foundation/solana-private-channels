@@ -1,3 +1,4 @@
+pub mod confidential_custody;
 pub mod constants;
 pub mod db_transaction_writer;
 pub mod escrow_sweep;

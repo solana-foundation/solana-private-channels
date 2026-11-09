@@ -1,3 +1,4 @@
+use bytemuck::Pod;
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_escrow_program_client::PrivateChannelEscrowProgramError;
 pub use private_channel_escrow_program_client::{INSTANCE_LEN, INSTANCE_V1_LEN};
@@ -8,27 +9,55 @@ use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
     instruction::{AccountMeta, Instruction},
+    message::{v1, VersionedMessage},
     program_option::COption,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
+};
+use solana_zk_elgamal_proof_interface::{
+    instruction::{ContextStateInfo, ProofInstruction},
+    proof_data::ZkProofData,
+    state::ProofContextState,
+};
+use solana_zk_sdk::{
+    encryption::{
+        auth_encryption::{AeCiphertext, AeKey},
+        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
+    },
+    zk_elgamal_proof_program::build_pubkey_validity_proof_data,
 };
 use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token::{
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
 };
+use spl_token_2022::error::TokenError;
 use spl_token_2022::{
     extension::{
+        confidential_transfer::{
+            ConfidentialTransferAccount, ConfidentialTransferMint, DecryptableBalance,
+            DEFAULT_MAXIMUM_PENDING_BALANCE_CREDIT_COUNTER,
+        },
+        confidential_transfer_fee::instruction::initialize_confidential_transfer_fee_config,
         memo_transfer::MemoTransfer,
         metadata_pointer::MetadataPointer,
-        pausable::PausableConfig,
+        pausable::{instruction::initialize as initialize_pausable, PausableConfig},
         permanent_delegate::PermanentDelegate,
-        transfer_fee::instruction::initialize_transfer_fee_config,
-        transfer_hook::{TransferHook, TransferHookAccount},
-        BaseStateWithExtensionsMut, ExtensionType,
+        transfer_fee::{instruction::initialize_transfer_fee_config, TransferFeeConfig},
+        transfer_hook::{
+            instruction::initialize as initialize_transfer_hook, TransferHook, TransferHookAccount,
+        },
+        BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
     },
     state::Mint as Token2022Mint,
+};
+use spl_token_2022_interface::extension::confidential_mint_burn::instruction as confidential_mint_burn_instruction;
+use spl_token_2022_interface::extension::confidential_transfer::instruction as confidential_instruction;
+use spl_token_confidential_transfer_proof_extraction::instruction::ProofLocation;
+use spl_token_confidential_transfer_proof_generation::{
+    transfer::transfer_split_proof_data, transfer_with_fee::transfer_with_fee_split_proof_data,
+    withdraw::withdraw_proof_data,
 };
 use spl_token_metadata_interface::state::TokenMetadata;
 use spl_transfer_hook_interface::{
@@ -37,7 +66,8 @@ use spl_transfer_hook_interface::{
 
 use solana_program::clock::Clock;
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account_idempotent,
+    get_associated_token_address, get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
 };
 use spl_token_2022::extension::PodStateWithExtensionsMut;
 use spl_token_2022::pod::{PodAccount, PodCOption, PodMint};
@@ -84,6 +114,37 @@ pub const BELOW_MINIMUM_DEPOSIT_ERROR: u32 =
 pub const WALLET_NOT_ALLOWED_ERROR: u32 = PrivateChannelEscrowProgramError::WalletNotAllowed as u32;
 pub const INVALID_ALLOWED_WALLET_PDA_ERROR: u32 =
     PrivateChannelEscrowProgramError::InvalidAllowedWalletPda as u32;
+pub const CONFIDENTIAL_ACCOUNT_NOT_CONFIGURED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::ConfidentialAccountNotConfigured as u32;
+pub const UNSUPPORTED_CONFIDENTIAL_MINT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::UnsupportedConfidentialMint as u32;
+pub const INVALID_RECIPIENT_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidRecipient as u32;
+pub const RECIPIENT_NOT_CONFIDENTIAL_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientNotConfidential as u32;
+pub const RECIPIENT_NOT_APPROVED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientNotApproved as u32;
+pub const RECIPIENT_CREDITS_DISABLED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientCreditsDisabled as u32;
+pub const RECIPIENT_PENDING_FULL_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientPendingFull as u32;
+pub const RECIPIENT_FROZEN_ERROR: u32 = PrivateChannelEscrowProgramError::RecipientFrozen as u32;
+pub const RECIPIENT_KEY_CHANGED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::RecipientKeyChanged as u32;
+pub const STALE_AUDITOR_KEY_ERROR: u32 = PrivateChannelEscrowProgramError::StaleAuditorKey as u32;
+pub const MINT_PAUSED_ERROR: u32 = PrivateChannelEscrowProgramError::MintPaused as u32;
+pub const STALE_CONFIDENTIAL_BALANCE_ERROR: u32 =
+    PrivateChannelEscrowProgramError::StaleConfidentialBalance as u32;
+
+// Token-2022 errors the confidential tests expect
+pub const TOKEN_CONFIDENTIAL_CREDITS_DISABLED_ERROR: u32 =
+    TokenError::ConfidentialTransferDepositsAndTransfersDisabled as u32;
+pub const TOKEN_CONFIDENTIAL_CREDITS_EXCEEDED_ERROR: u32 =
+    TokenError::MaximumPendingBalanceCreditCounterExceeded as u32;
+pub const TOKEN_MINT_PAUSED_ERROR: u32 = TokenError::MintPaused as u32;
+pub const TOKEN_ACCOUNT_FROZEN_ERROR: u32 = TokenError::AccountFrozen as u32;
+pub const TOKEN_CPI_GUARD_TRANSFER_BLOCKED_ERROR: u32 = TokenError::CpiGuardTransferBlocked as u32;
+pub const TOKEN_ILLEGAL_MINT_BURN_CONVERSION_ERROR: u32 =
+    TokenError::IllegalMintBurnConversion as u32;
 
 /// Withdraw fee every test AllowMint sets. The escrow records it but does not
 /// act on it.
@@ -145,6 +206,11 @@ impl TestContext {
         let hook_fixture_data =
             include_bytes!("../../../../target/deploy/transfer_hook_fixture.so");
         let _ = svm.add_program(HOOK_FIXTURE_PROGRAM_ID, hook_fixture_data);
+
+        // Mainnet's Token-2022 build, the one confidential transfers run against.
+        let token_2022 = include_bytes!("../../../../core/precompiles/spl_token_2022-11.1.0.so");
+        svm.add_program(TOKEN_2022_PROGRAM_ID, token_2022)
+            .expect("Failed to load the pinned Token-2022 program");
 
         let payer = Keypair::new();
 
@@ -266,6 +332,47 @@ impl TestContext {
             Ok(logs) => Ok(logs),
             Err(e) => Err(format!("Transaction failed: {:?}", e).into()),
         }
+    }
+
+    /// Sends `instructions` as one v1 transaction, the format that carries
+    /// confidential transfer proofs inline. LiteSVM does not enforce the v1 size
+    /// limit, so this does.
+    pub fn send_v1(
+        &mut self,
+        instructions: &[Instruction],
+        signers: &[&Keypair],
+    ) -> Result<TransactionMetadata, Box<dyn std::error::Error>> {
+        // A fresh blockhash keeps a repeated transaction from being dropped as a replay.
+        self.svm.expire_blockhash();
+        // v1 needs both limits set; Token-2022 alone loads 1.3 MB.
+        let config = v1::TransactionConfig::empty()
+            .with_compute_unit_limit(1_400_000)
+            .with_loaded_accounts_data_size_limit(4_000_000);
+        let message = v1::Message::try_compile_with_config(
+            &self.payer.pubkey(),
+            instructions,
+            self.svm.latest_blockhash(),
+            config,
+        )?;
+
+        let mut all_signers = vec![&self.payer];
+        all_signers.extend(signers);
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::V1(message), &all_signers)?;
+
+        // Message plus signatures: the wire size, give or take a length byte.
+        let size = transaction.message.serialize().len() + 64 * transaction.signatures.len();
+        if size > v1::MAX_TRANSACTION_SIZE {
+            return Err(format!(
+                "Transaction size {size} exceeds the v1 limit {}",
+                v1::MAX_TRANSACTION_SIZE
+            )
+            .into());
+        }
+
+        self.svm
+            .send_transaction(transaction)
+            .map_err(|error| format!("Transaction failed: {:?}", error).into())
     }
 
     pub fn get_account(&mut self, pubkey: &Pubkey) -> Option<Account> {
@@ -542,6 +649,38 @@ pub fn assert_program_error(
             expected_error_code
         ),
     }
+}
+
+pub const INVALID_ACCOUNT_DATA_LOG: &str = "invalid account data for instruction";
+pub const INCORRECT_PROGRAM_ID_LOG: &str = "incorrect program id for instruction";
+
+/// How the runtime logs a program's custom error.
+pub fn custom_error(code: u32) -> String {
+    format!("custom program error: {code:#x}")
+}
+
+/// Asserts that `program_id` failed first, with `reason` in its log. Escrow and
+/// Token-2022 error numbers overlap, and a failed CPI fails its caller with the
+/// same error, so only the first failure names the program that refused.
+pub fn assert_failed_first(
+    result: Result<TransactionMetadata, Box<dyn std::error::Error>>,
+    program_id: &Pubkey,
+    reason: &str,
+) {
+    let message = result.expect_err("Transaction should fail").to_string();
+    // Skip the "Transaction failed: ..." text before the first program log.
+    let first_failure = message
+        .split("Program ")
+        .skip(1)
+        .find(|log| log.contains(" failed: "))
+        .expect("A program should have failed");
+    let (failed_program, failed_reason) = first_failure.split_once(" failed: ").unwrap();
+    // The log line ends at its closing quote.
+    let failed_reason = failed_reason.split('"').next().unwrap();
+    assert_eq!(
+        (failed_program, failed_reason),
+        (program_id.to_string().as_str(), reason)
+    );
 }
 
 pub fn assert_event_discriminator_present(
@@ -826,9 +965,53 @@ pub fn set_mint_2022_with_transfer_hook(
         .expect("Failed to set Token 2022 mint account with TransferHook");
 }
 
+/// A fee mint with confidential transfers but no `ConfidentialTransferFeeConfig`.
+/// Token-2022 refuses to create one since v0.9, so this writes the bytes of a mint
+/// from before that.
+pub fn set_legacy_confidential_fee_mint(context: &mut TestContext, mint: &Pubkey) {
+    let extensions = [
+        ExtensionType::TransferFeeConfig,
+        ExtensionType::ConfidentialTransferMint,
+    ];
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+    state.init_extension::<TransferFeeConfig>(true).unwrap();
+    state
+        .init_extension::<ConfidentialTransferMint>(true)
+        .unwrap();
+
+    *state.base = PodMint {
+        mint_authority: COption::Some(context.payer.pubkey()).into(),
+        supply: 0u64.into(),
+        decimals: CONFIDENTIAL_MINT_DECIMALS,
+        is_initialized: true.into(),
+        freeze_authority: COption::None.into(),
+    };
+
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set legacy confidential fee mint");
+}
+
 /// Writes the `ExtraAccountMetaList` validation PDA the hook fixture reads.
 /// Token-2022 resolves the transfer's hook accounts from it.
-fn set_extra_account_meta_list(
+pub fn set_extra_account_meta_list(
     context: &mut TestContext,
     mint: &Pubkey,
     extras: &[ExtraAccountMeta],
@@ -896,7 +1079,17 @@ pub fn setup_malicious_hook_mint(
     attacker: &Pubkey,
 ) {
     set_mint_2022_with_transfer_hook(context, mint, &HOOK_FIXTURE_PROGRAM_ID);
+    set_malicious_extra_account_meta_list(context, mint, victim, attacker);
+}
 
+/// The `ExtraAccountMetaList` of [`setup_malicious_hook_mint`], for a hook mint
+/// that already exists.
+pub fn set_malicious_extra_account_meta_list(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    victim: &Pubkey,
+    attacker: &Pubkey,
+) {
     // victim: signer + writable, since a System transfer's source needs
     // both. attacker: the writable sink. system program: so the hook can
     // CPI it.
@@ -1150,6 +1343,647 @@ pub fn setup_test_balances(
     (user_ata, instance_ata)
 }
 
+/// Decimals of the mints from [`create_confidential_mint`].
+pub const CONFIDENTIAL_MINT_DECIMALS: u8 = 6;
+
+/// The ElGamal and AES keys behind one confidential account.
+pub struct ConfidentialKeys {
+    pub elgamal: ElGamalKeypair,
+    pub aes: AeKey,
+}
+
+impl ConfidentialKeys {
+    pub fn new() -> Self {
+        Self {
+            elgamal: ElGamalKeypair::new_rand(),
+            aes: AeKey::new_rand(),
+        }
+    }
+
+    /// `amount` encrypted the way Token-2022 stores a decryptable balance.
+    pub fn decryptable(&self, amount: u64) -> DecryptableBalance {
+        self.aes.encrypt(amount).into()
+    }
+}
+
+impl Default for ConfidentialKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
+pub struct ConfidentialMintOptions {
+    /// Basis points and maximum fee.
+    pub transfer_fee: Option<(u16, u64)>,
+    pub transfer_hook: bool,
+    pub manual_approval: bool,
+    pub confidential_mint_burn: bool,
+    /// The payer can pause the mint.
+    pub pausable: bool,
+    /// The payer can freeze accounts.
+    pub freeze_authority: bool,
+    /// No auditor, so proofs name the default key.
+    pub no_auditor: bool,
+}
+
+/// A confidential mint and the keys its transfer proofs name. The fee
+/// authority's key matters only when the mint has a transfer fee.
+pub struct ConfidentialMint {
+    pub address: Pubkey,
+    pub auditor: Option<ElGamalKeypair>,
+    pub transfer_fee: Option<(u16, u64)>,
+    pub withdraw_withheld_authority: ElGamalKeypair,
+}
+
+/// Creates a confidential Token-2022 mint with an auditor and the payer as mint
+/// authority. A hook mint runs the hook fixture with the extras of
+/// [`setup_hook_mint`].
+pub fn create_confidential_mint(
+    context: &mut TestContext,
+    options: ConfidentialMintOptions,
+) -> ConfidentialMint {
+    let mint = Keypair::new();
+    let auditor = (!options.no_auditor).then(ElGamalKeypair::new_rand);
+    let withdraw_withheld_authority = ElGamalKeypair::new_rand();
+    let payer = context.payer.pubkey();
+
+    let mut extensions = vec![ExtensionType::ConfidentialTransferMint];
+    if options.transfer_fee.is_some() {
+        extensions.push(ExtensionType::TransferFeeConfig);
+        extensions.push(ExtensionType::ConfidentialTransferFeeConfig);
+    }
+    if options.transfer_hook {
+        extensions.push(ExtensionType::TransferHook);
+    }
+    if options.confidential_mint_burn {
+        extensions.push(ExtensionType::ConfidentialMintBurn);
+    }
+    if options.pausable {
+        extensions.push(ExtensionType::Pausable);
+    }
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
+
+    let mut instructions = vec![
+        solana_system_interface::instruction::create_account(
+            &payer,
+            &mint.pubkey(),
+            context.svm.minimum_balance_for_rent_exemption(space),
+            space as u64,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
+        confidential_instruction::initialize_mint(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            Some(payer),
+            !options.manual_approval,
+            auditor.as_ref().map(|auditor| (*auditor.pubkey()).into()),
+        )
+        .unwrap(),
+    ];
+    if let Some((basis_points, maximum_fee)) = options.transfer_fee {
+        instructions.push(
+            initialize_transfer_fee_config(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                Some(&payer),
+                Some(&payer),
+                basis_points,
+                maximum_fee,
+            )
+            .unwrap(),
+        );
+        instructions.push(
+            initialize_confidential_transfer_fee_config(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                Some(payer),
+                &(*withdraw_withheld_authority.pubkey()).into(),
+            )
+            .unwrap(),
+        );
+    }
+    if options.transfer_hook {
+        instructions.push(
+            initialize_transfer_hook(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                Some(payer),
+                Some(HOOK_FIXTURE_PROGRAM_ID),
+            )
+            .unwrap(),
+        );
+    }
+    if options.confidential_mint_burn {
+        let supply_keys = ConfidentialKeys::new();
+        instructions.push(
+            confidential_mint_burn_instruction::initialize_mint(
+                &TOKEN_2022_PROGRAM_ID,
+                &mint.pubkey(),
+                &(*supply_keys.elgamal.pubkey()).into(),
+                &supply_keys.decryptable(0),
+            )
+            .unwrap(),
+        );
+    }
+    if options.pausable {
+        instructions
+            .push(initialize_pausable(&TOKEN_2022_PROGRAM_ID, &mint.pubkey(), &payer).unwrap());
+    }
+    instructions.push(
+        spl_token_2022::instruction::initialize_mint2(
+            &TOKEN_2022_PROGRAM_ID,
+            &mint.pubkey(),
+            &payer,
+            options.freeze_authority.then_some(&payer),
+            CONFIDENTIAL_MINT_DECIMALS,
+        )
+        .unwrap(),
+    );
+    context
+        .send_v1(&instructions, &[&mint])
+        .expect("Confidential mint should be created");
+
+    if options.transfer_hook {
+        let extras =
+            [
+                ExtraAccountMeta::new_with_pubkey(
+                    &solana_sdk_ids::system_program::ID,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            ];
+        set_extra_account_meta_list(context, &mint.pubkey(), &extras);
+    }
+
+    ConfidentialMint {
+        address: mint.pubkey(),
+        auditor,
+        transfer_fee: options.transfer_fee,
+        withdraw_withheld_authority,
+    }
+}
+
+/// Creates `owner`'s Token-2022 ATA for `mint` and configures it for
+/// confidential transfers under `keys`.
+pub fn create_confidential_account(
+    context: &mut TestContext,
+    owner: &Keypair,
+    mint: &ConfidentialMint,
+    keys: &ConfidentialKeys,
+) -> Pubkey {
+    let payer = context.payer.pubkey();
+    let account = get_associated_token_address_with_program_id(
+        &owner.pubkey(),
+        &mint.address,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let mut extensions = vec![ExtensionType::ConfidentialTransferAccount];
+    if mint.transfer_fee.is_some() {
+        extensions.push(ExtensionType::ConfidentialTransferFeeAmount);
+    }
+
+    let proof = build_pubkey_validity_proof_data(&keys.elgamal).unwrap();
+    let mut instructions = vec![
+        create_associated_token_account_idempotent(
+            &payer,
+            &owner.pubkey(),
+            &mint.address,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
+        spl_token_2022::instruction::reallocate(
+            &TOKEN_2022_PROGRAM_ID,
+            &account,
+            &payer,
+            &owner.pubkey(),
+            &[],
+            &extensions,
+        )
+        .unwrap(),
+    ];
+    instructions.extend(
+        confidential_instruction::configure_account(
+            &TOKEN_2022_PROGRAM_ID,
+            &account,
+            &mint.address,
+            &keys.decryptable(0),
+            DEFAULT_MAXIMUM_PENDING_BALANCE_CREDIT_COUNTER,
+            &owner.pubkey(),
+            &[],
+            ProofLocation::InstructionOffset(1.try_into().unwrap(), &proof),
+        )
+        .unwrap(),
+    );
+    context
+        .send_v1(&instructions, &[owner])
+        .expect("Confidential account should be configured");
+
+    account
+}
+
+/// Mints `amount` to `account` and moves it into the available confidential
+/// balance, Token-2022's deposit and apply.
+pub fn fund_confidential_balance(
+    context: &mut TestContext,
+    owner: &Keypair,
+    account: &Pubkey,
+    mint: &Pubkey,
+    keys: &ConfidentialKeys,
+    amount: u64,
+) {
+    let available = decrypt_available(context, account, keys);
+    let instructions = [
+        spl_token_2022::instruction::mint_to(
+            &TOKEN_2022_PROGRAM_ID,
+            mint,
+            account,
+            &context.payer.pubkey(),
+            &[],
+            amount,
+        )
+        .unwrap(),
+        confidential_instruction::deposit(
+            &TOKEN_2022_PROGRAM_ID,
+            account,
+            mint,
+            amount,
+            CONFIDENTIAL_MINT_DECIMALS,
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap(),
+        confidential_instruction::apply_pending_balance(
+            &TOKEN_2022_PROGRAM_ID,
+            account,
+            1,
+            &keys.decryptable(available + amount),
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    ];
+    context
+        .send_v1(&instructions, &[owner])
+        .expect("Confidential balance should be funded");
+}
+
+pub fn confidential_state(
+    context: &mut TestContext,
+    account: &Pubkey,
+) -> ConfidentialTransferAccount {
+    let data = context.get_account_data(account).unwrap();
+    *StateWithExtensions::<Token2022Account>::unpack(&data)
+        .unwrap()
+        .get_extension::<ConfidentialTransferAccount>()
+        .unwrap()
+}
+
+/// Decrypts the change from `before` to `after`, two ciphertexts of one part of
+/// an amount Token-2022 splits into low and high bits. The change can be
+/// negative: a fee taken from a pending balance can shrink its low part.
+pub fn decrypt_change(keys: &ConfidentialKeys, before: &[u8; 64], after: &[u8; 64]) -> i64 {
+    let before = ElGamalCiphertext::from_bytes(before).unwrap();
+    let after = ElGamalCiphertext::from_bytes(after).unwrap();
+    let secret = keys.elgamal.secret();
+    match (after - before).decrypt_u32(secret) {
+        Some(gain) => gain as i64,
+        None => -((before - after).decrypt_u32(secret).unwrap() as i64),
+    }
+}
+
+/// Low part plus high part shifted past the low 16 bits.
+pub fn combine_lo_hi(lo: i64, hi: i64) -> u64 {
+    (lo + (hi << 16)) as u64
+}
+
+pub fn decrypt_pending(
+    context: &mut TestContext,
+    account: &Pubkey,
+    keys: &ConfidentialKeys,
+) -> u64 {
+    let state = confidential_state(context, account);
+    combine_lo_hi(
+        decrypt_change(keys, &[0; 64], &state.pending_balance_lo.0),
+        decrypt_change(keys, &[0; 64], &state.pending_balance_hi.0),
+    )
+}
+
+/// The available balance as Token-2022 holds it, not the AES copy.
+pub fn decrypt_available(
+    context: &mut TestContext,
+    account: &Pubkey,
+    keys: &ConfidentialKeys,
+) -> u64 {
+    let state = confidential_state(context, account);
+    decrypt_change(keys, &[0; 64], &state.available_balance.0) as u64
+}
+
+/// The data of the escrow event with `discriminator`, after its tag and discriminator.
+pub fn event_data(transaction_metadata: &TransactionMetadata, discriminator: u8) -> Vec<u8> {
+    let event_tag = [228, 69, 165, 46, 81, 203, 154, 29]; // EVENT_IX_TAG_LE
+    transaction_metadata
+        .inner_instructions
+        .iter()
+        .flatten()
+        .map(|inner_instruction| &inner_instruction.instruction.data)
+        .find(|data| data.len() >= 9 && data[0..8] == event_tag && data[8] == discriminator)
+        .map(|data| data[9..].to_vec())
+        .expect("event should be emitted")
+}
+
+/// Where a test puts confidential transfer proofs.
+#[derive(Clone, Copy)]
+pub enum ProofPlacement {
+    /// Verify instructions right after the escrow instruction, in one v1 transaction.
+    Inline,
+    /// Context accounts, verified in earlier transactions.
+    ContextAccounts,
+    /// Alternating, first inline, so the validity proof goes in a context account
+    /// behind an inline equality proof.
+    Mixed,
+}
+
+/// The proofs of one escrow instruction, in Token-2022's proof order.
+pub struct PlacedProofs {
+    placement: ProofPlacement,
+    instructions: Vec<Instruction>,
+    pub context_accounts: Vec<AccountMeta>,
+}
+
+impl PlacedProofs {
+    pub fn new(placement: ProofPlacement) -> Self {
+        Self {
+            placement,
+            instructions: Vec::new(),
+            context_accounts: Vec::new(),
+        }
+    }
+
+    /// Places one proof and returns the offset the escrow instruction passes for it.
+    pub fn place<T: Pod + ZkProofData<U>, U: Pod>(
+        &mut self,
+        context: &mut TestContext,
+        instruction: ProofInstruction,
+        proof: &T,
+    ) -> i8 {
+        let inline = match self.placement {
+            ProofPlacement::Inline => true,
+            ProofPlacement::ContextAccounts => false,
+            ProofPlacement::Mixed => {
+                (self.instructions.len() + self.context_accounts.len()).is_multiple_of(2)
+            }
+        };
+        if inline {
+            self.instructions
+                .push(instruction.encode_verify_proof(None, proof));
+            // Counts only the inline proofs, so it stays right when they are mixed.
+            return self.instructions.len() as i8;
+        }
+        let account = create_context_account(context, instruction, proof);
+        self.context_accounts
+            .push(AccountMeta::new_readonly(account, false));
+        0
+    }
+
+    /// The escrow instruction followed by the inline proofs, if any.
+    pub fn with(&self, escrow_instruction: Instruction) -> Vec<Instruction> {
+        let mut instructions = vec![escrow_instruction];
+        instructions.extend(self.instructions.iter().cloned());
+        instructions
+    }
+}
+
+/// Verifies `proof` into a new context account, with the payer as its authority.
+fn create_context_account<T: Pod + ZkProofData<U>, U: Pod>(
+    context: &mut TestContext,
+    instruction: ProofInstruction,
+    proof: &T,
+) -> Pubkey {
+    let account = Keypair::new();
+    let space = size_of::<ProofContextState<U>>();
+    let instructions = [
+        solana_system_interface::instruction::create_account(
+            &context.payer.pubkey(),
+            &account.pubkey(),
+            context.svm.minimum_balance_for_rent_exemption(space),
+            space as u64,
+            &solana_zk_elgamal_proof_interface::id(),
+        ),
+        instruction.encode_verify_proof(
+            Some(ContextStateInfo {
+                context_state_account: &account.pubkey(),
+                context_state_authority: &context.payer.pubkey(),
+            }),
+            proof,
+        ),
+    ];
+    context
+        .send_v1(&instructions, &[&account])
+        .expect("Proof should verify into a context account");
+    account.pubkey()
+}
+
+/// A confidential transfer's proofs and the sender fields the escrow forwards.
+pub struct PreparedTransfer {
+    pub proofs: PlacedProofs,
+    /// The source's available balance the proofs were built against.
+    pub expected_available_balance: [u8; 64],
+    pub new_source_decryptable_available_balance: [u8; 36],
+    pub auditor_ciphertext_lo: [u8; 64],
+    pub auditor_ciphertext_hi: [u8; 64],
+    pub equality_proof_instruction_offset: i8,
+    pub ciphertext_validity_proof_instruction_offset: i8,
+    pub range_proof_instruction_offset: i8,
+    pub fee_sigma_proof_instruction_offset: i8,
+    pub fee_ciphertext_validity_proof_instruction_offset: i8,
+}
+
+/// Proves a transfer of `amount` from `source`'s available balance to an account
+/// under `destination`, for the mint's auditor, and its fee when it has one.
+pub fn prepare_transfer(
+    context: &mut TestContext,
+    source: &Pubkey,
+    source_keys: &ConfidentialKeys,
+    destination: &ElGamalPubkey,
+    mint: &ConfidentialMint,
+    amount: u64,
+    placement: ProofPlacement,
+) -> PreparedTransfer {
+    let state = confidential_state(context, source);
+    let decryptable: AeCiphertext = state.decryptable_available_balance.try_into().unwrap();
+    let balance = source_keys.aes.decrypt(&decryptable).unwrap();
+    prepare_transfer_from_balance(
+        context,
+        source,
+        source_keys,
+        balance,
+        destination,
+        mint,
+        amount,
+        placement,
+    )
+}
+
+/// `prepare_transfer` from a known available balance instead of the AES copy, which
+/// can lag after an apply.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_transfer_from_balance(
+    context: &mut TestContext,
+    source: &Pubkey,
+    source_keys: &ConfidentialKeys,
+    balance: u64,
+    destination: &ElGamalPubkey,
+    mint: &ConfidentialMint,
+    amount: u64,
+    placement: ProofPlacement,
+) -> PreparedTransfer {
+    let state = confidential_state(context, source);
+    let available: ElGamalCiphertext = state.available_balance.try_into().unwrap();
+    // The proof generators read the balance from an AES ciphertext.
+    let decryptable = source_keys.aes.encrypt(balance);
+    let new_balance = balance - amount;
+    let mut proofs = PlacedProofs::new(placement);
+
+    // Placed in Token-2022's order, so the context accounts line up with it.
+    let Some((basis_points, maximum_fee)) = mint.transfer_fee else {
+        let data = transfer_split_proof_data(
+            &available,
+            &decryptable,
+            amount,
+            &source_keys.elgamal,
+            &source_keys.aes,
+            destination,
+            mint.auditor.as_ref().map(|auditor| auditor.pubkey()),
+        )
+        .unwrap();
+        let validity = &data.ciphertext_validity_proof_data_with_ciphertext;
+        let equality_proof_instruction_offset = proofs.place(
+            context,
+            ProofInstruction::VerifyCiphertextCommitmentEquality,
+            &data.equality_proof_data,
+        );
+        let ciphertext_validity_proof_instruction_offset = proofs.place(
+            context,
+            ProofInstruction::VerifyBatchedGroupedCiphertext3HandlesValidity,
+            &validity.proof_data,
+        );
+        let range_proof_instruction_offset = proofs.place(
+            context,
+            ProofInstruction::VerifyBatchedRangeProofU128,
+            &data.range_proof_data,
+        );
+        return PreparedTransfer {
+            equality_proof_instruction_offset,
+            ciphertext_validity_proof_instruction_offset,
+            range_proof_instruction_offset,
+            fee_sigma_proof_instruction_offset: 0,
+            fee_ciphertext_validity_proof_instruction_offset: 0,
+            expected_available_balance: available.to_bytes(),
+            new_source_decryptable_available_balance: source_keys.decryptable(new_balance).0,
+            auditor_ciphertext_lo: validity.ciphertext_lo.0,
+            auditor_ciphertext_hi: validity.ciphertext_hi.0,
+            proofs,
+        };
+    };
+
+    let data = transfer_with_fee_split_proof_data(
+        &available,
+        &decryptable,
+        amount,
+        &source_keys.elgamal,
+        &source_keys.aes,
+        destination,
+        mint.auditor.as_ref().map(|auditor| auditor.pubkey()),
+        mint.withdraw_withheld_authority.pubkey(),
+        basis_points,
+        maximum_fee,
+    )
+    .unwrap();
+    let validity = &data.transfer_amount_ciphertext_validity_proof_data_with_ciphertext;
+    let equality_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &data.equality_proof_data,
+    );
+    let ciphertext_validity_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyBatchedGroupedCiphertext3HandlesValidity,
+        &validity.proof_data,
+    );
+    let fee_sigma_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyPercentageWithCap,
+        &data.percentage_with_cap_proof_data,
+    );
+    let fee_ciphertext_validity_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyBatchedGroupedCiphertext2HandlesValidity,
+        &data.fee_ciphertext_validity_proof_data,
+    );
+    let range_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyBatchedRangeProofU256,
+        &data.range_proof_data,
+    );
+    PreparedTransfer {
+        equality_proof_instruction_offset,
+        ciphertext_validity_proof_instruction_offset,
+        range_proof_instruction_offset,
+        fee_sigma_proof_instruction_offset,
+        fee_ciphertext_validity_proof_instruction_offset,
+        expected_available_balance: available.to_bytes(),
+        new_source_decryptable_available_balance: source_keys.decryptable(new_balance).0,
+        auditor_ciphertext_lo: validity.ciphertext_lo.0,
+        auditor_ciphertext_hi: validity.ciphertext_hi.0,
+        proofs,
+    }
+}
+
+/// The proofs for moving `amount` from `account`'s available balance to its
+/// public one, and the fields the escrow forwards.
+pub struct PreparedWithdraw {
+    pub proofs: PlacedProofs,
+    pub new_decryptable_available_balance: [u8; 36],
+    pub equality_proof_instruction_offset: i8,
+    pub range_proof_instruction_offset: i8,
+}
+
+pub fn prepare_withdraw(
+    context: &mut TestContext,
+    account: &Pubkey,
+    keys: &ConfidentialKeys,
+    amount: u64,
+    placement: ProofPlacement,
+) -> PreparedWithdraw {
+    let state = confidential_state(context, account);
+    let available: ElGamalCiphertext = state.available_balance.try_into().unwrap();
+    let balance = keys
+        .aes
+        .decrypt(&state.decryptable_available_balance.try_into().unwrap())
+        .unwrap();
+    let data = withdraw_proof_data(&available, balance, amount, &keys.elgamal).unwrap();
+
+    let mut proofs = PlacedProofs::new(placement);
+    let equality_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyCiphertextCommitmentEquality,
+        &data.equality_proof_data,
+    );
+    let range_proof_instruction_offset = proofs.place(
+        context,
+        ProofInstruction::VerifyBatchedRangeProofU64,
+        &data.range_proof_data,
+    );
+    PreparedWithdraw {
+        proofs,
+        new_decryptable_available_balance: keys.decryptable(balance - amount).0,
+        equality_proof_instruction_offset,
+        range_proof_instruction_offset,
+    }
+}
+
 /// Map instruction discriminator to operation name for profiling
 fn get_operation_name(instruction: &Instruction) -> &'static str {
     if instruction.data.is_empty() {
@@ -1169,6 +2003,12 @@ fn get_operation_name(instruction: &Instruction) -> &'static str {
         9 => "AddOrUpdateAllowedWallet",
         10 => "RemoveAllowedWallet",
         11 => "SetWhitelistEnabled",
+        12 => "ConfigureConfidentialAccount",
+        13 => "ConfidentialDeposit",
+        14 => "ConfidentialReleaseFunds",
+        15 => "ApplyPendingBalance",
+        16 => "MoveToConfidential",
+        17 => "MoveToPublic",
         _ => "Unknown",
     }
 }

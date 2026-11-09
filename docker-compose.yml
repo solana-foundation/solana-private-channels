@@ -521,6 +521,9 @@ services:
       validator:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
+      - ESCROW_CONFIDENTIAL_PUBKEY=${ESCROW_CONFIDENTIAL_PUBKEY:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
@@ -609,6 +612,9 @@ services:
       write-node:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
+      - ESCROW_CONFIDENTIAL_PUBKEY=${ESCROW_CONFIDENTIAL_PUBKEY:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = gateway internal listener. Sends mints, so it needs the gateway's
@@ -675,6 +681,9 @@ services:
       postgres-indexer:
         condition: service_healthy
     environment:
+      # Escrow instance confidential keys; blank until an escrow account is configured.
+      - ESCROW_CONFIDENTIAL_KEYS=${ESCROW_CONFIDENTIAL_KEYS:-}
+      - ESCROW_CONFIDENTIAL_PUBKEY=${ESCROW_CONFIDENTIAL_PUBKEY:-}
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = Solana Solana validator (where ReleaseFunds transactions are sent)

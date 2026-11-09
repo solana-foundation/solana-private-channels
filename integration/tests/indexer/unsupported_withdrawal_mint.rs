@@ -251,6 +251,11 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     };
     storage.insert_db_transaction(&withdrawal).await?;
 
@@ -472,6 +477,11 @@ fn make_withdrawal(
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     }
 }
 

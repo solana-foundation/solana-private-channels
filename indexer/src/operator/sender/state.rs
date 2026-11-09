@@ -108,6 +108,7 @@ impl SenderState {
             solvency_fence,
             send_tasks: tokio::task::JoinSet::new(),
             consumed: None,
+            confidential: None,
         })
     }
 }
@@ -907,9 +908,10 @@ impl SenderState {
 
             // The journal is the authority, as on the live handoff: only it carries
             // each attempt's blockhash slot, which the coverage proof needs. An empty
-            // or corrupt journal cannot prove the release dead, so it escalates.
+            // or corrupt journal cannot prove the release dead, so it escalates, unless the
+            // refusal came before anything was sent.
             let parsed = match load_pending_sigs(&self.storage, tx.id).await {
-                Ok(sigs) if sigs.is_empty() => {
+                Ok(sigs) if sigs.is_empty() && !tx.release_refused_on_chain => {
                     Err("no withdrawal signatures stored; cannot verify finality".to_string())
                 }
                 Ok(sigs) => Ok(sigs),
@@ -1112,6 +1114,11 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
             release_refused_on_chain: false,
+            confidential: false,
+            not_before: None,
+            wait_started_at: None,
+            confidential_undecrypted: false,
+            confidential_raw: None,
         }
     }
 
@@ -1556,6 +1563,32 @@ mod tests {
             "a row with an empty journal must not be queued"
         );
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// A refund queued for a release refused before any send has nothing journaled by design;
+    /// its refusal flag lets a restart load it instead of escalating.
+    #[tokio::test]
+    async fn recover_pending_remints_loads_a_refusal_before_any_send() {
+        let mock = MockStorage::new();
+        let mut row = make_pending_remint_row(
+            46,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Signature::new_unique(),
+            Utc::now(),
+        );
+        row.release_refused_on_chain = true;
+        mock.pending_remint_transactions.lock().unwrap().push(row);
+
+        let mut state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        assert!(storage_rx.try_recv().is_err(), "no escalation");
+        assert_eq!(state.pending_remints.len(), 1);
+        assert!(state.pending_remints[0].signatures.is_empty());
+        assert!(state.pending_remints[0].release_refused_on_chain);
     }
 
     /// No writer stores a negative height, so one is corruption. Wrapped to a huge
@@ -2204,6 +2237,11 @@ mod tests {
                 inner_index: None,
                 landed_remint_signature: None,
                 release_refused_on_chain: false,
+                confidential: false,
+                not_before: None,
+                wait_started_at: None,
+                confidential_undecrypted: false,
+                confidential_raw: None,
             });
 
         if let Some(sig) = signature {

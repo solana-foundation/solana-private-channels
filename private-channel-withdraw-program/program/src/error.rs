@@ -36,6 +36,14 @@ pub enum PrivateChannelWithdrawProgramError {
     /// (7) Withdrawal amount is below the mint's minimum
     #[error("Withdrawal amount is below the mint's minimum")]
     AmountBelowMinimum,
+
+    /// (8) Confidential withdrawal amount is above 2^48 - 1
+    #[error("Confidential withdrawal amount is above 2^48 - 1")]
+    AmountAboveConfidentialMaximum,
+
+    /// (9) The mint only takes confidential withdrawals
+    #[error("The mint only takes confidential withdrawals")]
+    ConfidentialOnlyMint,
 }
 
 impl From<PrivateChannelWithdrawProgramError> for ProgramError {

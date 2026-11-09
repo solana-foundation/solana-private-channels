@@ -300,6 +300,11 @@ async fn start_escrow_mock_harness(
             "value": crate::instance_helper::test_instance_account(),
         })),
     );
+    // The boot key check lists the instance's escrow accounts; none is configured.
+    custody_rpc.enqueue(
+        "getTokenAccountsByOwner",
+        Reply::result(serde_json::json!({"context": {"slot": 1}, "value": []})),
+    );
     // Boot waits for the channel's address index before reading mint history; report it caught up.
     for _ in 0..4 {
         rpc.enqueue(

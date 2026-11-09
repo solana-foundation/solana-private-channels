@@ -35,6 +35,9 @@ use crate::{
     error::{IndexerError, ReconciliationError, StorageError},
     indexer::checkpoint::program_key,
     operator::{
+        confidential_custody::{
+            resolve_confidential_custody, resolve_custody, ConfidentialCustody, ConfidentialHold,
+        },
         escrow_sweep::{
             channel_anchor, fetch_escrow_balances_by_mint, fetch_fresh_channel_supply,
             CustodySnapshot, SweepFailure, SUPPLY_REREAD_BUDGET,
@@ -50,6 +53,7 @@ use crate::{
     },
     storage::Storage,
 };
+use private_channel_confidential::Keys;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -121,6 +125,7 @@ pub async fn run_startup_reconciliation(
     rpc_url: &str,
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
     if program_type != ProgramType::Escrow {
         info!("Startup reconciliation skipped (program_type is not Escrow)");
@@ -136,6 +141,7 @@ pub async fn run_startup_reconciliation(
             rpc_url,
             channel_rpc_url,
             instance_pda,
+            confidential_keys,
         )
         .await;
         match result {
@@ -186,6 +192,7 @@ async fn reconcile_once(
     rpc_url: &str,
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
     let key = program_key(program_type);
     let floor = storage
@@ -218,6 +225,7 @@ async fn reconcile_once(
         channel_rpc_url,
         instance_pda,
         &snapshot,
+        confidential_keys,
     )
     .await
 }
@@ -274,6 +282,8 @@ pub async fn capture_custody_snapshot(
 }
 
 /// Compare a captured custody snapshot against the ledger as of the snapshot's slot.
+/// Configured mints that cannot be judged are held, never compared as public-only custody.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_against_snapshot(
     config: &ReconciliationConfig,
     program_type: ProgramType,
@@ -282,10 +292,37 @@ pub async fn reconcile_against_snapshot(
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
     snapshot: &CustodySnapshot,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
+    reconcile_snapshot(
+        config,
+        program_type,
+        storage,
+        rpc_url,
+        channel_rpc_url,
+        instance_pda,
+        snapshot,
+        confidential_keys,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The comparison itself; returns the configured mints it held out.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_snapshot(
+    config: &ReconciliationConfig,
+    program_type: ProgramType,
+    storage: &Storage,
+    rpc_url: &str,
+    channel_rpc_url: Option<&str>,
+    instance_pda: &Pubkey,
+    snapshot: &CustodySnapshot,
+    confidential_keys: Option<&Keys>,
+) -> Result<Vec<(Pubkey, ConfidentialHold)>, IndexerError> {
     if program_type != ProgramType::Escrow {
         info!("Reconciliation skipped (program_type is not Escrow)");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // The supply invariant must always run for an escrow indexer, so the channel
@@ -311,17 +348,22 @@ pub async fn reconcile_against_snapshot(
     // Bounded by the snapshot's slot so the ledger side answers for the same instant the
     // custody side does. Without it, rows indexed after the reading would be counted
     // against custody that never reflected them.
-    let mint_balances = storage
-        .get_mint_balances_for_reconciliation(snapshot.slot)
-        .await
-        .map_err(ReconciliationError::Storage)?;
+    let check = judge_confidential_custody(storage, confidential_keys, snapshot).await?;
+    let held = check.held.clone();
+    let mint_balances = without_held(
+        storage
+            .get_mint_balances_for_reconciliation(snapshot.slot)
+            .await
+            .map_err(ReconciliationError::Storage)?,
+        &held,
+    );
 
-    let results = build_reconciliation_set(&mint_balances, &snapshot.balances)?;
+    let results = build_reconciliation_set(&mint_balances, &check.balances)?;
 
     if results.is_empty() {
         // Reached only when both the escrow sweep and the DB are genuinely empty, i.e. a truly-first deploy.
         info!("Both on-chain escrow and DB are empty; reconciliation passed (empty state)");
-        return Ok(());
+        return Ok(held);
     }
 
     info!(
@@ -340,6 +382,7 @@ pub async fn reconcile_against_snapshot(
         config,
         &results,
         snapshot.slot,
+        &check,
     )
     .await?;
 
@@ -367,14 +410,97 @@ pub async fn reconcile_against_snapshot(
                 .get_mint_balances_for_unpinned_reconciliation(snapshot.slot)
                 .await
                 .map_err(ReconciliationError::Storage)?;
-            build_reconciliation_set(&unpinned, &snapshot.balances)?
+            build_reconciliation_set(&without_held(unpinned, &held), &check.balances)?
         }
         None => results,
     };
 
     classify_and_report(config, &results)?;
 
-    Ok(())
+    Ok(held)
+}
+
+/// Configured mints judged from the snapshot's account reads: custody with each counted mint at
+/// public + pending + verified available, and the mints held out.
+struct ConfidentialCheck<'a> {
+    storage: &'a Storage,
+    keys: Option<&'a Keys>,
+    balances: HashMap<Pubkey, u64>,
+    held: Vec<(Pubkey, ConfidentialHold)>,
+}
+
+/// Judge every configured mint in `snapshot` by the runtime's rules. A mismatch stops the run,
+/// since that mint's custody is unknown; held mints are left out with a warning, except a
+/// foreign-key mint, which is compared on its public balance.
+async fn judge_confidential_custody<'a>(
+    storage: &'a Storage,
+    keys: Option<&'a Keys>,
+    snapshot: &CustodySnapshot,
+) -> Result<ConfidentialCheck<'a>, IndexerError> {
+    let resolved = resolve_custody(storage, keys, &snapshot.balances, &snapshot.confidential)
+        .await
+        .map_err(ReconciliationError::Storage)?;
+    if let Some((mint, reason)) = resolved.mismatched.first() {
+        error!(
+            reconciliation_alert = true,
+            mint = %mint,
+            reason = %reason,
+            "RECONCILIATION ALERT: confidential custody does not match its escrow account"
+        );
+        return Err(ReconciliationError::ConfidentialCustodyUnreadable {
+            mint: mint.to_string(),
+            reason: reason.clone(),
+        }
+        .into());
+    }
+    for (mint, hold) in &resolved.held {
+        if hold.reconciled_on_public() {
+            warn!(mint = %mint, reason = hold.label(), "Confidential custody held; this mint is compared on its public balance");
+        } else {
+            warn!(mint = %mint, reason = hold.label(), "Confidential custody held; this mint is left out of the comparison");
+        }
+    }
+    Ok(ConfidentialCheck {
+        storage,
+        keys,
+        balances: resolved.balances,
+        held: resolved
+            .held
+            .into_iter()
+            .filter(|(_, hold)| !hold.reconciled_on_public())
+            .collect(),
+    })
+}
+
+/// Ledger rows without the held mints, so neither side of the comparison sees them.
+fn without_held(
+    rows: Vec<MintDbBalance>,
+    held: &[(Pubkey, ConfidentialHold)],
+) -> Vec<MintDbBalance> {
+    let held: HashSet<String> = held.iter().map(|(mint, _)| mint.to_string()).collect();
+    rows.into_iter()
+        .filter(|row| !held.contains(&row.mint_address))
+        .collect()
+}
+
+/// A custody re-read for `mint`, judged again from that read; `None` unless it counts.
+async fn reread_custody(
+    custody: &CustodySnapshot,
+    mint: &Pubkey,
+    check: &ConfidentialCheck<'_>,
+) -> Result<Option<u64>, IndexerError> {
+    let public = custody.balances.get(mint).copied().unwrap_or(0);
+    let Some(part) = custody.confidential.get(mint) else {
+        return Ok(Some(public));
+    };
+    let verdict = resolve_confidential_custody(check.storage, check.keys, mint, public, part)
+        .await
+        .map_err(ReconciliationError::Storage)?;
+    Ok(match verdict {
+        ConfidentialCustody::Counted(custody) => Some(custody),
+        ConfidentialCustody::Held(hold) if hold.reconciled_on_public() => Some(public),
+        _ => None,
+    })
 }
 
 /// Metric label for the live-state lock a manual reconciliation holds.
@@ -391,6 +517,7 @@ pub async fn run_manual_reconciliation(
     rpc_url: &str,
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
+    confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
     let live_lock_lost = CancellationToken::new();
     let live_lock = storage
@@ -428,7 +555,7 @@ pub async fn run_manual_reconciliation(
                 .into())
             }
         }
-        reconcile_against_snapshot(
+        let held = reconcile_snapshot(
             config,
             ProgramType::Escrow,
             storage,
@@ -436,8 +563,19 @@ pub async fn run_manual_reconciliation(
             channel_rpc_url,
             instance_pda,
             &snapshot,
+            confidential_keys,
         )
-        .await
+        .await?;
+        // A manual run is asked for a verdict, so a mint it could not judge is reported.
+        if held.is_empty() {
+            return Ok(());
+        }
+        let mints = held
+            .iter()
+            .map(|(mint, hold)| format!("{mint} ({})", hold.label()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(ReconciliationError::ConfidentialCustodyHeld { mints }.into())
     })
     .await;
     // The heartbeat notices a loss late, so prove the lock held through the comparison.
@@ -492,6 +630,7 @@ struct SupplyReading {
 /// Each supply must answer at or past the channel's newest recent block, taken once per
 /// round, or it counts as unread: a lagging replica's old supply can look solvent.
 /// The custody re-read must answer at or past `custody_floor`.
+#[allow(clippy::too_many_arguments)]
 async fn measure_supply_breaches(
     channel_rpc: &RpcClientWithRetry,
     escrow_rpc_url: &str,
@@ -500,6 +639,7 @@ async fn measure_supply_breaches(
     results: &[MintReconciliation],
     only: Option<&HashSet<Pubkey>>,
     custody_floor: u64,
+    confidential: &ConfidentialCheck<'_>,
 ) -> Result<SupplyReading, IndexerError> {
     let anchor = match channel_anchor(channel_rpc).await {
         Ok(anchor) => Some(anchor),
@@ -565,7 +705,11 @@ async fn measure_supply_breaches(
 
     let mut breaches = Vec::new();
     for (r, mint, supply) in supplies {
-        let on_chain_custody = custody.balances.get(&mint).copied().unwrap_or(0);
+        let Some(on_chain_custody) = reread_custody(&custody, &mint, confidential).await? else {
+            warn!(mint = %r.mint, "Supply invariant: confidential custody not provable at the re-read");
+            unread.insert(mint);
+            continue;
+        };
         let gap = supply.saturating_sub(on_chain_custody);
         if gap > startup_tolerance_raw(config, on_chain_custody) {
             breaches.push(SupplyBreach {
@@ -602,6 +746,7 @@ async fn check_channel_supply_invariant(
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
     custody_floor: u64,
+    confidential: &ConfidentialCheck<'_>,
 ) -> Result<(), IndexerError> {
     let channel_rpc = RpcClientWithRetry::with_retry_config(
         channel_rpc_url.to_string(),
@@ -626,6 +771,7 @@ async fn check_channel_supply_invariant(
             results,
             suspects.as_ref(),
             custody_floor,
+            confidential,
         )
         .await?;
 
@@ -1342,6 +1488,7 @@ mod tests {
             "http://localhost:8899",
             None,
             &seed,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -1366,6 +1513,7 @@ mod tests {
             &server.url(),
             None,
             &seed,
+            None,
         )
         .await;
         assert!(matches!(
@@ -1394,6 +1542,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -1428,6 +1577,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
 
@@ -1464,6 +1614,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -1497,6 +1648,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         assert!(result.is_ok(), "balanced state should pass: {:?}", result);
@@ -1570,6 +1722,7 @@ mod tests {
             &url,
             Some(&url),
             &instance,
+            None,
         )
         .await;
 
@@ -1611,6 +1764,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -1645,6 +1799,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -1680,6 +1835,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         match result {
@@ -1731,6 +1887,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await
     }
@@ -1832,6 +1989,7 @@ mod tests {
             &server.url(),
             Some(&server.url()),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -1856,6 +2014,7 @@ mod tests {
 
         // The snapshot predates the deposit: at that slot the escrow held nothing.
         let snapshot = CustodySnapshot {
+            confidential: HashMap::new(),
             balances: HashMap::from([(mint, 0)]),
             slot: 50,
         };
@@ -1874,6 +2033,7 @@ mod tests {
             Some(&url),
             &seed,
             &snapshot,
+            None,
         )
         .await;
 
@@ -1900,6 +2060,7 @@ mod tests {
 
         // The snapshot predates the release: at that slot custody still backed the supply.
         let snapshot = CustodySnapshot {
+            confidential: HashMap::new(),
             balances: HashMap::from([(mint, 1_000)]),
             slot: 50,
         };
@@ -1921,6 +2082,7 @@ mod tests {
             Some(&url),
             &seed,
             &snapshot,
+            None,
         )
         .await;
 
@@ -1946,6 +2108,7 @@ mod tests {
 
         // Taken while custody still backed the supply, so the ledger comparison passes.
         let snapshot = CustodySnapshot {
+            confidential: HashMap::new(),
             balances: HashMap::from([(mint, 1_000)]),
             slot: 50,
         };
@@ -1966,6 +2129,7 @@ mod tests {
             Some(&url),
             &seed,
             &snapshot,
+            None,
         )
         .await;
 
@@ -2059,6 +2223,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -2154,6 +2319,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -2197,6 +2363,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -2258,6 +2425,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -2300,6 +2468,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         match result {
@@ -2340,6 +2509,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
 
@@ -2380,6 +2550,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         assert!(result.is_ok(), "supply <= custody must pass: {:?}", result);
@@ -2413,6 +2584,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -2446,6 +2618,7 @@ mod tests {
             &breach_url,
             Some(&breach_url),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -2521,6 +2694,7 @@ mod tests {
             server_url,
             Some(channel_url),
             seed,
+            None,
         )
         .await
     }
@@ -2905,6 +3079,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -2937,6 +3112,7 @@ mod tests {
             &breach_url,
             Some(&breach_url),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -2976,6 +3152,7 @@ mod tests {
                 &url,
                 Some(&url),
                 &seed,
+                None,
             )
             .await;
             match result {
@@ -3018,7 +3195,8 @@ mod tests {
             ..Default::default()
         };
         let url = server.url();
-        let result = run_manual_reconciliation(&config, &storage, &url, Some(&url), &seed).await;
+        let result =
+            run_manual_reconciliation(&config, &storage, &url, Some(&url), &seed, None).await;
         assert!(
             matches!(
                 result,
@@ -3055,6 +3233,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         assert!(
@@ -3103,6 +3282,7 @@ mod tests {
             &url,
             Some(&url),
             &seed,
+            None,
         )
         .await;
         match result {
@@ -3115,5 +3295,205 @@ mod tests {
             mock_storage.calls("get_mint_balances_for_reconciliation"),
             0
         );
+    }
+
+    // =========================================================================
+    // confidential custody at startup and in a manual run
+    // =========================================================================
+
+    /// Sweep with one configured Token-2022 escrow ATA holding `public` plus `balances`.
+    async fn mock_confidential_sweep(
+        server: &mut mockito::Server,
+        instance: &Pubkey,
+        mint: &Pubkey,
+        public: u64,
+        balances: &crate::operator::escrow_sweep::ConfidentialBalances,
+    ) {
+        use crate::operator::escrow_sweep::tests::{
+            account_with_confidential, keyed_token2022_account,
+        };
+        let body = |value: String| {
+            format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{value}]}},"id":1}}"#
+            )
+        };
+        mock_anchor(server, 100).await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(body(String::new()))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+            .with_status(200)
+            .with_body(body(keyed_token2022_account(
+                *instance,
+                *mint,
+                &account_with_confidential(*mint, public, balances),
+            )))
+            .create_async()
+            .await;
+        mock_all_mints_allowed(server).await;
+    }
+
+    /// Storage whose ledger owes `liability` for `mint`, poisoned when asked.
+    fn confidential_storage(mint: &Pubkey, liability: u64, poisoned: bool) -> MockStorage {
+        use crate::storage::common::models::{DbTransactionBuilder, TransactionType};
+        let mock = MockStorage::new();
+        mock.set_mint_balances(vec![make_mint_balance(&mint.to_string(), liability, 0)]);
+        mock.set_checkpoint(&program_key(ProgramType::Escrow), 100);
+        if poisoned {
+            mock.pending_transactions.lock().unwrap().push(
+                DbTransactionBuilder::new("s".into(), 1, mint.to_string(), 0)
+                    .initiator("user".into())
+                    .recipient("user".into())
+                    .transaction_type(TransactionType::Deposit)
+                    .confidential(true)
+                    .undecrypted(vec![1])
+                    .build(),
+            );
+        }
+        mock
+    }
+
+    /// Startup and manual verdicts for one configured mint, with supply equal to `liability`.
+    async fn confidential_verdicts(
+        balances: &crate::operator::escrow_sweep::ConfidentialBalances,
+        liability: u64,
+        poisoned: bool,
+    ) -> (Result<(), IndexerError>, Result<(), IndexerError>) {
+        let keys = private_channel_confidential::test_support::keys();
+        let mut server = mockito::Server::new_async().await;
+        let seed = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        mock_confidential_sweep(&mut server, &seed, &mint, 900, balances).await;
+        mock_channel_supply(&mut server, liability).await;
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        };
+        let url = server.url();
+        let startup = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &Storage::Mock(confidential_storage(&mint, liability, poisoned)),
+            &url,
+            Some(&url),
+            &seed,
+            Some(&keys),
+        )
+        .await;
+        let manual = run_manual_reconciliation(
+            &config,
+            &Arc::new(Storage::Mock(confidential_storage(
+                &mint, liability, poisoned,
+            ))),
+            &url,
+            Some(&url),
+            &seed,
+            Some(&keys),
+        )
+        .await;
+        (startup, manual)
+    }
+
+    /// A verified account counts public + pending + available on both paths: exact custody
+    /// passes, and a ledger one unit above it is a shortfall.
+    #[tokio::test]
+    async fn startup_and_manual_count_verified_confidential_custody() {
+        use crate::operator::confidential_custody::tests::{healthy, HEALTHY_CONFIDENTIAL};
+        let keys = private_channel_confidential::test_support::keys();
+        let exact = 900 + HEALTHY_CONFIDENTIAL;
+        let (startup, manual) = confidential_verdicts(&healthy(&keys), exact, false).await;
+        assert!(startup.is_ok(), "{startup:?}");
+        assert!(manual.is_ok(), "{manual:?}");
+
+        let (startup, manual) = confidential_verdicts(&healthy(&keys), exact + 1, false).await;
+        for result in [startup, manual] {
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::MismatchExceedsThreshold { .. }
+                            | ReconciliationError::SupplyExceedsCustody { .. }
+                    ))
+                ),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// A stale AES copy and a poisoned mint are held on both paths: startup passes without
+    /// them, a manual run reports them by reason.
+    #[tokio::test]
+    async fn startup_and_manual_hold_a_lagging_or_poisoned_mint() {
+        use crate::operator::confidential_custody::tests::{healthy, stale_aes_unreadable_gap};
+        let keys = private_channel_confidential::test_support::keys();
+        for (balances, poisoned, reason) in [
+            (stale_aes_unreadable_gap(&keys), false, "stale_aes"),
+            (healthy(&keys), true, "poisoned"),
+        ] {
+            // The ledger is far above custody: compared, it would block.
+            let (startup, manual) = confidential_verdicts(&balances, 10_000_000, poisoned).await;
+            assert!(startup.is_ok(), "{reason}: {startup:?}");
+            assert!(
+                matches!(
+                    &manual,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::ConfidentialCustodyHeld { mints }
+                    )) if mints.contains(reason)
+                ),
+                "{reason}: {manual:?}"
+            );
+        }
+    }
+
+    /// A mint under a foreign key is compared on its public balance on both paths: exact
+    /// passes, a ledger above the public balance is a shortfall.
+    #[tokio::test]
+    async fn startup_and_manual_reconcile_a_foreign_key_mint_on_its_public_balance() {
+        use crate::operator::confidential_custody::tests::healthy;
+        let keys = private_channel_confidential::test_support::keys();
+        let mut foreign = healthy(&keys);
+        foreign.elgamal_pubkey = private_channel_confidential::test_support::other_keys().pubkey();
+        let (startup, manual) = confidential_verdicts(&foreign, 900, false).await;
+        assert!(startup.is_ok(), "{startup:?}");
+        assert!(manual.is_ok(), "{manual:?}");
+
+        let (startup, manual) = confidential_verdicts(&foreign, 901, false).await;
+        for result in [startup, manual] {
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::MismatchExceedsThreshold { .. }
+                            | ReconciliationError::SupplyExceedsCustody { .. }
+                    ))
+                ),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// An AES copy that does not open with matching counters stops both paths.
+    #[tokio::test]
+    async fn startup_and_manual_stop_on_a_confidential_mismatch() {
+        use crate::operator::confidential_custody::tests::mismatched;
+        let keys = private_channel_confidential::test_support::keys();
+        let (startup, manual) = confidential_verdicts(&mismatched(&keys), 900, false).await;
+        for result in [startup, manual] {
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::ConfidentialCustodyUnreadable { .. }
+                    ))
+                ),
+                "{result:?}"
+            );
+        }
     }
 }

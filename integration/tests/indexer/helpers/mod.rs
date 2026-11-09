@@ -9,6 +9,7 @@ pub mod tokens;
 pub mod transaction_executor;
 pub mod transactions;
 pub mod verification;
+pub mod worker;
 
 pub use db::*;
 pub use instance::*;

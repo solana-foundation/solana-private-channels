@@ -113,6 +113,7 @@ pub(super) fn sender_state_with_storage_and_role(
         solvency_fence: crate::operator::solvency_fence::SolvencyFence::open_from_start(),
         send_tasks: tokio::task::JoinSet::new(),
         consumed: None,
+        confidential: None,
     }
 }
 
@@ -229,6 +230,11 @@ fn withdrawal_row(id: i64, status: TransactionStatus) -> DbTransaction {
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
+        confidential: false,
+        not_before: None,
+        wait_started_at: None,
+        confidential_undecrypted: false,
+        confidential_raw: None,
     }
 }
 

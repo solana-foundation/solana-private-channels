@@ -218,6 +218,22 @@ const withdrawIx = await getWithdrawFundsInstructionAsync({
 - **Minimum amount**: An `amount` below the mint's `minWithdrawAmount` fails with `AmountBelowMinimum` and nothing is burned. The treasury has no minimum.
 - **Whitelist**: If the instance whitelists withdrawals, the release goes through only when both the burning wallet and the destination are allowed to withdraw. With the gateway check on, the `sendTransaction` is refused with a 403 (`-32006`) and nothing is burned. Without it, or if the check cannot run, only `amount` is reminted and the withdraw fee is not refunded.
 
+## Confidential withdrawals
+
+A withdrawal can be released into the destination's **confidential** balance on Solana instead, so the amount is hidden there. Burn with `ConfidentialWithdrawFunds` (discriminator 2) instead of `WithdrawFunds`: same accounts, `amount`, `destination`, fee and minimum. The burn itself is public on the channel; the operator then sends `ConfidentialReleaseFunds`, which consumes the same nonce in the bitmap.
+
+Before burning, make sure the destination can take it:
+
+- its Token-2022 associated token account for the mint exists on Solana and is configured for confidential transfers (Token-2022 `ConfigureAccount` with your own ElGamal and AES keys);
+- it is approved, if the mint requires approval, accepts confidential credits, is not frozen, and its pending credit counter is below its maximum (apply your pending balance if it is full);
+- `amount` is at most 2^48 - 1 base units, Token-2022's cap on one confidential transfer.
+
+Otherwise the withdrawal parks with `destination_not_ready`: nothing is lost, but it waits for an operator, who can re-arm it once you fix the account, release it publicly or remint it. Funds arrive in your **pending** balance; run Token-2022 `ApplyPendingBalance` to make them spendable, and decrypt the amount with your ElGamal key.
+
+On a confidential-only mint (one with Token-2022 `ConfidentialMintBurn` on Solana), `WithdrawFunds` fails with custom error 9 (`ConfidentialOnlyMint`), so `ConfidentialWithdrawFunds` is the only way out. Configure the destination before burning: a parked withdrawal of such a mint can only be re-armed or reminted, never released publicly.
+
+From the repository, `cargo run --bin confidential_withdraw -- <gateway-rpc> <keypair> <mint> <amount> [destination]` sends it, and with `SOLANA_RPC_URL` set it checks the destination first. `confidential_deposit` configures your account on its first run.
+
 ### Related Documentation
 - [Escrow Interaction Guide](ESCROW_INTERACTION_GUIDE.md)
 - [Architecture Overview](ARCHITECTURE.md)

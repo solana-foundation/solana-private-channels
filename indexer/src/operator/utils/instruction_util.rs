@@ -4,9 +4,12 @@ use crate::operator::{
     SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use crate::storage::common::models::DbTransaction;
+use private_channel_confidential::{MoveToPublicProofs, ReleaseProofs};
 use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, RotateBitmapBuilder,
+    ApplyPendingBalanceBuilder, ConfidentialReleaseFundsBuilder, MoveToConfidentialBuilder,
+    MoveToPublicBuilder, ReleaseFundsBuilder, RotateBitmapBuilder,
 };
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_withdraw_program_client::{
     instructions::SetWithdrawConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     WITHDRAW_CONFIG_SEED,
@@ -160,13 +163,18 @@ pub enum TransactionBuilder {
     Mint(Box<MintToBuilderWithTxnId>),
     /// Rotate the withdrawal bitmap - clears the bits and opens the next generation
     RotateBitmap(Box<RotateBitmapBuilder>),
+    /// Confidential release - consumes a nonce bit; the sender adds the proofs
+    ConfidentialReleaseFunds(Box<ConfidentialReleaseRequest>),
 }
 
 impl TransactionBuilder {
     /// The one place a builder variant is turned into the kind carried downstream.
     pub fn kind(&self) -> TransactionKind {
         match self {
-            Self::ReleaseFunds(_) => TransactionKind::ReleaseFunds,
+            // Same nonce, journal and remint path as a public release.
+            Self::ReleaseFunds(_) | Self::ConfidentialReleaseFunds(_) => {
+                TransactionKind::ReleaseFunds
+            }
             Self::InitializeMint(_) => TransactionKind::InitializeMint,
             Self::Mint(_) => TransactionKind::Mint,
             Self::RotateBitmap(_) => TransactionKind::RotateBitmap,
@@ -181,12 +189,17 @@ impl TransactionBuilder {
             Self::InitializeMint(builder) => builder.instructions(),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
             Self::RotateBitmap(builder) => Ok(vec![builder.instruction()]),
+            Self::ConfidentialReleaseFunds(_) => Err(crate::error::ProgramError::InvalidBuilder {
+                reason: "a confidential release is built by the sender with its proofs".into(),
+            }),
         }
     }
 
     pub fn compute_unit_price(&self) -> Option<u64> {
         match self {
-            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => Some(1),
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) | Self::ConfidentialReleaseFunds(_) => {
+                Some(1)
+            }
             Self::InitializeMint(_) | Self::Mint(_) => None,
         }
     }
@@ -196,13 +209,18 @@ impl TransactionBuilder {
     pub fn compute_budget(&self) -> Option<u32> {
         match self {
             Self::ReleaseFunds(_) => DEFAULT_CU_RELEASE_FUNDS,
+            Self::ConfidentialReleaseFunds(_) => {
+                Some(crate::operator::confidential_constants::CU_CONFIDENTIAL_RELEASE)
+            }
             Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => DEFAULT_CU_MINT,
         }
     }
 
     pub fn signers(&self) -> Vec<&'static Signer> {
         match self {
-            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => Self::release_signers(),
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) | Self::ConfidentialReleaseFunds(_) => {
+                Self::release_signers()
+            }
             Self::InitializeMint(_) | Self::Mint(_) => vec![SignerUtil::admin_signer()],
         }
     }
@@ -218,6 +236,7 @@ impl TransactionBuilder {
     pub fn transaction_id(&self) -> Option<i64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.transaction_id),
+            Self::ConfidentialReleaseFunds(request) => Some(request.transaction_id),
             Self::Mint(builder) => Some(builder.txn_id),
             Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
@@ -226,6 +245,7 @@ impl TransactionBuilder {
     pub fn trace_id(&self) -> Option<String> {
         match self {
             Self::ReleaseFunds(b) => Some(b.trace_id.clone()),
+            Self::ConfidentialReleaseFunds(r) => Some(r.trace_id.clone()),
             Self::Mint(b) => Some(b.trace_id.clone()),
             Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
@@ -237,13 +257,17 @@ impl TransactionBuilder {
     pub fn fetched_updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
             Self::Mint(b) => Some(b.fetched_updated_at),
-            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
+            Self::ReleaseFunds(_)
+            | Self::InitializeMint(_)
+            | Self::RotateBitmap(_)
+            | Self::ConfidentialReleaseFunds(_) => None,
         }
     }
 
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.nonce),
+            Self::ConfidentialReleaseFunds(request) => Some(request.nonce),
             Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => None,
         }
     }
@@ -262,9 +286,10 @@ impl TransactionBuilder {
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
             Self::Mint(_) => RetryPolicy::None,
-            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => {
-                RetryPolicy::Idempotent
-            }
+            Self::ReleaseFunds(_)
+            | Self::InitializeMint(_)
+            | Self::RotateBitmap(_)
+            | Self::ConfidentialReleaseFunds(_) => RetryPolicy::Idempotent,
         }
     }
 
@@ -274,7 +299,9 @@ impl TransactionBuilder {
             Self::InitializeMint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
-            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => ExtraErrorCheckPolicy::None,
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) | Self::ConfidentialReleaseFunds(_) => {
+                ExtraErrorCheckPolicy::None
+            }
         }
     }
 }
@@ -298,6 +325,131 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A confidential withdrawal as the processor hands it to the sender. The proofs depend on
+/// the escrow's available balance at send time, so the sender reads, proves and builds.
+#[derive(Clone, Debug)]
+pub struct ConfidentialReleaseRequest {
+    /// Accounts, user, nonce and withdrawer set; the transfer fields are filled per attempt.
+    pub builder: ConfidentialReleaseFundsBuilder,
+    pub nonce: u64,
+    pub transaction_id: i64,
+    pub trace_id: String,
+    pub remint_info: Option<WithdrawalRemintInfo>,
+    pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
+    pub mint: Pubkey,
+    pub instance_ata: Pubkey,
+    pub amount: u64,
+    /// The user's token account the release credits. Its key and the mint's auditor and
+    /// fee are read again for every proof build, since any of them can change.
+    pub destination: Pubkey,
+    /// Transfer-hook accounts, resolved for an amount of `u64::MAX`.
+    pub hook_extras: Vec<AccountMeta>,
+    /// Set while the row waits for a verifiable balance, so its backoff keeps doubling.
+    pub wait_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ConfidentialReleaseRequest {
+    /// The escrow instruction for `proofs`, followed by the proofs inline.
+    pub fn instructions(&self, proofs: &ReleaseProofs) -> Vec<Instruction> {
+        let mut builder = self.builder.clone();
+        builder
+            .expected_available_balance(proofs.expected_available_balance)
+            .new_source_decryptable_available_balance(proofs.new_decryptable_available_balance)
+            .auditor_ciphertext_lo(proofs.auditor_ciphertext_lo)
+            .auditor_ciphertext_hi(proofs.auditor_ciphertext_hi)
+            .equality_proof_instruction_offset(proofs.equality_offset)
+            .ciphertext_validity_proof_instruction_offset(proofs.ciphertext_validity_offset)
+            .range_proof_instruction_offset(proofs.range_offset)
+            .fee_sigma_proof_instruction_offset(proofs.fee_sigma_offset)
+            .fee_ciphertext_validity_proof_instruction_offset(
+                proofs.fee_ciphertext_validity_offset,
+            );
+        // Inline proofs pass no context accounts, so the hook extras follow the fixed ones.
+        builder.add_remaining_accounts(&self.hook_extras);
+        let mut instructions = vec![builder.instruction()];
+        instructions.extend(proofs.instructions.iter().cloned());
+        instructions
+    }
+}
+
+/// The accounts every operator-side confidential instruction on one escrow account shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EscrowConfidentialAccounts {
+    pub payer: Pubkey,
+    pub operator: Pubkey,
+    pub instance: Pubkey,
+    pub operator_pda: Pubkey,
+    pub mint: Pubkey,
+    pub instance_ata: Pubkey,
+    pub event_authority: Pubkey,
+}
+
+/// `ApplyPendingBalance`. The counter and the AES value must come from the same read.
+pub fn apply_pending_balance_instruction(
+    accounts: &EscrowConfidentialAccounts,
+    expected_credit_counter: u64,
+    new_decryptable_available_balance: [u8; 36],
+) -> Instruction {
+    ApplyPendingBalanceBuilder::new()
+        .payer(accounts.payer)
+        .operator(accounts.operator)
+        .instance(accounts.instance)
+        .operator_pda(accounts.operator_pda)
+        .mint(accounts.mint)
+        .instance_ata(accounts.instance_ata)
+        .token_program(spl_token_2022::ID)
+        .event_authority(accounts.event_authority)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .expected_credit_counter(expected_credit_counter)
+        .new_decryptable_available_balance(new_decryptable_available_balance)
+        .instruction()
+}
+
+/// `MoveToPublic` with its proofs inline.
+pub fn move_to_public_instructions(
+    accounts: &EscrowConfidentialAccounts,
+    amount: u64,
+    proofs: &MoveToPublicProofs,
+) -> Vec<Instruction> {
+    let escrow = MoveToPublicBuilder::new()
+        .payer(accounts.payer)
+        .operator(accounts.operator)
+        .instance(accounts.instance)
+        .operator_pda(accounts.operator_pda)
+        .mint(accounts.mint)
+        .instance_ata(accounts.instance_ata)
+        .token_program(spl_token_2022::ID)
+        .event_authority(accounts.event_authority)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(amount)
+        .new_decryptable_available_balance(proofs.new_decryptable_available_balance)
+        .equality_proof_instruction_offset(proofs.equality_offset)
+        .range_proof_instruction_offset(proofs.range_offset)
+        .instruction();
+    let mut instructions = vec![escrow];
+    instructions.extend(proofs.instructions.iter().cloned());
+    instructions
+}
+
+/// `MoveToConfidential`: public balance into pending, applied later like a deposit.
+pub fn move_to_confidential_instruction(
+    accounts: &EscrowConfidentialAccounts,
+    amount: u64,
+) -> Instruction {
+    MoveToConfidentialBuilder::new()
+        .payer(accounts.payer)
+        .operator(accounts.operator)
+        .instance(accounts.instance)
+        .operator_pda(accounts.operator_pda)
+        .mint(accounts.mint)
+        .instance_ata(accounts.instance_ata)
+        .token_program(spl_token_2022::ID)
+        .event_authority(accounts.event_authority)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(amount)
+        .instruction()
+}
+
 /// The mint's withdraw config a deposit writes to the channel before minting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WithdrawConfigSetup {
@@ -308,6 +460,9 @@ pub struct WithdrawConfigSetup {
     pub allow_mint_slot: u64,
     pub treasury: Pubkey,
     pub min_withdraw_amount: u64,
+    /// The Solana mint has ConfidentialMintBurn; the channel refuses its public
+    /// withdrawals.
+    pub confidential_only: bool,
 }
 
 /// Builder for channel Token-2022 mint instructions (deposit flow)
@@ -457,6 +612,7 @@ impl MintToBuilder {
                     .allow_mint_slot(withdraw_config_setup.allow_mint_slot)
                     .treasury(withdraw_config_setup.treasury)
                     .min_withdraw_amount(withdraw_config_setup.min_withdraw_amount)
+                    .confidential_only(withdraw_config_setup.confidential_only)
                     .instruction(),
             );
         }
@@ -637,6 +793,7 @@ mod tests {
                 allow_mint_slot: 0,
                 treasury,
                 min_withdraw_amount: 100,
+                confidential_only: false,
             });
 
         let ixs = b.instructions().unwrap();

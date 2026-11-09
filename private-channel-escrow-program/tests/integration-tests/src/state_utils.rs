@@ -4,9 +4,10 @@ use crate::assertions::{
 };
 use crate::pda_utils::{find_allowed_mint_pda, find_allowed_wallet_pda, find_event_authority_pda};
 use crate::utils::{
-    assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID,
-    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT,
-    TEST_WITHDRAW_FEE,
+    assert_event_discriminator_present, confidential_state, create_confidential_mint,
+    decrypt_available, decrypt_pending, get_token_balance, ConfidentialKeys, ConfidentialMint,
+    ConfidentialMintOptions, ATA_PROGRAM_ID, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    TEST_MIN_DEPOSIT_AMOUNT, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
 };
 use crate::{
     assertions::{
@@ -18,10 +19,13 @@ use crate::{
     pda_utils::{find_instance_pda, find_operator_pda, find_withdrawal_bitmap_pda},
     utils::{TestContext, TOKEN_2022_PROGRAM_ID},
 };
+use litesvm::types::TransactionMetadata;
 use private_channel_escrow_program_client::instructions::{
-    AddOperatorBuilder, AddOrUpdateAllowedWalletBuilder, AllowMintBuilder, BlockMintBuilder,
-    CreateInstanceBuilder, ReleaseFundsBuilder, RemoveAllowedWalletBuilder, RemoveOperatorBuilder,
-    SetNewAdminBuilder, SetWhitelistEnabledBuilder,
+    AddOperatorBuilder, AddOrUpdateAllowedWalletBuilder, AllowMintBuilder,
+    ApplyPendingBalanceBuilder, BlockMintBuilder, ConfigureConfidentialAccountBuilder,
+    CreateInstanceBuilder, MoveToConfidentialBuilder, ReleaseFundsBuilder,
+    RemoveAllowedWalletBuilder, RemoveOperatorBuilder, SetNewAdminBuilder,
+    SetWhitelistEnabledBuilder,
 };
 use private_channel_escrow_program_client::instructions::{DepositBuilder, RotateBitmapBuilder};
 use private_channel_escrow_program_client::WithdrawalBitmap;
@@ -30,6 +34,8 @@ use solana_sdk::{
     signature::{Keypair, Signer},
 };
 use solana_sdk_ids::system_program::ID as SYSTEM_PROGRAM_ID;
+use solana_zk_elgamal_proof_interface::instruction::ProofInstruction;
+use solana_zk_sdk::zk_elgamal_proof_program::build_pubkey_validity_proof_data;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
@@ -727,4 +733,128 @@ pub fn assert_get_or_rotate_bitmap(
     assert_event_discriminator_present(&transaction_metadata, 8);
 
     Ok(())
+}
+
+/// An instance with a confidential mint allowed, its escrow account configured
+/// under `keys`, and an operator.
+pub struct ConfidentialEscrow {
+    pub admin: Keypair,
+    pub instance_pda: Pubkey,
+    pub mint: ConfidentialMint,
+    pub keys: ConfidentialKeys,
+    pub escrow_ata: Pubkey,
+    pub operator: Keypair,
+    pub operator_pda: Pubkey,
+}
+
+pub fn setup_confidential_escrow(
+    context: &mut TestContext,
+    options: ConfidentialMintOptions,
+) -> ConfidentialEscrow {
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+    let operator = Keypair::new();
+    let keys = ConfidentialKeys::new();
+    let mint = create_confidential_mint(context, options);
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+    let (allowed_mint_pda, _) =
+        assert_get_or_allow_mint(context, &admin, &instance_pda, &mint.address, false, false)
+            .expect("AllowMint should succeed");
+    let (operator_pda, _) = assert_get_or_add_operator(
+        context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let escrow_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.address,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let configure = ConfigureConfidentialAccountBuilder::new()
+        .payer(context.payer.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance_pda)
+        .mint(mint.address)
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(escrow_ata)
+        .decryptable_zero_balance(keys.decryptable(0).0)
+        .proof_instruction_offset(1)
+        .instruction();
+    let proof = ProofInstruction::VerifyPubkeyValidity.encode_verify_proof(
+        None,
+        &build_pubkey_validity_proof_data(&keys.elgamal).unwrap(),
+    );
+    context
+        .send_v1(&[configure, proof], &[&admin])
+        .expect("ConfigureConfidentialAccount should succeed");
+
+    ConfidentialEscrow {
+        admin,
+        instance_pda,
+        mint,
+        keys,
+        escrow_ata,
+        operator,
+        operator_pda,
+    }
+}
+
+/// ApplyPendingBalance on the escrow, with the counter and new AES balance taken
+/// from its account.
+pub fn apply_escrow_pending(
+    context: &mut TestContext,
+    escrow: &ConfidentialEscrow,
+) -> Result<TransactionMetadata, Box<dyn std::error::Error>> {
+    let credit_counter = confidential_state(context, &escrow.escrow_ata)
+        .pending_balance_credit_counter
+        .into();
+    let available = decrypt_available(context, &escrow.escrow_ata, &escrow.keys);
+    let pending = decrypt_pending(context, &escrow.escrow_ata, &escrow.keys);
+
+    let apply = ApplyPendingBalanceBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .instance_ata(escrow.escrow_ata)
+        .expected_credit_counter(credit_counter)
+        .new_decryptable_available_balance(escrow.keys.decryptable(available + pending).0)
+        .instruction();
+    context.send_v1(&[apply], &[&escrow.operator])
+}
+
+/// Mints `amount` to the escrow's public balance and makes it available for
+/// confidential releases.
+pub fn fund_escrow_available(context: &mut TestContext, escrow: &ConfidentialEscrow, amount: u64) {
+    let mint_to = spl_token_2022::instruction::mint_to(
+        &TOKEN_2022_PROGRAM_ID,
+        &escrow.mint.address,
+        &escrow.escrow_ata,
+        &context.payer.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
+    let move_to_confidential = MoveToConfidentialBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(escrow.operator.pubkey())
+        .instance(escrow.instance_pda)
+        .operator_pda(escrow.operator_pda)
+        .mint(escrow.mint.address)
+        .instance_ata(escrow.escrow_ata)
+        .amount(amount)
+        .instruction();
+    context
+        .send_v1(&[mint_to, move_to_confidential], &[&escrow.operator])
+        .expect("MoveToConfidential should succeed");
+    apply_escrow_pending(context, escrow).expect("ApplyPendingBalance should succeed");
 }

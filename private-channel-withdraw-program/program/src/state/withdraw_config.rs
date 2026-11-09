@@ -9,9 +9,9 @@ pub const WITHDRAW_CONFIG_SEED: &[u8] = b"withdraw_config";
 
 /// Seeds: [b"withdraw_config", mint]
 ///
-/// The fee `WithdrawFunds` charges on top of the burned amount, and the
-/// smallest amount it burns. The operator rewrites both on every deposit from
-/// the values set at the escrow's AllowMint.
+/// The fee `WithdrawFunds` charges on top of the burned amount, the smallest
+/// amount it burns, and whether the mint is confidential-only. The operator
+/// rewrites all three on every deposit from the escrow's AllowMint.
 ///
 /// No discriminator: this is the program's only account type, and every read
 /// already checks the owner, the PDA address and the length.
@@ -30,6 +30,9 @@ pub struct WithdrawConfig {
     pub treasury_token_account: Address,
     /// Smallest `amount` a withdrawal may burn, 0 for none. The fee is on top.
     pub min_withdraw_amount: u64,
+    /// The Solana mint has `ConfidentialMintBurn`, so it has no public balance
+    /// and WithdrawFunds is refused. Only ConfidentialWithdrawFunds works.
+    pub confidential_only: bool,
 }
 
 impl WithdrawConfig {
@@ -38,7 +41,8 @@ impl WithdrawConfig {
         8 + // allow_mint_slot
         32 + // treasury
         32 + // treasury_token_account
-        8; // min_withdraw_amount
+        8 + // min_withdraw_amount
+        1; // confidential_only
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(Self::LEN);
@@ -48,6 +52,7 @@ impl WithdrawConfig {
         data.extend_from_slice(self.treasury.as_ref());
         data.extend_from_slice(self.treasury_token_account.as_ref());
         data.extend_from_slice(&self.min_withdraw_amount.to_le_bytes());
+        data.push(self.confidential_only as u8);
         data
     }
 
@@ -97,6 +102,14 @@ impl WithdrawConfig {
                 .try_into()
                 .map_err(|_| PrivateChannelWithdrawProgramError::InvalidWithdrawConfig)?,
         );
+        offset += 8;
+
+        // The Borsh client refuses any bool byte but 0 or 1, so we do too.
+        let confidential_only = match data[offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(PrivateChannelWithdrawProgramError::InvalidWithdrawConfig.into()),
+        };
 
         Ok(Self {
             bump,
@@ -105,6 +118,7 @@ impl WithdrawConfig {
             treasury,
             treasury_token_account,
             min_withdraw_amount,
+            confidential_only,
         })
     }
 }
@@ -124,6 +138,7 @@ mod tests {
             treasury: Address::new_from_array([7u8; 32]),
             treasury_token_account: Address::new_from_array([9u8; 32]),
             min_withdraw_amount: 2_468_024,
+            confidential_only: true,
         };
 
         let bytes = config.to_bytes();
