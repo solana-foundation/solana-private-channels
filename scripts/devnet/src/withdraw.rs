@@ -4,15 +4,12 @@ use private_channel_withdraw_program_client::{
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, WITHDRAW_CONFIG_SEED,
 };
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Signer},
-    transaction::Transaction,
-};
+use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::{env, error::Error, str::FromStr};
 
 use crate::confidential::{confidential_withdraw_instruction, destination_not_ready};
+use crate::signer::{load_signer, parse_signer_arg, sign, signer_pubkey};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -22,7 +19,7 @@ pub fn run(confidential: bool) -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 5 {
-        eprintln!("Usage: {} <private-channel-gateway-rpc> <user-keypair-path> <mint-address> <amount> [destination]", args[0]);
+        eprintln!("Usage: {} <private-channel-gateway-rpc> <user-keypair-path | env:PREFIX> <mint-address> <amount> [destination]", args[0]);
         eprintln!("Example: {} http://localhost:8899 ./keypairs/user.json PANskKbAxqUQuqVfwzMtkyxii5GLaG1VFmB9xWb5tTP 500000", args[0]);
         eprintln!("\n⚠️  IMPORTANT: RPC URL must be PrivateChannel gateway (NOT Solana devnet)");
         eprintln!("  - Local:  http://localhost:8899");
@@ -39,6 +36,8 @@ pub fn run(confidential: bool) -> Result<()> {
         eprintln!(
             "Set PRIVATE_CHANNEL_READ_RPC_URL to the read node when the gateway enforces JWT."
         );
+        eprintln!("env:PREFIX loads a remote signer (e.g. the admin for a fee sweep) from");
+        eprintln!("PREFIX_SIGNER and its backend vars, named like the operators' ADMIN_* vars.");
         std::process::exit(1);
     }
 
@@ -57,7 +56,7 @@ pub fn run(confidential: bool) -> Result<()> {
         println!("Mode: confidential (ConfidentialWithdrawFunds)");
     }
     println!("Connecting to PrivateChannel gateway: {}", rpc_url);
-    println!("Using user keypair: {}", keypair_path);
+    println!("Using user signer: {}", keypair_path);
     println!("Mint: {}", mint);
     println!("Amount: {}", amount);
     if let Some(dest) = destination {
@@ -67,17 +66,16 @@ pub fn run(confidential: bool) -> Result<()> {
     }
 
     let client = RpcClient::new(rpc_url.to_string());
-    let user_keypair =
-        read_keypair_file(keypair_path).map_err(|e| format!("Failed to read keypair: {}", e))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let user_signer = rt
+        .block_on(load_signer(&parse_signer_arg(keypair_path)?))
+        .map_err(|e| format!("Failed to load signer: {}", e))?;
+    let user = signer_pubkey(&user_signer);
 
-    println!("User pubkey: {}", user_keypair.pubkey());
+    println!("User pubkey: {}", user);
 
     // Channel token accounts are Token-2022 ATAs.
-    let user_ata = get_associated_token_address_with_program_id(
-        &user_keypair.pubkey(),
-        &mint,
-        &spl_token_2022::ID,
-    );
+    let user_ata = get_associated_token_address_with_program_id(&user, &mint, &spl_token_2022::ID);
 
     // The fee, where it goes and the minimum live in the mint's config on
     // PrivateChannel. The operator writes it on the mint's deposits, so a mint
@@ -105,7 +103,7 @@ pub fn run(confidential: bool) -> Result<()> {
     let withdraw_config = WithdrawConfig::from_bytes(&withdraw_config_data)
         .map_err(|e| format!("Failed to decode withdraw config: {}", e))?;
     // The treasury moves its collected fees out without a fee or a minimum.
-    let is_treasury = user_keypair.pubkey() == withdraw_config.treasury;
+    let is_treasury = user == withdraw_config.treasury;
     let (fee, min_withdraw_amount) = if is_treasury {
         (0, 0)
     } else {
@@ -132,7 +130,7 @@ pub fn run(confidential: bool) -> Result<()> {
     println!("Total debited: {} (amount + fee)", total);
 
     let accounts = WithdrawFunds {
-        user: user_keypair.pubkey(),
+        user,
         mint,
         token_account: user_ata,
         token_program: spl_token_2022::ID,
@@ -145,19 +143,15 @@ pub fn run(confidential: bool) -> Result<()> {
         destination,
     };
     let instruction = if confidential {
-        check_confidential_destination(&mint, &destination.unwrap_or(user_keypair.pubkey()))?;
+        check_confidential_destination(&mint, &destination.unwrap_or(user))?;
         confidential_withdraw_instruction(accounts, args)?
     } else {
         accounts.instruction(args)
     };
 
-    let recent_blockhash = client.get_latest_blockhash()?;
-    let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
-        Some(&user_keypair.pubkey()),
-        &[&user_keypair],
-        recent_blockhash,
-    );
+    let mut transaction = Transaction::new_with_payer(&[instruction], Some(&user));
+    transaction.message.recent_blockhash = client.get_latest_blockhash()?;
+    rt.block_on(sign(&user_signer, &mut transaction))?;
 
     // Print the locally-derived signature *before* sending so callers (the
     // smoke test in particular) can capture it even if the subsequent

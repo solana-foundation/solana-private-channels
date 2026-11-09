@@ -539,13 +539,22 @@ broadcast signatures enters the automatic remint flow, which remints only once
 it proves no release landed and otherwise sends the row to manual review. A row
 with no signatures goes straight to manual review for an out-of-band remint.
 
-The admin's control over an operator key is `RemoveOperator`. That separation is
-on chain only. The indexer's operator process always loads the admin signer, uses
-it to pay for rotations, and signs as the operator with it when `OPERATOR_SIGNER`
-is unset (a set `OPERATOR_SIGNER` that fails to load stops the process instead),
-so whoever holds that process holds both roles and
-there is no one left to revoke anything. Containment requires an operator key
-that is distinct from the admin key and kept outside that process.
+The admin's control over an operator key is `RemoveOperator`, signed by
+`Instance.admin`, an offline key that never reaches the operator host. The
+operator key is separate from the channel admin key (the service key that pays
+release fees, signs remints and collects withdraw fees): the deposit operator
+(`operator-solana`) loads only the channel admin, and the withdraw operator
+(`operator-private-channel`) loads both, signing releases with its own operator
+key. The Ansible deploy refuses equal keys off localnet; raw compose falls back to
+the admin key when `OPERATOR_PRIVATE_KEY` is blank, and the process signs as the
+operator with the admin key when `OPERATOR_SIGNER` is unset (a set
+`OPERATOR_SIGNER` that fails to load stops it instead). The split gives
+separation and independent rotation, not containment: the withdraw operator
+process still holds both keys, and `ReleaseFunds` does not tie its fee payer to
+the channel admin, so the operator key alone can release funds. Protect it at
+least as well as the admin key, with a remote signer on mainnet (the deploy
+refuses the memory signer there). Rotation is in
+[runbooks/key_rotation.md](runbooks/key_rotation.md).
 
 ## Accounts
 

@@ -52,7 +52,10 @@ async fn main() {
 
     let state = AppState {
         pool,
-        jwt: Arc::new(JwtConfig::new(&config.jwt_secret)),
+        jwt: Arc::new(JwtConfig::with_previous(
+            &config.jwt_secret,
+            config.jwt_secret_previous(),
+        )),
         pool_status: pool_status.clone(),
         passwords: PasswordWorker::new(config.argon2_max_concurrency),
         throttle: auth_throttle,

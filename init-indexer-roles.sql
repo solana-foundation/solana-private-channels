@@ -13,7 +13,7 @@
 -- to a function some other login created in public.
 SET search_path = pg_catalog, pg_temp;
 
-\set grafana_password `echo "$POSTGRES_GRAFANA_PASSWORD"`
+\set grafana_password `if [ -n "$POSTGRES_GRAFANA_PASSWORD_FILE" ]; then cat "$POSTGRES_GRAFANA_PASSWORD_FILE"; else printf %s "$POSTGRES_GRAFANA_PASSWORD"; fi`
 \set app_db `echo "$POSTGRES_DB"`
 
 -- set_config returns what it was given, and the entrypoint runs psql without

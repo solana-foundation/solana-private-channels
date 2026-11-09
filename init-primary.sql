@@ -1,10 +1,8 @@
 -- Create replication user
--- Password is provided via the POSTGRES_REPLICATION_PASSWORD env var rendered
--- through psql variable substitution. The Postgres entrypoint exports all
--- POSTGRES_* env vars; we forward it via PSQL_OPTIONS / -v to make it visible
--- here as :'replication_password'.
+-- Password comes from the POSTGRES_REPLICATION_PASSWORD_FILE secret file when set
+-- (the Ansible deploy), else from POSTGRES_REPLICATION_PASSWORD (raw compose).
 \set replication_user `echo "$POSTGRES_REPLICATION_USER"`
-\set replication_password `echo "$POSTGRES_REPLICATION_PASSWORD"`
+\set replication_password `if [ -n "$POSTGRES_REPLICATION_PASSWORD_FILE" ]; then cat "$POSTGRES_REPLICATION_PASSWORD_FILE"; else printf %s "$POSTGRES_REPLICATION_PASSWORD"; fi`
 CREATE USER :"replication_user" WITH REPLICATION ENCRYPTED PASSWORD :'replication_password';
 
 -- Grant necessary permissions for replication. The default privileges that keep

@@ -105,6 +105,10 @@ async fn insert_wallet(pool: &PgPool, user_id: Uuid, pubkey: &str) {
 /// Generate a signed JWT for the given user and role using TEST_JWT_SECRET.
 /// Expires in 1 hour — sufficient for any test run.
 fn generate_token(user_id: Uuid, role: &str) -> String {
+    generate_token_with_secret(user_id, role, TEST_JWT_SECRET)
+}
+
+fn generate_token_with_secret(user_id: Uuid, role: &str, secret: &str) -> String {
     let claims = json!({
         "sub": user_id.to_string(),
         "role": role,
@@ -115,7 +119,7 @@ fn generate_token(user_id: Uuid, role: &str) -> String {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()),
     )
     .unwrap()
 }
@@ -248,6 +252,37 @@ async fn start_gateway(auth_db: PgPool, write_url: String, read_url: String) -> 
         Some(TEST_JWT_SECRET.to_string()),
         Some(auth_db),
     ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let _ = serve(listener, gateway, Access::Public).await;
+    });
+
+    addr
+}
+
+/// Start a gateway that verifies with `TEST_JWT_SECRET`, then `previous`.
+async fn start_gateway_with_previous(
+    auth_db: PgPool,
+    read_url: String,
+    previous: &str,
+) -> SocketAddr {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    let gateway = Arc::new(
+        Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            read_url,
+            "*".to_string(),
+            Some(TEST_JWT_SECRET.to_string()),
+            Some(auth_db),
+        )
+        .with_previous_jwt_secret(Some(previous.to_string())),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -795,6 +830,41 @@ async fn test_get_account_info_owned_wallet_pubkey_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// During a rotation a token signed with the previous key still reads, and one
+/// signed with any other key is unauthenticated.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_previous_key_token_is_accepted_and_an_unknown_key_is_401() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let previous = "test-gateway-previous-secret";
+    let pubkey = "So11111111111111111111111111111111111111112";
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, pubkey).await;
+
+    let backend = start_mock_backend_with_body(system_account_response()).await;
+    let addr = start_gateway_with_previous(pool, format!("http://{}", backend), previous).await;
+
+    for (name, secret, expected) in [
+        ("previous", previous, 200),
+        ("unknown", "some-unknown-secret", 401),
+    ] {
+        let res = Client::new()
+            .post(format!("http://{}", addr))
+            .bearer_auth(generate_token_with_secret(user_id, "user", secret))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAccountInfo",
+                "params": [pubkey]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), expected, "{name} key");
+    }
 }
 
 /// A user querying a System Program account whose pubkey is NOT in their

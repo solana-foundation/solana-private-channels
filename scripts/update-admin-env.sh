@@ -9,8 +9,15 @@ set -euo pipefail
 # Public admin key goes to the tracked template; the private key goes only to a
 # gitignored runtime env file, so `make build-*` never puts a live key in git.
 
+# --operator-keypair also writes the withdraw operator's own release key.
+operator_keypair=""
+if [[ "${1:-}" == --operator-keypair ]]; then
+  operator_keypair="${2:-}"
+  shift 2
+fi
+
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 <env-file> <channel-admin-keypair-path> [runtime-env-file]" >&2
+  echo "Usage: $0 [--operator-keypair <path>] <env-file> <channel-admin-keypair-path> [runtime-env-file]" >&2
   exit 1
 fi
 
@@ -22,6 +29,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 admin_pubkey="$(solana-keygen pubkey "$admin_keypair")"
 admin_private_key="$(tr -d '\n' < "$admin_keypair")"
+
+if [[ -n "$operator_keypair" ]]; then
+  operator_pubkey="$(solana-keygen pubkey "$operator_keypair")"
+  if [[ "$operator_pubkey" == "$admin_pubkey" ]]; then
+    echo "ERROR: the operator keypair is the channel admin key ($admin_pubkey); use a separate one." >&2
+    exit 1
+  fi
+fi
 
 # Public key -> tracked template (safe to commit).
 "$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$admin_pubkey"
@@ -40,6 +55,11 @@ fi
 # Private key -> gitignored runtime file only, on stdin via the printf builtin
 # so it never sits in a child argv.
 printf '%s' "$admin_private_key" | "$script_dir/upsert-env.sh" "$runtime_env_file" "ADMIN_PRIVATE_KEY"
+
+if [[ -n "$operator_keypair" ]]; then
+  tr -d '\n' < "$operator_keypair" | "$script_dir/upsert-env.sh" "$runtime_env_file" "OPERATOR_PRIVATE_KEY"
+  echo "Wrote OPERATOR_PRIVATE_KEY ($operator_pubkey) to $runtime_env_file (gitignored)"
+fi
 
 echo "Updated $env_file with PRIVATE_CHANNEL_ADMIN_KEYS=$admin_pubkey"
 echo "Wrote ADMIN_PRIVATE_KEY to $runtime_env_file (gitignored)"

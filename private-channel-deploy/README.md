@@ -30,8 +30,8 @@ Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once **on both 
 
 Three one-time edits per environment, done before the first deploy. They tell the playbook where the host is, what to deploy, and which credentials to use.
 
-1. **Point at a host** ([`inventory.ini`](./inventory.ini)): IP, SSH user, key path.
-2. **Choose what to deploy** ([`vars/dev.yml`](./vars/dev.yml)): image registry/tag, target Solana network, on-host paths. Each option has an inline comment explaining what to pick.
+1. **Point at a host** ([`inventory.ini`](./inventory.ini)): IP, SSH user, key path. [`inventory.example.ini`](./inventory.example.ini) has one group per network (`dev`, `devnet`, `mainnet`).
+2. **Choose what to deploy** ([`vars/dev.yml`](./vars/dev.yml)): image registry/tag, target Solana network, on-host paths. Each option has an inline comment explaining what to pick. The inventory group selects `vars/<group>.yml`; for devnet and mainnet copy [`vars/devnet.example.yml`](./vars/devnet.example.yml) or [`vars/mainnet.example.yml`](./vars/mainnet.example.yml).
 3. **Provide credentials**, via one of the two backends below. For the default file backend, copy the template and fill in real values:
 
    ```bash
@@ -42,6 +42,24 @@ Three one-time edits per environment, done before the first deploy. They tell th
 
 Everything else is wired and shouldn't need routine changes.
 
+### Choose your setup
+
+Pick a network, a secrets backend and a signer backend, copy the files in that row, then run its command. Every row also needs `inventory.example.ini` copied to `inventory.ini` with the group you deploy. With Doppler, upload the secrets once with `scripts/doppler-import.sh` (or fill [`examples/doppler/secrets.template.json`](./examples/doppler/secrets.template.json)) instead of keeping `secrets.yml`, and `export DOPPLER_TOKEN=<read-only service token>` before the command.
+
+| Network | Secrets | Signers | Files to copy and fill | Command |
+| --- | --- | --- | --- | --- |
+| localnet | file or Doppler | memory | `secrets.yml.example` to `secrets.yml` (`vars/dev.yml` is shipped) | `ansible-playbook deploy.yml -l dev` |
+| devnet | file or Doppler | memory | `vars/devnet.example.yml` to `vars/devnet.yml`, `secrets.yml.example` to `secrets.yml` | `ansible-playbook deploy.yml -l devnet` |
+| devnet | file or Doppler | vault, turnkey or privy | as above, plus the backend secret in `secrets.yml` or Doppler | `ansible-playbook deploy.yml -l devnet -e @examples/signers/<backend>.yml` |
+| mainnet | file or Doppler | vault | `vars/mainnet.example.yml` to `vars/mainnet.yml` (Vault already set), `secrets.yml` or Doppler | `ansible-playbook deploy.yml -l mainnet` |
+| mainnet | file or Doppler | turnkey or privy | as above | `ansible-playbook deploy.yml -l mainnet -e @examples/signers/<backend>.yml` |
+
+- **Signers.** The channel admin (`admin_signer`) is fee payer, mint and freeze authority and withdraw fee treasury; the withdraw operator (`operator_signer`) signs `ReleaseFunds` with its own key. Each is `memory`, `vault`, `turnkey` or `privy` (default `memory`). [`examples/signers/`](./examples/signers/) has one file per backend with every var it needs; `-e @file` overrides the vars file. Mainnet refuses `memory` for either role.
+- **Separate keys.** Off localnet the admin and operator pubkeys must differ, and the operator needs an Operator PDA: run `add_operator` for the operator pubkey with the escrow `Instance.admin` key before the deploy, or preflight refuses it. On localnet `keypairs/withdraw-operator.json` is generated next to `keypairs/admin.json`; once the instance exists, run `add_operator` for its pubkey before the deploy that sets `escrow_instance_id`, or preflight refuses it.
+- **Image.** The app image must have the `with-secrets` entrypoint. The deploy refuses older images, `v0.1.0` included.
+
+Key and secret rotation: [`docs/runbooks/key_rotation.md`](../docs/runbooks/key_rotation.md) and [`docs/runbooks/secret_rotation.md`](../docs/runbooks/secret_rotation.md).
+
 ### Secrets backends
 
 The deploy reads secrets from one of two backends, chosen automatically:
@@ -51,16 +69,12 @@ The deploy reads secrets from one of two backends, chosen automatically:
 
 Doppler setup (one time):
 
-1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `POSTGRES_RUNTIME_PASSWORD`, `POSTGRES_AUTH_RUNTIME_PASSWORD`, `POSTGRES_AUTH_OWNER_PASSWORD`, `POSTGRES_GATEWAY_PASSWORD`, `POSTGRES_MONITORING_PASSWORD`, `POSTGRES_GRAFANA_PASSWORD`, `POSTGRES_INDEXER_PASSWORD`, `JWT_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`. Two use their rendered `.env` names instead: `DEVNET_YELLOWSTONE_ENDPOINT` (optional; overrides `yellowstone_endpoint` from `vars/<env>.yml`) and `ALERT_WEBHOOK_URL` (the webhook; `NOTIFY_WEBHOOK` is also accepted).
-2. Import your existing file in one shot (uppercases the keys, keeps values):
+1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `POSTGRES_RUNTIME_PASSWORD`, `POSTGRES_AUTH_RUNTIME_PASSWORD`, `POSTGRES_AUTH_OWNER_PASSWORD`, `POSTGRES_GATEWAY_PASSWORD`, `POSTGRES_MONITORING_PASSWORD`, `POSTGRES_GRAFANA_PASSWORD`, `POSTGRES_INDEXER_PASSWORD`, `JWT_SECRET`, `JWT_SECRET_PREVIOUS` (only during a rotation), `GRAFANA_ADMIN_PASSWORD`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`, `FALLBACK_RPC_URL`, `GATEWAY_WHITELIST_RPC_URL`, and per signer role the backend secret: `ADMIN_VAULT_TOKEN`, `OPERATOR_VAULT_TOKEN`, `ADMIN_TURNKEY_API_PRIVATE_KEY`, `OPERATOR_TURNKEY_API_PRIVATE_KEY`, `ADMIN_PRIVY_APP_SECRET`, `OPERATOR_PRIVY_APP_SECRET`. A memory signer may take its key from `ADMIN_KEYPAIR` or `OPERATOR_KEYPAIR` (the keypair JSON byte array, which wins over `<role>_keypair_path`; refused on mainnet). Three names differ from the file keys: `ALERT_WEBHOOK_URL` is `notify_webhook` (`NOTIFY_WEBHOOK` is also accepted), `GRAFANA_ALERT_WEBHOOK_URL` is `alert_webhook_url`, and `DEVNET_YELLOWSTONE_ENDPOINT` (optional) overrides `yellowstone_endpoint` from `vars/<env>.yml`. An empty `RPC_URL`, `FALLBACK_RPC_URL`, `GATEWAY_WHITELIST_RPC_URL` or `DEVNET_YELLOWSTONE_ENDPOINT` keeps the vars value. [`examples/doppler/secrets.template.json`](./examples/doppler/secrets.template.json) lists every key.
+2. Import your existing file in one shot with [`scripts/doppler-import.sh`](../scripts/doppler-import.sh). It applies the names above, skips empty values, keeps the plaintext JSON in a 0700 temp dir it always deletes, never prints a value, and uploads with your own `doppler login` (it ignores `DOPPLER_TOKEN`). It needs `python3` with PyYAML.
    ```bash
-   # from private-channel-deploy/, with the doppler CLI installed + `doppler setup` done.
-   # Subshell keeps the plaintext in a private 0700 tempdir and wipes it on any exit
-   # (including failure or Ctrl-C), so credentials never linger in a world-readable /tmp.
-   ( set -euo pipefail
-     dir="$(mktemp -d)"; trap 'rm -rf "$dir"' EXIT
-     uv run --with pyyaml python3 -c "import yaml,json,sys; d=yaml.safe_load(open('secrets.yml')); json.dump({k.upper():('' if v is None else str(v)) for k,v in d.items()}, sys.stdout)" > "$dir/secrets.json"
-     doppler secrets upload "$dir/secrets.json" )
+   # from private-channel-deploy/; --create-config creates the config first.
+   ../scripts/doppler-import.sh --project <project> --config <config> [--create-config] secrets.yml
+   ../scripts/doppler-import.sh --dry-run secrets.yml   # key names only, uploads nothing
    ```
 3. Mint a **read-only** service token scoped to that config, then run deploys with it in the environment:
    ```bash
@@ -74,15 +88,17 @@ The token pins the project + config, so the playbook needs nothing else. The fil
 
 The deploy pulls images from GHCR. Build + push them once from the control node, then every host can `docker compose pull`.
 
-1. **Create a GitHub Personal Access Token (PAT)** with the `write:packages` [scope](https://github.com/settings/tokens/new?scopes=write:packages) (covers both push and pull)
+1. **Create two GitHub Personal Access Tokens (classic PATs).**
+   - **Deploy PAT** (goes in `secrets.yml`): `read:packages` [only](https://github.com/settings/tokens/new?scopes=read:packages), ideally on an org-scoped bot account. The deploy refuses any other scope set and fine-grained `github_pat_` tokens, and uses the PAT only for the pull, from a throwaway docker config it deletes afterwards.
+   - **Push PAT** (stays on your workstation, never in `secrets.yml`): `write:packages`, used only for the manual push below. CI pushes with its own `GITHUB_TOKEN`.
 2. **Set the Personal Access Token (PAT) in `secrets.yml`:**
    - `ghcr_user`: GitHub username
-   - `ghcr_token`: the PAT from step 1.
+   - `ghcr_token`: the deploy (read-only) PAT from step 1.
 3. **Build and push from the control node.** Set `image_registry` and `image_tag` in [`vars/dev.yml`](./vars/dev.yml) (e.g. `image_registry: ghcr.io/<your-github-username-lowercase>`, `image_tag: v0.1.0`), then run the snippet below from inside the `private-channel-deploy/` directory.
 
    ```bash
    export GHCR_USER=<your-github-username>
-   export GHCR_TOKEN=<your-pat-from-step-1>
+   export GHCR_TOKEN=<your-push-pat-from-step-1>
    OWNER=$(echo "$GHCR_USER" | tr '[:upper:]' '[:lower:]')   # GHCR namespace must be lowercase
    echo "$OWNER"           # sanity-check it's all lowercase
    TAG=v0.1.0              # must match image_tag in vars/dev.yml
@@ -114,7 +130,7 @@ Images published by [`.github/workflows/publish-image.yml`](../.github/workflows
 
 ## Operating
 
-Cluster-agnostic by design, the commands don't change between localnet, devnet/mainnet. The deploy target is set once in [`vars/dev.yml`](./vars/dev.yml) (`network` + `rpc_url`); the playbook auto-selects the matching compose file ([`docker-compose.yml`](../docker-compose.yml) for localnet, [`docker-compose.devnet.yml`](../docker-compose.devnet.yml) for devnet/mainnet) and renders a per-env `.env` from `vars/dev.yml` + `secrets.yml`.
+Cluster-agnostic by design, the commands don't change between localnet, devnet/mainnet. The deploy target is set once in [`vars/dev.yml`](./vars/dev.yml) (`network` + `rpc_url`); the playbook auto-selects the matching compose file ([`docker-compose.yml`](../docker-compose.yml) for localnet, [`docker-compose.devnet.yml`](../docker-compose.devnet.yml) for devnet/mainnet) and renders a per-env `.env` from `vars/dev.yml`. Secrets never go in that `.env` (their keys are present but empty): each container reads only its own, from files under `{{ host_data_dir }}/secrets/<service>/` (root-owned: a 0700 parent, 0755 service dirs, 0444 files), mounted read-only at `/run/secrets`. A per-service `secrets-rev` label changes when that service's secrets change, so a redeploy recreates exactly those containers. `--tags secrets_render` rewrites only the secret files.
 
 PHASE 1 refuses a config the binaries would refuse or ignore:
 
@@ -186,9 +202,9 @@ Dashboard JSON + alerting rules live under [`monitoring/`](../monitoring/) — e
 | #   | Symptom                                                                                              | Fix                                                                                                                                                                                                                                                                                                                                           |
 | --- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | Indexer crashes with `MismatchExceedsThreshold`                                                      | Validator was reset but indexer DB wasn't. Run [`teardown.yml`](./teardown.yml) then redeploy: `reset_state: true` (default in [`vars/dev.yml`](./vars/dev.yml)) wipes both in lockstep.                                                                                                                                                      |
-| 2   | `postgres-replica` unhealthy / `pg_basebackup: password authentication failed for user "replicator"` | The primary's stored credentials drifted from `postgres_replication_password` in `secrets.yml` (typically a stale Postgres volume from an earlier password). Run `ansible-playbook teardown.yml -l dev && ansible-playbook deploy.yml -l dev` so the volume is wiped and the primary re-initialises with the current secret. |
-| 3   | `dependency failed to start: container ... is unhealthy`                                             | Stale Postgres volume from a different password. Teardown + redeploy.                                                                                                                                                                                                                                                                         |
-| 4   | `password authentication failed for user "private_channel_runtime"` (or `..._auth_runtime`, `..._auth_owner`) | The service logins come from [`init-auth-roles.sql`](../init-auth-roles.sql), which the Postgres entrypoint runs only on an empty data directory. PHASE 4 applies it on every deploy, so this means the cluster is one Ansible does not manage. On a raw Compose stack run `make docker-migrate` (or `make docker-devnet-migrate`), which applies both role scripts and resets Grafana's stored admin password. Otherwise apply it by hand, from the directory holding the compose files: `set -a; . ./.env; set +a; docker exec -i -e POSTGRES_REPLICATION_USER -e POSTGRES_RUNTIME_PASSWORD -e POSTGRES_AUTH_RUNTIME_PASSWORD -e POSTGRES_AUTH_OWNER_PASSWORD -e POSTGRES_GATEWAY_PASSWORD -e POSTGRES_MONITORING_PASSWORD private-channel-postgres-primary sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' < init-auth-roles.sql`. |
+| 2   | `postgres-replica` unhealthy / `pg_basebackup: password authentication failed for user "replicator"` | Every deploy re-applies the superuser and replicator passwords on the primary and rewrites the replica's `primary_conninfo`, so first redeploy: `ansible-playbook deploy.yml -l dev`. Secrets are not in `.env`; compare against the files the containers read, as root: `sudo cat {{ host_data_dir }}/secrets/postgres-primary/POSTGRES_REPLICATION_PASSWORD`. If it still fails on a dev stack, `ansible-playbook teardown.yml -l dev && ansible-playbook deploy.yml -l dev` wipes the volume and the primary re-initialises with the current secret. |
+| 3   | `dependency failed to start: container ... is unhealthy`                                             | Stale Postgres volume from a different password. Teardown + redeploy. A container that exits at once with `with-secrets: cannot read the file for X` or `the file for X is empty` is missing a secret: rerun `ansible-playbook deploy.yml -l <group> --tags secrets_render,deploy` and check `sudo ls {{ host_data_dir }}/secrets/<service>/`. |
+| 4   | `password authentication failed for user "private_channel_runtime"` (or `..._auth_runtime`, `..._auth_owner`) | The service logins come from [`init-auth-roles.sql`](../init-auth-roles.sql), which the Postgres entrypoint runs only on an empty data directory. PHASE 4 applies it on every deploy, so this means the cluster is one Ansible does not manage (on an Ansible stack, read the expected value with `sudo cat {{ host_data_dir }}/secrets/postgres-primary/POSTGRES_RUNTIME_PASSWORD`, not from `.env`, which holds no secrets). On a raw Compose stack run `make docker-migrate` (or `make docker-devnet-migrate`), which applies both role scripts and resets Grafana's stored admin password. Otherwise apply it by hand, from the directory holding the compose files: `set -a; . ./.env; set +a; docker exec -i -e POSTGRES_REPLICATION_USER -e POSTGRES_RUNTIME_PASSWORD -e POSTGRES_AUTH_RUNTIME_PASSWORD -e POSTGRES_AUTH_OWNER_PASSWORD -e POSTGRES_GATEWAY_PASSWORD -e POSTGRES_MONITORING_PASSWORD private-channel-postgres-primary sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -' < init-auth-roles.sql`. |
 
 ## Potential future improvements
 

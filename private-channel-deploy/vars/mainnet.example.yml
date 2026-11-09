@@ -1,0 +1,81 @@
+# Example vars for a Solana mainnet stack. Copy to vars/mainnet.yml and fill in the
+# <placeholders>; the [mainnet] inventory group loads it (`-l mainnet`).
+#   cp vars/mainnet.example.yml vars/mainnet.yml
+# Every key is explained in vars/dev.yml; this file only notes what differs on mainnet.
+# Secrets (passwords, tokens, webhooks, keyed RPC URLs) go in secrets.yml or Doppler.
+
+# === What to deploy =========================================================
+
+image_registry: ghcr.io/<owner>
+# Must be built with the with-secrets entrypoint: the deploy refuses older images
+# such as v0.1.0, which would start with blank secrets.
+image_tag: <tag>
+
+# Refuse an image the publish workflow did not sign (needs cosign on the control node).
+verify_image_signature: true
+
+# === Network ================================================================
+
+network: mainnet
+
+# rpc_url and fallback_rpc_url carry provider API keys, so they are secrets: set
+# them in secrets.yml or Doppler (RPC_URL, FALLBACK_RPC_URL), not here. Both are
+# required, and the fallback must be an independent archival provider.
+
+# Required off localnet; pair with yellowstone_token in secrets.yml.
+yellowstone_endpoint: "https://<provider-yellowstone-host>"
+
+# === On-host layout ========================================================
+
+host_data_dir: /opt/private-channel
+
+# === Gateway auth & port ===================================================
+
+gateway_enforce_jwt: true
+# gateway_port: 8899
+# Optional withdraw whitelist check: set gateway_whitelist_rpc_url in secrets.yml too.
+# gateway_whitelist_instance: <escrow instance PDA>
+
+# === Escrow instance =======================================================
+escrow_instance_id: "<your_instance_address>"
+
+# === Signers ================================================================
+# Mainnet refuses the memory signer for either role, and a Doppler ADMIN_KEYPAIR or
+# OPERATOR_KEYPAIR. This example uses Vault; see examples/signers/ for Turnkey and
+# Privy. The two pubkeys must differ, and the operator needs an Operator PDA
+# (add_operator, signed by the escrow Instance.admin) before the first deploy.
+# Tokens go in secrets.yml or Doppler: admin_vault_token, operator_vault_token.
+admin_signer: vault
+admin_vault_addr: "https://vault.example.internal:8200"
+admin_vault_key_name: pc-admin
+admin_pubkey: "<base58 pubkey of transit/keys/pc-admin>"
+
+operator_signer: vault
+operator_vault_addr: "https://vault.example.internal:8200"
+operator_vault_key_name: pc-operator
+operator_pubkey: "<base58 pubkey of transit/keys/pc-operator>"
+
+# Extra channel admin pubkeys the node accepts, only during a channel admin rotation.
+extra_admin_keys: []
+
+# === Seize keys =============================================================
+# A dedicated delegate key, kept offline; never the channel admin.
+permanent_delegate: "<delegate_pubkey>"
+compliance_owner: "<compliance_owner_pubkey>"
+
+# === Public surface ========================================================
+
+domain: <app.example.com>
+
+# === Reset-state binding ===================================================
+reset_state: false
+
+# === Monitoring ports (host-side) ==========================================
+monitoring_dir: "{{ host_data_dir }}/monitoring"
+monitoring_grafana_port: 3001
+monitoring_prometheus_port: 9090
+monitoring_blackbox_port: 9115
+monitoring_cadvisor_port: 8081
+monitoring_node_exporter_port: 9101
+monitoring_postgres_exporter_port: 9187
+monitoring_postgres_exporter_indexer_port: 9188

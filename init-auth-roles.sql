@@ -22,15 +22,16 @@
 -- to the built-ins before anything runs.
 SET search_path = pg_catalog, pg_temp;
 
--- Passwords arrive as env vars the Postgres entrypoint exports. They are staged
+-- Passwords come from X_FILE secret files when set (the Ansible deploy), else from
+-- the X env vars (raw compose). They are staged
 -- through set_config because psql substitutes :'vars' only outside quoted
 -- strings, and the role statements below are built inside dollar-quoted blocks.
-\set runtime_password `echo "$POSTGRES_RUNTIME_PASSWORD"`
-\set auth_runtime_password `echo "$POSTGRES_AUTH_RUNTIME_PASSWORD"`
-\set auth_owner_password `echo "$POSTGRES_AUTH_OWNER_PASSWORD"`
-\set gateway_password `echo "$POSTGRES_GATEWAY_PASSWORD"`
+\set runtime_password `if [ -n "$POSTGRES_RUNTIME_PASSWORD_FILE" ]; then cat "$POSTGRES_RUNTIME_PASSWORD_FILE"; else printf %s "$POSTGRES_RUNTIME_PASSWORD"; fi`
+\set auth_runtime_password `if [ -n "$POSTGRES_AUTH_RUNTIME_PASSWORD_FILE" ]; then cat "$POSTGRES_AUTH_RUNTIME_PASSWORD_FILE"; else printf %s "$POSTGRES_AUTH_RUNTIME_PASSWORD"; fi`
+\set auth_owner_password `if [ -n "$POSTGRES_AUTH_OWNER_PASSWORD_FILE" ]; then cat "$POSTGRES_AUTH_OWNER_PASSWORD_FILE"; else printf %s "$POSTGRES_AUTH_OWNER_PASSWORD"; fi`
+\set gateway_password `if [ -n "$POSTGRES_GATEWAY_PASSWORD_FILE" ]; then cat "$POSTGRES_GATEWAY_PASSWORD_FILE"; else printf %s "$POSTGRES_GATEWAY_PASSWORD"; fi`
 \set replication_user `echo "$POSTGRES_REPLICATION_USER"`
-\set monitoring_password `echo "$POSTGRES_MONITORING_PASSWORD"`
+\set monitoring_password `if [ -n "$POSTGRES_MONITORING_PASSWORD_FILE" ]; then cat "$POSTGRES_MONITORING_PASSWORD_FILE"; else printf %s "$POSTGRES_MONITORING_PASSWORD"; fi`
 \set app_db `echo "$POSTGRES_DB"`
 
 -- set_config returns what it was given, and the entrypoint runs psql without

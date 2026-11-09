@@ -1,0 +1,21 @@
+# Privy signers: each role signs with a Privy server wallet. No private key reaches
+# the host; only the Privy app secret does, as a secret file.
+# Use with: ansible-playbook deploy.yml -l <group> -e @examples/signers/privy.yml
+#
+# Secrets (secrets.yml or Doppler, never this file):
+#   admin_privy_app_secret     (Doppler ADMIN_PRIVY_APP_SECRET)
+#   operator_privy_app_secret  (Doppler OPERATOR_PRIVY_APP_SECRET)
+#
+# The signer has no pubkey setting, so <role>_pubkey is required: the deploy renders
+# PRIVATE_CHANNEL_ADMIN_KEYS from admin_pubkey and checks the Operator PDA of
+# operator_pubkey. Set each to its wallet's Solana address.
+
+admin_signer: privy
+admin_privy_app_id: "<Privy app id>"
+admin_privy_wallet_id: "<admin wallet id>"
+admin_pubkey: "<admin wallet base58 address>"
+
+operator_signer: privy
+operator_privy_app_id: "<Privy app id>"
+operator_privy_wallet_id: "<operator wallet id>"
+operator_pubkey: "<operator wallet base58 address>"

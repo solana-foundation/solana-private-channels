@@ -39,6 +39,7 @@ cargo run --bin create_instance -- \
 ```
 
 ## 2. Add Operator
+`<OPERATOR_PUBKEY>` is the withdraw operator's key (`solana-keygen pubkey keypairs/withdraw-operator.json` after `make build-devnet`), not the channel admin key.
 ```bash
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \

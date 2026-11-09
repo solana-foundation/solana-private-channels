@@ -1,0 +1,22 @@
+# Turnkey signers: each role signs with a Turnkey-held ed25519 private key. No
+# private key reaches the host; only the Turnkey API private key does, as a secret file.
+# Use with: ansible-playbook deploy.yml -l <group> -e @examples/signers/turnkey.yml
+#
+# Secrets (secrets.yml or Doppler, never this file):
+#   admin_turnkey_api_private_key     (Doppler ADMIN_TURNKEY_API_PRIVATE_KEY)
+#   operator_turnkey_api_private_key  (Doppler OPERATOR_TURNKEY_API_PRIVATE_KEY)
+#
+# Use a separate Turnkey private key per role, and ideally a separate API key pair per
+# role, scoped by policy to signing with that role's key only.
+
+admin_signer: turnkey
+admin_turnkey_api_public_key: "<admin API key pair public key>"
+admin_turnkey_organization_id: "<organization id>"
+admin_turnkey_private_key_id: "<id of the admin's Solana private key>"
+admin_pubkey: "<admin base58 Solana address>"
+
+operator_signer: turnkey
+operator_turnkey_api_public_key: "<operator API key pair public key>"
+operator_turnkey_organization_id: "<organization id>"
+operator_turnkey_private_key_id: "<id of the operator's Solana private key>"
+operator_pubkey: "<operator base58 Solana address>"

@@ -119,11 +119,14 @@ test_compose_interpolation() {
     || fail "devnet compose config: $(cat "$TMP/err")"
 
   for json in "$local_json" "$devnet_json"; do
+    # The deposit operator signs as the channel admin only and never holds a release key.
+    jq -e '.services["operator-solana"].environment | keys | map(select(test("^OPERATOR_(SIGNER|PRIVATE_KEY|VAULT_|TURNKEY_|PRIVY_)"))) | length == 0' \
+      <<<"$json" >/dev/null || fail "operator-solana carries an OPERATOR_* signer var"
+    [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_SIGNER' <<<"$json")" == memory ]] \
+      || fail "operator-private-channel OPERATOR_SIGNER not taken from the env file"
     for svc in operator-solana operator-private-channel; do
       [[ "$(jq -r --arg s "$svc" '.services[$s].environment.ADMIN_SIGNER' <<<"$json")" == memory ]] \
         || fail "$svc ADMIN_SIGNER not taken from the env file"
-      [[ "$(jq -r --arg s "$svc" '.services[$s].environment.OPERATOR_SIGNER' <<<"$json")" == memory ]] \
-        || fail "$svc OPERATOR_SIGNER not taken from the env file"
       bad="$(jq -r --arg s "$svc" '[.services[$s].ports[]? | select(.host_ip != "127.0.0.1")] | length' <<<"$json")"
       [[ "$bad" == 0 ]] || fail "$svc publishes a port beyond loopback"
     done
@@ -134,6 +137,18 @@ test_compose_interpolation() {
     got="$(jq -r --arg s "$svc" '.services[$s].environment.COMMON_ESCROW_INSTANCE_ID' <<<"$devnet_json")"
     [[ "$got" == "$preserved" ]] || fail "devnet $svc instance is '$got', not the preserved PDA"
   done
+
+  # A single-key env: the release key falls back to the admin key. A separate one wins.
+  printf 'ADMIN_PRIVATE_KEY=SNTLadmin\n' >"$TMP/admin-key.env"
+  printf 'OPERATOR_PRIVATE_KEY=SNTLoperator\n' >"$TMP/operator-key.env"
+  local one two
+  one="$(compose_json docker-compose.yml --env-file .env.local --env-file "$TMP/admin-key.env")" || fail "single-key config"
+  [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' <<<"$one")" == SNTLadmin ]] \
+    || fail "OPERATOR_PRIVATE_KEY does not fall back to ADMIN_PRIVATE_KEY"
+  two="$(compose_json docker-compose.devnet.yml --env-file .env.devnet --env-file "$TMP/instance.env" \
+    --env-file "$TMP/admin-key.env" --env-file "$TMP/operator-key.env")" || fail "two-key config"
+  [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' <<<"$two")" == SNTLoperator ]] \
+    || fail "a separate OPERATOR_PRIVATE_KEY does not reach the withdraw operator"
 
   # No default backend: an env file without ADMIN_SIGNER is refused at interpolation.
   grep -v '^ADMIN_SIGNER=' .env.local >"$TMP/no-signer.env"

@@ -87,7 +87,9 @@
 
   # Wipe everything under host_data_dir, including the bootstrap marker so
   # the next `deploy.yml` re-runs PHASE 2 (bootstrap) cleanly.
+  # The secrets tree is root-owned 0700, so this needs root.
   - name: Wipe host_data_dir
+    become: true
     ansible.builtin.file:
       path: "{{ host_data_dir }}"
       state: absent

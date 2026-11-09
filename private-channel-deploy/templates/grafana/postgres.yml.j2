@@ -1,0 +1,21 @@
+# Rendered by Ansible over the shared provisioning copy. Same datasource as
+# monitoring/provisioning/datasources/postgres.yml, but the password comes from
+# a secret file instead of the container env.
+apiVersion: 1
+
+datasources:
+  - name: Postgres (Indexer)
+    uid: postgres-indexer
+    type: postgres
+    access: proxy
+    url: ${POSTGRES_INDEXER_HOST}:5432
+    database: ${POSTGRES_INDEXER_DB}
+    # SELECT on the transaction_monitoring view and nothing else.
+    user: private_channel_grafana
+    secureJsonData:
+      password: $__file{/run/secrets/POSTGRES_GRAFANA_PASSWORD}
+    jsonData:
+      database: ${POSTGRES_INDEXER_DB}
+      sslmode: disable
+      postgresVersion: 1600
+    editable: false

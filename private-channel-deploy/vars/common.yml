@@ -16,6 +16,10 @@ deployed_tag_file: "{{ host_data_dir }}/.deployed-tag"
 # vars/<env>.yml (see vars/dev.yml). Common.yml provides no defaults so a
 # missing var fails fast instead of silently falling back.
 
+# Registry host of image_registry. GHCR login, the token scope check and the
+# old GHCR entry cleanup only run when it is ghcr.io.
+_registry_host: "{{ image_registry.split('/')[0] }}"
+
 # --- Repo location ---
 # Path on the control node containing docker-compose.yml + the files PHASE 3
 # RENDER ships to the target (init scripts, indexer config, etc.).
@@ -52,6 +56,125 @@ compiled_withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # Set to "" (empty) in vars/<env>.yml to publish on every interface instead. Only
 # do that behind a reverse proxy with TLS and a network allowlist.
 monitoring_bind_address: "127.0.0.1:"
+
+# --- Signers -----------------------------------------------------------------
+# Backend per role: memory, vault, turnkey or privy. memory loads the key from
+# <role>_keypair_path (or Doppler <ROLE>_KEYPAIR); mainnet refuses it. Remote
+# backends need <role>_pubkey plus the vars below; secrets among them (vault
+# token, turnkey API private key, privy app secret) go in secrets.yml or Doppler.
+admin_signer: memory
+operator_signer: memory
+# Extra channel admin pubkeys the node accepts, for the admin rotation overlap.
+extra_admin_keys: []
+# Vars each backend needs, per role (prefixed with admin_ or operator_).
+signer_backend_vars:
+  memory: []
+  vault: [ vault_addr, vault_token, vault_key_name, pubkey ]
+  turnkey: [ turnkey_api_public_key, turnkey_api_private_key, turnkey_organization_id, turnkey_private_key_id, pubkey ]
+  privy: [ privy_app_id, privy_app_secret, privy_wallet_id, pubkey ]
+
+# --- Secret files ------------------------------------------------------------
+# Every secret a container needs, per service directory under
+# {{ host_data_dir }}/secrets/. Each container mounts only its own directory at
+# /run/secrets and reads KEY from the file KEY (the app image entrypoint turns
+# KEY_FILE into KEY; postgres and Grafana read files natively). An empty value
+# gets no file and no KEY_FILE, so the base compose default applies.
+# The rendered .env keeps these keys present but empty.
+_pc_remote_rpc: "{{ network | default('localnet') != 'localnet' }}"
+_pc_indexer_db_url: "postgres://{{ postgres_indexer_user }}:{{ postgres_indexer_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}"
+# The one secret each signer backend needs, as the env key suffix and its deploy var.
+_pc_signer_secret:
+  memory: { key: PRIVATE_KEY, var: pc_ROLE_private_key }
+  vault: { key: VAULT_TOKEN, var: ROLE_vault_token }
+  turnkey: { key: TURNKEY_API_PRIVATE_KEY, var: ROLE_turnkey_api_private_key }
+  privy: { key: PRIVY_APP_SECRET, var: ROLE_privy_app_secret }
+secret_files:
+  postgres-primary:
+  - { key: POSTGRES_PASSWORD, value: "{{ postgres_password }}" }
+  - { key: POSTGRES_REPLICATION_PASSWORD, value: "{{ postgres_replication_password }}" }
+  - { key: POSTGRES_RUNTIME_PASSWORD, value: "{{ postgres_runtime_password }}" }
+  - { key: POSTGRES_AUTH_RUNTIME_PASSWORD, value: "{{ postgres_auth_runtime_password }}" }
+  - { key: POSTGRES_AUTH_OWNER_PASSWORD, value: "{{ postgres_auth_owner_password }}" }
+  - { key: POSTGRES_GATEWAY_PASSWORD, value: "{{ postgres_gateway_password }}" }
+  - { key: POSTGRES_MONITORING_PASSWORD, value: "{{ postgres_monitoring_password }}" }
+  postgres-replica:
+  - { key: POSTGRES_PASSWORD, value: "{{ postgres_password }}" }
+  - { key: POSTGRES_REPLICATION_PASSWORD, value: "{{ postgres_replication_password }}" }
+  postgres-indexer:
+  - { key: POSTGRES_PASSWORD, value: "{{ postgres_indexer_password }}" }
+  - { key: POSTGRES_GRAFANA_PASSWORD, value: "{{ postgres_grafana_password }}" }
+  write-node:
+  - { key: PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL, value: "postgres://private_channel_runtime:{{ postgres_runtime_password }}@postgres-primary:5432/{{ postgres_db }}" }
+  read-node:
+  - { key: PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL, value: "postgres://private_channel_runtime:{{ postgres_runtime_password }}@postgres-replica:5432/{{ postgres_db }}" }
+  gateway:
+  - { key: JWT_SECRET, value: "{{ jwt_secret if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_SECRET_PREVIOUS, value: "{{ jwt_secret_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_gateway:{{ postgres_gateway_password }}@postgres-primary:5432/{{ postgres_db }}" }
+  - { key: GATEWAY_WHITELIST_RPC_URL, value: "{{ gateway_whitelist_rpc_url | default('') }}" }
+  auth-migrate:
+  - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_auth_owner:{{ postgres_auth_owner_password }}@postgres-primary:5432/{{ postgres_db }}" }
+  auth:
+  - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_auth_runtime:{{ postgres_auth_runtime_password }}@postgres-primary:5432/{{ postgres_db }}" }
+  - { key: JWT_SECRET, value: "{{ jwt_secret if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_SECRET_PREVIOUS, value: "{{ jwt_secret_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  indexer-solana:
+  - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
+  - { key: COMMON_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: COMMON_FALLBACK_RPC_URL, value: "{{ fallback_rpc_url | default('') if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: INDEXER_BACKFILL_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: INDEXER_YELLOWSTONE_TOKEN, value: "{{ yellowstone_token | default('') if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
+  indexer-private-channel:
+  - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
+  - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  operator-solana: "{{ _pc_operator_solana_secrets + _pc_signer_secrets_admin }}"
+  operator-private-channel: "{{ _pc_operator_pc_secrets + _pc_signer_secrets_admin + _pc_signer_secrets_operator }}"
+  pg-backup-primary:
+  - { key: PGPASSWORD, value: "{{ postgres_replication_password }}" }
+  pg-backup-indexer:
+  - { key: PGPASSWORD, value: "{{ postgres_indexer_password }}" }
+  # Only in the localnet compose file.
+  streamer:
+  - { key: STREAMER_ACCOUNTSDB_CONNECTION_URL, value: "{{ '' if (_pc_remote_rpc | bool) else 'postgres://private_channel_runtime:' ~ postgres_runtime_password ~ '@postgres-replica:5432/' ~ postgres_db }}" }
+  - { key: STREAMER_DATABASE_URL, value: "{{ '' if (_pc_remote_rpc | bool) else _pc_indexer_db_url }}" }
+  # Monitoring stack (monitoring.compose.yml).
+  mon-grafana:
+  - { key: GF_SECURITY_ADMIN_PASSWORD, value: "{{ grafana_admin_password }}" }
+  - { key: POSTGRES_GRAFANA_PASSWORD, value: "{{ postgres_grafana_password }}" }
+  - { key: ALERT_WEBHOOK_URL, value: "{{ alert_webhook_url | default('http://localhost:9/no-op', true) }}" }
+  mon-pgexp-primary:
+  - { key: DATA_SOURCE_PASS, value: "{{ postgres_monitoring_password }}" }
+  mon-pgexp-indexer:
+  - { key: DATA_SOURCE_PASS, value: "{{ postgres_indexer_password }}" }
+# Secrets that need a restart to take effect feed a service's secrets-rev; a service not
+# listed uses all of its secrets. Postgres uses its passwords only at initdb (the deploy
+# applies changes by ALTER ROLE and the replica passfile), and the replica re-reads its
+# files from the live mount on each start. Grafana's admin password is reset by grafana-cli.
+secrets_rev_keys:
+  postgres-primary: []
+  postgres-indexer: []
+  postgres-replica: []
+  mon-grafana: [ POSTGRES_GRAFANA_PASSWORD, ALERT_WEBHOOK_URL ]
+_pc_operator_solana_secrets:
+  - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
+  - { key: COMMON_SOURCE_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: OPERATOR_RECONCILIATION_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
+_pc_operator_pc_secrets:
+  - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
+  - { key: COMMON_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: COMMON_FALLBACK_RPC_URL, value: "{{ fallback_rpc_url | default('') if (_pc_remote_rpc | bool) else '' }}" }
+  - { key: ALERT_WEBHOOK_URL, value: "{{ notify_webhook | default('') }}" }
+  - { key: ESCROW_CONFIDENTIAL_KEYS, value: "{{ escrow_confidential_keys | default('') | trim }}" }
+_pc_signer_secrets_admin:
+  - key: "ADMIN_{{ _pc_signer_secret[admin_signer | default('memory')].key }}"
+    value: "{{ lookup('vars', _pc_signer_secret[admin_signer | default('memory')].var | replace('ROLE', 'admin'), default='') }}"
+_pc_signer_secrets_operator:
+  - key: "OPERATOR_{{ _pc_signer_secret[operator_signer | default('memory')].key }}"
+    value: "{{ lookup('vars', _pc_signer_secret[operator_signer | default('memory')].var | replace('ROLE', 'operator'), default='') }}"
 
 # --- Ports (host-side) — read by health probes ---
 gateway_port: 8899
@@ -109,14 +232,14 @@ validator_reset: true
 fallback_rpc_url: ""
 
 # --- Optional notification webhook posted from the report phase ---
+# A secret: set it in secrets.yml or Doppler, never in a vars file.
 notify_webhook: ""
 
 # --- Grafana alerting contact point (vendor-neutral by default) ------------
-# Grafana's provisioned contact point reads these via env substitution. Leave
-# at the defaults for a no-op (alerting evaluates but notifies nowhere). To
-# enable, set both, e.g. in your env vars or secrets:
-#   alert_contact_type: slack            # any Grafana receiver type
-#   alert_webhook_url: <slack incoming webhook URL>   # treat as a secret
+# Leave at the defaults for a no-op (alerting evaluates but notifies nowhere).
+# To enable, set alert_contact_type here (e.g. slack) and alert_webhook_url in
+# secrets.yml or Doppler (GRAFANA_ALERT_WEBHOOK_URL). Both webhooks are secrets;
+# only these no-op defaults live in vars.
 alert_contact_type: "webhook"
 alert_webhook_url: "http://localhost:9/no-op"
 # External URL Grafana uses when generating links (alert notifications, share

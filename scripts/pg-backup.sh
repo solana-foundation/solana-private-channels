@@ -8,11 +8,23 @@ set -eu
 #   PGHOST          — Postgres host to back up
 #   PGUSER          — Postgres user (needs replication or superuser)
 #   PGPASSWORD      — Postgres password
+#   PGPASSWORD_FILE   a file holding the password, used instead of PGPASSWORD
 # Optional:
 #   PG_BACKUP_INTERVAL_HOURS  — hours between backups (default: 6)
 #   PG_BACKUP_RETENTION_COUNT — number of backups to keep (default: 3)
 #   BACKUP_DIR                — base directory for backups (default: /backups)
 #   WAL_ARCHIVE_DIR           — WAL archive directory to prune (default: /wal_archive)
+
+# The deploy mounts the password as a file; a missing or unreadable one fails here.
+if [ -n "${PGPASSWORD_FILE:-}" ]; then
+  if [ ! -r "${PGPASSWORD_FILE}" ]; then
+    echo "FATAL: PGPASSWORD_FILE is set but not readable" >&2
+    exit 1
+  fi
+  PGPASSWORD="$(cat "${PGPASSWORD_FILE}")"
+  export PGPASSWORD
+  unset PGPASSWORD_FILE
+fi
 
 # Validate required env vars
 for var in PGHOST PGUSER PGPASSWORD; do
