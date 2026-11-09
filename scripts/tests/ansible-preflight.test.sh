@@ -70,6 +70,10 @@ test_syntax() {
     fail "syntax-check"
     tail -20 "$TMP/syntax.log" >&2
   }
+  # Operators copy this file to secrets.yml, which include_vars must load.
+  python3 -c 'import sys, yaml; assert isinstance(yaml.safe_load(open(sys.argv[1])), dict)' \
+    "$REPO/private-channel-deploy/secrets.yml.example" 2>"$TMP/example.err" \
+    || fail "secrets.yml.example is not a YAML mapping: $(tail -1 "$TMP/example.err")"
 }
 
 test_preflight_cases() {
@@ -470,9 +474,12 @@ test_jwt_previous() {
 # Secret files: right value, right owner and mode, exact set, stale files removed,
 # secrets-rev changes only where values changed, nothing leaks into logs, and the
 # Doppler backend renders the same tree.
+# The secrets tree is root-only (0700), and CI runs as a user with passwordless sudo.
+asroot() { if [[ $(id -u) == 0 ]]; then "$@"; else sudo -n "$@"; fi; }
+
 secrets_snapshot() {
   local host="$1" out="$2"
-  (cd "$host" && find secrets -type f ! -name .salt | sort | while read -r f; do printf '%s=%s\n' "$f" "$(cat "$f")"; done) >"$out.tree"
+  asroot sh -c 'cd "$1" && find secrets -type f ! -name .salt | sort | while read -r f; do printf "%s=%s\n" "$f" "$(cat "$f")"; done' _ "$host" >"$out.tree"
   grep -v '^#' "$host/config/.env" >"$out.env"
   cp "$host/config/compose.override.yml" "$out.override"
 }
@@ -513,26 +520,26 @@ test_secrets_render() {
 
   local sv
   sv() { grep -E "^$1:" "$D/secrets.yml" | sed -E "s/^$1: '?([^']*)'?$/\1/"; }
-  [[ "$(cat "$host/secrets/postgres-primary/POSTGRES_PASSWORD")" == "$(sv postgres_password)" ]] || fail "postgres-primary POSTGRES_PASSWORD value"
-  [[ "$(cat "$host/secrets/gateway/JWT_SECRET")" == "$(sv jwt_secret)" ]] || fail "gateway JWT_SECRET value"
-  [[ "$(cat "$host/secrets/operator-solana/COMMON_SOURCE_RPC_URL")" == "$(sv rpc_url)" ]] || fail "operator-solana rpc value"
-  [[ "$(cat "$host/secrets/write-node/PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")" == \
+  [[ "$(asroot cat "$host/secrets/postgres-primary/POSTGRES_PASSWORD")" == "$(sv postgres_password)" ]] || fail "postgres-primary POSTGRES_PASSWORD value"
+  [[ "$(asroot cat "$host/secrets/gateway/JWT_SECRET")" == "$(sv jwt_secret)" ]] || fail "gateway JWT_SECRET value"
+  [[ "$(asroot cat "$host/secrets/operator-solana/COMMON_SOURCE_RPC_URL")" == "$(sv rpc_url)" ]] || fail "operator-solana rpc value"
+  [[ "$(asroot cat "$host/secrets/write-node/PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")" == \
      "postgres://private_channel_runtime:$(sv postgres_runtime_password)@postgres-primary:5432/private_channel" ]] || fail "write-node DB URL"
-  [[ -s "$host/secrets/operator-private-channel/OPERATOR_PRIVATE_KEY" ]] || fail "operator key file missing"
-  [[ -e "$host/secrets/operator-solana/OPERATOR_PRIVATE_KEY" ]] && fail "operator-solana got the release key"
-  [[ "$(cat "$host/secrets/operator-solana/ESCROW_CONFIDENTIAL_KEYS")" == "$(sv escrow_confidential_keys)" ]] \
+  asroot test -s "$host/secrets/operator-private-channel/OPERATOR_PRIVATE_KEY" || fail "operator key file missing"
+  asroot test -e "$host/secrets/operator-solana/OPERATOR_PRIVATE_KEY" && fail "operator-solana got the release key"
+  [[ "$(asroot cat "$host/secrets/operator-solana/ESCROW_CONFIDENTIAL_KEYS")" == "$(sv escrow_confidential_keys)" ]] \
     || fail "operator-solana ESCROW_CONFIDENTIAL_KEYS value"
 
   [[ "$(stat -c '%a %U' "$host/secrets")" == "700 root" ]] || fail "secrets root mode/owner: $(stat -c '%a %U' "$host/secrets")"
   local bad
-  bad="$(find "$host/secrets" -mindepth 1 -maxdepth 1 -type d ! -perm 0755 -o -mindepth 1 -maxdepth 1 -type d ! -user root)"
+  bad="$(asroot find "$host/secrets" -mindepth 1 -maxdepth 1 -type d ! -perm 0755 -o -mindepth 1 -maxdepth 1 -type d ! -user root)"
   [[ -z "$bad" ]] || fail "service dirs not root 0755: $bad"
-  bad="$(find "$host/secrets" -mindepth 2 -type f ! -perm 0444 -o -mindepth 2 -type f ! -user root)"
+  bad="$(asroot find "$host/secrets" -mindepth 2 -type f ! -perm 0444 -o -mindepth 2 -type f ! -user root)"
   [[ -z "$bad" ]] || fail "secret files not root 0444: $bad"
-  [[ "$(stat -c '%a' "$host/secrets/.salt")" == 400 ]] || fail "salt not 0400"
+  [[ "$(asroot stat -c '%a' "$host/secrets/.salt")" == 400 ]] || fail "salt not 0400"
 
   # Completeness: every secret the base compose interpolates for a service has a file.
-  python3 - "$REPO/docker-compose.devnet.yml" "$host" <<'PY' || fail "secret_files is incomplete (see above)"
+  asroot python3 - "$REPO/docker-compose.devnet.yml" "$host" <<'PY' || fail "secret_files is incomplete (see above)"
 import os, re, sys, yaml
 SECRET = re.compile(r'\$\{(POSTGRES_PASSWORD|POSTGRES_\w*_PASSWORD|JWT_SECRET\w*|ADMIN_PRIVATE_KEY|OPERATOR_PRIVATE_KEY|INDEXER_YELLOWSTONE_TOKEN|ALERT_WEBHOOK_URL|RECONCILIATION_WEBHOOK_URL|GF_ADMIN_PASSWORD|LOCAL_VALIDATOR_RPC_URL|DEVNET_RPC_URL|DEVNET_FALLBACK_RPC_URL|GATEWAY_WHITELIST_RPC_URL|ESCROW_CONFIDENTIAL_KEYS)')
 compose, host = sys.argv[1], sys.argv[2]
@@ -603,7 +610,7 @@ EOF
   # services whose values changed get a new secrets-rev.
   sed -i -E "s/^notify_webhook: .*/notify_webhook: ''/; s/^postgres_runtime_password: (.*)/postgres_runtime_password: \1new/" "$D/secrets.yml"
   if playbook "$TMP/sec2.log" "$D/deploy.yml" --tags render,secrets_render "${args[@]}"; then
-    [[ -e "$host/secrets/indexer-solana/ALERT_WEBHOOK_URL" ]] && fail "a cleared webhook left its file"
+    asroot test -e "$host/secrets/indexer-solana/ALERT_WEBHOOK_URL" && fail "a cleared webhook left its file"
     grep -q 'ALERT_WEBHOOK_URL_FILE' "$host/config/compose.override.yml" && fail "a cleared webhook kept its _FILE var"
     labels_of "$host/config/compose.override.yml" >"$TMP/labels2"
     local changed
