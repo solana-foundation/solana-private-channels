@@ -1261,6 +1261,12 @@
       loop_control:
         label: "{{ item }}:{{ _health_probes[item] }}"
 
+    # Sanity check 5 counts gateway errors from here on, after this deploy's own recreates.
+    - name: Start the sanity error window
+      ansible.builtin.command: date +%s
+      register: _sanity_window_start
+      changed_when: false
+
     # /health answers before the auth check, so the probe above passes whether
     # RBAC is on or off. The two checks below are a pair:
     #   1. the internal port still serves a gated read, with no JWT
@@ -1552,6 +1558,8 @@
       POSTGRES_USER: "{{ postgres_user }}"
       PROMETHEUS_URL: "http://127.0.0.1:{{ monitoring_prometheus_port }}"
       SANITY_WORKERS_EXPECTED: "{{ _workers_enabled | default(true) | bool | lower }}"
+      # Judge only errors since the stack came up, not 502s from read-node recreates.
+      SANITY_WINDOW_START: "{{ _sanity_window_start.stdout | default(deploy_start_epoch) }}"
     register: _sanity
     changed_when: false
     failed_when: _sanity.rc != 0

@@ -157,12 +157,17 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.16.0
     container_name: private-channel-mon-pgexp-primary
     restart: unless-stopped
+    # The exporter logs its DSN on a refused connection, so the password lives only in a libpq passfile.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        umask 077; p=$$(sed -e 's/\\/\\\\/g' -e 's/:/\\:/g' /run/secrets/DATA_SOURCE_PASS); printf '*:*:*:*:%s\n' "$$p" > /tmp/pgpass; unset p; exec /bin/postgres_exporter
     environment:
       # pg_monitor only. This container is long-lived on the same network as the
       # auth tables, so the bootstrap superuser has no business being here.
-      - DATA_SOURCE_URI=postgres-primary:5432/{{ postgres_db }}?sslmode=disable
-      - DATA_SOURCE_USER=private_channel_monitoring
-      - DATA_SOURCE_PASS_FILE=/run/secrets/DATA_SOURCE_PASS
+      - DATA_SOURCE_NAME=postgresql://private_channel_monitoring@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+      - PGPASSFILE=/tmp/pgpass
     labels:
       secrets-rev: "{{ _secrets_rev['mon-pgexp-primary'] | default('none') }}"
     volumes:
@@ -175,12 +180,17 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.16.0
     container_name: private-channel-mon-pgexp-indexer
     restart: unless-stopped
+    # Same passfile wrapper as the primary exporter.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        umask 077; p=$$(sed -e 's/\\/\\\\/g' -e 's/:/\\:/g' /run/secrets/DATA_SOURCE_PASS); printf '*:*:*:*:%s\n' "$$p" > /tmp/pgpass; unset p; exec /bin/postgres_exporter
     environment:
       # The indexer cluster's own superuser. Not the primary's: this container
       # can reach postgres-primary too.
-      - DATA_SOURCE_URI=postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
-      - DATA_SOURCE_USER={{ postgres_indexer_user }}
-      - DATA_SOURCE_PASS_FILE=/run/secrets/DATA_SOURCE_PASS
+      - DATA_SOURCE_NAME=postgresql://{{ postgres_indexer_user }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
+      - PGPASSFILE=/tmp/pgpass
     labels:
       secrets-rev: "{{ _secrets_rev['mon-pgexp-indexer'] | default('none') }}"
     volumes:

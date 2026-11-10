@@ -2,7 +2,7 @@
 # Points the running replica at the current replicator password (see deploy.yml).
 # pg_basebackup -R left the replication password in primary_conninfo, and Postgres
 # logs that value whenever it changes. So the password lives in a 0600 passfile in
-# PGDATA instead; a rotation rewrites the file and restarts the walreceiver.
+# PGDATA instead; a rotation rewrites the file and restarts the walreceiver by SIGTERM.
 # A running container is not enough: while it waits for the primary or runs
 # pg_basebackup, Postgres is not listening. Skip then; a fresh base backup needs no fix.
 - name: Check whether the replica's Postgres accepts connections
@@ -21,7 +21,12 @@
         | docker exec -i "$c" sh -c "umask 077; cat > $f.new"
       if docker exec "$c" cmp -s "$f.new" "$f"; then docker exec "$c" rm -f "$f.new"; pw=0
       else docker exec "$c" mv "$f.new" "$f"; pw=1; fi
-      docker exec -i "$c" psql -v ON_ERROR_STOP=1 -q -U {{ postgres_user }} -d postgres -v pw_changed=$pw -f -
+      out="$(docker exec -i "$c" psql -v ON_ERROR_STOP=1 -q -U {{ postgres_user }} -d postgres -v pw_changed=$pw -f -)"
+      echo "$out"
+      # PG 16 will not terminate the walreceiver as a backend; SIGTERM makes the startup
+      # process start a new one at once, which reads the new passfile.
+      wr="$(sed -n 's/^PC_WALRECEIVER_PID //p' <<<"$out")"
+      if [ -n "$wr" ]; then docker exec "$c" kill -TERM "$wr"; echo PC_CONNINFO_UPDATED; fi
     executable: /bin/bash
     stdin: |
       PC_REPL_USER={{ postgres_replication_user }}
@@ -40,8 +45,8 @@
       SELECT pg_reload_conf();
       \echo PC_CONNINFO_UPDATED
       \elif :pw_changed
-      SELECT pg_terminate_backend(pid) FROM pg_stat_wal_receiver;
-      \echo PC_CONNINFO_UPDATED
+      SELECT coalesce(max(pid)::text, '') AS wr_pid FROM pg_stat_wal_receiver \gset
+      \echo PC_WALRECEIVER_PID :wr_pid
       \endif
   register: _replica_conninfo
   no_log: true

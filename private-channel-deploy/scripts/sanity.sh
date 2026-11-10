@@ -24,6 +24,10 @@ PIPELINE_OBSERVE_SECS="${PIPELINE_OBSERVE_SECS:-10}"
 # docker (compose host) or k8s (control node, through kubectl and port-forwards).
 RUNTIME="${RUNTIME:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-private-channel}"
+# Set by both deploy paths: check 5 counts only requests since this epoch, so a
+# restart's lifetime counters cannot false-alarm, and skips below SANITY_MIN_REQUESTS.
+SANITY_WINDOW_START="${SANITY_WINDOW_START:-}"
+SANITY_MIN_REQUESTS="${SANITY_MIN_REQUESTS:-20}"
 
 # The workload kind each worker runs as on k8s.
 k8s_ref() {
@@ -209,12 +213,25 @@ fi
 # ---------------------------------------------------------------------------
 banner 5 "gateway error ratio (< ${GATEWAY_ERROR_RATIO_MAX})"
 
-reqs=$(prom "sum(private_channel_gateway_requests_total)")
 # Refused tokens and whitelist-refused withdrawals are client errors, not gateway
 # faults, and the deploy's own unauthenticated probe makes one on every JWT-on deploy.
-errs=$(prom 'sum(private_channel_gateway_errors_total{error_type!~"auth_rejected|wallet_not_allowed"})')
+err_sel='private_channel_gateway_errors_total{error_type!~"auth_rejected|wallet_not_allowed"}'
+min_reqs=1
+if [[ -n "$SANITY_WINDOW_START" ]]; then
+  window=$(( $(date +%s) - SANITY_WINDOW_START ))
+  # increase() needs about 60 s of scrapes; wait for them, never look back past the start.
+  if (( window < 60 )); then sleep $(( 60 - window )); window=60; fi
+  reqs=$(prom "sum(increase(private_channel_gateway_requests_total[${window}s]))")
+  errs=$(prom "sum(increase(${err_sel}[${window}s]))")
+  min_reqs="$SANITY_MIN_REQUESTS"
+else
+  reqs=$(prom "sum(private_channel_gateway_requests_total)")
+  errs=$(prom "sum(${err_sel})")
+fi
 
-if [ -z "$reqs" ] || [ "${reqs%.*}" = "0" ]; then
+if [[ -n "$SANITY_WINDOW_START" ]] && [ -n "$reqs" ] && lt "$reqs" "$min_reqs"; then
+  sk "only ${reqs} gateway requests since the rollout (< ${min_reqs}); too few to judge"
+elif [ -z "$reqs" ] || [ "${reqs%.*}" = "0" ]; then
   sk "no gateway requests yet (fresh deploy; cannot compute error ratio)"
 elif [ -z "$errs" ] || [ "${errs%.*}" = "0" ]; then
   ok "$reqs requests, 0 errors"
