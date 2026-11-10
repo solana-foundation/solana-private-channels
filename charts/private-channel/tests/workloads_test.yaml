@@ -84,6 +84,13 @@ tests:
     documentSelector: { path: metadata.name, value: gateway }
     asserts:
       - equal: { path: "spec.template.metadata.annotations.secrets-rev", value: deadbeef }
+  - it: passes the gateway timeout and read limits through from config
+    set: { config: { gatewayUpstreamTimeoutSecs: 45, gatewayMaxForwardedReads: 100, gatewayWhitelistReadsPerSecond: 5 } }
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_UPSTREAM_TIMEOUT_SECS, value: "45" } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_MAX_FORWARDED_READS, value: "100" } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_WHITELIST_READS_PER_SECOND, value: "5" } }
   - it: names the container after the compose service
     documentSelector: { path: metadata.name, value: read-node }
     asserts:

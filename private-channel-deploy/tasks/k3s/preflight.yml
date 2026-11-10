@@ -98,8 +98,9 @@
   run_once: true
 
 # ---- Destructive switches: refused before anything connects ----
+# Each guard also carries its action's tags, so `--tags <action>` alone still runs it.
 - name: Refuse reset_state off localnet
-  tags: [ k3s_host ]
+  tags: [ k3s_host, reset_state ]
   ansible.builtin.assert:
     that: network == 'localnet' or not (reset_state | default(false) | bool)
     fail_msg: >-
@@ -108,7 +109,7 @@
       its indexer in lockstep.
 
 - name: Refuse reset_state on a host not marked as an e2e host when asked to require it
-  tags: [ k3s_host ]
+  tags: [ k3s_host, reset_state ]
   when:
   - reset_state | default(false) | bool
   - k3s_reset_requires_e2e_host | default(false) | bool
@@ -117,7 +118,7 @@
     fail_msg: "reset_state on {{ inventory_hostname }} needs e2e_host=true in the inventory."
 
 - name: Refuse a token lifetime above the cap
-  tags: [ k3s_host ]
+  tags: [ k3s_host, connect, render, secrets, database, deploy, health, monitoring, sanity, report ]
   ansible.builtin.assert:
     that:
     - k3s_token_duration is match('^[0-9]+[hm]$')
@@ -142,7 +143,7 @@
 # ---- Target host: k3s version, disk and io_uring (probed, then asserted) ----
 # _k3s_host_override is a test hook for the contract tests; a real run probes the host.
 - name: Probe the target host
-  tags: [ k3s_host ]
+  tags: [ k3s_host, bootstrap ]
   when: _k3s_host_override is not defined
   become: true
   ansible.builtin.shell: |
@@ -160,12 +161,12 @@
   check_mode: false
 
 - name: Record the host facts
-  tags: [ k3s_host ]
+  tags: [ k3s_host, bootstrap ]
   ansible.builtin.set_fact:
     _k3s_host: "{{ _k3s_host_override if _k3s_host_override is defined else (_k3s_probe.stdout | from_json) }}"
 
 - name: Refuse a k3s newer than the pinned version (no downgrades)
-  tags: [ k3s_host ]
+  tags: [ k3s_host, bootstrap ]
   when: _k3s_host.k3s_version | length > 0
   ansible.builtin.assert:
     that: (_k3s_host.k3s_version | regex_replace('\\+.*$', '') | regex_replace('^v', '')) is version(k3s_version | regex_replace('\\+.*$', '') | regex_replace('^v', ''), '<=')

@@ -187,8 +187,8 @@ imagePullSecrets:
 - { name: METRICS_PORT, value: {{ $v.ports.gatewayMetrics | quote }} }
 - { name: GATEWAY_WRITE_URL, value: {{ printf "http://write-node:%v" $v.ports.write | quote }} }
 - { name: GATEWAY_READ_URL, value: {{ $readUrl | quote }} }
-- { name: GATEWAY_UPSTREAM_TIMEOUT_SECS, value: "30" }
-- { name: GATEWAY_MAX_FORWARDED_READS, value: "768" }
+- { name: GATEWAY_UPSTREAM_TIMEOUT_SECS, value: {{ $v.config.gatewayUpstreamTimeoutSecs | quote }} }
+- { name: GATEWAY_MAX_FORWARDED_READS, value: {{ $v.config.gatewayMaxForwardedReads | quote }} }
 - { name: GATEWAY_MAX_CONNECTIONS, value: "1024" }
 - { name: GATEWAY_MAX_CONNECTIONS_PER_IP, value: "64" }
 - { name: GATEWAY_RATE_LIMIT_PER_SECOND, value: "50" }
@@ -197,7 +197,7 @@ imagePullSecrets:
 - { name: GATEWAY_REQUIRE_JWT, value: {{ ternary "1" "" $v.auth.enabled | quote }} }
 - { name: AUTH_DATABASE_MAX_CONNECTIONS, value: "10" }
 - { name: GATEWAY_WHITELIST_INSTANCE, value: {{ $v.config.gatewayWhitelistInstance | quote }} }
-- { name: GATEWAY_WHITELIST_READS_PER_SECOND, value: "20" }
+- { name: GATEWAY_WHITELIST_READS_PER_SECOND, value: {{ $v.config.gatewayWhitelistReadsPerSecond | quote }} }
 {{- else if eq .name "auth" }}
 - { name: RUST_LOG, value: info }
 - { name: AUTH_PORT, value: {{ $v.ports.auth | quote }} }

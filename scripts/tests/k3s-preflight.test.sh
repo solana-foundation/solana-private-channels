@@ -111,6 +111,11 @@ test_host_checks() {
     -e fallback_rpc_url=https://f.invalid -e escrow_instance_id=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz \
     -e reset_state=true -e "$(host "$host_ok")"
   refused long_token "at most 4h" "${tags[@]}" -e k3s_token_duration=8h -e "$(host "$host_ok")"
+  # The guard runs even when only its action's tag is selected.
+  refused reset_tag_only "reset_state=true is refused for network=devnet" --tags reset_state -e network=devnet \
+    -e fallback_rpc_url=https://f.invalid -e escrow_instance_id=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz \
+    -e reset_state=true -e "$(host "$host_ok")"
+  refused long_token_deploy_tag "at most 4h" --tags deploy -e k3s_token_duration=8h -e "$(host "$host_ok")"
   refused backup_no_creds "backup_s3_access_key_id" "${tags[@]}" -e k3s_backup_enabled=true \
     -e k3s_backup_destination_path=s3://b/p -e "$(host "$host_ok")"
   refused wrong_program_id "must equal the compiled" "${tags[@]}" \

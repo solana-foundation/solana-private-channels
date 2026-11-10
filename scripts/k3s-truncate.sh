@@ -21,6 +21,17 @@ pg="${PG_IMAGE:-postgres:16-bookworm}"
 job="pc-truncate-$(date +%s)"
 pullyaml=""
 [[ -n "$pull" ]] && pullyaml="imagePullSecrets: [ { name: $pull } ]"
+# A real cut keeps its dump on a pc-retain claim, which outlives the Job and its TTL.
+workvol="emptyDir: {}"
+if [[ -z "$dry" ]]; then
+  kubectl -n "$ns" apply -f - >/dev/null <<Y
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: $job, labels: { app.kubernetes.io/name: pc-truncate } }
+spec: { accessModes: [ ReadWriteOnce ], storageClassName: pc-retain, resources: { requests: { storage: 10Gi } } }
+Y
+  workvol="persistentVolumeClaim: { claimName: $job }"
+fi
 kubectl -n "$ns" apply -f - >/dev/null <<Y
 apiVersion: batch/v1
 kind: Job
@@ -65,7 +76,7 @@ spec:
           valueFrom: { secretKeyRef: { name: pc-db-superuser-indexer, key: password } }
         securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ ALL ] } }
         volumeMounts: [ { name: tools, mountPath: /tools }, { name: work, mountPath: /work } ]
-      volumes: [ { name: tools, emptyDir: {} }, { name: work, emptyDir: {} } ]
+      volumes: [ { name: tools, emptyDir: {} }, { name: work, $workvol } ]
 Y
 # Poll: a refused cut fails the Job, and kubectl wait cannot wait for either outcome.
 for _ in $(seq 1 240); do
@@ -74,4 +85,5 @@ for _ in $(seq 1 240); do
   sleep 5
 done
 kubectl -n "$ns" logs "job/$job" -c truncate 2>&1 | sed -E 's#postgres://[^ "]*#<db-url>#g'
+[[ -z "$dry" ]] && echo "dump kept on PVC $job (core.dump); copy it off-host, then delete the PVC"
 [[ "$(kubectl -n "$ns" get job "$job" -o jsonpath='{.status.succeeded}')" == 1 ]]

@@ -24,6 +24,9 @@ spec:
   ingress:
     - ports:
         {{- range $p := $row.ports }}
+        {{- if kindIs "string" $p }}
+        {{- $p = required (printf "networkPolicy port %q is not a key of .Values.ports" $p) (get $.Values.ports $p) }}
+        {{- end }}
         - { protocol: TCP, port: {{ $p }} }
         {{- end }}
       {{- if not (has "public" $row.from) }}

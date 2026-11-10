@@ -10,7 +10,13 @@ sql() { hk -n $NS exec "$(primary)" -c postgres -- psql -U postgres -d private_c
 
 # Writer lease.
 old="$(hk -n $NS get pod -l app.kubernetes.io/name=write-node -o jsonpath='{.items[0].metadata.name}')"
-hk -n $NS exec "$old" -c write-node -- sh -c 'kill -9 1' || true
+restarts() { hk -n $NS get pod "$old" -o jsonpath='{.status.containerStatuses[?(@.name=="write-node")].restartCount}'; }
+r0="$(restarts)"
+# The pod shares its PID namespace, so PID 1 is pause; kill the writer by its binary.
+k="$(hk -n $NS exec "$old" -c write-node -- sh -c 'for p in /proc/[0-9]*; do
+  c="$(tr "\0" " " <"$p/cmdline" 2>/dev/null)" || continue
+  case "$c" in /usr/local/bin/private-channel-node*) kill -9 "${p#/proc/}" && echo killed ;; esac; done')" || true
+[[ "$k" == *killed* ]] || die "no write-node process found to kill"
 running_max=0
 for _ in $(seq 1 60); do
   n="$(hk -n $NS get pods -l app.kubernetes.io/name=write-node --field-selector=status.phase=Running -o name | wc -l)"
@@ -18,6 +24,8 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 hk -n $NS rollout status deploy/write-node --timeout=300s >>"$LOG" || die "write-node did not come back"
+r1="$(restarts)"
+(( r1 > r0 )) || die "write-node was not restarted after kill -9 (restarts $r0, now $r1)"
 (( running_max <= 1 )) || die "$running_max write-node pods Running at once"
 hk -n $NS logs deploy/write-node --tail=200 | grep -iE 'lease|writer' | tail -3 | tee -a "$LOG"
 ok "kill -9 write-node: one writer at a time, replacement running"

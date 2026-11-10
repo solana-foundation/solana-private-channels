@@ -134,8 +134,8 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: pc-deployer }
 subjects:
 - { kind: ServiceAccount, name: deployer, namespace: {{ k3s_namespace }} }
 ---
-# Secret write in private-channel is inherent to deploying secrets; this stops it from
-# minting a service account token, and from opening host ports beyond gateway and auth.
+# Secret write is inherent to deploying; this stops the deployer minting its own token
+# (a token Secret, or a pod running as deployer) and opening host ports beyond gateway and auth.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -147,10 +147,26 @@ spec:
     - apiGroups: [ "" ]
       apiVersions: [ v1 ]
       operations: [ CREATE, UPDATE ]
-      resources: [ secrets, services ]
+      resources: [ secrets, services, pods ]
+    - apiGroups: [ apps ]
+      apiVersions: [ v1 ]
+      operations: [ CREATE, UPDATE ]
+      resources: [ deployments, statefulsets ]
+    - apiGroups: [ batch ]
+      apiVersions: [ v1 ]
+      operations: [ CREATE, UPDATE ]
+      resources: [ jobs ]
+    - apiGroups: [ postgresql.cnpg.io ]
+      apiVersions: [ v1 ]
+      operations: [ CREATE, UPDATE ]
+      resources: [ clusters ]
   matchConditions:
   - name: is-deployer
     expression: "request.userInfo.username == 'system:serviceaccount:{{ k3s_namespace }}:deployer'"
+  variables:
+  # Lazily evaluated, so only pods and workload templates ever read it.
+  - name: podSpec
+    expression: "request.resource.resource == 'pods' ? object.spec : object.spec.template.spec"
   validations:
   - expression: "request.resource.resource != 'secrets' || !has(object.type) || object.type != 'kubernetes.io/service-account-token'"
     message: "the deployer may not create service account token Secrets"
@@ -161,6 +177,20 @@ spec:
       || (request.namespace == '{{ x.namespace }}' && object.metadata.name == '{{ x.name }}')
 {% endfor %}
     message: "only the gateway and auth Services in {{ k3s_namespace }} may be LoadBalancer or NodePort"
+  # externalIPs make kube-proxy forward any port on that address, past the host firewall.
+  - expression: >-
+      request.resource.resource != 'services' || ((!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0)
+      && (!has(object.spec.type) || object.spec.type != 'ExternalName'))
+    message: "the deployer may not set externalIPs or create ExternalName Services"
+  # A pod-bound token outlives the run's bound Secret, so nothing may run as deployer.
+  - expression: >-
+      !(request.resource.resource in ['pods', 'deployments', 'statefulsets', 'jobs'])
+      || ((!has(variables.podSpec.serviceAccountName) || variables.podSpec.serviceAccountName != 'deployer')
+      && (!has(variables.podSpec.serviceAccount) || variables.podSpec.serviceAccount != 'deployer'))
+    message: "the deployer may not run a pod as the deployer service account"
+  # CNPG names a Cluster's service account after the Cluster.
+  - expression: "request.resource.resource != 'clusters' || object.metadata.name != 'deployer'"
+    message: "the deployer may not create a Cluster named deployer"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
