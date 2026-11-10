@@ -9,7 +9,7 @@ A second deploy target next to the compose deploy in `private-channel-deploy/`. 
 | `charts/private-channel` | control node | The app: nodes, gateway, auth, indexers, operators, validator (localnet), blackbox and the Postgres exporters, NetworkPolicies. |
 | `charts/pc-db` | control node | The ledger (`pc-ledger`, primary plus synchronous replica) and indexer (`pc-indexer`) CloudNativePG Clusters, their logins, the grants hook, backups. |
 | `private-channel-deploy/k3s.yml` | control node | The playbook. helm and kubectl run on the control node through an SSH tunnel with a 1h, namespace-scoped `deployer` token. |
-| bootstrap | host, as root | k3s at the pinned version, a firewall rule that drops 6443 and 10250 on the public interface, the `pc-retain` StorageClass, namespaces, deployer RBAC, an admission policy, cert-manager, CNPG, the Barman plugin and kube-prometheus-stack. |
+| bootstrap | host, as root | k3s at the pinned version, a firewall rule that drops 6443, 10250, 9100, the NodePort range and flannel VXLAN (UDP 8472) on the public interface, the `pc-retain` StorageClass, namespaces, deployer RBAC, an admission policy, cert-manager, CNPG, the Barman plugin and kube-prometheus-stack. |
 
 Versions are pinned in `versions.env` (`K3S_VERSION`, `HELM_VERSION`, `KUBECTL_VERSION`, `CRANE_VERSION`, the chart versions). The control node needs helm, kubectl and crane at those versions, the `kubernetes.core` collection and the Python `kubernetes` package; preflight checks each.
 

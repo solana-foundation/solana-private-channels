@@ -76,7 +76,7 @@ if [[ -z "${SKIP_REBOOT:-}" ]]; then
 wait_for 300 hk wait --for=condition=Ready node --all --timeout=10s || die "node not Ready after reboot"
   wait_for 600 bash -c "$(declare -f hk); E2E_HOST='$E2E_HOST'; hk -n $NS wait --for=condition=Ready pod -l app.kubernetes.io/part-of=private-channel --timeout=10s" \
     || die "app pods not Ready after reboot"
-  onhost "nft list table inet pc_k3s_guard" >>"$LOG" || die "guard table missing after reboot"
+  onhost "nft list table inet pc_k3s_guard" | tee -a "$LOG" | grep -q 8472 || die "guard table (with the VXLAN drop) missing after reboot"
   ctl "nc -z -w 3 $E2E_HOST_IP 6443" && die "6443 open after reboot"
   wait_for 300 bash -c "$E2E_CTL bash -lc 'nc -z -w 3 $E2E_HOST_IP 8899'" || die "8899 closed after reboot"
   playbook "$STEP-health-after-reboot" k3s.yml -e reset_state=false --tags health || die "health after reboot failed"
