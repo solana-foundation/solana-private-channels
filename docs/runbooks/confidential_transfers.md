@@ -33,38 +33,52 @@ How it works, in short:
 
 Once per instance:
 
-1. Generate the keys offline:
+1. Generate the keys on an offline machine:
    `cargo run -p devnet-scripts --bin confidential_keygen -- ./escrow-confidential.json`.
    It writes a new owner-only file and prints the line
    `ESCROW_CONFIDENTIAL_PUBKEY=<base64 ElGamal pubkey>`. Record that line with the
-   instance's records (it is not secret). Back the file up like `Instance.admin`:
-   losing it strands every confidential balance of the instance for good.
-2. Set the file's content, single-quoted, as `ESCROW_CONFIDENTIAL_KEYS` in the
-   stack's `.env` (Ansible: `escrow_confidential_keys` in `secrets.yml`, Doppler:
-   `ESCROW_CONFIDENTIAL_KEYS`). `scripts/check-required-env.sh` and the deploy
-   refuse a value that is not JSON with `elgamal_secret` and `aes_key`.
-3. Set the printed line as is: `ESCROW_CONFIDENTIAL_PUBKEY` in the same `.env`
+   instance's records (it is not secret).
+2. Back the file up like `Instance.admin`, in at least two offline copies stored in
+   separate places: losing every copy strands every confidential balance of the
+   instance for good.
+3. Verify each copy, read from its own medium, with a second person present:
+   `cargo run -p devnet-scripts --bin confidential_verify -- <copy> '<recorded line>'`.
+   This proves the ElGamal half; the AES half is proven against the chain at the first
+   mint. Replace a copy that fails from one that passes, and verify the new copy.
+   Continue only once every copy passes.
+4. Set the content of a restored copy, not the original, single-quoted, as
+   `ESCROW_CONFIDENTIAL_KEYS` in the stack's `.env` (Ansible: `escrow_confidential_keys`
+   in `secrets.yml`, Doppler: `ESCROW_CONFIDENTIAL_KEYS`), so the restore path is proven
+   too. `scripts/check-required-env.sh` and the deploy refuse a value that is not JSON
+   with `elgamal_secret` and `aes_key`.
+5. Set the printed line as is: `ESCROW_CONFIDENTIAL_PUBKEY` in the same `.env`
    (Ansible: `escrow_confidential_pubkey`, Doppler: `ESCROW_CONFIDENTIAL_PUBKEY`),
    before the first configure. From then on `indexer-solana`, both operators and
    `resync` refuse to start unless `ESCROW_CONFIDENTIAL_KEYS` holds the matching keys,
    even on an empty database, where the per-mint check has no mint to read. The env
    check and the deploy refuse a pubkey that is not base64 of 32 bytes, or one set
    without the keys.
-4. Restart `indexer-solana`, `operator-solana` and `operator-private-channel`.
+6. Restart `indexer-solana`, `operator-solana` and `operator-private-channel`.
 
 Once per mint:
 
 1. `block_mint` the mint's deposits, so no deposit lands while the switch flips.
-2. `configure_confidential <rpc> <escrow-admin> <instance> <mint> ./escrow-confidential.json`.
+2. `configure_confidential <rpc> <escrow-admin> <instance> <mint> <verified copy>`.
    It refuses a mint whose escrow account is already configured under another key.
 3. Confirm `indexer-solana` logged at INFO the line `configure_confidential` printed:
    `escrow account configured under the instance key mint=<mint> elgamal_pubkey=<pubkey>`
    (followed by the configure `signature`), and
    `private_channel_confidential_mint_poisoned{mint="<mint>"}` is 0. A foreign key
    poisons the mint at index time; stop here and [escalate](_escalation.md) (Tier 1).
-4. On a mint that requires approval, have the issuer's confidential authority
+4. On the instance's first confidential mint, verify every copy against the chain:
+   `confidential_verify <copy> <rpc> <instance> <mint>`. It checks the copy's ElGamal
+   key against the escrow account's, and that its AES key decrypts the account's AES
+   copy, which the pin cannot prove. Deposits are still blocked, so nothing depends on
+   the keys yet. If a copy fails, stop: replace it from one that passes and verify the
+   new copy before going on.
+5. On a mint that requires approval, have the issuer's confidential authority
    approve the escrow account.
-5. On a `ConfidentialMintBurn` mint (confidential-only: the channel refuses its
+6. On a `ConfidentialMintBurn` mint (confidential-only: the channel refuses its
    public withdrawals, including the treasury's):
    - Configure the Solana account the treasury withdraws its fees to for confidential
      transfers, approved if the mint requires it. Otherwise every fee withdrawal parks
@@ -72,13 +86,20 @@ Once per mint:
    - If it has a transfer hook, check the hook accepts `u64::MAX`. Such a mint has no
      public release, so with a hook that refuses it no withdrawal can ever be paid, and
      every one ends in remint. Nothing on chain detects this.
-6. `allow_mint` again to reopen deposits, with the same arguments. This also records
+7. `allow_mint` again to reopen deposits, with the same arguments. This also records
    whether the mint is confidential-only.
 
 Never remove `ESCROW_CONFIDENTIAL_KEYS` or `ESCROW_CONFIDENTIAL_PUBKEY` once any escrow
 account is configured: the indexer and both operators refuse to start without the key
 that account holds, and without the pin a fresh database (a new host, or a resync into
 an empty one) has no mint to check, so a missing key would only show as poisoned deposits.
+
+### Backup drill
+
+Quarterly, and after any change of custodian or medium, verify every copy against the
+chain (`confidential_verify <copy> <rpc> <instance> <mint>`, with any configured mint)
+and record the date, who ran it and the result. Replace a copy that fails from one that
+passes, and verify the new copy.
 
 ## Park labels
 

@@ -135,6 +135,54 @@ pub fn confidential_account(
         .map(|extension| (state.base.state, *extension)))
 }
 
+/// Check a keys file against the instance's pinned pubkey, the base64 alone or the whole
+/// `ESCROW_CONFIDENTIAL_PUBKEY=` line `confidential_keygen` printed. Proves the ElGamal half only.
+pub fn verify_against_pin(keys: &ConfidentialKeyPair, pin: &str) -> Result<()> {
+    let pin = pin.trim();
+    let value = pin
+        .strip_prefix(private_channel_confidential::PUBKEY_ENV)
+        .and_then(|rest| rest.strip_prefix('='))
+        .unwrap_or(pin);
+    let pinned = private_channel_confidential::parse_pubkey(value).map_err(|e| e.to_string())?;
+    if pinned != keys.keys.pubkey() {
+        return Err(format!(
+            "the file's ElGamal pubkey {} does not match the pin {}",
+            BASE64.encode(keys.keys.pubkey()),
+            BASE64.encode(pinned)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Check a keys file against a configured escrow account: the account's ElGamal pubkey must be
+/// the file's, and the file's AES key must decrypt the account's AES copy. Proves both halves.
+/// The decrypted balance is confidential, so it is dropped here.
+pub fn verify_against_account(
+    keys: &ConfidentialKeyPair,
+    escrow_ata: &Pubkey,
+    data: &[u8],
+) -> Result<()> {
+    let Some((_, extension)) = confidential_account(data)? else {
+        return Err(format!(
+            "escrow account {escrow_ata} is not configured for confidential transfers"
+        )
+        .into());
+    };
+    if extension.elgamal_pubkey.0 != keys.keys.pubkey() {
+        return Err(format!(
+            "escrow account {escrow_ata} is configured under another key ({}); this file is not \
+             the instance key",
+            BASE64.encode(extension.elgamal_pubkey.0)
+        )
+        .into());
+    }
+    decrypt_available(keys, &extension).map_err(|_| {
+        format!("the file's aes_key does not decrypt escrow account {escrow_ata}'s AES copy")
+    })?;
+    Ok(())
+}
+
 /// Why the operator would park a confidential release to this account, if it would.
 pub fn destination_not_ready(data: Option<&[u8]>) -> Option<String> {
     let Some(data) = data else {
@@ -505,6 +553,49 @@ mod tests {
             .contains("already configured under another key"));
         let plain = account_bytes(AccountState::Initialized, None);
         assert_eq!(existing_configuration(&ata, &plain, &ours).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_against_pin_accepts_only_the_files_pubkey() {
+        let keys = parse_keys(&test_support::keys_json()).unwrap();
+        let pin_line = pinned_pubkey_line(&keys.keys);
+        let (_, pin) = pin_line.split_once('=').unwrap();
+        verify_against_pin(&keys, pin).unwrap();
+        verify_against_pin(&keys, &pin_line).unwrap();
+        let other_pin = BASE64.encode(test_support::other_keys().pubkey());
+        let err = verify_against_pin(&keys, &other_pin).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        assert!(verify_against_pin(&keys, "not-a-pubkey").is_err());
+    }
+
+    #[test]
+    fn verify_against_account_checks_both_halves() {
+        let keys = parse_keys(&test_support::keys_json()).unwrap();
+        let ata = Pubkey::new_unique();
+        let mut extension = ready_extension();
+        extension.elgamal_pubkey = test_support::keys().pubkey().into();
+        extension.decryptable_available_balance.0 =
+            test_support::encrypt_aes(&test_support::keys(), 0);
+        let configured = account_bytes(AccountState::Initialized, Some(extension));
+        verify_against_account(&keys, &ata, &configured).unwrap();
+
+        // Right ElGamal key, wrong AES key: only the chain can tell.
+        let mut foreign_aes = extension;
+        foreign_aes.decryptable_available_balance.0 =
+            test_support::encrypt_aes(&test_support::other_keys(), 0);
+        let foreign_aes = account_bytes(AccountState::Initialized, Some(foreign_aes));
+        let err = verify_against_account(&keys, &ata, &foreign_aes).unwrap_err();
+        assert!(err.to_string().contains("aes_key"), "{err}");
+
+        let mut foreign_elgamal = extension;
+        foreign_elgamal.elgamal_pubkey = test_support::other_keys().pubkey().into();
+        let foreign_elgamal = account_bytes(AccountState::Initialized, Some(foreign_elgamal));
+        let err = verify_against_account(&keys, &ata, &foreign_elgamal).unwrap_err();
+        assert!(err.to_string().contains("another key"), "{err}");
+
+        let plain = account_bytes(AccountState::Initialized, None);
+        let err = verify_against_account(&keys, &ata, &plain).unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
     }
 
     #[test]

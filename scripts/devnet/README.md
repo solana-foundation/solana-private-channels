@@ -159,8 +159,10 @@ See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) befo
 Setup, once per instance, then once per mint (see
 [confidential_transfers.md](../../docs/runbooks/confidential_transfers.md#setup-ceremony)):
 ```bash
-# Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json.
+# Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json,
+# then check each copy against the ESCROW_CONFIDENTIAL_PUBKEY=... line it prints.
 cargo run --bin confidential_keygen -- ./keypairs/escrow-confidential.json
+cargo run --bin confidential_verify -- <COPY> '<ESCROW_CONFIDENTIAL_PUBKEY=... line>'
 # Put its content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS, and the
 # ESCROW_CONFIDENTIAL_PUBKEY=... line it prints as is, then restart indexer-solana
 # and both operators. Then, with the mint's deposits blocked:
@@ -172,7 +174,8 @@ cargo run --bin configure_confidential -- \
   ./keypairs/escrow-confidential.json
 # Check indexer-solana logged at INFO the line it prints:
 #   escrow account configured under the instance key mint=<MINT_ADDRESS> elgamal_pubkey=<pubkey>
-# then allow_mint again.
+# On the first mint, check each copy against the chain too, then allow_mint again:
+cargo run --bin confidential_verify -- <COPY> https://api.devnet.solana.com <INSTANCE_ID> <MINT_ADDRESS>
 ```
 
 Deposit a hidden amount. The user keys file is the user's own (`confidential_keygen`
