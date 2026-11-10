@@ -81,7 +81,8 @@ Once per mint:
      `confidential_verify <copy> <instance> <mint> ./escrow-account.bin`. It checks each
      copy's ElGamal key against the account's, and that its AES key decrypts the
      account's AES copy, which the pin cannot prove. If a copy fails, stop: replace it
-     from one that passes, and verify the new copy before going on.
+     from one that passes, and verify the new copy before going on. If every copy fails,
+     overwrite none, keep the mint's deposits blocked and [escalate](_escalation.md) (Tier 1).
 5. On a mint that requires approval, have the issuer's confidential authority
    approve the escrow account.
 6. On a `ConfidentialMintBurn` mint (confidential-only: the channel refuses its
@@ -109,12 +110,12 @@ copy against it on the offline machine
 and the result. Replace a copy that fails from one that passes, and verify the new copy.
 
 If every copy fails, overwrite none: the backups and the deployed key may have diverged.
-Wait one full reconciliation interval (`OPERATOR_RECONCILIATION_INTERVAL_SECS`, 5 minutes by
-default), then check the mint's `private_channel_reconciliation_confidential_mismatch` is 0
-and its `private_channel_reconciliation_confidential_lagging` is 0 for every reason. Only a
-mint counted that way shows the deployed AES key decrypts the account's AES copy. If the
-mint is held for any reason, check another configured mint or wait for the hold to clear.
-Then [escalate](_escalation.md) (Tier 1).
+[Escalate](_escalation.md) (Tier 1) at once, with what you collect: after one full
+reconciliation interval (`OPERATOR_RECONCILIATION_INTERVAL_SECS`, 5 minutes by default),
+whether the mint's `private_channel_reconciliation_confidential_mismatch` is 0 and its
+`private_channel_reconciliation_confidential_lagging` is 0 for every reason. Only a mint
+counted that way shows the deployed AES key decrypts the account's AES copy. If the mint is
+held, record the reason and check another configured mint, if there is one.
 
 ## Park labels
 
