@@ -108,9 +108,13 @@ copy against it on the offline machine
 (`confidential_verify <copy> <instance> <mint> <file>`), and record the date, who ran it
 and the result. Replace a copy that fails from one that passes, and verify the new copy.
 
-If every copy fails, overwrite none: the backups and the deployed key have diverged. Check
-the mint's `private_channel_reconciliation_confidential_mismatch` is 0, which shows the
-deployed key is the one on chain, and [escalate](_escalation.md) (Tier 1).
+If every copy fails, overwrite none: the backups and the deployed key may have diverged.
+Wait one full reconciliation interval (`OPERATOR_RECONCILIATION_INTERVAL_SECS`, 5 minutes by
+default), then check the mint's `private_channel_reconciliation_confidential_mismatch` is 0
+and its `private_channel_reconciliation_confidential_lagging` is 0 for every reason. Only a
+mint counted that way shows the deployed AES key decrypts the account's AES copy. If the
+mint is held for any reason, check another configured mint or wait for the hold to clear.
+Then [escalate](_escalation.md) (Tier 1).
 
 ## Park labels
 
