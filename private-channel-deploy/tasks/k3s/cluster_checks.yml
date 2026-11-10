@@ -1,0 +1,63 @@
+---
+# Escrow instance resolution from pc-deploy-state, then the shared asserts, then on
+# a run with an instance the Operator PDA check (through a port-forward on localnet).
+- name: Read the instance a previous deploy recorded
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    kind: ConfigMap
+    namespace: "{{ k3s_namespace }}"
+    name: pc-deploy-state
+  register: _k3s_state
+
+- name: Hand the recorded instance to the shared resolution
+  ansible.builtin.set_fact:
+    pc_previous_instance_id: "{{ (_k3s_state.resources | first).data.COMMON_ESCROW_INSTANCE_ID | default('') if _k3s_state.resources else '' }}"
+
+- name: Resolve the escrow instance
+  ansible.builtin.import_tasks: ../escrow_instance.yml
+
+- name: Open a port-forward to the localnet validator for the PDA check
+  when:
+  - _escrow_instance | default('') | length > 0
+  - network == 'localnet'
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Pick a free local port for the validator RPC
+    ansible.builtin.command:
+      argv: [ python3, -c, "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])" ]
+    register: _k3s_val_port
+    changed_when: false
+
+  - name: Forward the validator RPC
+    ansible.builtin.command:
+      argv: [ "{{ playbook_dir }}/scripts/k3s-port-forward.sh", start, "{{ k3s_namespace }}", svc/validator,
+              "{{ _k3s_val_port.stdout | trim }}:8899", "{{ pc_tmp }}/pf-validator.pid" ]
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    register: _k3s_val_pf
+    changed_when: false
+    failed_when: false
+
+  # No validator yet (first boot) leaves the shared check to warn and continue.
+  - name: Point the PDA check at the forwarded validator
+    when: _k3s_val_pf.rc == 0
+    ansible.builtin.set_fact:
+      pc_pda_rpc_url: "http://127.0.0.1:{{ _k3s_val_port.stdout | trim }}"
+
+- name: Check the Operator PDA
+  when: _escrow_instance | default('') | length > 0
+  delegate_to: localhost
+  run_once: true
+  vars:
+    pc_pda_rpc_delegate: localhost
+  block:
+  - name: Run the shared Operator PDA check
+    ansible.builtin.import_tasks: ../operator_pda.yml
+  always:
+  - name: Stop the validator port-forward
+    ansible.builtin.command:
+      argv: [ "{{ playbook_dir }}/scripts/k3s-port-forward.sh", stop, "{{ pc_tmp }}/pf-validator.pid" ]
+    changed_when: false

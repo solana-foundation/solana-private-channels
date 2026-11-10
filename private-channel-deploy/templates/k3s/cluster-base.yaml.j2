@@ -1,0 +1,171 @@
+# Rendered by Ansible (k3s bootstrap) and applied on the host with the admin kubeconfig.
+# Cluster-scoped and RBAC objects the deploy token itself may never create.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pc-retain
+provisioner: rancher.io/local-path
+# Deleting a PVC keeps the volume (Released) and its data directory on the host.
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k3s_namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k3s_monitoring_namespace }}
+  labels:
+    # node-exporter needs host namespaces; the deployer cannot create pods here.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k3s_cnpg_namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ k3s_cert_manager_namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deployer
+  namespace: {{ k3s_namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pc-deployer
+  namespace: {{ k3s_namespace }}
+rules:
+- apiGroups: [ apps ]
+  resources: [ deployments, statefulsets ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ apps ]
+  resources: [ replicasets, controllerrevisions ]
+  verbs: [ get, list, watch ]
+# down-k3s.yml scales the app to 0.
+- apiGroups: [ apps ]
+  resources: [ deployments/scale, statefulsets/scale ]
+  verbs: [ get, update, patch ]
+- apiGroups: [ batch ]
+  resources: [ jobs ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ "" ]
+  resources: [ services, configmaps, secrets, persistentvolumeclaims ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ "" ]
+  resources: [ endpoints, events ]
+  verbs: [ get, list, watch ]
+- apiGroups: [ events.k8s.io ]
+  resources: [ events ]
+  verbs: [ get, list, watch ]
+- apiGroups: [ discovery.k8s.io ]
+  resources: [ endpointslices ]
+  verbs: [ get, list, watch ]
+# create is for the NetworkPolicy probe pod and Jobs' pods are made by the Job controller.
+- apiGroups: [ "" ]
+  resources: [ pods ]
+  verbs: [ get, list, watch, create, delete ]
+- apiGroups: [ "" ]
+  resources: [ pods/exec, pods/portforward ]
+  verbs: [ get, create ]
+- apiGroups: [ "" ]
+  resources: [ pods/log ]
+  verbs: [ get ]
+- apiGroups: [ networking.k8s.io ]
+  resources: [ networkpolicies ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ postgresql.cnpg.io ]
+  resources: [ clusters, scheduledbackups, backups ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ barmancloud.cnpg.io ]
+  resources: [ objectstores ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pc-deployer
+  namespace: {{ k3s_namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: pc-deployer }
+subjects:
+- { kind: ServiceAccount, name: deployer, namespace: {{ k3s_namespace }} }
+---
+# Monitoring: ConfigMaps only, plus the reads sanity needs. No Secrets, no pods, no exec,
+# so the deploy token can never run code or mint a token as a monitoring service account.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pc-deployer
+  namespace: {{ k3s_monitoring_namespace }}
+rules:
+- apiGroups: [ "" ]
+  resources: [ configmaps ]
+  verbs: [ get, list, watch, create, update, patch, delete ]
+- apiGroups: [ "" ]
+  resources: [ pods, services ]
+  verbs: [ get, list ]
+- apiGroups: [ "" ]
+  resources: [ pods/portforward ]
+  verbs: [ get, create ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pc-deployer
+  namespace: {{ k3s_monitoring_namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: pc-deployer }
+subjects:
+- { kind: ServiceAccount, name: deployer, namespace: {{ k3s_namespace }} }
+---
+# Secret write in private-channel is inherent to deploying secrets; this stops it from
+# minting a service account token, and from opening host ports beyond gateway and auth.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pc-deployer-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [ "" ]
+      apiVersions: [ v1 ]
+      operations: [ CREATE, UPDATE ]
+      resources: [ secrets, services ]
+  matchConditions:
+  - name: is-deployer
+    expression: "request.userInfo.username == 'system:serviceaccount:{{ k3s_namespace }}:deployer'"
+  validations:
+  - expression: "request.resource.resource != 'secrets' || !has(object.type) || object.type != 'kubernetes.io/service-account-token'"
+    message: "the deployer may not create service account token Secrets"
+  - expression: >-
+      request.resource.resource != 'services' || !has(object.spec.type) || !(object.spec.type in ['LoadBalancer', 'NodePort'])
+      || (request.namespace == '{{ k3s_namespace }}' && object.metadata.name in ['gateway', 'auth'])
+{% for x in k3s_admission_public_extra | default([]) %}
+      || (request.namespace == '{{ x.namespace }}' && object.metadata.name == '{{ x.name }}')
+{% endfor %}
+    message: "only the gateway and auth Services in {{ k3s_namespace }} may be LoadBalancer or NodePort"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pc-deployer-guard
+spec:
+  policyName: pc-deployer-guard
+  validationActions: [ Deny ]

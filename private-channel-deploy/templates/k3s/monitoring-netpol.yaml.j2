@@ -1,0 +1,40 @@
+# Rendered by Ansible (k3s bootstrap), applied from the host: the deploy token cannot
+# write NetworkPolicies in {{ k3s_monitoring_namespace }}. Default deny, then only what
+# kube-prometheus-stack needs. No app pod may reach Grafana or Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: pc-default-deny, namespace: {{ k3s_monitoring_namespace }} }
+spec:
+  podSelector: {}
+  policyTypes: [ Ingress ]
+---
+# Grafana queries Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: pc-allow-grafana-to-prometheus, namespace: {{ k3s_monitoring_namespace }} }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: prometheus } }
+  policyTypes: [ Ingress ]
+  ingress:
+  - ports: [ { protocol: TCP, port: 9090 } ]
+    from: [ { podSelector: { matchLabels: { app.kubernetes.io/name: grafana } } } ]
+---
+# Prometheus scrapes the stack's own exporters and the operator.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: pc-allow-prometheus-scrapes, namespace: {{ k3s_monitoring_namespace }} }
+spec:
+  podSelector: { matchExpressions: [ { key: app.kubernetes.io/name, operator: In, values: [ kube-state-metrics, kube-prometheus-stack-prometheus-operator, prometheus ] } ] }
+  policyTypes: [ Ingress ]
+  ingress:
+  - from: [ { podSelector: { matchLabels: { app.kubernetes.io/name: prometheus } } } ]
+---
+# The API server calls the operator's admission webhook from the node address.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: pc-allow-operator-webhook, namespace: {{ k3s_monitoring_namespace }} }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: kube-prometheus-stack-prometheus-operator } }
+  policyTypes: [ Ingress ]
+  ingress:
+  - ports: [ { protocol: TCP, port: 10250 } ]

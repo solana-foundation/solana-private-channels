@@ -1,0 +1,7 @@
+# Rendered by Ansible: plain-HTTP registries for the e2e image pushes.
+mirrors:
+{% for r in k3s_insecure_registries %}
+  "{{ r }}":
+    endpoint:
+      - "http://{{ r }}"
+{% endfor %}

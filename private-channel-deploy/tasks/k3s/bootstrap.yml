@@ -1,0 +1,307 @@
+---
+# k3s host bootstrap, on the host as root with the admin kubeconfig. Idempotent and
+# re-run on every deploy, so a version bump in versions.env applies.
+- name: Read the public interface (default route)
+  ansible.builtin.shell: ip -o route show default | awk '{print $5; exit}'
+  register: _k3s_wan_probe
+  changed_when: false
+  check_mode: false
+
+- name: Record the public interface
+  ansible.builtin.set_fact:
+    _k3s_wan: "{{ k3s_public_iface if k3s_public_iface | length > 0 else (_k3s_wan_probe.stdout | trim) }}"
+    _k3s_kubeconfig: /etc/rancher/k3s/k3s.yaml
+    _k3s_url_version: "{{ k3s_version | urlencode | replace('+', '%2B') }}"
+
+- name: Assert a public interface was found
+  ansible.builtin.assert:
+    that: _k3s_wan | length > 0
+    fail_msg: "No default route on {{ inventory_hostname }}; set k3s_public_iface to the public interface."
+
+- name: Install nftables
+  ansible.builtin.package:
+    name: nftables
+    state: present
+
+# ---- Host firewall: 6443 and 10250 closed on the public interface, before k3s starts ----
+- name: Render the API guard ruleset
+  ansible.builtin.template:
+    src: templates/k3s/pc-k3s-guard.nft.j2
+    dest: /etc/pc-k3s-guard.nft
+    mode: "0600"
+  register: _k3s_guard_file
+
+- name: Install the API guard unit (loads before k3s, survives reboots)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/pc-k3s-guard.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Drop k3s API and kubelet ports on the public interface
+      After=nftables.service network-pre.target
+      Before=k3s.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/pc-k3s-guard.nft
+      [Install]
+      WantedBy=multi-user.target
+  register: _k3s_guard_unit
+
+- name: Enable and (re)load the API guard
+  ansible.builtin.systemd:
+    name: pc-k3s-guard.service
+    enabled: true
+    state: "{{ 'restarted' if (_k3s_guard_file.changed or _k3s_guard_unit.changed) else 'started' }}"
+    daemon_reload: "{{ _k3s_guard_unit.changed }}"
+
+# ---- k3s binary at the pinned version, checksum-verified ----
+- name: Read the installed k3s version
+  ansible.builtin.shell: (k3s --version 2>/dev/null || true) | awk 'NR==1 {print $3}'
+  register: _k3s_installed
+  changed_when: false
+  check_mode: false
+
+- name: Download and verify the pinned k3s
+  when: _k3s_installed.stdout | trim != k3s_version
+  block:
+  - name: Fetch the k3s release checksums
+    ansible.builtin.uri:
+      url: "https://github.com/k3s-io/k3s/releases/download/{{ _k3s_url_version }}/sha256sum-amd64.txt"
+      return_content: true
+    register: _k3s_sums
+
+  - name: Download the k3s binary
+    ansible.builtin.get_url:
+      url: "https://github.com/k3s-io/k3s/releases/download/{{ _k3s_url_version }}/k3s"
+      dest: /usr/local/bin/k3s.download
+      mode: "0755"
+      checksum: "sha256:{{ (_k3s_sums.content | regex_search('(?m)^([0-9a-f]{64})\\s+k3s$', '\\1') | first) }}"
+      force: true
+
+  - name: Download the install script at the same tag
+    ansible.builtin.get_url:
+      url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version }}/install.sh"
+      dest: /usr/local/bin/k3s-install.sh
+      mode: "0755"
+      force: true
+
+  - name: Put the verified binary in place
+    ansible.builtin.command: mv -f /usr/local/bin/k3s.download /usr/local/bin/k3s
+    changed_when: true
+
+- name: Create the k3s config dir
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: "0755"
+
+- name: Render the k3s config
+  ansible.builtin.template:
+    src: templates/k3s/k3s-config.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    mode: "0600"
+  register: _k3s_cfg
+
+- name: Render registries.yaml for plain-HTTP e2e registries
+  when: k3s_insecure_registries | length > 0
+  ansible.builtin.template:
+    src: templates/k3s/registries.yaml.j2
+    dest: /etc/rancher/k3s/registries.yaml
+    mode: "0600"
+  register: _k3s_reg
+
+- name: Remove registries.yaml when no e2e registry is configured
+  when: k3s_insecure_registries | length == 0
+  ansible.builtin.file:
+    path: /etc/rancher/k3s/registries.yaml
+    state: absent
+  register: _k3s_reg_rm
+
+# The validator's io_uring depends on this staying off: a pod without a profile is unconfined.
+- name: Refuse a kubelet seccomp default on localnet
+  when: network == 'localnet'
+  ansible.builtin.assert:
+    that: "'seccomp-default' not in (lookup('template', 'templates/k3s/k3s-config.yaml.j2'))"
+    fail_msg: "k3s_extra_config turns on seccomp-default, which would block the localnet validator's io_uring."
+
+- name: Stat the k3s unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/k3s.service
+  register: _k3s_unit
+
+- name: Install or upgrade the k3s service with the verified binary
+  when: (not _k3s_unit.stat.exists) or (_k3s_installed.stdout | trim != k3s_version)
+  ansible.builtin.command: /usr/local/bin/k3s-install.sh
+  environment:
+    INSTALL_K3S_SKIP_DOWNLOAD: "true"
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: server
+  changed_when: true
+  register: _k3s_install
+
+# install.sh does not restart a running k3s whose unit is unchanged, so the version the
+# node actually runs is compared too (a run killed after the binary swap leaves it behind).
+- name: Read the version the node runs
+  ansible.builtin.shell: (k3s kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null || true)
+  register: _k3s_running
+  changed_when: false
+  check_mode: false
+
+- name: Restart k3s on a new binary or a config change
+  when: >-
+    (_k3s_running.stdout | trim | length > 0 and _k3s_running.stdout | trim != k3s_version)
+    or _k3s_cfg.changed or _k3s_reg.changed | default(false) or _k3s_reg_rm.changed | default(false)
+  ansible.builtin.systemd:
+    name: k3s
+    state: restarted
+
+- name: Make sure k3s is running and enabled
+  ansible.builtin.systemd:
+    name: k3s
+    state: started
+    enabled: true
+
+- name: Wait for the node to be Ready
+  ansible.builtin.command: k3s kubectl wait --for=condition=Ready node --all --timeout=30s
+  register: _k3s_node
+  until: _k3s_node.rc == 0
+  retries: 20
+  delay: 6
+  changed_when: false
+
+- name: Assert secrets encryption is on
+  ansible.builtin.command: k3s secrets-encrypt status
+  register: _k3s_enc
+  changed_when: false
+  failed_when: "'Encryption Status: Enabled' not in _k3s_enc.stdout"
+
+# ---- helm on the host, for the cluster add-ons ----
+- name: Read the host helm version
+  ansible.builtin.shell: (helm version --template '{{ "{{" }} .Version {{ "}}" }}' 2>/dev/null || true)
+  register: _k3s_host_helm
+  changed_when: false
+  check_mode: false
+
+- name: Install the pinned helm on the host
+  when: _k3s_host_helm.stdout | trim != k3s_helm_version
+  block:
+  - name: Fetch the helm checksum
+    ansible.builtin.uri:
+      url: "https://get.helm.sh/helm-{{ k3s_helm_version }}-linux-amd64.tar.gz.sha256sum"
+      return_content: true
+    register: _k3s_helm_sum
+
+  - name: Download helm
+    ansible.builtin.get_url:
+      url: "https://get.helm.sh/helm-{{ k3s_helm_version }}-linux-amd64.tar.gz"
+      dest: /tmp/pc-helm.tgz
+      checksum: "sha256:{{ _k3s_helm_sum.content.split()[0] }}"
+      mode: "0600"
+      force: true
+
+  - name: Unpack helm
+    ansible.builtin.unarchive:
+      src: /tmp/pc-helm.tgz
+      dest: /usr/local/bin
+      remote_src: true
+      extra_opts: [ --strip-components=1, linux-amd64/helm ]
+
+  - name: Remove the helm archive
+    ansible.builtin.file:
+      path: /tmp/pc-helm.tgz
+      state: absent
+
+# ---- Cluster-scoped objects: StorageClass, namespaces, deployer RBAC, admission policy ----
+- name: Render the cluster base manifests
+  ansible.builtin.template:
+    src: templates/k3s/cluster-base.yaml.j2
+    dest: /etc/rancher/k3s/pc-cluster-base.yaml
+    mode: "0600"
+
+- name: Apply the cluster base manifests
+  ansible.builtin.command: k3s kubectl apply --server-side --force-conflicts -f /etc/rancher/k3s/pc-cluster-base.yaml
+  register: _k3s_base
+  changed_when: "'serverside-applied' in _k3s_base.stdout and 'unchanged' not in _k3s_base.stdout"
+
+# kps references these two; without placeholders its first install hangs.
+- name: Create placeholder monitoring Secrets if absent
+  ansible.builtin.shell: |
+    set -e
+    for s in pc-mon-grafana pc-prometheus-scrape; do
+      if ! k3s kubectl -n {{ k3s_monitoring_namespace }} get secret "$s" >/dev/null 2>&1; then
+        case "$s" in
+          pc-mon-grafana) k3s kubectl -n {{ k3s_monitoring_namespace }} create secret generic "$s" \
+            --from-literal=admin-user=admin --from-literal=admin-password="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" ;;
+          pc-prometheus-scrape) k3s kubectl -n {{ k3s_monitoring_namespace }} create secret generic "$s" --from-literal=scrape.yaml='[]' ;;
+        esac
+        echo created
+      fi
+    done
+  register: _k3s_placeholders
+  changed_when: "'created' in _k3s_placeholders.stdout"
+
+# ---- Add-ons at pinned chart versions ----
+- name: Install cert-manager (the backup plugin's TLS)
+  kubernetes.core.helm:
+    kubeconfig: "{{ _k3s_kubeconfig }}"
+    name: cert-manager
+    chart_ref: cert-manager
+    chart_repo_url: https://charts.jetstack.io
+    chart_version: "{{ k3s_cert_manager_chart_version }}"
+    release_namespace: "{{ k3s_cert_manager_namespace }}"
+    values: { crds: { enabled: true } }
+    wait: true
+    wait_timeout: 10m
+
+- name: Install the CloudNativePG operator
+  kubernetes.core.helm:
+    kubeconfig: "{{ _k3s_kubeconfig }}"
+    name: cnpg
+    chart_ref: cloudnative-pg
+    chart_repo_url: https://cloudnative-pg.github.io/charts
+    chart_version: "{{ k3s_cnpg_chart_version }}"
+    release_namespace: "{{ k3s_cnpg_namespace }}"
+    wait: true
+    wait_timeout: 10m
+
+- name: Install the Barman Cloud backup plugin
+  kubernetes.core.helm:
+    kubeconfig: "{{ _k3s_kubeconfig }}"
+    name: barman-cloud
+    chart_ref: plugin-barman-cloud
+    chart_repo_url: https://cloudnative-pg.github.io/charts
+    chart_version: "{{ k3s_barman_chart_version }}"
+    release_namespace: "{{ k3s_cnpg_namespace }}"
+    wait: true
+    wait_timeout: 10m
+
+- name: Render the kube-prometheus-stack values
+  ansible.builtin.template:
+    src: templates/k3s/kps-values.yaml.j2
+    dest: /etc/rancher/k3s/pc-kps-values.yaml
+    mode: "0600"
+
+- name: Install kube-prometheus-stack
+  kubernetes.core.helm:
+    kubeconfig: "{{ _k3s_kubeconfig }}"
+    name: pc-kps
+    chart_ref: kube-prometheus-stack
+    chart_repo_url: https://prometheus-community.github.io/helm-charts
+    chart_version: "{{ k3s_kps_chart_version }}"
+    release_namespace: "{{ k3s_monitoring_namespace }}"
+    values_files: [ /etc/rancher/k3s/pc-kps-values.yaml ]
+    wait: true
+    wait_timeout: 15m
+
+- name: Render the monitoring namespace NetworkPolicies
+  ansible.builtin.template:
+    src: templates/k3s/monitoring-netpol.yaml.j2
+    dest: /etc/rancher/k3s/pc-monitoring-netpol.yaml
+    mode: "0600"
+
+- name: Apply the monitoring namespace NetworkPolicies
+  ansible.builtin.command: k3s kubectl apply -f /etc/rancher/k3s/pc-monitoring-netpol.yaml
+  register: _k3s_monnp
+  changed_when: "'created' in _k3s_monnp.stdout or 'configured' in _k3s_monnp.stdout"
+

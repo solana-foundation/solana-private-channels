@@ -1,0 +1,100 @@
+# k3s-only defaults, loaded by k3s.yml after vars/common.yml and the env file.
+# The env file keeps every shared setting; override a key here per env with -e or
+# in vars/<env>.yml.
+
+# --- Pins (versions.env is the source of truth) ---------------------------------
+_k3s_versions: "{{ lookup('file', repo_root ~ '/versions.env') }}"
+k3s_version: "{{ _k3s_versions | regex_search('(?m)^K3S_VERSION=(\\S+)', '\\1') | first }}"
+k3s_helm_version: "{{ _k3s_versions | regex_search('(?m)^HELM_VERSION=(\\S+)', '\\1') | first }}"
+k3s_kubectl_version: "{{ _k3s_versions | regex_search('(?m)^KUBECTL_VERSION=(\\S+)', '\\1') | first }}"
+k3s_crane_version: "{{ _k3s_versions | regex_search('(?m)^CRANE_VERSION=(\\S+)', '\\1') | first }}"
+k3s_cnpg_chart_version: "{{ _k3s_versions | regex_search('(?m)^CNPG_CHART_VERSION=(\\S+)', '\\1') | first }}"
+k3s_barman_chart_version: "{{ _k3s_versions | regex_search('(?m)^BARMAN_PLUGIN_VERSION=(\\S+)', '\\1') | first }}"
+k3s_cert_manager_chart_version: "{{ _k3s_versions | regex_search('(?m)^CERT_MANAGER_CHART_VERSION=(\\S+)', '\\1') | first }}"
+k3s_kps_chart_version: "{{ _k3s_versions | regex_search('(?m)^KPS_CHART_VERSION=(\\S+)', '\\1') | first }}"
+
+# --- Namespaces -----------------------------------------------------------------
+k3s_namespace: private-channel
+k3s_monitoring_namespace: pc-monitoring
+k3s_cnpg_namespace: cnpg-system
+k3s_cert_manager_namespace: cert-manager
+
+# --- Host -----------------------------------------------------------------------
+# Free space needed under /var/lib/rancher before bootstrap or deploy.
+k3s_min_free_gb: 20
+# Interface whose inbound 6443 and 10250 are dropped; empty picks the default route's.
+k3s_public_iface: ""
+# Plain-HTTP registries k3s may pull from (e2e only), as host:port.
+k3s_insecure_registries: []
+# e2e_host (inventory host var) marks the dedicated e2e hosts; it is read with a default,
+# never set here, since play vars would override the inventory.
+
+# --- Deploy access (D13) --------------------------------------------------------
+# Lifetime of the per-run deployer token; a large migration may ask for up to 4h.
+k3s_token_duration: 1h
+k3s_token_duration_max_hours: 4
+# Ends the run after the database phase (compose to k3s migration).
+k3s_stop_after: ""
+k3s_helm_timeout: 15m
+
+# --- Images ---------------------------------------------------------------------
+k3s_validator_image: "{{ image_registry }}/private-channel-validator:{{ image_tag }}"
+k3s_postgres_image: ghcr.io/cloudnative-pg/postgresql:16.10
+
+# --- Databases (pc-db) ----------------------------------------------------------
+k3s_ledger_instances: 2
+k3s_ledger_storage: 20Gi
+k3s_indexer_storage: 20Gi
+k3s_pg_shared_buffers: 4GB
+k3s_pg_max_wal_size: 4GB
+k3s_failover_delay: 60
+k3s_sync_replication: true
+
+# --- Backups (D10) --------------------------------------------------------------
+k3s_backup_enabled: false
+# s3://bucket/path; endpoint only for R2 or MinIO.
+k3s_backup_destination_path: ""
+k3s_backup_endpoint_url: ""
+# AES256 on AWS S3 only.
+k3s_backup_encryption: ""
+k3s_backup_retention: "{{ '30d' if network == 'mainnet' else '7d' }}"
+k3s_backup_schedule: "0 0 */6 * * *"
+k3s_backup_endpoint_ca_secret: ""
+
+# --- Monitoring -----------------------------------------------------------------
+k3s_prometheus_storage: 20Gi
+k3s_grafana_storage: 5Gi
+k3s_prometheus_retention: 15d
+
+# --- Secrets --------------------------------------------------------------------
+# k3s workload -> its entry in secret_files. Postgres and the backup sidecars are
+# CNPG now; Grafana's Secret is written from the host (pc-mon-grafana).
+k3s_secret_services:
+  write-node: write-node
+  read-node: read-node
+  gateway: gateway
+  auth: auth
+  auth-migrate: auth-migrate
+  indexer-solana: indexer-solana
+  indexer-private-channel: indexer-private-channel
+  operator-solana: operator-solana
+  operator-private-channel: operator-private-channel
+  streamer: streamer
+  postgres-exporter-primary: mon-pgexp-primary
+  postgres-exporter-indexer: mon-pgexp-indexer
+# The kps sidecars read Grafana's admin login only at start, so on k3s it rolls Grafana too.
+k3s_secrets_rev_keys:
+  mon-grafana: [ POSTGRES_GRAFANA_PASSWORD, ALERT_WEBHOOK_URL, GF_SECURITY_ADMIN_PASSWORD ]
+# CNPG managed role -> the deploy var holding its password.
+k3s_db_roles:
+  private_channel_runtime: "{{ postgres_runtime_password }}"
+  private_channel_auth_runtime: "{{ postgres_auth_runtime_password }}"
+  private_channel_auth_owner: "{{ postgres_auth_owner_password }}"
+  private_channel_gateway: "{{ postgres_gateway_password }}"
+  private_channel_monitoring: "{{ postgres_monitoring_password }}"
+  private_channel_indexer: "{{ postgres_indexer_password }}"
+  private_channel_grafana: "{{ postgres_grafana_password }}"
+# CNPG superusers (enableSuperuserAccess): only the grants Job and break-glass use them.
+k3s_db_superusers:
+  pc-db-superuser-ledger: "{{ postgres_password }}"
+  pc-db-superuser-indexer: "{{ postgres_indexer_password }}"

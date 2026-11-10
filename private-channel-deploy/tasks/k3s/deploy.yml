@@ -1,0 +1,109 @@
+---
+# Deploy: the app chart. Checked here, not in preflight, so a same-host migration can
+# bring up k3s and the databases while compose still holds 8899 and 8903.
+- name: Read what listens on the public ports
+  become: true
+  ansible.builtin.shell: ss -Hltn '( sport = :{{ gateway_port }} or sport = :{{ auth_port }} )'
+  register: _k3s_ports
+  changed_when: false
+  check_mode: false
+
+# ServiceLB publishes through iptables, not a listening socket, so a listener is foreign.
+- name: Refuse when something else holds the gateway or auth port
+  ansible.builtin.assert:
+    that: _k3s_ports.stdout | trim | length == 0
+    fail_msg: |
+      Something listens on {{ gateway_port }} or {{ auth_port }} on {{ inventory_hostname }}:
+      {{ _k3s_ports.stdout }}
+      A compose stack still running? Stop it first (migration: k3s.yml -e k3s_stop_after=database runs while it is up).
+
+- name: Install or upgrade the app release
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.helm:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    name: private-channel
+    chart_ref: "{{ repo_root }}/charts/private-channel"
+    release_namespace: "{{ k3s_namespace }}"
+    values_files: [ "{{ pc_tmp }}/values.generated.yaml" ]
+    wait: true
+    wait_timeout: "{{ k3s_helm_timeout }}"
+    # Never auto-roll back: a DB-adjacent change must stay for a human to look at.
+    atomic: false
+
+# down-k3s.yml scaled the app to 0 and helm does not touch an unchanged release.
+- name: Restore the replicas a down recorded
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    set -eu
+    kubectl -n {{ k3s_namespace }} get deployment,statefulset -l app.kubernetes.io/part-of=private-channel \
+      -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.private-channel\.io/replicas-before-down}{"\n"}{end}' \
+      | while read -r w n; do
+        [ -n "${n:-}" ] || continue
+        kubectl -n {{ k3s_namespace }} scale "$w" --replicas="$n" >/dev/null
+        kubectl -n {{ k3s_namespace }} annotate "$w" private-channel.io/replicas-before-down- >/dev/null
+        echo "restored $w to $n"
+      done
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  register: _k3s_restore
+  changed_when: _k3s_restore.stdout | length > 0
+
+- name: List the workloads
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    kind: "{{ item }}"
+    namespace: "{{ k3s_namespace }}"
+    label_selectors: [ app.kubernetes.io/part-of=private-channel ]
+  loop: [ Deployment, StatefulSet ]
+  register: _k3s_workloads
+
+- name: Wait for every rollout to finish
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.command:
+    argv: [ kubectl, -n, "{{ k3s_namespace }}", rollout, status, "{{ item }}", --timeout=10m ]
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  loop: >-
+    {{ _k3s_workloads.results | map(attribute='resources') | flatten
+       | map(attribute='kind') | map('lower')
+       | zip(_k3s_workloads.results | map(attribute='resources') | flatten | map(attribute='metadata.name'))
+       | map('join', '/') | list }}
+  changed_when: false
+
+# A restarted dependency (the validator on a reset-flag change) can leave a worker
+# NotReady after its rollout finished; health and sanity run only once all are Ready.
+- name: Wait for every app pod to be Ready
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.command:
+    argv: [ kubectl, -n, "{{ k3s_namespace }}", wait, --for=condition=Ready, pod,
+            -l, "app.kubernetes.io/part-of=private-channel,!job-name", --timeout=10m ]
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  changed_when: false
+
+# The next deploy reads the instance from here, as compose reads the previous .env.
+- name: Record the deploy state
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: { name: pc-deploy-state, namespace: "{{ k3s_namespace }}" }
+      data:
+        COMMON_ESCROW_INSTANCE_ID: "{{ (escrow_instance_id | default('', true) or escrow_instance_id_pda | default('')) | trim }}"
+        IMAGE_TAG: "{{ image_tag | string }}"
+        DEPLOYED_AT: "{{ ansible_date_time.iso8601 }}"
+
+- name: Record when the rollout ended (sanity check 5 window)
+  ansible.builtin.set_fact:
+    _k3s_rollout_end: "{{ lookup('pipe', 'date +%s') }}"

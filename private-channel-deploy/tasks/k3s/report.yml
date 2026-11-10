@@ -1,0 +1,41 @@
+---
+# Report: the same summary and webhook POST as the compose deploy.
+- name: Refresh facts for elapsed time
+  ansible.builtin.setup:
+    gather_subset: [ "!all", "!min", "date_time" ]
+
+# rpc_url is reduced to scheme and host: paid RPC URLs carry API keys.
+- name: Build report
+  ansible.builtin.set_fact:
+    _report: |
+      ============================================================
+      Solana Private Channels deploy report (k3s)
+      ------------------------------------------------------------
+      host           : {{ inventory_hostname }} ({{ ansible_host | default('local') }})
+      env (group)    : {{ group_names | difference(['all']) | first | default('?') }}
+      image_tag      : {{ image_tag }}
+      network        : {{ network }}
+      rpc_url        : {{ rpc_url | urlsplit('scheme') }}://{{ rpc_url | urlsplit('hostname') }}{{ ':' ~ rpc_url | urlsplit('port') if rpc_url | urlsplit('port') else '' }} (path/query redacted)
+      k3s            : {{ k3s_version }}
+      namespace      : {{ k3s_namespace }}
+      workers        : {{ _workers_enabled | default(true) }}
+      reset_state    : {{ reset_state | default(false) }}
+      started_at     : {{ deploy_start_ts }}
+      elapsed        : {{ (ansible_date_time.epoch | int) - (deploy_start_epoch | int) }}s
+      ============================================================
+
+- name: Print report
+  ansible.builtin.debug:
+    msg: "{{ _report.split('\n') }}"
+
+- name: POST report to notify_webhook
+  when: notify_webhook | default('') | length > 0
+  delegate_to: localhost
+  ansible.builtin.uri:
+    url: "{{ notify_webhook }}"
+    method: POST
+    body_format: json
+    body: { text: "{{ _report }}" }
+    status_code: [ 200, 201, 202, 204 ]
+  failed_when: false
+  no_log: true

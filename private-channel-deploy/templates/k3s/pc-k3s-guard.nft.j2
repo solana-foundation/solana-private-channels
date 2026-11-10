@@ -1,0 +1,13 @@
+#!/usr/sbin/nft -f
+# Rendered by Ansible. On the public interface only: the k3s API, kubelet, node-exporter
+# and the NodePort range LoadBalancer Services allocate. Prerouting, before kube-proxy's
+# NodePort DNAT; pods still reach all of these over the pod network.
+table inet pc_k3s_guard
+delete table inet pc_k3s_guard
+table inet pc_k3s_guard {
+  chain prerouting {
+    type filter hook prerouting priority -150; policy accept;
+    iifname "{{ _k3s_wan }}" tcp dport { 6443, 9100, 10250, 30000-32767 } drop
+    iifname "{{ _k3s_wan }}" udp dport 30000-32767 drop
+  }
+}

@@ -1,0 +1,34 @@
+---
+# Always runs: close the tunnel, delete the temporary kubeconfig, and delete the
+# per-run Secret, which revokes the token at once.
+- name: Close the SSH tunnel
+  when: _k3s_sock is defined
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    if [ -S "{{ _k3s_sock }}" ]; then ssh -S "{{ _k3s_sock }}" -O exit pc-k3s 2>/dev/null || rm -f "{{ _k3s_sock }}"; fi
+  changed_when: true
+  failed_when: false
+
+- name: Stop port-forwards this run left
+  when: pc_tmp is defined
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    for f in "{{ pc_tmp }}"/pf-*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; true
+  changed_when: false
+
+- name: Delete the temporary kubeconfig dir
+  when: pc_tmp is defined
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.file:
+    path: "{{ pc_tmp }}"
+    state: absent
+
+- name: Delete this run's Secret (revokes the token)
+  when: _k3s_run_secret is defined
+  become: true
+  ansible.builtin.command: k3s kubectl -n {{ k3s_namespace }} delete secret {{ _k3s_run_secret }} --ignore-not-found
+  changed_when: true
+  failed_when: false

@@ -1,0 +1,69 @@
+# Rendered by Ansible (k3s.yml render phase) from vars/<env>.yml and vars/common.yml.
+# Holds no secret: Secrets are applied separately and only their key names appear here.
+{% set _extra = extra_admin_keys | default([]) %}
+{% if _extra is string %}{% set _extra = _extra.split(',') | map('trim') | select | list %}{% endif %}
+{% set _signer_plain = {
+  'memory': [],
+  'vault': ['VAULT_ADDR', 'VAULT_KEY_NAME', 'VAULT_PUBKEY'],
+  'turnkey': ['TURNKEY_API_PUBLIC_KEY', 'TURNKEY_ORGANIZATION_ID', 'TURNKEY_PRIVATE_KEY_ID', 'TURNKEY_PUBKEY'],
+  'privy': ['PRIVY_APP_ID', 'PRIVY_WALLET_ID'],
+} %}
+{% set _signer_src = {
+  'VAULT_ADDR': 'vault_addr', 'VAULT_KEY_NAME': 'vault_key_name', 'VAULT_PUBKEY': None,
+  'TURNKEY_API_PUBLIC_KEY': 'turnkey_api_public_key', 'TURNKEY_ORGANIZATION_ID': 'turnkey_organization_id',
+  'TURNKEY_PRIVATE_KEY_ID': 'turnkey_private_key_id', 'TURNKEY_PUBKEY': None,
+  'PRIVY_APP_ID': 'privy_app_id', 'PRIVY_WALLET_ID': 'privy_wallet_id',
+} %}
+{% set _signer_env = {'admin': {}, 'operator': {}} %}
+{% for role in ['admin', 'operator'] %}
+{% for k in _signer_plain[lookup('vars', role ~ '_signer', default='memory')] %}
+{% set _ = _signer_env[role].update({(role | upper) ~ '_' ~ k: (lookup('vars', 'pc_' ~ role ~ '_pubkey') if _signer_src[k] is none else lookup('vars', role ~ '_' ~ _signer_src[k]))}) %}
+{% endfor %}
+{% endfor %}
+{{ {
+  'network': network,
+  'image': {
+    'registry': image_registry,
+    'repository': 'private-channel-app',
+    'tag': image_tag | string,
+    'digest': (pc_app_image_digest | default('')) if (verify_image_signature | default(false) | bool) else '',
+  },
+  'imagePullSecret': 'pc-ghcr' if _registry_host == 'ghcr.io' else '',
+  'workers': {'enabled': _workers_enabled | default(true) | bool},
+  'auth': {'enabled': gateway_enforce_jwt | default(true) | bool, 'corsAllowedOrigin': 'https://' ~ domain if domain | default('') else '*'},
+  'escrow': {
+    'instanceId': (escrow_instance_id | default('', true) or escrow_instance_id_pda | default('')) | trim,
+    'confidentialPubkey': escrow_confidential_pubkey | default('') | trim,
+  },
+  'config': {
+    'adminKeys': ([pc_admin_pubkey | default('admin_pubkey', true)] + _extra) | join(','),
+    'permanentDelegate': permanent_delegate | default(''),
+    'complianceOwner': compliance_owner | default(''),
+    'yellowstoneEndpoint': yellowstone_endpoint | default(''),
+    'gatewayWhitelistInstance': gateway_whitelist_instance | default(''),
+    'adminSigner': admin_signer | default('memory'),
+    'operatorSigner': operator_signer | default('memory'),
+    'adminSignerEnv': _signer_env.admin,
+    'operatorSignerEnv': _signer_env.operator,
+  },
+  'secretKeys': _k3s_secret_keys,
+  'secretsRev': _k3s_secrets_rev,
+  'waitImages': {'postgres': k3s_postgres_image},
+  'validator': {
+    'enabled': network == 'localnet',
+    'image': k3s_validator_image,
+    'resetFlag': '--reset' if (validator_reset | default(true) | bool) else '',
+    'escrowProgramId': compiled_escrow_program_id,
+    'withdrawProgramId': compiled_withdraw_program_id,
+  },
+  'ports': {
+    'gateway': gateway_port | int, 'gatewayInternal': gateway_internal_port | int, 'write': write_port | int,
+    'read': read_port | int, 'streamer': streamer_port | int, 'auth': auth_port | int,
+  },
+  'networkPolicy': {
+    'prometheus': {'namespace': k3s_monitoring_namespace, 'podLabels': {'app.kubernetes.io/name': 'prometheus'}},
+    'grafana': {'namespace': k3s_monitoring_namespace, 'podLabels': {'app.kubernetes.io/name': 'grafana'}},
+    'cnpgOperator': {'namespace': k3s_cnpg_namespace, 'podLabels': {'app.kubernetes.io/name': 'cloudnative-pg'}},
+    'extraRules': k3s_np_extra_rules | default([]),
+  },
+} | to_nice_yaml(indent=2) }}

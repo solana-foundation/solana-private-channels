@@ -1,0 +1,133 @@
+---
+# Connect: a short-lived deployer token bound to a per-run Secret, an SSH tunnel to the
+# API and a temporary kubeconfig. The host's admin kubeconfig never leaves the host.
+- name: Record the tunnel and token settings
+  ansible.builtin.set_fact:
+    _k3s_ctl_dir: "{{ lookup('env', 'HOME') }}/.cache/pc-k3s"
+    # k3s-connect.sh uses its own owner label, socket and temp prefix, so neither side
+    # ever closes or revokes the other's session.
+    _k3s_owner: "{{ k3s_token_owner | default('deploy') }}"
+    _k3s_sock: "{{ lookup('env', 'HOME') }}/.cache/pc-k3s/tunnel-{{ k3s_token_owner | default('deploy') }}-{{ inventory_hostname }}.sock"
+    _k3s_run_secret: "pc-deploy-run-{{ lookup('community.general.random_string', length=10, upper=false, special=false) }}"
+
+# Deploys to one host never run in parallel, so any per-run Secret left is from a
+# killed run; deleting it revokes that run's token at once.
+- name: Delete per-run Secrets left by earlier deploy runs
+  become: true
+  ansible.builtin.command: >-
+    k3s kubectl -n {{ k3s_namespace }} delete secret
+    -l private-channel.io/token-owner={{ _k3s_owner }} --ignore-not-found
+  register: _k3s_stale
+  changed_when: "'deleted' in _k3s_stale.stdout"
+
+- name: Create this run's Secret and mint the bound token
+  become: true
+  ansible.builtin.shell: |
+    set -eu
+    k3s kubectl -n {{ k3s_namespace }} create secret generic {{ _k3s_run_secret }} >/dev/null
+    k3s kubectl -n {{ k3s_namespace }} label secret {{ _k3s_run_secret }} \
+      private-channel.io/token-owner={{ _k3s_owner }} >/dev/null
+    k3s kubectl create token deployer -n {{ k3s_namespace }} --duration={{ k3s_token_duration }} \
+      --bound-object-kind Secret --bound-object-name {{ _k3s_run_secret }}
+  register: _k3s_token
+  changed_when: true
+  no_log: true
+
+- name: Read the cluster CA
+  become: true
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/tls/server-ca.crt
+  register: _k3s_ca
+
+- name: Open the tunnel and write the temporary kubeconfig
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Create the tunnel control dir
+    ansible.builtin.file:
+      path: "{{ _k3s_ctl_dir }}"
+      state: directory
+      mode: "0700"
+
+  # A run killed hard leaves its tunnel: close it by its control socket, and kill any
+  # master still bound to that path whose socket a later run already replaced.
+  - name: Close a stale tunnel for this host
+    ansible.builtin.shell: |
+      if [ -S "{{ _k3s_sock }}" ]; then ssh -S "{{ _k3s_sock }}" -O exit pc-k3s 2>/dev/null || rm -f "{{ _k3s_sock }}"; fi
+      for p in $(pgrep -f -- "[-]S {{ _k3s_sock }} "); do kill "$p" 2>/dev/null; done; true
+    changed_when: false
+
+  - name: Remove temporary kubeconfig dirs left by killed runs for this host
+    ansible.builtin.shell: rm -rf "${TMPDIR:-/tmp}"/pc-k3s-{{ _k3s_owner }}-{{ inventory_hostname }}.*
+    changed_when: false
+
+  - name: Create the temporary kubeconfig dir (0700)
+    ansible.builtin.tempfile:
+      state: directory
+      prefix: "pc-k3s-{{ _k3s_owner }}-{{ inventory_hostname }}."
+    register: _k3s_tmp
+
+  - name: Pick a free local port for the tunnel
+    ansible.builtin.command:
+      argv: [ python3, -c, "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])" ]
+    register: _k3s_port
+    changed_when: false
+
+  # Same user, key, port and host-key settings as the inventory connection.
+  - name: Open the SSH tunnel to the API server
+    ansible.builtin.command:
+      argv: >-
+        {{ ['ssh', '-f', '-N', '-M', '-S', _k3s_sock,
+            '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15', '-o', 'BatchMode=yes',
+            '-L', '127.0.0.1:' ~ (_k3s_port.stdout | trim) ~ ':127.0.0.1:6443']
+          + (['-p', ansible_port | string] if ansible_port is defined else [])
+          + (['-i', ansible_ssh_private_key_file] if ansible_ssh_private_key_file is defined else [])
+          + ((ansible_ssh_common_args | default('')) | split | list)
+          + ((ansible_ssh_extra_args | default('')) | split | list)
+          + [(ansible_user ~ '@' if ansible_user is defined else '') ~ (ansible_host | default(inventory_hostname))] }}
+    changed_when: true
+
+  - name: Wait until the tunnel answers
+    ansible.builtin.wait_for:
+      host: 127.0.0.1
+      port: "{{ _k3s_port.stdout | trim }}"
+      timeout: 30
+
+  - name: Write the temporary kubeconfig
+    ansible.builtin.copy:
+      dest: "{{ _k3s_tmp.path }}/kubeconfig"
+      mode: "0600"
+      content: |
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - name: pc
+          cluster:
+            server: https://127.0.0.1:{{ _k3s_port.stdout | trim }}
+            certificate-authority-data: {{ _k3s_ca.content }}
+        users:
+        - name: deployer
+          user:
+            token: {{ _k3s_token.stdout | trim }}
+        contexts:
+        - name: pc
+          context: { cluster: pc, user: deployer, namespace: {{ k3s_namespace }} }
+        current-context: pc
+    no_log: true
+
+  - name: Use the temporary kubeconfig for every later phase
+    ansible.builtin.set_fact:
+      pc_kubeconfig: "{{ _k3s_tmp.path }}/kubeconfig"
+      pc_tmp: "{{ _k3s_tmp.path }}"
+
+- name: Prove the token works through the tunnel
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    kind: ConfigMap
+    namespace: "{{ k3s_namespace }}"
+  register: _k3s_probe_api
+  retries: 5
+  delay: 3
+  until: _k3s_probe_api is succeeded

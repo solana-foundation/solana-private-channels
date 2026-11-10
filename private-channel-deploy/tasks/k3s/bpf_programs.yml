@@ -1,0 +1,23 @@
+---
+# The localnet validator loads both programs from target/deploy; build any that is missing.
+- name: Stat the BPF programs
+  ansible.builtin.stat:
+    path: "{{ repo_root }}/target/deploy/{{ item }}.so"
+  loop: [ private_channel_escrow_program, private_channel_withdraw_program ]
+  register: _k3s_bpf
+
+- name: Build a missing BPF program with cargo-build-sbf
+  when: not item.stat.exists
+  ansible.builtin.command:
+    cmd: cargo-build-sbf
+    chdir: "{{ repo_root }}/{{ item.item | replace('_', '-') }}/program"
+  loop: "{{ _k3s_bpf.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Assert both BPF programs exist
+  ansible.builtin.stat:
+    path: "{{ repo_root }}/target/deploy/{{ item }}.so"
+  loop: [ private_channel_escrow_program, private_channel_withdraw_program ]
+  register: _k3s_bpf_after
+  failed_when: not _k3s_bpf_after.stat.exists

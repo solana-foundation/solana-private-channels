@@ -1,0 +1,20 @@
+---
+# Ad hoc access the way a deploy connects (scoped token, tunnel, temporary kubeconfig).
+# Run it through scripts/k3s-connect.sh, which prints the export line.
+- name: Connect to the k3s API through an SSH tunnel
+  hosts: all
+  gather_facts: false
+  serial: 1
+  vars_files:
+  - vars/common.yml
+  - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
+  - vars/k3s.yml
+  vars:
+    k3s_token_owner: connect
+  tasks:
+  - name: Connect
+    ansible.builtin.import_tasks: tasks/k3s/connect.yml
+
+  - name: Print the kubeconfig to use
+    ansible.builtin.debug:
+      msg: "PC_KUBECONFIG={{ pc_kubeconfig }} PC_TUNNEL_SOCKET={{ _k3s_sock }}"
