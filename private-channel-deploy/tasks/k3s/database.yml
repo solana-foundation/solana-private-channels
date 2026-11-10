@@ -1,0 +1,128 @@
+---
+# Role Secrets, the pc-db release, then both Clusters Ready and the grants hook. CNPG
+# applies a changed password at once (cnpg.io/reload), so this runs right before the
+# app chart rolls the pods that use it.
+- name: Apply the CNPG role Secrets
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "pc-db-role-{{ item.key | replace('_', '-') }}"
+        namespace: "{{ k3s_namespace }}"
+        labels: { cnpg.io/reload: "true", private-channel.io/secret-set: db }
+      type: kubernetes.io/basic-auth
+      data: { username: "{{ item.key | b64encode }}", password: "{{ item.value | string | b64encode }}" }
+  loop: "{{ k3s_db_roles | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
+- name: Apply the CNPG superuser Secrets
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ item.key }}"
+        namespace: "{{ k3s_namespace }}"
+        labels: { cnpg.io/reload: "true", private-channel.io/secret-set: db }
+      type: kubernetes.io/basic-auth
+      data: { username: "{{ 'postgres' | b64encode }}", password: "{{ item.value | string | b64encode }}" }
+  loop: "{{ k3s_db_superusers | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true
+
+- name: Apply the backup bucket credentials
+  when: k3s_backup_enabled | bool
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata: { name: pc-db-backup-s3, namespace: "{{ k3s_namespace }}", labels: { private-channel.io/secret-set: db } }
+      type: Opaque
+      data:
+        ACCESS_KEY_ID: "{{ backup_s3_access_key_id | b64encode }}"
+        ACCESS_SECRET_KEY: "{{ backup_s3_secret_access_key | b64encode }}"
+  no_log: true
+
+# down-k3s.yml hibernates the Clusters; a deploy wakes them.
+- name: Wake hibernated Clusters
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: patched
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    namespace: "{{ k3s_namespace }}"
+    name: "{{ item }}"
+    definition:
+      metadata:
+        annotations: { cnpg.io/hibernation: "off" }
+  loop: [ "{{ (k3s_ledger_overrides | default({})).name | default('pc-ledger') }}", "{{ (k3s_indexer_overrides | default({})).name | default('pc-indexer') }}" ]
+  failed_when: false
+
+- name: Render the pc-db values
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.template:
+    src: templates/k3s/pc-db-values.yaml.j2
+    dest: "{{ pc_tmp }}/pc-db-values.yaml"
+    mode: "0600"
+
+# --wait also waits for the post-install/post-upgrade grants hook to finish.
+- name: Install or upgrade the pc-db release
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.helm:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    name: pc-db
+    chart_ref: "{{ repo_root }}/charts/pc-db"
+    release_namespace: "{{ k3s_namespace }}"
+    values_files: [ "{{ pc_tmp }}/pc-db-values.yaml" ]
+    wait: true
+    wait_timeout: "{{ k3s_helm_timeout }}"
+    atomic: false
+
+# Ready, not running: the Cluster condition, never a pod that merely runs.
+- name: Wait for both Clusters to be Ready
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    api_version: postgresql.cnpg.io/v1
+    kind: Cluster
+    namespace: "{{ k3s_namespace }}"
+    name: "{{ item }}"
+    wait: true
+    wait_condition: { type: Ready, status: "True" }
+    wait_timeout: 900
+  loop: [ "{{ (k3s_ledger_overrides | default({})).name | default('pc-ledger') }}", "{{ (k3s_indexer_overrides | default({})).name | default('pc-indexer') }}" ]
+
+- name: Assert the grants hook succeeded
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    kind: Job
+    namespace: "{{ k3s_namespace }}"
+    name: pc-db-grants
+  register: _k3s_grants
+  failed_when: (_k3s_grants.resources | first).status.succeeded | default(0) | int < 1

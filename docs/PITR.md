@@ -386,3 +386,24 @@ docker compose logs pg-backup-indexer --tail 20
 3. Insert another row after the target time
 4. Perform PITR to the target time (steps 1-6 above)
 5. Verify: first row present, second row absent
+
+## PITR on k3s (CloudNativePG)
+
+On k3s the Barman Cloud plugin archives WAL continuously and takes a base backup every 6h into the bucket set by `k3s_backup_destination_path`, one path per Cluster lifetime (`serverName`: the Cluster name plus a creation stamp). The rule above still holds: restore the indexer to a target at least 60 s before the ledger target, and restore whole databases only.
+
+The Services `postgres-primary`, `postgres-replica` and `postgres-indexer` belong to the Cluster that declares them, and two Clusters cannot both own them. So a restore recovers into a new Cluster first and moves the names after:
+
+1. Stop the app: `ansible-playbook down-k3s.yml -l <env>` (or scale the app workloads to 0; the old Clusters may stay up for the check below).
+2. Find the source `serverName`: `kubectl -n private-channel get cluster pc-ledger -o jsonpath='{.spec.plugins[0].parameters.serverName}'`.
+3. Recover a new Cluster without the role Services, from the object store, to a target time and with a fresh `serverName`, by a pc-db upgrade with overrides (example for the ledger):
+   ```bash
+   ansible-playbook k3s.yml -l <env> --tags database -e k3s_stop_after=database -e '{"k3s_ledger_overrides":
+     {"name": "pc-ledger-r1", "services": false,
+      "recovery": {"serverName": "<source serverName>", "targetTime": "2026-11-09T10:00:00Z"}}}'
+   ```
+   helm keeps the old `pc-ledger` (resource-policy keep), so both exist side by side. The new Cluster's pods carry the same `private-channel.io/db` label, so the NetworkPolicies apply unchanged.
+4. Check it (`kubectl exec` into `pc-ledger-r1-1`, query the rows around the target), then delete the old Cluster: `kubectl -n private-channel delete cluster pc-ledger`. Its volume stays `Released` under `pc-retain` until removed on the host.
+5. Run the same command with `"services": true` (and the recovery block left in place, so the Cluster spec is unchanged): the role Services move to the new Cluster and every app URL works unchanged. Keep `k3s_ledger_overrides` with `name: pc-ledger-r1` in the env vars from now on.
+6. `ansible-playbook k3s.yml -l <env>`: the app starts and the fence and bitmap checks run at boot. CNPG recreates the replica; no manual replica wipe is needed.
+
+A mainnet go-live requires one timed drill of this procedure.

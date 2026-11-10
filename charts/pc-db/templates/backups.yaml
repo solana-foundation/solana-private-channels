@@ -1,0 +1,46 @@
+{{- if .Values.backup.enabled }}
+{{- $root := . }}
+{{- $b := .Values.backup }}
+{{- range $db := list "ledger" "indexer" }}
+{{- $c := get $root.Values $db }}
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ printf "pc-%s-store" $db }}
+spec:
+  retentionPolicy: {{ $b.retentionPolicy | quote }}
+  configuration:
+    destinationPath: {{ required "backup.destinationPath is required" $b.destinationPath | quote }}
+    {{- with $b.endpointURL }}
+    endpointURL: {{ . | quote }}
+    {{- end }}
+    {{- with $b.endpointCASecret }}
+    endpointCA: { name: {{ . }}, key: ca.crt }
+    {{- end }}
+    s3Credentials:
+      accessKeyId: { name: {{ $b.credentialsSecret }}, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: {{ $b.credentialsSecret }}, key: ACCESS_SECRET_KEY }
+    wal:
+      compression: gzip
+      {{- with $b.encryption }}
+      encryption: {{ . }}
+      {{- end }}
+    data:
+      compression: gzip
+      {{- with $b.encryption }}
+      encryption: {{ . }}
+      {{- end }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ printf "%s-every-6h" $c.name }}
+spec:
+  schedule: {{ $b.schedule | quote }}
+  backupOwnerReference: self
+  cluster: { name: {{ $c.name }} }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+{{- end }}
+{{- end }}

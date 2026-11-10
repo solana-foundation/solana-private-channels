@@ -1,0 +1,76 @@
+# CNPG operand image; pg_dump 16 and psql live here too.
+imageName: ghcr.io/cloudnative-pg/postgresql:16.10
+storageClass: pc-retain
+
+ledger:
+  # A PITR restore recovers into a new name; the stable db label keeps NetworkPolicies valid.
+  name: pc-ledger
+  instances: 2
+  database: private_channel
+  # Owns the database and the objects a compose dump carries; NOLOGIN here.
+  owner: private_channel
+  size: 20Gi
+  # Seconds before a dead primary is failed over; covers the just-rejoined standby case.
+  failoverDelay: 60
+  synchronous:
+    enabled: true
+    dataDurability: preferred
+  parameters:
+    shared_buffers: 4GB
+    synchronous_commit: "on"
+    wal_compression: lz4
+    max_wal_size: 4GB
+    hot_standby_feedback: "on"
+  # Declares postgres-primary and postgres-replica; off on a PITR Cluster until the old one is gone.
+  services: true
+  superuserSecret: pc-db-superuser-ledger
+  roles:
+    - { name: private_channel_runtime }
+    - { name: private_channel_auth_runtime }
+    - { name: private_channel_auth_owner }
+    - { name: private_channel_gateway }
+    - { name: private_channel_monitoring }
+  # NOLOGIN roles kept for ownership and grants parity with compose.
+  nologinRoles: [ private_channel, replicator ]
+  # Set by the PITR runbook: { serverName: <source>, targetTime: "<RFC3339>" }.
+  recovery: {}
+  serverName: ""
+
+indexer:
+  name: pc-indexer
+  instances: 1
+  database: indexer
+  owner: private_channel_indexer
+  size: 20Gi
+  failoverDelay: 60
+  synchronous:
+    enabled: false
+    dataDurability: preferred
+  parameters: {}
+  services: true
+  superuserSecret: pc-db-superuser-indexer
+  roles:
+    # SUPERUSER for parity with compose, where this login is the cluster's initdb user.
+    - { name: private_channel_indexer, superuser: true }
+    - { name: private_channel_grafana }
+  nologinRoles: [ private_channel ]
+  recovery: {}
+  serverName: ""
+
+backup:
+  enabled: false
+  # s3://bucket/path; endpointURL only for R2 or MinIO.
+  destinationPath: ""
+  endpointURL: ""
+  credentialsSecret: pc-db-backup-s3
+  # AES256 for AWS S3 only: R2 may reject the header and encrypts at rest anyway.
+  encryption: ""
+  retentionPolicy: 7d
+  # CNPG cron has six fields, seconds first.
+  schedule: "0 0 */6 * * *"
+  # Test hook: trust a self-signed endpoint CA from this Secret (key ca.crt).
+  endpointCASecret: ""
+
+grants:
+  # Waits this long for CNPG to create the managed roles before failing.
+  roleWaitSeconds: 300

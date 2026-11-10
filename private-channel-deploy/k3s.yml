@@ -106,6 +106,10 @@
       ansible.builtin.import_tasks: tasks/k3s/secrets.yml
       tags: [ secrets, deploy, monitoring ]
 
+    - name: "==== DATABASE ===="
+      ansible.builtin.import_tasks: tasks/k3s/database.yml
+      tags: [ database ]
+
     - name: Stop after the database phase (migration)
       when: k3s_stop_after != 'database'
       block:

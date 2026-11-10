@@ -1,0 +1,88 @@
+{{- $root := . }}
+{{- range $db := list "ledger" "indexer" }}
+{{- $c := get $root.Values $db }}
+{{- $svc := ternary (list (dict "type" "rw" "name" "postgres-primary") (dict "type" "ro" "name" "postgres-replica")) (list (dict "type" "rw" "name" "postgres-indexer")) (eq $db "ledger") }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $c.name }}
+  annotations:
+    # helm uninstall or a renamed Cluster must never drop a database.
+    helm.sh/resource-policy: keep
+  labels:
+    app.kubernetes.io/part-of: private-channel
+    private-channel.io/db: {{ $db }}
+spec:
+  instances: {{ $c.instances }}
+  imageName: {{ $root.Values.imageName }}
+  enableSuperuserAccess: true
+  superuserSecret: { name: {{ $c.superuserSecret }} }
+  failoverDelay: {{ $c.failoverDelay }}
+  # Stable label on every instance pod, for the app chart's NetworkPolicies.
+  inheritedMetadata:
+    labels:
+      private-channel.io/db: {{ $db }}
+  storage:
+    storageClass: {{ $root.Values.storageClass }}
+    size: {{ $c.size }}
+  postgresql:
+    {{- with $c.parameters }}
+    parameters:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- if $c.synchronous.enabled }}
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: {{ $c.synchronous.dataDurability }}
+    {{- end }}
+  bootstrap:
+    {{- if $c.recovery }}
+    recovery:
+      source: origin
+      {{- with $c.recovery.targetTime }}
+      recoveryTarget: { targetTime: {{ . | quote }} }
+      {{- end }}
+    {{- else }}
+    initdb:
+      database: {{ $c.database }}
+      owner: {{ $c.owner }}
+    {{- end }}
+  {{- if $c.recovery }}
+  externalClusters:
+    - name: origin
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters: { barmanObjectName: {{ printf "pc-%s-store" $db }}, serverName: {{ $c.recovery.serverName }} }
+  {{- end }}
+  {{- if $root.Values.backup.enabled }}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ printf "pc-%s-store" $db }}
+        serverName: {{ include "pcdb.serverName" (dict "root" $root "c" $c) }}
+  {{- end }}
+  managed:
+    {{- if $c.services }}
+    services:
+      additional:
+        {{- range $s := $svc }}
+        - selectorType: {{ $s.type }}
+          serviceTemplate: { metadata: { name: {{ $s.name }} } }
+        {{- end }}
+    {{- end }}
+    roles:
+      {{- range $r := $c.roles }}
+      - name: {{ $r.name }}
+        ensure: present
+        login: true
+        superuser: {{ default false $r.superuser }}
+        inherit: true
+        passwordSecret: { name: {{ include "pcdb.roleSecret" $r.name }} }
+      {{- end }}
+      {{- range $r := $c.nologinRoles }}
+      - { name: {{ $r }}, ensure: present, login: false }
+      {{- end }}
+{{- end }}
