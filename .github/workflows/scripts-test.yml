@@ -52,7 +52,7 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: private-channel-runner-1
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -77,6 +77,27 @@ jobs:
           }
           "$RUNNER_TEMP/ansible/bin/pip" install --quiet 'ansible-core>=2.16'
           echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+
+      # The k3s chart and preflight tests need helm, helm-unittest, kubeconform and kubernetes.core.
+      # Checksums are for the versions.env pins; a bump fails here until they are updated.
+      - name: Install the k3s test tools
+        run: |
+          set -euo pipefail
+          . ./versions.env
+          bin="$RUNNER_TEMP/k3s-bin"; plugins="$RUNNER_TEMP/helm-plugins"; mkdir -p "$bin" "$plugins/helm-unittest"
+          get() { curl -fsSL --retry 3 -o "$RUNNER_TEMP/$2" "$1"; echo "$3  $RUNNER_TEMP/$2" | sha256sum -c -; }
+          get "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" helm.tgz \
+            896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+          tar -xzf "$RUNNER_TEMP/helm.tgz" -C "$bin" --strip-components=1 linux-amd64/helm
+          get "https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION/kubeconform-linux-amd64.tar.gz" kubeconform.tgz \
+            9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+          tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$bin" kubeconform
+          get "https://github.com/helm-unittest/helm-unittest/releases/download/v$HELM_UNITTEST_VERSION/helm-unittest-linux-amd64-$HELM_UNITTEST_VERSION.tgz" unittest.tgz \
+            48e86ecc1467b009630e5954375e5d8494139f73b466df5fe8c04fa45b634939
+          tar -xzf "$RUNNER_TEMP/unittest.tgz" -C "$plugins/helm-unittest"
+          ansible-galaxy collection install "kubernetes.core==$KUBERNETES_CORE_VERSION"
+          echo "$bin" >> "$GITHUB_PATH"
+          echo "HELM_PLUGINS=$plugins" >> "$GITHUB_ENV"
 
       - name: Run script tests
         run: |
