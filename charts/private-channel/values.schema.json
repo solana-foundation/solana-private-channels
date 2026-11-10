@@ -1,0 +1,215 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "network",
+    "image",
+    "apps"
+  ],
+  "properties": {
+    "network": {
+      "enum": [
+        "localnet",
+        "devnet",
+        "mainnet"
+      ]
+    },
+    "image": {
+      "type": "object",
+      "required": [
+        "registry",
+        "repository"
+      ],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^(|sha256:[0-9a-f]+)$"
+        }
+      }
+    },
+    "apps": {
+      "type": "object",
+      "properties": {
+        "write-node": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "streamer": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "indexer-solana": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "indexer-private-channel": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "operator-solana": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "operator-private-channel": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1
+            }
+          }
+        },
+        "read-node": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "gateway": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "secretKeys": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        }
+      }
+    },
+    "secretsRev": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "adminSigner": {
+          "enum": [
+            "memory",
+            "vault",
+            "turnkey",
+            "privy"
+          ]
+        },
+        "operatorSigner": {
+          "enum": [
+            "memory",
+            "vault",
+            "turnkey",
+            "privy"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "network": {
+            "const": "mainnet"
+          }
+        },
+        "required": [
+          "network"
+        ]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "adminSigner": {
+                "not": {
+                  "const": "memory"
+                }
+              },
+              "operatorSigner": {
+                "not": {
+                  "const": "memory"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "network": {
+            "const": "localnet"
+          }
+        },
+        "required": [
+          "network"
+        ]
+      },
+      "else": {
+        "properties": {
+          "streamer": {
+            "properties": {
+              "enabled": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

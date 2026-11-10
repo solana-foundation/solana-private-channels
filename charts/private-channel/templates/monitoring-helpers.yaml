@@ -1,0 +1,101 @@
+{{- /* blackbox and the two Postgres exporters run next to the app, as in compose, so probe instances and DSNs keep their short names. */}}
+{{- $root := . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blackbox-exporter
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "blackbox-exporter") | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: blackbox-exporter } }
+  template:
+    metadata:
+      labels:
+        {{- include "pc.labels" (dict "root" . "name" "blackbox-exporter") | nindent 8 }}
+    spec:
+      {{- include "pc.podSecurity" . | nindent 6 }}
+      containers:
+        - name: blackbox-exporter
+          image: {{ .Values.blackbox.image }}
+          args: [ --config.file=/etc/blackbox_exporter/config.yml ]
+          ports: [ { name: http, containerPort: 9115 } ]
+          readinessProbe: { httpGet: { path: /-/healthy, port: 9115 }, periodSeconds: 10 }
+          livenessProbe: { tcpSocket: { port: 9115 }, periodSeconds: 20 }
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+          {{- include "pc.containerSecurity" . | nindent 10 }}
+          volumeMounts: [ { name: config, mountPath: /etc/blackbox_exporter, readOnly: true } ]
+      volumes:
+        - name: config
+          configMap: { name: pc-blackbox-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blackbox-exporter
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "blackbox-exporter") | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: blackbox-exporter }
+  ports: [ { name: http, port: 9115, targetPort: 9115 } ]
+{{- range $which := list "primary" "indexer" }}
+{{- $name := printf "postgres-exporter-%s" $which }}
+{{- $db := get $root.Values.postgresExporter $which }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: {{ $name }} } }
+  template:
+    metadata:
+      labels:
+        {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 8 }}
+      annotations:
+        secrets-rev: {{ get $root.Values.secretsRev $name | default "none" | quote }}
+    spec:
+      {{- include "pc.podSecurity" $root | nindent 6 }}
+      {{- /* The exporter logs its DSN with the password on a refused connection, so it waits for Postgres. */}}
+      initContainers:
+        - name: wait-postgres
+          image: {{ $root.Values.waitImages.postgres }}
+          command: [ /bin/sh, -c ]
+          args: [ 'until pg_isready -q -h {{ $db.host }} -p 5432 -U postgres -d postgres; do sleep 2; done' ]
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ ALL ] } }
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 64Mi } }
+      containers:
+        - name: {{ $name }}
+          image: {{ $root.Values.postgresExporter.image }}
+          {{- /* The exporter logs its DSN on a refused connection, so the password lives only in a libpq passfile. */}}
+          command: [ /bin/sh, -c ]
+          args:
+            - {{ include "pc.pgpassWrapper" . | quote }}
+          env:
+            - { name: DATA_SOURCE_NAME, value: {{ printf "postgresql://%s@%s:5432/%s?sslmode=disable" $db.user $db.host $db.database | quote }} }
+            - { name: PGPASSFILE, value: /pgpass/pgpass }
+          ports: [ { name: http, containerPort: 9187 } ]
+          readinessProbe: { httpGet: { path: /metrics, port: 9187 }, periodSeconds: 20, timeoutSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: 9187 }, periodSeconds: 20 }
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 256Mi } }
+          {{- include "pc.containerSecurity" $root | nindent 10 }}
+          volumeMounts: [ { name: secrets, mountPath: /run/secrets, readOnly: true }, { name: pgpass, mountPath: /pgpass } ]
+      volumes:
+        - name: secrets
+          secret: { secretName: {{ printf "pc-%s" $name }}, defaultMode: 288 }
+        - name: pgpass
+          emptyDir: { medium: Memory }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  selector: { app.kubernetes.io/name: {{ $name }} }
+  ports: [ { name: http, port: 9187, targetPort: 9187 } ]
+{{- end }}

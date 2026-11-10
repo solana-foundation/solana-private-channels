@@ -1,0 +1,109 @@
+{{- $root := . -}}
+{{- $apps := include "pc.apps" . | fromYaml -}}
+{{- $order := list "write-node" "read-node" "gateway" "auth" "streamer" "indexer-solana" "indexer-private-channel" "operator-solana" "operator-private-channel" -}}
+{{- range $name := $order }}
+{{- $a := get $apps $name }}
+{{- if include "pc.enabled" (dict "root" $root "gate" ($a.gate | default "")) }}
+{{- $knobs := get $root.Values.apps $name }}
+{{- $keys := get $root.Values.secretKeys $name | default list }}
+{{- /* A key the Secret carries is never also plain env, so a value cannot shadow the file. */}}
+{{- $env := list }}
+{{- range $e := (include "pc.env" (dict "root" $root "name" $name) | fromYamlArray) }}
+{{- if not (has $e.name $keys) }}{{ $env = append $env $e }}{{ end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: {{ $a.kind }}
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  replicas: {{ ternary 1 $knobs.replicas (default false $a.single) }}
+  {{- if eq $a.kind "StatefulSet" }}
+  serviceName: {{ $name }}
+  podManagementPolicy: OrderedReady
+  {{- else }}
+  strategy:
+    type: {{ ternary "Recreate" "RollingUpdate" (default false $a.recreate) }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 8 }}
+      annotations:
+        secrets-rev: {{ get $root.Values.secretsRev $name | default "none" | quote }}
+    spec:
+      {{- include "pc.podSecurity" $root | nindent 6 }}
+      {{- include "pc.pullSecrets" $root | nindent 6 }}
+      terminationGracePeriodSeconds: {{ $knobs.terminationGracePeriodSeconds }}
+      {{- $waits := include "pc.waits" (dict "root" $root "name" $name) }}
+      {{- if $waits }}
+      initContainers:
+        {{- $waits | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "pc.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          {{- if $a.worker }}
+          {{- $dir := ternary "local" "devnet" (eq $root.Values.network "localnet") }}
+          {{- /* exec: the binary itself receives the SIGTERM, not a shell. */}}
+          {{- /* args, never command: command would replace the with-secrets entrypoint. */}}
+          args:
+            - /bin/sh
+            - -c
+            - exec /usr/local/bin/indexer --config /config/{{ $dir }}/{{ $name }}.toml -v {{ $a.worker }}
+          {{- else }}
+          args: [ {{ $a.binary }} ]
+          {{- end }}
+          env:
+            {{- toYaml $env | nindent 12 }}
+            {{- include "pc.secretEnv" (dict "root" $root "name" $name) | indent 12 }}
+          ports:
+            - { name: http, containerPort: {{ $a.port }} }
+            {{- range $pn, $pp := $a.extraPorts }}
+            - { name: {{ $pn }}, containerPort: {{ $pp }} }
+            {{- end }}
+          startupProbe:
+            tcpSocket: { port: {{ $a.port }} }
+            periodSeconds: {{ $root.Values.probes.startupPeriodSeconds }}
+            failureThreshold: {{ $root.Values.probes.startupFailureThreshold }}
+          readinessProbe:
+            httpGet: { path: /health, port: {{ $a.port }} }
+            periodSeconds: {{ $root.Values.probes.readinessPeriodSeconds }}
+            timeoutSeconds: 3
+          {{- /* Liveness never checks /health: an upstream outage must not restart the fleet. */}}
+          livenessProbe:
+            tcpSocket: { port: {{ $a.port }} }
+            periodSeconds: {{ $root.Values.probes.livenessPeriodSeconds }}
+            failureThreshold: {{ $root.Values.probes.livenessFailureThreshold }}
+          resources:
+            {{- toYaml $knobs.resources | nindent 12 }}
+          {{- include "pc.containerSecurity" $root | nindent 10 }}
+          {{- if or $keys $a.worker }}
+          volumeMounts:
+            {{- if $keys }}
+            - { name: secrets, mountPath: /run/secrets, readOnly: true }
+            {{- end }}
+            {{- if $a.worker }}
+            - { name: worker-config, mountPath: /config/{{ ternary "local" "devnet" (eq $root.Values.network "localnet") }}, readOnly: true }
+            {{- end }}
+          {{- end }}
+      {{- if or $keys $a.worker }}
+      volumes:
+        {{- if $keys }}
+        {{- /* Whole Secret as a volume (never subPath, which with-secrets skips); 0440 = 288. */}}
+        - name: secrets
+          secret: { secretName: {{ printf "pc-%s" $name }}, defaultMode: 288 }
+        {{- end }}
+        {{- if $a.worker }}
+        - name: worker-config
+          configMap: { name: {{ $root.Values.workerConfigMap }} }
+        {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}

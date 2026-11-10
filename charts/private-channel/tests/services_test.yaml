@@ -1,0 +1,26 @@
+suite: services
+templates:
+  - templates/services.yaml
+tests:
+  - it: publishes gateway 8899 only, as LoadBalancer with Local traffic policy
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - equal: { path: spec.type, value: LoadBalancer }
+      - equal: { path: spec.externalTrafficPolicy, value: Local }
+      - lengthEqual: { path: spec.ports, count: 1 }
+      - equal: { path: "spec.ports[0].port", value: 8899 }
+  - it: publishes auth 8903 as LoadBalancer
+    documentSelector: { path: metadata.name, value: auth }
+    asserts:
+      - equal: { path: spec.type, value: LoadBalancer }
+      - equal: { path: "spec.ports[0].port", value: 8903 }
+  - it: keeps the internal gateway port on a ClusterIP Service
+    documentSelector: { path: metadata.name, value: gateway-internal }
+    asserts:
+      - equal: { path: spec.type, value: ClusterIP }
+      - contains: { path: spec.ports, content: { name: internal, port: 8904, targetPort: 8904 } }
+  - it: switches the public type through the infra block
+    set: { infra.publicService.type: NodePort }
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - equal: { path: spec.type, value: NodePort }

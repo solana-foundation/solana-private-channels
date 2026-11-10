@@ -1,0 +1,19 @@
+suite: postgres exporters keep the password out of the DSN
+templates:
+  - templates/monitoring-helpers.yaml
+tests:
+  - it: gives the exporter a DSN with no password and a libpq passfile
+    documentSelector: { path: "spec.template.spec.containers[0].name", value: postgres-exporter-primary }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: PGPASSFILE, value: /pgpass/pgpass } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: DATA_SOURCE_NAME, value: "postgresql://private_channel_monitoring@postgres-primary:5432/private_channel?sslmode=disable" } }
+      - notContains: { path: "spec.template.spec.containers[0].env", content: { name: DATA_SOURCE_PASS_FILE, value: /run/secrets/DATA_SOURCE_PASS } }
+      - contains: { path: spec.template.spec.volumes, content: { name: pgpass, emptyDir: { medium: Memory } } }
+  - it: writes the passfile 0600 from the Secret and never passes the password as an arg
+    documentSelector: { path: "spec.template.spec.containers[0].name", value: postgres-exporter-indexer }
+    asserts:
+      - matchRegex: { path: "spec.template.spec.containers[0].args[0]", pattern: 'umask 077' }
+      - matchRegex: { path: "spec.template.spec.containers[0].args[0]", pattern: '/run/secrets/DATA_SOURCE_PASS' }
+      - matchRegex: { path: "spec.template.spec.containers[0].args[0]", pattern: 'exec /bin/postgres_exporter$' }
+      # Only the password-free DSN and the passfile path: no DATA_SOURCE_PASS or _FILE env.
+      - lengthEqual: { path: "spec.template.spec.containers[0].env", count: 2 }

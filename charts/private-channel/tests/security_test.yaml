@@ -1,0 +1,19 @@
+suite: pod security
+templates:
+  - templates/workloads.yaml
+  - templates/monitoring-helpers.yaml
+tests:
+  - it: uses no host access or unconfined seccomp in app pods
+    template: templates/workloads.yaml
+    asserts:
+      - notExists: { path: spec.template.spec.hostNetwork }
+      - notExists: { path: spec.template.spec.hostPID }
+      - notExists: { path: spec.template.spec.nodeName }
+      - notExists: { path: spec.template.spec.nodeSelector }
+      - notExists: { path: "spec.template.spec.containers[0].ports[0].hostPort" }
+      - notExists: { path: spec.template.spec.securityContext.seccompProfile }
+  - it: disables the service account token on the monitoring helpers
+    template: templates/monitoring-helpers.yaml
+    documentSelector: { path: kind, value: Deployment, matchMany: true }
+    asserts:
+      - equal: { path: spec.template.spec.automountServiceAccountToken, value: false }

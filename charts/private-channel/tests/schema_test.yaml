@@ -1,0 +1,32 @@
+suite: values schema
+templates:
+  - templates/workloads.yaml
+tests:
+  - it: refuses two write-node copies
+    set: { apps.write-node.replicas: 2 }
+    asserts:
+      - failedTemplate: {}
+  - it: refuses two indexer copies
+    set: { apps.indexer-solana.replicas: 2 }
+    asserts:
+      - failedTemplate: {}
+  - it: refuses two operator copies
+    set: { apps.operator-private-channel.replicas: 2 }
+    asserts:
+      - failedTemplate: {}
+  - it: allows two read-node copies
+    set: { apps.read-node.replicas: 2 }
+    asserts:
+      - notFailedTemplate: {}
+  - it: refuses the memory signer on mainnet
+    set: { network: mainnet, escrow.instanceId: X, config.adminSigner: memory, config.operatorSigner: vault }
+    asserts:
+      - failedTemplate: {}
+  - it: accepts remote signers on mainnet
+    set: { network: mainnet, escrow.instanceId: X, config.adminSigner: privy, config.operatorSigner: vault }
+    asserts:
+      - notFailedTemplate: {}
+  - it: refuses an unknown network
+    set: { network: mainnet-beta }
+    asserts:
+      - failedTemplate: {}
