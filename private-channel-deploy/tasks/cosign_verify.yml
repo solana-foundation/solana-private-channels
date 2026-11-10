@@ -1,0 +1,58 @@
+---
+# Cosign gate for the app image and its digest pin; imported by deploy.yml and k3s.yml.
+
+# Opt-in supply-chain gate. When verify_image_signature is set, refuse to
+# deploy an app image that wasn't built + signed by our publish workflow
+# (.github/workflows/publish-image.yml). cosign resolves the tag to its
+# digest and checks the keyless signature (Fulcio cert identity + Rekor), so
+# a tampered, unsigned, or foreign image fails before any pull.
+# Off by default; set `verify_image_signature: true` on stacks that pull the
+# signed org image from GHCR.
+# Tagged `deploy` as well as `preflight` so the gate still runs when an
+# operator invokes the deploy phase standalone (`--tags deploy`); otherwise
+# the phase-4 pull below would fetch the mutable tag unverified.
+- name: Verify app image signature (cosign)
+  when: verify_image_signature | default(false) | bool
+  delegate_to: localhost
+  run_once: true
+  tags: [ preflight, deploy ]
+  block:
+  - name: Probe cosign on the control node
+    ansible.builtin.command: cosign version
+    changed_when: false
+    failed_when: false
+    register: _cosign_probe
+
+  - name: Assert cosign is installed
+    ansible.builtin.assert:
+      that: _cosign_probe.rc == 0
+      fail_msg: |
+        `verify_image_signature` is set but cosign isn't on the control node.
+        Install: brew install cosign  (or https://docs.sigstore.dev/cosign/system_config/installation)
+
+  - name: cosign verify the app image
+    ansible.builtin.command:
+      argv:
+        - cosign
+        - verify
+        - --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+        - "--certificate-identity-regexp={{ image_signer_identity }}"
+        - --output=json
+        - "{{ image_registry }}/private-channel-app:{{ image_tag }}"
+    changed_when: false
+    register: _cosign_verify
+
+  - name: Report the verified digest
+    ansible.builtin.debug:
+      msg: >-
+        Verified {{ image_registry }}/private-channel-app:{{ image_tag }}
+        @ {{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}
+
+# Pin the render + deploy to the exact digest cosign just verified, so the
+# phase-4 pull can't fetch a tag that moved between verify and pull. Set on
+# the target host (not delegated) so the render task can read it.
+- name: Record the verified image digest for digest-pinned deploy
+  when: verify_image_signature | default(false) | bool
+  ansible.builtin.set_fact:
+    pc_app_image_digest: "{{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}"
+  tags: [ preflight, deploy ]
