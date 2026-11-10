@@ -48,9 +48,9 @@ Once per instance:
    Continue only once every copy passes.
 4. Set the content of a restored copy, not the original, single-quoted, as
    `ESCROW_CONFIDENTIAL_KEYS` in the stack's `.env` (Ansible: `escrow_confidential_keys`
-   in `secrets.yml`, Doppler: `ESCROW_CONFIDENTIAL_KEYS`), so the restore path is proven
-   too. `scripts/check-required-env.sh` and the deploy refuse a value that is not JSON
-   with `elgamal_secret` and `aes_key`.
+   in `secrets.yml`, Doppler: `ESCROW_CONFIDENTIAL_KEYS`), so the restore path is used;
+   the first mint's reconciliation check proves it. `scripts/check-required-env.sh` and
+   the deploy refuse a value that is not JSON with `elgamal_secret` and `aes_key`.
 5. Set the printed line as is: `ESCROW_CONFIDENTIAL_PUBKEY` in the same `.env`
    (Ansible: `escrow_confidential_pubkey`, Doppler: `ESCROW_CONFIDENTIAL_PUBKEY`),
    before the first configure. From then on `indexer-solana`, both operators and
@@ -70,12 +70,18 @@ Once per mint:
    (followed by the configure `signature`), and
    `private_channel_confidential_mint_poisoned{mint="<mint>"}` is 0. A foreign key
    poisons the mint at index time; stop here and [escalate](_escalation.md) (Tier 1).
-4. On the instance's first confidential mint, verify every copy against the chain:
-   `confidential_verify <copy> <rpc> <instance> <mint>`. It checks the copy's ElGamal
-   key against the escrow account's, and that its AES key decrypts the account's AES
-   copy, which the pin cannot prove. Deposits are still blocked, so nothing depends on
-   the keys yet. If a copy fails, stop: replace it from one that passes and verify the
-   new copy before going on.
+4. On the instance's first confidential mint, while deposits are still blocked so
+   nothing depends on the keys yet:
+   - Confirm `private_channel_reconciliation_confidential_mismatch{mint="<mint>"}` is 0
+     after the escrow operator's next reconciliation tick. This proves the AES half of
+     the deployed key, which the boot check does not.
+   - Online, write the escrow account's public bytes:
+     `escrow_account_data <rpc> <instance> <mint> ./escrow-account.bin`. Carry the file
+     to the offline machine and verify every copy there:
+     `confidential_verify <copy> <instance> <mint> ./escrow-account.bin`. It checks each
+     copy's ElGamal key against the account's, and that its AES key decrypts the
+     account's AES copy, which the pin cannot prove. If a copy fails, stop: replace it
+     from one that passes, and verify the new copy before going on.
 5. On a mint that requires approval, have the issuer's confidential authority
    approve the escrow account.
 6. On a `ConfidentialMintBurn` mint (confidential-only: the channel refuses its
@@ -96,10 +102,15 @@ an empty one) has no mint to check, so a missing key would only show as poisoned
 
 ### Backup drill
 
-Quarterly, and after any change of custodian or medium, verify every copy against the
-chain (`confidential_verify <copy> <rpc> <instance> <mint>`, with any configured mint)
-and record the date, who ran it and the result. Replace a copy that fails from one that
-passes, and verify the new copy.
+Quarterly, and after any change of custodian or medium, write any configured mint's
+escrow account online (`escrow_account_data <rpc> <instance> <mint> <file>`), verify every
+copy against it on the offline machine
+(`confidential_verify <copy> <instance> <mint> <file>`), and record the date, who ran it
+and the result. Replace a copy that fails from one that passes, and verify the new copy.
+
+If every copy fails, overwrite none: the backups and the deployed key have diverged. Check
+the mint's `private_channel_reconciliation_confidential_mismatch` is 0, which shows the
+deployed key is the one on chain, and [escalate](_escalation.md) (Tier 1).
 
 ## Park labels
 

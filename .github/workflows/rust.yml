@@ -119,6 +119,7 @@ jobs:
               - 'core/**'
               - 'indexer/**'
               - 'confidential/**'
+              - 'scripts/devnet/**'
               - 'integration/**'
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
@@ -147,6 +148,7 @@ jobs:
               - 'core/**'
               - 'indexer/**'
               - 'confidential/**'
+              - 'scripts/devnet/**'
               - 'gateway/**'
               - 'auth/**'
               # Re-vendoring the DvP client runs its tests via ci-unit-coverage.

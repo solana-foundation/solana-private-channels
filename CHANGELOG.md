@@ -35,7 +35,7 @@
 ### Confidential transfers: deployment, tools and docs
 - New optional secret `ESCROW_CONFIDENTIAL_KEYS` (the escrow instance's ElGamal and AES keys, JSON with base64 `elgamal_secret` and `aes_key`), passed to `indexer-solana`, `operator-solana` and `operator-private-channel` in both compose files and the Ansible deploy (`escrow_confidential_keys` in `secrets.yml`, or Doppler). Blank until an escrow account is configured; `check-required-env.sh` and the deploy refuse a malformed value
 - New optional `ESCROW_CONFIDENTIAL_PUBKEY` (the instance's ElGamal pubkey, base64, as `confidential_keygen` prints it; not secret), wired like `ESCROW_CONFIDENTIAL_KEYS` (`escrow_confidential_pubkey` in the deploy). When set, `indexer-solana`, both operators and `resync` refuse to start unless the keys are set and match it, even on an empty database
-- Devnet tools `confidential_keygen`, `confidential_verify` (checks a backup copy of the instance keys against the pinned pubkey or a configured escrow account), `configure_confidential`, `confidential_deposit` and `confidential_withdraw`
+- Devnet tools `confidential_keygen`, `confidential_verify` (checks a backup copy of the instance keys against the pinned pubkey or, offline, a configured escrow account's data), `escrow_account_data` (writes that data to a file; reads no key), `configure_confidential`, `confidential_deposit` and `confidential_withdraw`
 - Runbook `docs/runbooks/confidential_transfers.md` (setup ceremony with backup verification and a quarterly backup drill, one entry per confidential park label and alert) and `docs/CONFIDENTIAL_SCOPE_CORRECTIONS.md`
 
 ### Indexer and operators

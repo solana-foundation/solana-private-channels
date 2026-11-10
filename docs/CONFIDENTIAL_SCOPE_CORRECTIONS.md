@@ -28,10 +28,10 @@ are right.
   at index time. The secret is optional until an account is configured, and
   `check-required-env.sh` and the deploy refuse a malformed value.
 - **Scope:** generated offline and backed up like `Instance.admin`.
-  **Shipped:** every backup copy is verified before funds depend on it, with
-  `confidential_verify`: against the pinned pubkey before the services load a restored copy,
-  and against the chain (ElGamal and AES halves) before the first mint's deposits open, then
-  on a quarterly drill. See the [setup ceremony](runbooks/confidential_transfers.md#setup-ceremony).
+  **Shipped:** the setup ceremony verifies every backup copy with `confidential_verify`: against
+  the pinned pubkey before the services load a restored copy, and offline against the escrow
+  account's data (ElGamal and AES halves) before the first mint's deposits open, then on a
+  quarterly drill. See the [setup ceremony](runbooks/confidential_transfers.md#setup-ceremony).
 
 ## Indexing
 
@@ -140,7 +140,8 @@ are right.
 
 ## Tools
 
-- The devnet tools are `confidential_keygen`, `confidential_verify`, `configure_confidential`,
-  `confidential_deposit` and `confidential_withdraw` in `scripts/devnet`. `confidential_deposit`
-  sends inline proofs in a v1 transaction and does not support transfer-hook mints. Rebalancing
-  is the indexer's `rebalance` command, not a devnet tool.
+- The devnet tools are `confidential_keygen`, `confidential_verify`, `escrow_account_data`,
+  `configure_confidential`, `confidential_deposit` and `confidential_withdraw` in
+  `scripts/devnet`. `confidential_deposit` sends inline proofs in a v1 transaction and does not
+  support transfer-hook mints. Rebalancing is the indexer's `rebalance` command, not a devnet
+  tool.
