@@ -9,6 +9,9 @@ ignore = [
     "RUSTSEC-2024-0421",
     # rsa: pulled in by jsonwebtoken, unused since every JWT key is an HMAC secret; no fix released
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys: in the lockfile only through sqlx's optional sqlite feature, which no
+    # workspace crate enables, so it is never compiled; sqlx 0.9 still caps it below 0.38
+    "RUSTSEC-2026-0459",
     # crypto-bigint 0.5: via elliptic-curve 0.13 (k256, p256, p384), which Agave, jsonwebtoken and
     # solana-keychain pin. JWTs are HMAC; the only secret-key use is local P-256 request signing
     "RUSTSEC-2026-0387",
