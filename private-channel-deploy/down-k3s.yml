@@ -1,0 +1,65 @@
+---
+# Stops the stack like compose down, keeping all data: app workloads scale to 0 and both
+# Clusters hibernate (Clusters and PVCs stay). The next k3s.yml run resumes them.
+#   ansible-playbook down-k3s.yml -l <env>
+- name: Stop Solana Private Channels on k3s
+  hosts: all
+  gather_facts: true
+  serial: 1
+  vars_files:
+  - vars/common.yml
+  - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
+  - vars/k3s.yml
+  tasks:
+  - name: Stop through the tunnel
+    block:
+    - name: Connect
+      ansible.builtin.import_tasks: tasks/k3s/connect.yml
+
+    # The next deploy restores these: helm skips an unchanged release, so it would not.
+    - name: Record each workload's replicas before stopping it
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.shell: |
+        set -eu
+        kubectl -n {{ k3s_namespace }} get deployment,statefulset -l app.kubernetes.io/part-of=private-channel \
+          -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.spec.replicas}{"\n"}{end}' | while read -r w n; do
+          [ "$n" -gt 0 ] && kubectl -n {{ k3s_namespace }} annotate --overwrite "$w" private-channel.io/replicas-before-down="$n" >/dev/null
+        done; true
+      environment:
+        KUBECONFIG: "{{ pc_kubeconfig }}"
+      changed_when: true
+
+    - name: Scale every app workload to 0
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.command:
+        argv: [ kubectl, -n, "{{ k3s_namespace }}", scale, "deployment,statefulset",
+                -l, app.kubernetes.io/part-of=private-channel, --replicas=0 ]
+      environment:
+        KUBECONFIG: "{{ pc_kubeconfig }}"
+      changed_when: true
+
+    - name: Wait for the app pods to stop
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.command:
+        # Finished hook Job pods (auth-migrate) stay by design; only workloads are waited on.
+        argv: [ kubectl, -n, "{{ k3s_namespace }}", wait, --for=delete, pod,
+                -l, "app.kubernetes.io/part-of=private-channel,!job-name", --timeout=5m ]
+      environment:
+        KUBECONFIG: "{{ pc_kubeconfig }}"
+      changed_when: false
+
+    - name: Hibernate both Clusters (data and PVCs stay)
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.command:
+        argv: [ kubectl, -n, "{{ k3s_namespace }}", annotate, --overwrite, cluster.postgresql.cnpg.io,
+                -l, private-channel.io/db, cnpg.io/hibernation=on ]
+      environment:
+        KUBECONFIG: "{{ pc_kubeconfig }}"
+      changed_when: true
+    always:
+    - name: Disconnect
+      ansible.builtin.import_tasks: tasks/k3s/disconnect.yml

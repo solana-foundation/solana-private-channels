@@ -1,0 +1,54 @@
+---
+# Localnet only, on the host (volumes are cluster-scoped). The validator ledger and the
+# indexer DB are wiped in lockstep, or reconciliation fails with MismatchExceedsThreshold;
+# Prometheus and Grafana data go too, as compose does.
+- name: Wipe the localnet stack, its Clusters, volumes and data directories
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    set -eu
+    k="k3s kubectl"
+    ns={{ k3s_namespace }}; mon={{ k3s_monitoring_namespace }}
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    helm -n "$ns" uninstall private-channel --wait 2>/dev/null || true
+    helm -n "$ns" uninstall pc-db --wait 2>/dev/null || true
+    # helm keeps the Clusters (resource-policy keep); delete them, every lifetime included.
+    $k -n "$ns" delete cluster.postgresql.cnpg.io -l private-channel.io/db --wait --timeout=5m --ignore-not-found
+    $k -n "$ns" delete statefulset,deployment,job -l app.kubernetes.io/part-of=private-channel --ignore-not-found --wait
+    $k -n "$ns" delete pvc --all --wait --timeout=5m
+    # Monitoring data: drop the claims, then the pods that hold them, so fresh ones bind.
+    old=$($k -n "$mon" get pvc -o jsonpath='{.items[*].metadata.uid}')
+    $k -n "$mon" delete pvc --all --wait=false
+    $k -n "$mon" delete pod -l app.kubernetes.io/name=grafana --wait=false
+    $k -n "$mon" delete pod -l app.kubernetes.io/name=prometheus --wait=false
+    for _ in $(seq 1 90); do
+      now=" $($k -n "$mon" get pvc -o jsonpath='{.items[*].metadata.uid}') "
+      left=0; for u in $old; do case "$now" in *" $u "*) left=1 ;; esac; done
+      [ "$left" = 0 ] && break
+      sleep 2
+    done
+    # pc-retain keeps every Released volume and its directory; remove both.
+    $k get pv -o json | python3 -c '
+    import json, sys
+    for pv in json.load(sys.stdin)["items"]:
+        ref = pv["spec"].get("claimRef") or {}
+        if ref.get("namespace") in sys.argv[1:] and pv["status"].get("phase") in ("Released", "Failed", "Available"):
+            path = (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", "")
+            print(pv["metadata"]["name"], path)
+    ' "$ns" "$mon" | while read -r pv path; do
+      $k delete pv "$pv" --wait --timeout=2m
+      case "$path" in /var/lib/rancher/k3s/storage/*) rm -rf -- "$path" ;; esac
+      echo "wiped $pv $path"
+    done
+    $k -n "$ns" delete configmap pc-deploy-state --ignore-not-found
+    # The Grafana claim belongs to the kps release; an upgrade recreates it empty.
+    helm -n "$mon" upgrade pc-kps kube-prometheus-stack --repo https://prometheus-community.github.io/helm-charts \
+      --version {{ k3s_kps_chart_version }} -f /etc/rancher/k3s/pc-kps-values.yaml --wait --timeout 10m >/dev/null
+  args:
+    executable: /bin/bash
+  register: _k3s_reset
+  changed_when: true
+
+- name: Report the wipe
+  ansible.builtin.debug:
+    var: _k3s_reset.stdout_lines

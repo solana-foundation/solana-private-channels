@@ -1,0 +1,36 @@
+# Test-only webhook receiver: logs the path and the first bytes of every POST body.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: hook, namespace: pc-e2e-hook }
+data:
+  hook.py: |
+    import http.server, sys
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n)
+            print("POST", self.path, body[:300].decode(errors="replace").replace("\n", " "), flush=True)
+            self.send_response(200); self.end_headers()
+        def log_message(self, *a): pass
+    http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: hook, namespace: pc-e2e-hook }
+spec:
+  selector: { matchLabels: { app: hook } }
+  template:
+    metadata: { labels: { app: hook } }
+    spec:
+      containers:
+      - name: hook
+        image: python:3.12-slim
+        command: [ python3, -u, /app/hook.py ]
+        volumeMounts: [ { name: app, mountPath: /app } ]
+        ports: [ { containerPort: 8080 } ]
+      volumes: [ { name: app, configMap: { name: hook } } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: hook, namespace: pc-e2e-hook }
+spec: { selector: { app: hook }, ports: [ { port: 8080 } ] }

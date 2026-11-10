@@ -85,6 +85,13 @@
     - name: Run the k3s bootstrap
       ansible.builtin.import_tasks: tasks/k3s/bootstrap.yml
 
+  - name: Reset localnet state
+    when: reset_state | default(false) | bool
+    tags: [ reset_state ]
+    block:
+    - name: Run the k3s reset_state
+      ansible.builtin.import_tasks: tasks/k3s/reset_state.yml
+
   # After connect only the tunnel and the deployer token are used. A single-phase run
   # (--tags health) still connects and disconnects; secrets also runs for deploy and
   # monitoring, which need its outputs.

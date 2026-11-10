@@ -1,0 +1,33 @@
+suite: localnet validator
+templates:
+  - templates/validator.yaml
+set:
+  validator.enabled: true
+  validator.image: reg/private-channel-validator:t
+tests:
+  - it: runs as a one-replica StatefulSet without a seccomp profile
+    documentSelector: { path: kind, value: StatefulSet }
+    asserts:
+      - equal: { path: spec.replicas, value: 1 }
+      - notExists: { path: spec.template.spec.securityContext }
+      - notExists: { path: "spec.template.spec.containers[0].securityContext" }
+      - equal: { path: spec.template.spec.automountServiceAccountToken, value: false }
+      - contains: { path: spec.template.spec.imagePullSecrets, content: { name: pc-ghcr } }
+  - it: probes with solana cluster-version
+    documentSelector: { path: kind, value: StatefulSet }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].readinessProbe.exec.command", content: cluster-version }
+  - it: keeps --reset by default and drops it with validator_reset=false
+    set: { validator.resetFlag: "" }
+    documentSelector: { path: kind, value: StatefulSet }
+    asserts:
+      - notContains: { path: "spec.template.spec.containers[0].args", content: --reset }
+  - it: serves both short names as ClusterIP
+    documentSelector: { path: metadata.name, value: validator-fallback }
+    asserts:
+      - equal: { path: spec.type, value: ClusterIP }
+      - equal: { path: "spec.selector['app.kubernetes.io/name']", value: validator }
+  - it: renders nothing off localnet
+    set: { network: devnet }
+    asserts:
+      - hasDocuments: { count: 0 }
