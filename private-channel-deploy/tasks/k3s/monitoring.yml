@@ -1,0 +1,172 @@
+---
+# Our provisioning and dashboards as ConfigMaps through the tunnel, then, from the host,
+# the two Secrets the deploy token must never write: a scrape job or a Secret there
+# could hand out a cluster-wide token.
+- name: Build the Grafana provisioning ConfigMaps
+  delegate_to: localhost
+  run_once: true
+  vars:
+    _secret_dir_fix: [ '/run/secrets/', '/etc/grafana/secrets/' ]
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ k3s_monitoring_namespace }}"
+        labels: "{{ {item.label: '1'} }}"
+      data: "{{ item.data }}"
+  loop:
+  - name: pc-grafana-datasources
+    label: grafana_datasource
+    data:
+      prometheus.yml: "{{ lookup('file', repo_root ~ '/monitoring/provisioning/datasources/prometheus.yml') }}"
+      postgres.yml: "{{ lookup('template', 'templates/grafana/postgres.yml.j2') | replace(*_secret_dir_fix) }}"
+  - name: pc-grafana-alerting
+    label: grafana_alert
+    data:
+      alert-rules.yml: "{{ lookup('file', repo_root ~ '/monitoring/provisioning/alerting/alert-rules.yml') }}"
+      contact-points.yml: "{{ lookup('template', 'templates/grafana/contact-points.yml.j2') | replace(*_secret_dir_fix) }}"
+      notification-policies.yml: "{{ lookup('file', repo_root ~ '/monitoring/provisioning/alerting/notification-policies.yml') }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Find the bundled dashboards
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.find:
+    paths: "{{ repo_root }}/monitoring/dashboards"
+    patterns: "*.json"
+  register: _k3s_dash
+
+# One ConfigMap per dashboard (1 MiB cap). CNPG pod names carry the Cluster, not the
+# role, so the two ledger panels select it; that is the only dashboard edit.
+- name: Apply one ConfigMap per dashboard
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "pc-dash-{{ item.path | basename | regex_replace('\\.json$', '') | regex_replace('^private-channel-', '') }}"
+        namespace: "{{ k3s_monitoring_namespace }}"
+        labels: { grafana_dashboard: "1" }
+        annotations: { grafana_folder: Solana Private Channels }
+      data: "{{ {item.path | basename: lookup('file', item.path) | replace('postgres-primary|postgres-replica', 'pc-ledger.*')} }}"
+  loop: "{{ _k3s_dash.files | sort(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Host-side monitoring Secrets and the Grafana admin reset
+  become: true
+  vars:
+    _grafana: "{{ dict(secret_files['mon-grafana'] | map(attribute='key') | zip(secret_files['mon-grafana'] | map(attribute='value'))) }}"
+    _scrape: >-
+      {{ lookup('template', repo_root ~ '/monitoring/prometheus.yml.j2')
+         | pc_k3s_scrape(k3s_namespace, ['prometheus', 'cadvisor', 'node-exporter'], {'gateway:9101': 'gateway-internal:9101'}) }}
+  block:
+  - name: Write pc-prometheus-scrape (values on stdin)
+    ansible.builtin.command:
+      argv: [ k3s, kubectl, apply, -f, "-" ]
+      stdin: "{{ {'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
+                  'metadata': {'name': 'pc-prometheus-scrape', 'namespace': k3s_monitoring_namespace},
+                  'data': {'scrape.yaml': _scrape | b64encode}} | to_json }}"
+    register: _k3s_scrape_apply
+    changed_when: "'configured' in _k3s_scrape_apply.stdout or 'created' in _k3s_scrape_apply.stdout"
+
+  - name: Write pc-mon-grafana (values on stdin)
+    ansible.builtin.command:
+      argv: [ k3s, kubectl, apply, -f, "-" ]
+      stdin: "{{ {'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
+                  'metadata': {'name': 'pc-mon-grafana', 'namespace': k3s_monitoring_namespace},
+                  'data': {'admin-user': 'admin' | b64encode,
+                           'admin-password': _grafana.GF_SECURITY_ADMIN_PASSWORD | b64encode,
+                           'POSTGRES_GRAFANA_PASSWORD': _grafana.POSTGRES_GRAFANA_PASSWORD | b64encode,
+                           'ALERT_WEBHOOK_URL': _grafana.ALERT_WEBHOOK_URL | b64encode}} | to_json }}"
+    no_log: true
+    changed_when: true
+
+  - name: Find the Grafana Deployment
+    ansible.builtin.shell: >-
+      k3s kubectl -n {{ k3s_monitoring_namespace }} get deploy -l app.kubernetes.io/name=grafana
+      -o jsonpath='{.items[0].metadata.name} {.items[0].spec.template.metadata.annotations.secrets-rev} {.items[0].spec.template.metadata.annotations.private-channel\.io/admin-rev}'
+    register: _k3s_graf
+    changed_when: false
+
+  # Grafana keeps the admin password from the user's creation, on its PVC, so the stored
+  # one is reset first; then the restart lets the sidecars pick up the new login.
+  - name: Reset the stored Grafana admin password when it changed
+    when: (_k3s_graf.stdout.split() + ['', '', ''])[2] != _k3s_grafana_admin_rev
+    ansible.builtin.command:
+      argv: [ k3s, kubectl, -n, "{{ k3s_monitoring_namespace }}", exec, -i, "deploy/{{ _k3s_graf.stdout.split()[0] }}",
+              -c, grafana, --, grafana, cli, --homepath, /usr/share/grafana, admin, reset-admin-password, --password-from-stdin ]
+      stdin: "{{ _grafana.GF_SECURITY_ADMIN_PASSWORD }}"
+    no_log: true
+    changed_when: true
+
+  - name: Roll Grafana only when its secrets changed
+    when: (_k3s_graf.stdout.split() + ['', '', ''])[1] != _k3s_grafana_rev or (_k3s_graf.stdout.split() + ['', '', ''])[2] != _k3s_grafana_admin_rev
+    ansible.builtin.command:
+      argv: [ k3s, kubectl, -n, "{{ k3s_monitoring_namespace }}", patch, deploy, "{{ _k3s_graf.stdout.split()[0] }}", --type, merge, -p,
+              "{{ {'spec': {'template': {'metadata': {'annotations': {'secrets-rev': _k3s_grafana_rev, 'private-channel.io/admin-rev': _k3s_grafana_admin_rev}}}}} | to_json }}" ]
+    changed_when: true
+
+  - name: Wait for Grafana to be rolled out
+    ansible.builtin.command: k3s kubectl -n {{ k3s_monitoring_namespace }} rollout status deploy/{{ _k3s_graf.stdout.split()[0] }} --timeout=5m
+    changed_when: false
+
+- name: Verify Prometheus and Grafana through port-forwards
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Forward Prometheus and Grafana
+    ansible.builtin.shell: |
+      set -e
+      for spec in pc-kps-prometheus:9090 pc-kps-grafana:80; do
+        svc=${spec%%:*}; port=${spec#*:}
+        local=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+        "{{ playbook_dir }}/scripts/k3s-port-forward.sh" start {{ k3s_monitoring_namespace }} "svc/$svc" "$local:$port" "{{ pc_tmp }}/pf-$svc.pid"
+        echo "$svc $local"
+      done
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    register: _k3s_mon_pf
+    changed_when: false
+
+  - name: Record the forwarded monitoring ports
+    ansible.builtin.set_fact:
+      pc_prometheus_url: "http://127.0.0.1:{{ (_k3s_mon_pf.stdout_lines | select('match', '^pc-kps-prometheus ') | first).split()[1] }}"
+      pc_grafana_url: "http://127.0.0.1:{{ (_k3s_mon_pf.stdout_lines | select('match', '^pc-kps-grafana ') | first).split()[1] }}"
+
+  - name: Verify blackbox is producing successful probes
+    ansible.builtin.uri:
+      url: "{{ pc_prometheus_url }}/api/v1/query?query=probe_success%20%3D%3D%201"
+      return_content: true
+    register: _k3s_bb
+    until: (_k3s_bb.json.data.result | default([]) | length) > 0
+    retries: 30
+    delay: 4
+
+  - name: Verify exactly our dashboards loaded
+    ansible.builtin.uri:
+      url: "{{ pc_grafana_url }}/api/search?type=dash-db"
+      user: admin
+      password: "{{ secret_files['mon-grafana'] | selectattr('key', 'equalto', 'GF_SECURITY_ADMIN_PASSWORD') | map(attribute='value') | first }}"
+      force_basic_auth: true
+      return_content: true
+    register: _k3s_dashes
+    until: (_k3s_dashes.json | default([]) | length) == (_k3s_dash.files | length)
+    retries: 30
+    delay: 4
+    no_log: true
+
+  - name: Report the dashboards
+    ansible.builtin.debug:
+      msg: "Dashboards: {{ _k3s_dashes.json | map(attribute='title') | list }}"

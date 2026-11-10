@@ -1,0 +1,46 @@
+---
+# Sanity: sanity.sh on the control node with RUNTIME=k8s, against port-forwards.
+- name: Run sanity.sh through port-forwards
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Forward the app services and Prometheus
+    ansible.builtin.shell: |
+      set -e
+      fwd() {
+        local=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+        "{{ playbook_dir }}/scripts/k3s-port-forward.sh" start "$1" "svc/$2" "$local:$3" "{{ pc_tmp }}/pf-sanity-$2.pid"
+        echo "$2 $local"
+      }
+      fwd {{ k3s_namespace }} gateway {{ gateway_port }}
+      fwd {{ k3s_namespace }} write-node {{ write_port }}
+      fwd {{ k3s_namespace }} read-node {{ read_port }}
+      fwd {{ k3s_monitoring_namespace }} pc-kps-prometheus 9090
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    register: _k3s_san_pf
+    changed_when: false
+
+  - name: Run sanity.sh
+    vars:
+      _p: "{{ dict(_k3s_san_pf.stdout_lines | map('split') | list) }}"
+    ansible.builtin.command:
+      argv: [ bash, "{{ playbook_dir }}/scripts/sanity.sh" ]
+    environment:
+      RUNTIME: k8s
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+      K8S_NAMESPACE: "{{ k3s_namespace }}"
+      GATEWAY_URL: "http://127.0.0.1:{{ _p.gateway }}"
+      WRITE_URL: "http://127.0.0.1:{{ _p['write-node'] }}"
+      READ_URL: "http://127.0.0.1:{{ _p['read-node'] }}"
+      PROMETHEUS_URL: "http://127.0.0.1:{{ _p['pc-kps-prometheus'] }}"
+      POSTGRES_USER: "{{ postgres_user }}"
+      SANITY_WORKERS_EXPECTED: "{{ _workers_enabled | default(true) | bool | lower }}"
+      SANITY_WINDOW_START: "{{ _k3s_rollout_end | default(lookup('pipe', 'date +%s')) }}"
+    register: _sanity
+    changed_when: false
+    failed_when: _sanity.rc != 0
+
+  - name: Sanity summary
+    ansible.builtin.debug:
+      var: _sanity.stdout_lines

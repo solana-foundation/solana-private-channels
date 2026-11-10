@@ -121,6 +121,14 @@
         ansible.builtin.import_tasks: tasks/k3s/health.yml
         tags: [ health ]
 
+      - name: "==== MONITORING ===="
+        ansible.builtin.import_tasks: tasks/k3s/monitoring.yml
+        tags: [ monitoring ]
+
+      - name: "==== SANITY ===="
+        ansible.builtin.import_tasks: tasks/k3s/sanity.yml
+        tags: [ sanity ]
+
       - name: "==== REPORT ===="
         ansible.builtin.import_tasks: tasks/k3s/report.yml
         tags: [ report ]
