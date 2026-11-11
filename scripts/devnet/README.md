@@ -160,9 +160,11 @@ See the [whitelist notes](../../docs/ESCROW_INTERACTION_GUIDE.md#whitelist) befo
 Setup, once per instance, then once per mint (see
 [confidential_transfers.md](../../docs/runbooks/confidential_transfers.md#setup-ceremony)):
 ```bash
-# Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json.
+# Instance keys: a new owner-only file; back it up like keypairs/escrow-admin.json,
+# then check each copy against the ESCROW_CONFIDENTIAL_PUBKEY=... line it prints.
 cargo run --bin confidential_keygen -- ./keypairs/escrow-confidential.json
-# Put its content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS, and the
+cargo run --bin confidential_verify -- <COPY> '<ESCROW_CONFIDENTIAL_PUBKEY=... line>'
+# Put a restored copy's content, single-quoted, in .env as ESCROW_CONFIDENTIAL_KEYS, and the
 # ESCROW_CONFIDENTIAL_PUBKEY=... line it prints as is, then restart indexer-solana
 # and both operators. Then, with the mint's deposits blocked:
 cargo run --bin configure_confidential -- \
@@ -170,10 +172,14 @@ cargo run --bin configure_confidential -- \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS> \
-  ./keypairs/escrow-confidential.json
+  <COPY>
 # Check indexer-solana logged at INFO the line it prints:
 #   escrow account configured under the instance key mint=<MINT_ADDRESS> elgamal_pubkey=<pubkey>
-# then allow_mint again.
+# On the first mint, check private_channel_reconciliation_confidential_mismatch{mint} is 0,
+# write the escrow account's public bytes online, check each copy against them offline,
+# then allow_mint again:
+cargo run --bin escrow_account_data -- https://api.devnet.solana.com <INSTANCE_ID> <MINT_ADDRESS> ./escrow-account.bin
+cargo run --bin confidential_verify -- <COPY> <INSTANCE_ID> <MINT_ADDRESS> ./escrow-account.bin
 ```
 
 Deposit a hidden amount. The user keys file is the user's own (`confidential_keygen`

@@ -135,6 +135,66 @@ pub fn confidential_account(
         .map(|extension| (state.base.state, *extension)))
 }
 
+/// Check a keys file against the instance's pinned pubkey, the base64 alone or the whole
+/// `ESCROW_CONFIDENTIAL_PUBKEY=` line `confidential_keygen` printed. Proves the ElGamal half only.
+pub fn verify_against_pin(keys: &ConfidentialKeyPair, pin: &str) -> Result<()> {
+    let pin = pin.trim();
+    let value = pin
+        .strip_prefix(private_channel_confidential::PUBKEY_ENV)
+        .and_then(|rest| rest.strip_prefix('='))
+        .unwrap_or(pin);
+    let pinned = private_channel_confidential::parse_pubkey(value).map_err(|e| e.to_string())?;
+    if pinned != keys.keys.pubkey() {
+        return Err(format!(
+            "the file's ElGamal pubkey {} does not match the pin {}",
+            BASE64.encode(keys.keys.pubkey()),
+            BASE64.encode(pinned)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Check a keys file against an escrow account's data, as `escrow_account_data` wrote it, so a
+/// backup never meets a network. The data must be `instance`'s escrow account for `mint`, its
+/// ElGamal pubkey the file's, and the file's AES key must decrypt its AES copy: both halves.
+/// The decrypted balance is confidential, so it is dropped here.
+pub fn verify_against_account(
+    keys: &ConfidentialKeyPair,
+    instance: &Pubkey,
+    mint: &Pubkey,
+    data: &[u8],
+) -> Result<()> {
+    let escrow_ata =
+        get_associated_token_address_with_program_id(instance, mint, &spl_token_2022::ID);
+    let account = StateWithExtensions::<Account>::unpack(data)
+        .map_err(|e| format!("the account data is not a Token-2022 account: {e}"))?;
+    if account.base.owner != *instance || account.base.mint != *mint {
+        return Err(format!(
+            "the account data is not the escrow account {escrow_ata} of mint {mint}"
+        )
+        .into());
+    }
+    let Some((_, extension)) = confidential_account(data)? else {
+        return Err(format!(
+            "escrow account {escrow_ata} is not configured for confidential transfers"
+        )
+        .into());
+    };
+    if extension.elgamal_pubkey.0 != keys.keys.pubkey() {
+        return Err(format!(
+            "escrow account {escrow_ata} is configured under another key ({}); this file is not \
+             the instance key",
+            BASE64.encode(extension.elgamal_pubkey.0)
+        )
+        .into());
+    }
+    decrypt_available(keys, &extension).map_err(|_| {
+        format!("the file's aes_key does not decrypt escrow account {escrow_ata}'s AES copy")
+    })?;
+    Ok(())
+}
+
 /// Why the operator would park a confidential release to this account, if it would.
 pub fn destination_not_ready(data: Option<&[u8]>) -> Option<String> {
     let Some(data) = data else {
@@ -505,6 +565,85 @@ mod tests {
             .contains("already configured under another key"));
         let plain = account_bytes(AccountState::Initialized, None);
         assert_eq!(existing_configuration(&ata, &plain, &ours).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_against_pin_accepts_only_the_files_pubkey() {
+        let keys = parse_keys(&test_support::keys_json()).unwrap();
+        let pin_line = pinned_pubkey_line(&keys.keys);
+        let (_, pin) = pin_line.split_once('=').unwrap();
+        verify_against_pin(&keys, pin).unwrap();
+        verify_against_pin(&keys, &pin_line).unwrap();
+        let other_pin = BASE64.encode(test_support::other_keys().pubkey());
+        let err = verify_against_pin(&keys, &other_pin).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        assert!(verify_against_pin(&keys, "not-a-pubkey").is_err());
+    }
+
+    #[test]
+    fn verify_against_account_checks_both_halves() {
+        let keys = parse_keys(&test_support::keys_json()).unwrap();
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut extension = ready_extension();
+        extension.elgamal_pubkey = test_support::keys().pubkey().into();
+        extension.decryptable_available_balance.0 =
+            test_support::encrypt_aes(&test_support::keys(), 0);
+        let configured = escrow_account_bytes(&instance, &mint, Some(extension));
+        verify_against_account(&keys, &instance, &mint, &configured).unwrap();
+
+        // Right ElGamal key, wrong AES key: only the account data can tell.
+        let mut foreign_aes = extension;
+        foreign_aes.decryptable_available_balance.0 =
+            test_support::encrypt_aes(&test_support::other_keys(), 0);
+        let foreign_aes = escrow_account_bytes(&instance, &mint, Some(foreign_aes));
+        let err = verify_against_account(&keys, &instance, &mint, &foreign_aes).unwrap_err();
+        assert!(err.to_string().contains("aes_key"), "{err}");
+
+        let mut foreign_elgamal = extension;
+        foreign_elgamal.elgamal_pubkey = test_support::other_keys().pubkey().into();
+        let foreign_elgamal = escrow_account_bytes(&instance, &mint, Some(foreign_elgamal));
+        let err = verify_against_account(&keys, &instance, &mint, &foreign_elgamal).unwrap_err();
+        assert!(err.to_string().contains("another key"), "{err}");
+
+        let plain = escrow_account_bytes(&instance, &mint, None);
+        let err = verify_against_account(&keys, &instance, &mint, &plain).unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    /// A file holding any other account is refused before either key is checked, even one
+    /// configured under the instance keys.
+    #[test]
+    fn verify_against_account_refuses_another_account() {
+        let keys = parse_keys(&test_support::keys_json()).unwrap();
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut extension = ready_extension();
+        extension.elgamal_pubkey = test_support::keys().pubkey().into();
+        extension.decryptable_available_balance.0 =
+            test_support::encrypt_aes(&test_support::keys(), 0);
+        let other_mint = escrow_account_bytes(&instance, &Pubkey::new_unique(), Some(extension));
+        let other_owner = escrow_account_bytes(&Pubkey::new_unique(), &mint, Some(extension));
+        for data in [other_mint, other_owner] {
+            let err = verify_against_account(&keys, &instance, &mint, &data).unwrap_err();
+            assert!(err.to_string().contains("not the escrow account"), "{err}");
+        }
+        assert!(verify_against_account(&keys, &instance, &mint, &[1, 2, 3]).is_err());
+    }
+
+    // `account_bytes`, owned by `owner` for `mint` as the instance's escrow account is.
+    fn escrow_account_bytes(
+        owner: &Pubkey,
+        mint: &Pubkey,
+        extension: Option<ConfidentialTransferAccount>,
+    ) -> Vec<u8> {
+        use spl_token_2022_interface::extension::StateWithExtensionsMut;
+        let mut data = account_bytes(AccountState::Initialized, extension);
+        let mut account = StateWithExtensionsMut::<Account>::unpack(&mut data).unwrap();
+        account.base.owner = *owner;
+        account.base.mint = *mint;
+        account.pack_base();
+        data
     }
 
     #[test]
