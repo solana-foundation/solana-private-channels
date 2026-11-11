@@ -181,7 +181,7 @@ eval "$(../scripts/k3s-connect.sh <inventory host>)"
 ../scripts/k3s-truncate.sh 1000000                # real cut
 ```
 
-The script waits until the Job succeeds or fails, however long the cut takes. `--no-withdraw-url` leaves out the withdraw indexer DB URL. A real cut keeps its `core.dump` on a `pc-retain` PVC named after the Job; copy it off-host, then delete the PVC.
+The script waits until the Job succeeds or fails, however long the cut takes, and prints the pod phase every minute. If it loses API access (the 1h token expires, the tunnel drops) it exits 3 and says the Job keeps running; follow it with `kubectl -n private-channel logs -f job/<name>`. A new cut is refused while one runs. `--no-withdraw-url` leaves out the withdraw indexer DB URL. A real cut keeps its `core.dump` on a `pc-retain` PVC named after the Job; copy it off-host, then delete the PVC.
 
 ## Compose to k3s migration (dump and restore)
 

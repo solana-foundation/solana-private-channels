@@ -2,6 +2,7 @@
 # Runs `admin truncate` on k3s as a Job: pg_dump 16 (postgres:16-bookworm) next to the CLI copied from
 # the app image. DB URLs are built inside the pod from the CNPG superuser Secrets, never argv.
 #   KUBECONFIG=... scripts/k3s-truncate.sh <keep-slots> [--dry-run] [--no-withdraw-url]
+# Exit 0 cut done, 1 cut failed, 2 refused (bad args or a cut already running), 3 API lost mid-cut.
 set -euo pipefail
 keep="${1:?usage: k3s-truncate.sh <keep-slots> [--dry-run] [--no-withdraw-url]}"
 shift
@@ -21,6 +22,9 @@ pull="$(kubectl -n "$ns" get deploy write-node -o jsonpath='{.spec.template.spec
 # Debian bookworm like the app image: the CLI needs glibc 2.34, the CNPG image is bullseye.
 pg="${PG_IMAGE:-postgres:16-bookworm}"
 job="pc-truncate-$(date +%s)"
+# A cut whose watcher lost API access keeps running; never start a second one beside it.
+running="$(kubectl -n "$ns" get job -l app.kubernetes.io/name=pc-truncate -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name} {end}')"
+[[ -z "$running" ]] || { echo "a truncate Job is still running: $running; wait for it (kubectl -n $ns logs -f job/<name>)" >&2; exit 2; }
 pullyaml=""
 [[ -n "$pull" ]] && pullyaml="imagePullSecrets: [ { name: $pull } ]"
 # A real cut keeps its dump on a pc-retain claim, which outlives the Job and its TTL.
@@ -81,10 +85,21 @@ spec:
       volumes: [ { name: tools, emptyDir: {} }, { name: work, $workvol } ]
 Y
 # Poll until the Job ends either way, however long the cut takes: a refused cut fails
-# the Job, and kubectl wait cannot wait for either outcome.
+# the Job, and kubectl wait cannot wait for either outcome. Only NotFound means gone.
+n=0
 while :; do
-  st="$(kubectl -n "$ns" get job "$job" -o jsonpath='{.status.succeeded}{.status.failed}')" || { echo "Job $job is gone" >&2; exit 1; }
+  if ! st="$(kubectl -n "$ns" get job "$job" -o jsonpath='{.status.succeeded}{.status.failed}' 2>&1)"; then
+    [[ "$st" == *NotFound* ]] && { echo "Job $job is gone" >&2; exit 1; }
+    echo "lost API access ($st); Job $job keeps running, follow it with: kubectl -n $ns logs -f job/$job" >&2
+    [[ -z "$dry" ]] && echo "its dump will be on PVC $job (core.dump)" >&2
+    exit 3
+  fi
   [[ -n "$st" ]] && break
+  # Every minute, the pod phase and any waiting reason (ImagePullBackOff, a Pending PVC).
+  if (( n++ % 12 == 0 )); then
+    echo "waiting on $job: $(kubectl -n "$ns" get pods -l job-name="$job" \
+      -o jsonpath='{.items[0].status.phase} {.items[0].status.containerStatuses[*].state.waiting.reason} {.items[0].status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null)"
+  fi
   sleep 5
 done
 kubectl -n "$ns" logs "job/$job" -c truncate 2>&1 | sed -E 's#postgres://[^ "]*#<db-url>#g'
