@@ -27,12 +27,12 @@ Versions are pinned in [`versions.env`](../versions.env): `K3S_VERSION`, `HELM_V
 - `helm`, `kubectl` and `crane` on `PATH`, at exactly the pinned versions
 - the `kubernetes.core` collection and the Python `kubernetes` package
 
-```bash
-ansible-galaxy collection install kubernetes.core:6.3.0   # KUBERNETES_CORE_VERSION
-pip install kubernetes
-```
+[`scripts/install-prereqs.sh --k3s`](../private-channel-deploy/scripts/install-prereqs.sh) installs all of these on Ubuntu or Debian (amd64 or arm64), each checked against its published checksum. It is idempotent:
 
-[`scripts/install-prereqs.sh`](../private-channel-deploy/scripts/install-prereqs.sh) does not install these four; install them by hand.
+```bash
+cd private-channel-deploy
+./scripts/install-prereqs.sh --k3s    # control node only; the target host needs just SSH and sudo
+```
 
 **Target host**:
 

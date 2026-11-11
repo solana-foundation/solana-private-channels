@@ -10,6 +10,7 @@ Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once **on both 
 
 ```
 ./scripts/install-prereqs.sh        # run on control node, then again on the target host
+./scripts/install-prereqs.sh --k3s  # control node of a k3s deploy (docs/K3S_DEPLOY.md)
 ```
 
 > Uses `sudo` (apt + Docker repo). Run this in a interactive terminal that can show password prompts.
