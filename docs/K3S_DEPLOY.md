@@ -4,6 +4,15 @@ A second deploy target next to the compose deploy in [`private-channel-deploy/`]
 
 **Phases** (fail-fast, idempotent): preflight, bootstrap, reset_state (localnet only), connect, cluster checks, render, secrets, database, deploy, health, monitoring, sanity, report, disconnect.
 
+## Deploy targets
+
+Two targets share the same inventory, `vars/<env>.yml` and secrets (or Doppler). This guide covers k3s; compose has the [operator runbook](../private-channel-deploy/README.md).
+
+| Target | Deploy | Guide |
+| --- | --- | --- |
+| Docker Compose (default) | `ansible-playbook deploy.yml -l <env>` | [private-channel-deploy/README.md](../private-channel-deploy/README.md) |
+| k3s (single-host Kubernetes, Helm, CloudNativePG) | `ansible-playbook k3s.yml -l <env>` | This guide |
+
 ## How it fits together
 
 | Piece | Runs on | What |
@@ -124,7 +133,7 @@ and the secrets `backup_s3_access_key_id`, `backup_s3_secret_access_key` in `sec
 
 The Barman Cloud plugin archives WAL continuously and takes a base backup every 6h (`k3s_backup_schedule`). Retention is `30d` on mainnet, `7d` elsewhere (`k3s_backup_retention`). Restore: [PITR on k3s](PITR.md#pitr-on-k3s-cloudnativepg).
 
-### Monitoring
+## Monitoring
 
 kube-prometheus-stack (release `pc-kps`) in `pc-monitoring`, with our scrape jobs, dashboards and alert rules from [`monitoring/`](../monitoring/). Nothing is published on the host; reach it with a port-forward:
 
@@ -133,6 +142,18 @@ eval "$(../scripts/k3s-connect.sh <inventory host>)"
 kubectl -n pc-monitoring port-forward svc/pc-kps-grafana 3001:80        # http://127.0.0.1:3001, admin / grafana_admin_password
 kubectl -n pc-monitoring port-forward svc/pc-kps-prometheus 9090:9090
 ```
+
+## Troubleshooting
+
+| # | Symptom | Fix |
+| --- | --- | --- |
+| 1 | Preflight: helm, kubectl or crane `is missing` or not at the version the deploy `is pinned to` | `./scripts/install-prereqs.sh --k3s` on the control node. |
+| 2 | Preflight: the host runs k3s `newer than the pinned` version | k3s cannot downgrade. Bump `K3S_VERSION` and `K3S_INSTALL_SH_SHA256` together in [`versions.env`](../versions.env). |
+| 3 | Bootstrap: checksum mismatch on `k3s-install.sh` | `K3S_VERSION` was bumped without `K3S_INSTALL_SH_SHA256`. Set it to the sha256 of `install.sh` at the new tag. |
+| 4 | Deploy: `Something listens on 8899 or 8903` | A compose stack still runs. Stop it, or follow [the migration](#compose-to-k3s-migration-dump-and-restore). |
+| 5 | `kubectl` returns `Unauthorized` after a while | The token lives 1h. Run `scripts/k3s-connect.sh <host>` again; open sessions are not affected. |
+| 6 | An indexer or validator pod stays not Ready on a bad image after `helm rollback` | Rerun `ansible-playbook k3s.yml -l <env>`, which replaces such pods, or delete the pod. |
+| 7 | Indexer crashes with `MismatchExceedsThreshold` (localnet) | Validator and indexer DB are out of step: `ansible-playbook k3s.yml -l dev -e reset_state=true` wipes both in lockstep. |
 
 ## Ad hoc access
 
