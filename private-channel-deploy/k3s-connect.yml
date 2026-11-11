@@ -11,6 +11,7 @@
   - vars/k3s.yml
   vars:
     k3s_token_owner: connect
+    k3s_token_per_session: true
   tasks:
   - name: Connect
     ansible.builtin.import_tasks: tasks/k3s/connect.yml

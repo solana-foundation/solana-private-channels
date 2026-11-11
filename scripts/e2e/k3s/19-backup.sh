@@ -64,10 +64,12 @@ done
 objs="$(hk -n pc-e2e-s3 exec deploy/s3 -- sh -c 'echo "fs.ls -l /buckets/pc-backups/local" | weed shell' 2>/dev/null | grep -c . || true)"
 (( objs > 0 )) || die "no objects in the bucket"
 ok "$objs objects in the bucket"
-# Same serverName across a redeploy: the chart reuses the live Cluster's.
+# Same serverName across a pc-db upgrade (a retention change forces one): the chart reuses the live Cluster's.
 s1="$(hk -n $NS get cluster pc-ledger -o jsonpath='{.spec.plugins[0].parameters.serverName}')"
-playbook "$STEP-again" k3s.yml "${inst_args[@]}" || die "second deploy failed"
+r1="$(helm_revision pc-db)"
+playbook "$STEP-again" k3s.yml "${inst_args[@]}" -e k3s_backup_retention=6d || die "second deploy failed"
+[[ "$(helm_revision pc-db)" -gt "$r1" ]] || die "pc-db was not upgraded, so the serverName lookup went untested"
 [[ "$(hk -n $NS get cluster pc-ledger -o jsonpath='{.spec.plugins[0].parameters.serverName}')" == "$s1" ]] || die "serverName changed across a redeploy"
-ok "serverName kept across a redeploy ($s1)"
+ok "serverName kept across a pc-db upgrade ($s1)"
 finding "Step 19 ran against a SeaweedFS S3 server only: PITR recovery, the reused-serverName refusal, SSE on a real bucket and the timed drill were not run."
 pass

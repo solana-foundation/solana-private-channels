@@ -98,6 +98,9 @@ test_host_checks() {
   passes host_ok "${tags[@]}" -e "$(host "$host_ok")"
   refused newer_k3s "newer than the pinned" "${tags[@]}" \
     -e "$(host '{"k3s_version": "v9.99.0+k3s1", "free_gb": 100, "io_uring_disabled": 0, "kernel": "6.8"}')"
+  local pin; pin="$(sed -n 's/^K3S_VERSION=//p' "$REPO/versions.env")"
+  refused newer_k3s_suffix "newer than the pinned" "${tags[@]}" \
+    -e "$(host '{"k3s_version": "'"${pin%+k3s*}+k3s9"'", "free_gb": 100, "io_uring_disabled": 0, "kernel": "6.8"}')"
   passes older_k3s_upgrades "${tags[@]}" \
     -e "$(host '{"k3s_version": "v1.30.0+k3s1", "free_gb": 100, "io_uring_disabled": 0, "kernel": "6.8"}')"
   refused low_disk "GB free under /var/lib/rancher" "${tags[@]}" \
@@ -115,6 +118,10 @@ test_host_checks() {
   refused reset_tag_only "reset_state=true is refused for network=devnet" --tags reset_state -e network=devnet \
     -e fallback_rpc_url=https://f.invalid -e escrow_instance_id=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz \
     -e reset_state=true -e "$(host "$host_ok")"
+  # Skipping the preflight guard still leaves the one next to the wipe.
+  refused reset_skip_preflight "wipes the ledger and indexer Clusters" --tags reset_state --skip-tags k3s_host \
+    -e network=devnet -e fallback_rpc_url=https://f.invalid \
+    -e escrow_instance_id=7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz -e reset_state=true -e "$(host "$host_ok")"
   refused long_token_deploy_tag "at most 4h" --tags deploy -e k3s_token_duration=8h -e "$(host "$host_ok")"
   refused backup_no_creds "backup_s3_access_key_id" "${tags[@]}" -e k3s_backup_enabled=true \
     -e k3s_backup_destination_path=s3://b/p -e "$(host "$host_ok")"

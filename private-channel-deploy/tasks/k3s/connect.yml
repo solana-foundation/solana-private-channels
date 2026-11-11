@@ -1,18 +1,25 @@
 ---
 # Connect: a short-lived deployer token bound to a per-run Secret, an SSH tunnel to the
 # API and a temporary kubeconfig. The host's admin kubeconfig never leaves the host.
+
+# Ad hoc sessions (k3s-connect.sh) each get their own owner, so a second one never
+# revokes or closes the first; deploys share one owner since they never run in parallel.
+- name: Record the token owner
+  ansible.builtin.set_fact:
+    _k3s_owner: >-
+      {{ k3s_token_owner | default('deploy') }}{{ ('-' ~ lookup('community.general.random_string', length=6, upper=false, special=false))
+         if (k3s_token_per_session | default(false) | bool) else '' }}
+
 - name: Record the tunnel and token settings
   ansible.builtin.set_fact:
     _k3s_ctl_dir: "{{ lookup('env', 'HOME') }}/.cache/pc-k3s"
-    # k3s-connect.sh uses its own owner label, socket and temp prefix, so neither side
-    # ever closes or revokes the other's session.
-    _k3s_owner: "{{ k3s_token_owner | default('deploy') }}"
-    _k3s_sock: "{{ lookup('env', 'HOME') }}/.cache/pc-k3s/tunnel-{{ k3s_token_owner | default('deploy') }}-{{ inventory_hostname }}.sock"
+    _k3s_sock: "{{ lookup('env', 'HOME') }}/.cache/pc-k3s/tunnel-{{ _k3s_owner }}-{{ inventory_hostname }}.sock"
     _k3s_run_secret: "pc-deploy-run-{{ lookup('community.general.random_string', length=10, upper=false, special=false) }}"
 
 # Deploys to one host never run in parallel, so any per-run Secret left is from a
 # killed run; deleting it revokes that run's token at once.
 - name: Delete per-run Secrets left by earlier deploy runs
+  when: not (k3s_token_per_session | default(false) | bool)
   become: true
   ansible.builtin.command: >-
     k3s kubectl -n {{ k3s_namespace }} delete secret
@@ -20,13 +27,27 @@
   register: _k3s_stale
   changed_when: "'deleted' in _k3s_stale.stdout"
 
+# Their tokens are dead past the lifetime cap, so only those Secrets are removed.
+- name: Delete ad hoc session Secrets older than the token cap
+  when: k3s_token_per_session | default(false) | bool
+  become: true
+  ansible.builtin.shell: |
+    set -eu
+    cut=$(date -u -d "-{{ k3s_token_duration_max_hours }} hours" +%Y-%m-%dT%H:%M:%SZ)
+    k3s kubectl -n {{ k3s_namespace }} get secret -l private-channel.io/token-session=true \
+      -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.creationTimestamp}{"\n"}{end}' \
+      | while read -r n t; do [ "$t" \< "$cut" ] && k3s kubectl -n {{ k3s_namespace }} delete secret "$n"; done; true
+  register: _k3s_stale_sessions
+  changed_when: "'deleted' in _k3s_stale_sessions.stdout"
+
 - name: Create this run's Secret and mint the bound token
   become: true
   ansible.builtin.shell: |
     set -eu
     k3s kubectl -n {{ k3s_namespace }} create secret generic {{ _k3s_run_secret }} >/dev/null
     k3s kubectl -n {{ k3s_namespace }} label secret {{ _k3s_run_secret }} \
-      private-channel.io/token-owner={{ _k3s_owner }} >/dev/null
+      private-channel.io/token-owner={{ _k3s_owner }} \
+      private-channel.io/token-session={{ k3s_token_per_session | default(false) | bool | lower }} >/dev/null
     k3s kubectl create token deployer -n {{ k3s_namespace }} --duration={{ k3s_token_duration }} \
       --bound-object-kind Secret --bound-object-name {{ _k3s_run_secret }}
   register: _k3s_token

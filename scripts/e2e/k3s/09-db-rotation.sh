@@ -52,7 +52,8 @@ done
 st="$(hk -n $NS exec "$(pod ledger)" -c postgres -- psql -U postgres -tAc "select state||'/'||sync_state from pg_stat_replication")"
 [[ "$st" == streaming/* ]] || { say "WRONG replica: $st"; fails=$((fails + 1)); }
 say "replica after the rotations: $st"
-[[ "$(hk -n $NS get job pc-db-grants -o jsonpath='{.status.succeeded}')" == 1 ]] || { say "WRONG grants hook"; fails=$((fails + 1)); }
+# The Job from pc-db's latest install or upgrade, not one left from an earlier revision.
+{ [[ "$(hk -n $NS get job pc-db-grants -o jsonpath='{.status.succeeded}')" == 1 ]] && hook_fresh pc-db-grants pc-db; } || { say "WRONG grants hook"; fails=$((fails + 1)); }
 for x in postgres-exporter-primary postgres-exporter-indexer; do
   v="$(hk -n $NS exec "deploy/$x" -- wget -qO- localhost:9187/metrics 2>/dev/null | awk '/^pg_up / {print $2}')"
   [[ "$v" == 1 ]] || { say "WRONG $x pg_up=$v"; fails=$((fails + 1)); }

@@ -17,6 +17,16 @@
       {{ _k3s_ports.stdout }}
       A compose stack still running? Stop it first (migration: k3s.yml -e k3s_stop_after=database runs while it is up).
 
+# Without helm-diff, kubernetes.core.helm upgrades only when values or the chart version
+# change. The chart's own hash as a value makes any template or file change upgrade too.
+- name: Hash the private-channel chart
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: cd "{{ repo_root }}/charts/private-channel" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16
+  register: _k3s_chart_sum
+  changed_when: false
+  check_mode: false
+
 - name: Install or upgrade the app release
   delegate_to: localhost
   run_once: true
@@ -26,8 +36,11 @@
     chart_ref: "{{ repo_root }}/charts/private-channel"
     release_namespace: "{{ k3s_namespace }}"
     values_files: [ "{{ pc_tmp }}/values.generated.yaml" ]
-    wait: true
-    wait_timeout: "{{ k3s_helm_timeout }}"
+    release_values: { chartChecksum: "{{ _k3s_chart_sum.stdout }}" }
+    # No --wait: a StatefulSet pod stuck on a bad revision is replaced below, then the
+    # rollouts are awaited. The pre-upgrade auth-migrate hook is still awaited.
+    wait: false
+    timeout: "{{ k3s_helm_timeout }}"
     # Never auto-roll back: a DB-adjacent change must stay for a human to look at.
     atomic: false
 
@@ -49,6 +62,29 @@
     KUBECONFIG: "{{ pc_kubeconfig }}"
   register: _k3s_restore
   changed_when: _k3s_restore.stdout | length > 0
+
+# OrderedReady never replaces a pod that is not Ready (forced rollback), so after a bad
+# release a redeploy deletes such pods still on an old revision; they come back on the new one.
+- name: Replace StatefulSet pods stuck on an old revision
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    set -eu
+    for s in $(kubectl -n {{ k3s_namespace }} get statefulset -l app.kubernetes.io/part-of=private-channel -o name); do
+      kubectl -n {{ k3s_namespace }} wait "$s" --for=jsonpath='{.status.observedGeneration}'="$(kubectl -n {{ k3s_namespace }} get "$s" -o jsonpath='{.metadata.generation}')" --timeout=60s >/dev/null
+      upd="$(kubectl -n {{ k3s_namespace }} get "$s" -o jsonpath='{.status.updateRevision}')"
+      kubectl -n {{ k3s_namespace }} get pods -l app.kubernetes.io/part-of=private-channel \
+        -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[0].name} {.metadata.labels.controller-revision-hash} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+        | while read -r pod owner rev ready; do
+          [ "$owner" = "${s#*/}" ] && [ "$rev" != "$upd" ] && [ "$ready" != True ] || continue
+          kubectl -n {{ k3s_namespace }} delete pod "$pod" --wait=false >/dev/null
+          echo "replaced $pod (was on $rev, not Ready)"
+        done
+    done
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  register: _k3s_stuck
+  changed_when: _k3s_stuck.stdout | length > 0
 
 - name: List the workloads
   delegate_to: localhost

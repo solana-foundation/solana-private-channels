@@ -14,6 +14,8 @@
   when: _replica_ready.rc == 0
   ansible.builtin.shell:
     cmd: |
+      # A failed psql or kill must fail the deploy, or the replica keeps the old password.
+      set -eo pipefail
       while IFS= read -r l && [ "$l" != __PC_END_ENV__ ]; do export "$l"; done
       c=private-channel-postgres-replica f=/var/lib/postgresql/data/pc-replication.pgpass
       # libpq passfile syntax: escape ':' and '\' in the password.

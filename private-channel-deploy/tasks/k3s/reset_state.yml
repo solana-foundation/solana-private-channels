@@ -1,4 +1,12 @@
 ---
+# Repeated next to the wipe so no --skip-tags or --start-at-task can run it unguarded.
+- name: Refuse the wipe off localnet or on a host not marked e2e when required
+  ansible.builtin.assert:
+    that:
+    - network == 'localnet'
+    - e2e_host | default(false) | bool or not (k3s_reset_requires_e2e_host | default(false) | bool)
+    fail_msg: "reset_state wipes the ledger and indexer Clusters; refused for network={{ network }} on {{ inventory_hostname }}."
+
 # Localnet only, on the host (volumes are cluster-scoped). The validator ledger and the
 # indexer DB are wiped in lockstep, or reconciliation fails with MismatchExceedsThreshold;
 # Prometheus and Grafana data go too, as compose does.

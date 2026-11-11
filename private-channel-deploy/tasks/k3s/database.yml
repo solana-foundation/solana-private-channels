@@ -87,6 +87,16 @@
     dest: "{{ pc_tmp }}/pc-db-values.yaml"
     mode: "0600"
 
+# Without helm-diff, kubernetes.core.helm upgrades only when values or the chart version
+# change. The chart's own hash as a value makes any template or file change upgrade too.
+- name: Hash the pc-db chart
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: cd "{{ repo_root }}/charts/pc-db" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16
+  register: _k3s_chart_sum
+  changed_when: false
+  check_mode: false
+
 # --wait also waits for the post-install/post-upgrade grants hook to finish.
 - name: Install or upgrade the pc-db release
   delegate_to: localhost
@@ -97,6 +107,7 @@
     chart_ref: "{{ repo_root }}/charts/pc-db"
     release_namespace: "{{ k3s_namespace }}"
     values_files: [ "{{ pc_tmp }}/pc-db-values.yaml" ]
+    release_values: { chartChecksum: "{{ _k3s_chart_sum.stdout }}" }
     wait: true
     wait_timeout: "{{ k3s_helm_timeout }}"
     atomic: false

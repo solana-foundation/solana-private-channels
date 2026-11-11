@@ -6,13 +6,20 @@
 progress "STEP $STEP ($E2E_PROFILE) deployer RBAC"
 sync_repo
 
-# A token like a deploy's, via k3s-connect (owner label "connect").
+# A token like a deploy's, via k3s-connect (its own owner label, connect-<random>).
 out="$(ctl "cd $CTL_REPO && scripts/k3s-connect.sh $E2E_INV_HOST -e @$CTL_REPO/private-channel-deploy/e2e-vars.yml")" || die "k3s-connect.sh failed"
 KC="$(sed -n 's/^export KUBECONFIG=//p' <<<"$out")"
 SOCK="$(sed -n 's/.*ssh -S \([^ ]*\) -O exit.*/\1/p' <<<"$out")"
 [[ -n "$KC" ]] || die "no kubeconfig from k3s-connect.sh"
 k() { ctl "KUBECONFIG=$KC kubectl $*"; }
 ok "k3s-connect.sh gave a kubeconfig"
+# A second session must not revoke or close the first.
+out2="$(ctl "cd $CTL_REPO && scripts/k3s-connect.sh $E2E_INV_HOST -e @$CTL_REPO/private-channel-deploy/e2e-vars.yml")" || die "second k3s-connect.sh failed"
+KC2="$(sed -n 's/^export KUBECONFIG=//p' <<<"$out2")"; SOCK2="$(sed -n 's/.*ssh -S \([^ ]*\) -O exit.*/\1/p' <<<"$out2")"
+k "-n $NS get cm -o name" >/dev/null || die "a second k3s-connect session revoked the first"
+ctl "KUBECONFIG=$KC2 kubectl -n $NS get cm -o name" >/dev/null || die "second session has no access"
+ctl "ssh -S $SOCK2 -O exit pc-k3s; rm -rf $(dirname "$KC2")" || true
+ok "two k3s-connect sessions stay open side by side"
 
 k "auth can-i --list -n $NS" >"$RUN/logs/$STEP-can-i-$NS.txt"
 k "auth can-i --list -n pc-monitoring" >"$RUN/logs/$STEP-can-i-mon.txt"
@@ -48,7 +55,7 @@ k "-n $NS get secrets -o name" >/dev/null || die "deployer cannot list Secrets i
 ok "deployer can list Secrets in $NS (needed for the secrets phase)"
 
 # Revocation: delete the bound Secret, the token must be rejected at once.
-hk -n $NS delete secret -l private-channel.io/token-owner=connect >>"$LOG"
+hk -n $NS delete secret -l private-channel.io/token-session=true >>"$LOG"
 wait_for 30 bash -c "! $E2E_CTL bash -lc 'KUBECONFIG=$KC kubectl -n $NS get cm' >/dev/null 2>&1" || die "token still valid after its Secret was deleted"
 ok "token rejected once its per-run Secret is deleted"
 ctl "ssh -S $SOCK -O exit pc-k3s; rm -rf $(dirname "$KC")" || true

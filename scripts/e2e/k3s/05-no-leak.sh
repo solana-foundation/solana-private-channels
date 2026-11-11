@@ -4,10 +4,18 @@
 # with-secrets exports values into the process env by design.
 . "$(dirname "$0")/lib.sh"
 progress "STEP $STEP ($E2E_PROFILE) no-leak sweep"
+# Webhook URLs are secrets too: deploy with unique ones so the sweep can look for them.
+extra="$RUN/e2e-$E2E_PROFILE-secrets.extra.yml"
+trap 'rm -f "$extra"' EXIT
+w="http://e2e-leak-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n').invalid"
+( umask 077; printf "notify_webhook: '%s/recon'\nalert_webhook_url: '%s/grafana'\n" "$w" "$w" >"$extra" )
 sync_repo
 vals="$RUN/e2e-$E2E_PROFILE-leakvals.txt"
 ( umask 077
-  sed -E 's/^[a-z_]+: //' "$RUN/e2e-$E2E_PROFILE-secrets.yml" | awk 'length($0) >= 8' | grep -v '^unused$'
+  # Every file staged into secrets.yml: the RPC, Yellowstone, backup and webhook values too.
+  for f in "$RUN/e2e-$E2E_PROFILE-secrets.yml" "$RUN/e2e-$E2E_PROFILE-secrets.rpc.yml" "$RUN/e2e-$E2E_PROFILE-secrets.extra.yml"; do
+    [[ -f "$f" ]] && sed -E -e 's/^[a-z_0-9]+: *//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\1/" "$f"
+  done | awk 'length($0) >= 8' | grep -v '^unused$'
   # The memory signer keys as the containers get them (base58).
   for k in admin withdraw-operator; do
     ctl "python3 -c 'import json,sys; A=b\"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz\"; b=bytes(json.load(open(sys.argv[1]))); n=int.from_bytes(b,\"big\"); s=b\"\"

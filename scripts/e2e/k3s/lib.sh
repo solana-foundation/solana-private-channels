@@ -130,14 +130,24 @@ wait_for() {
   done
 }
 
-helm_revision() { onhost "KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm -n $NS status private-channel -o json 2>/dev/null | jq -r .version" || echo none; }
+helm_revision() { onhost "KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm -n $NS status ${1:-private-channel} -o json 2>/dev/null | jq -r .version" || echo none; }
+# hook_fresh <job> <release>: the hook Job was created by the release's latest install or upgrade.
+hook_fresh() {
+  local job rel
+  job="$(date -d "$(hk -n $NS get job "$1" -o jsonpath='{.metadata.creationTimestamp}')" +%s)" || return 1
+  rel="$(date -d "$(onhost "KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm -n $NS status $2 -o json" | jq -r .info.last_deployed)" +%s)" || return 1
+  ((job >= rel))
+}
 
 # Deployer access from the control node, for the bins and port-forwards a human would use.
+# Each k3s-connect session stays open on its own, so the suite closes its previous one.
 connect_ctl() {
-  local out
+  local out last=/tmp/pc-e2e-connect.sock
+  ctl "[ -f $last ] && ssh -S \"\$(cat $last)\" -O exit pc-k3s 2>/dev/null; rm -f $last; true"
   out="$(ctl "cd $CTL_REPO && scripts/k3s-connect.sh $E2E_INV_HOST -e @$CTL_REPO/private-channel-deploy/e2e-vars.yml")" || die "k3s-connect.sh failed"
   KC="$(sed -n 's/^export KUBECONFIG=//p' <<<"$out")"
   [[ -n "$KC" ]] || die "no kubeconfig"
+  ctl "echo $(sed -n 's/.*ssh -S \([^ ]*\) -O exit.*/\1/p' <<<"$out") >$last"
   export KC
 }
 # pf <ns> <target> <local:remote>: a port-forward on the control node that lives past this call.

@@ -13,7 +13,8 @@ data:
   indexer-grants.sql: |
     {{- .Files.Get "files/indexer-grants.sql" | nindent 4 }}
 ---
-# A finished Job is never re-run by helm upgrade, so this is a hook recreated on every deploy.
+# A finished Job is never re-run by helm upgrade, so this is a hook recreated on every
+# install or upgrade (any pc-db values or chart file change).
 apiVersion: batch/v1
 kind: Job
 metadata:

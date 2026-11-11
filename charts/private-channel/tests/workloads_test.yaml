@@ -57,7 +57,7 @@ tests:
   - it: renders every workload by default except the streamer
     asserts:
       - hasDocuments: { count: 8 }
-  - it: starts workers with exec so the binary is PID 1
+  - it: starts workers with exec so the binary replaces the shell and gets SIGTERM itself
     documentSelector: { path: metadata.name, value: indexer-solana }
     asserts:
       - matchRegex: { path: "spec.template.spec.containers[0].args[2]", pattern: '^exec /usr/local/bin/indexer --config /config/local/indexer-solana.toml -v indexer$' }

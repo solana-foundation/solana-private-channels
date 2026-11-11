@@ -40,10 +40,14 @@
       Description=Drop k3s API and kubelet ports on the public interface
       After=nftables.service network-pre.target
       Before=k3s.service
+      # nftables.conf starts with flush ruleset: reload the guard after its restart or reload.
+      PartOf=nftables.service
+      ReloadPropagatedFrom=nftables.service
       [Service]
       Type=oneshot
       RemainAfterExit=yes
       ExecStart=/usr/sbin/nft -f /etc/pc-k3s-guard.nft
+      ExecReload=/usr/sbin/nft -f /etc/pc-k3s-guard.nft
       [Install]
       WantedBy=multi-user.target
   register: _k3s_guard_unit
@@ -84,6 +88,7 @@
       url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version }}/install.sh"
       dest: /usr/local/bin/k3s-install.sh
       mode: "0755"
+      checksum: "sha256:{{ k3s_install_sh_sha256 }}"
       force: true
 
   - name: Put the verified binary in place

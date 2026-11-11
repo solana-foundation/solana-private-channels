@@ -5,6 +5,7 @@
 # --- Pins (versions.env is the source of truth) ---------------------------------
 _k3s_versions: "{{ lookup('file', repo_root ~ '/versions.env') }}"
 k3s_version: "{{ _k3s_versions | regex_search('(?m)^K3S_VERSION=(\\S+)', '\\1') | first }}"
+k3s_install_sh_sha256: "{{ _k3s_versions | regex_search('(?m)^K3S_INSTALL_SH_SHA256=(\\S+)', '\\1') | first }}"
 k3s_helm_version: "{{ _k3s_versions | regex_search('(?m)^HELM_VERSION=(\\S+)', '\\1') | first }}"
 k3s_kubectl_version: "{{ _k3s_versions | regex_search('(?m)^KUBECTL_VERSION=(\\S+)', '\\1') | first }}"
 k3s_crane_version: "{{ _k3s_versions | regex_search('(?m)^CRANE_VERSION=(\\S+)', '\\1') | first }}"
@@ -22,7 +23,7 @@ k3s_cert_manager_namespace: cert-manager
 # --- Host -----------------------------------------------------------------------
 # Free space needed under /var/lib/rancher before bootstrap or deploy.
 k3s_min_free_gb: 20
-# Interface whose inbound 6443 and 10250 are dropped; empty picks the default route's.
+# Interface the host firewall guard drops on (pc-k3s-guard.nft.j2); empty picks the default route's.
 k3s_public_iface: ""
 # Plain-HTTP registries k3s may pull from (e2e only), as host:port.
 k3s_insecure_registries: []

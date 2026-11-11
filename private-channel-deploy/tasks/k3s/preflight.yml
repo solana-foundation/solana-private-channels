@@ -169,7 +169,8 @@
   tags: [ k3s_host, bootstrap ]
   when: _k3s_host.k3s_version | length > 0
   ansible.builtin.assert:
-    that: (_k3s_host.k3s_version | regex_replace('\\+.*$', '') | regex_replace('^v', '')) is version(k3s_version | regex_replace('\\+.*$', '') | regex_replace('^v', ''), '<=')
+    # v1.35.9+k3s2 compares as 1.35.9.2, so a +k3sN step back counts as a downgrade.
+    that: (_k3s_host.k3s_version | regex_replace('^v', '') | regex_replace('\\+k3s', '.')) is version(k3s_version | regex_replace('^v', '') | regex_replace('\\+k3s', '.'), '<=')
     fail_msg: >-
       The host runs k3s {{ _k3s_host.k3s_version }}, newer than the pinned {{ k3s_version }}.
       k3s does not support downgrades. Fix: bump K3S_VERSION in versions.env instead.

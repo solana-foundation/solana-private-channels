@@ -148,20 +148,37 @@
             command: [ sleep, "600" ]
             securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ ALL ] } }
 
+  # Positive controls through the same Services: an allowed pod connects, so a refusal
+  # below is the policy and not a closed port. read-node is proven by the gated reads above.
+  - name: Allowed pods reach the guarded ports
+    ansible.builtin.shell: |
+      set -eu
+      # SSLRequest: Postgres answers one byte (N or S); a silent connect would prove nothing.
+      b=$(kubectl -n {{ k3s_namespace }} exec deploy/gateway -c gateway -- sh -c \
+        "printf '\\0\\0\\0\\10\\4\\322\\26\\57' | curl -s -m 4 telnet://postgres-primary:5432 | head -c1 | wc -c" || true)
+      [ "$b" = 1 ] || { echo "gateway got no answer from postgres-primary:5432"; exit 1; }
+      {% if _workers_enabled | default(true) | bool %}
+      kubectl -n {{ k3s_namespace }} exec deploy/operator-solana -c operator-solana -- \
+        curl -s -o /dev/null -m 4 "http://gateway-internal:{{ gateway_internal_port }}/" \
+        || { echo "operator-solana cannot reach gateway-internal"; exit 1; }
+      {% endif %}
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    changed_when: false
+
+  # curl rejects (7) or drops (28); for Postgres also no reply byte, since a connect alone
+  # times out (28) too while Postgres waits for a startup packet.
   - name: The probe pod cannot reach the guarded ports
     ansible.builtin.command:
-      argv: [ kubectl, -n, "{{ k3s_namespace }}", exec, "{{ _probe }}", --,
-              curl, -s, -o, /dev/null, -m, "4", "{{ item }}" ]
+      argv: [ kubectl, -n, "{{ k3s_namespace }}", exec, "{{ _probe }}", --, sh, -c, "{{ item }}" ]
     environment:
       KUBECONFIG: "{{ pc_kubeconfig }}"
     loop:
-    - "http://gateway-internal:{{ gateway_internal_port }}/"
-    - "http://read-node:{{ read_port }}/"
-    - "telnet://postgres-primary:5432"
+    - "curl -s -o /dev/null -m 4 http://gateway-internal:{{ gateway_internal_port }}/"
+    - "curl -s -o /dev/null -m 4 http://read-node:{{ read_port }}/"
+    - "printf '\\0\\0\\0\\10\\4\\322\\26\\57' | curl -s -m 4 telnet://postgres-primary:5432 | head -c1 | wc -c | grep -qx 0 && exit 28"
     register: _k3s_np
     changed_when: false
-    # The k3s policy controller rejects (curl 7) or drops (curl 28); the gated-read checks
-    # above prove these same ports answer an allowed pod, so a refusal here is the policy.
     failed_when: _k3s_np.rc not in [7, 28]
   always:
   - name: Delete the probe pod

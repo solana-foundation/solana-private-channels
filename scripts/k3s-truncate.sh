@@ -5,6 +5,8 @@
 set -euo pipefail
 keep="${1:?usage: k3s-truncate.sh <keep-slots> [--dry-run] [--no-withdraw-url]}"
 shift
+# It lands in the pod script, so only digits pass.
+[[ "$keep" =~ ^[0-9]+$ ]] || { echo "keep-slots must be a number, got: $keep" >&2; exit 2; }
 dry="" withdraw=1
 for a in "$@"; do
   case "$a" in
@@ -78,9 +80,10 @@ spec:
         volumeMounts: [ { name: tools, mountPath: /tools }, { name: work, mountPath: /work } ]
       volumes: [ { name: tools, emptyDir: {} }, { name: work, $workvol } ]
 Y
-# Poll: a refused cut fails the Job, and kubectl wait cannot wait for either outcome.
-for _ in $(seq 1 240); do
-  st="$(kubectl -n "$ns" get job "$job" -o jsonpath='{.status.succeeded}{.status.failed}')"
+# Poll until the Job ends either way, however long the cut takes: a refused cut fails
+# the Job, and kubectl wait cannot wait for either outcome.
+while :; do
+  st="$(kubectl -n "$ns" get job "$job" -o jsonpath='{.status.succeeded}{.status.failed}')" || { echo "Job $job is gone" >&2; exit 1; }
   [[ -n "$st" ]] && break
   sleep 5
 done
