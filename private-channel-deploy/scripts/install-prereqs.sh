@@ -175,12 +175,14 @@ if [ "$K3S" = true ]; then
     ok "python kubernetes client ($py)"
   else
     inst "python kubernetes client into $py"
-    if [[ "$py" == */pipx/venvs/* ]]; then
-      pipx inject ansible-core kubernetes
-    else
-      "$py" -m pip install kubernetes \
-        || { log "ERROR: could not install it; run: $py -m pip install kubernetes"; exit 1; }
-    fi
+    case "$py" in
+      # pipx: inject into the venv that runs ansible-playbook (ansible or ansible-core).
+      */pipx/venvs/*) v="${py#*/pipx/venvs/}"; pipx inject "${v%%/*}" kubernetes ;;
+      # OS Python (apt ansible): pip is blocked there (PEP 668), so use the OS package.
+      /usr/bin/*) sudo apt-get install -y python3-kubernetes ;;
+      *) "$py" -m pip install kubernetes \
+           || { log "ERROR: could not install it; run: $py -m pip install kubernetes"; exit 1; } ;;
+    esac
   fi
 fi
 

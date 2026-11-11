@@ -151,7 +151,7 @@ kubectl -n pc-monitoring port-forward svc/pc-kps-prometheus 9090:9090
 | 2 | Preflight: the host runs k3s `newer than the pinned` version | k3s cannot downgrade. Bump `K3S_VERSION` and `K3S_INSTALL_SH_SHA256` together in [`versions.env`](../versions.env). |
 | 3 | Bootstrap: checksum mismatch on `k3s-install.sh` | `K3S_VERSION` was bumped without `K3S_INSTALL_SH_SHA256`. Set it to the sha256 of `install.sh` at the new tag. |
 | 4 | Deploy: `Something listens on 8899 or 8903` | A compose stack still runs. Stop it, or follow [the migration](#compose-to-k3s-migration-dump-and-restore). |
-| 5 | `kubectl` returns `Unauthorized` after a while | The token lives 1h. Run `scripts/k3s-connect.sh <host>` again; open sessions are not affected. |
+| 5 | `kubectl` returns `Unauthorized` after a while | The token lives 1h. Run `../scripts/k3s-connect.sh <host>` again; open sessions are not affected. |
 | 6 | An indexer or validator pod stays not Ready on a bad image after `helm rollback` | Rerun `ansible-playbook k3s.yml -l <env>`, which replaces such pods, or delete the pod. |
 | 7 | Indexer crashes with `MismatchExceedsThreshold` (localnet) | Validator and indexer DB are out of step: `ansible-playbook k3s.yml -l dev -e reset_state=true` wipes both in lockstep. |
 
@@ -160,8 +160,8 @@ kubectl -n pc-monitoring port-forward svc/pc-kps-prometheus 9090:9090
 [`scripts/k3s-connect.sh`](../scripts/k3s-connect.sh) opens the same tunnel and token a deploy uses (via [`k3s-connect.yml`](./k3s-connect.yml)) and prints the `export KUBECONFIG=...` line plus the command to close it.
 
 ```bash
-scripts/k3s-connect.sh <inventory host>      # prints export KUBECONFIG=... and how to close
-eval "$(scripts/k3s-connect.sh <inventory host>)"
+../scripts/k3s-connect.sh <inventory host>      # prints export KUBECONFIG=... and how to close
+eval "$(../scripts/k3s-connect.sh <inventory host>)"
 kubectl -n private-channel get pods
 kubectl -n private-channel port-forward svc/postgres-primary 15432:5432   # tools that used host loopback ports
 # when done, run the printed: ssh -S <socket> -O exit pc-k3s; rm -rf <kubeconfig dir>
@@ -176,9 +176,9 @@ Each session has its own token and tunnel, so several can stay open side by side
 [`scripts/k3s-truncate.sh`](../scripts/k3s-truncate.sh) runs `admin truncate` as a Job: `pg_dump` 16 next to the `admin` CLI copied from the app image. DB URLs are built inside the pod from the CNPG superuser Secrets, never on argv.
 
 ```bash
-eval "$(scripts/k3s-connect.sh <inventory host>)"
-scripts/k3s-truncate.sh 1000000 --dry-run      # <keep-slots>; cuts nothing, dump in a throwaway emptyDir
-scripts/k3s-truncate.sh 1000000                # real cut
+eval "$(../scripts/k3s-connect.sh <inventory host>)"
+../scripts/k3s-truncate.sh 1000000 --dry-run      # <keep-slots>; cuts nothing, dump in a throwaway emptyDir
+../scripts/k3s-truncate.sh 1000000                # real cut
 ```
 
 The script waits until the Job succeeds or fails, however long the cut takes. `--no-withdraw-url` leaves out the withdraw indexer DB URL. A real cut keeps its `core.dump` on a `pc-retain` PVC named after the Job; copy it off-host, then delete the PVC.
@@ -188,8 +188,8 @@ The script waits until the Job succeeds or fails, however long the cut takes. `-
 On the same host or a new one. [`scripts/k3s-migrate-from-compose.sh`](../scripts/k3s-migrate-from-compose.sh) does the data move.
 
 1. `ansible-playbook k3s.yml -l <env> -e k3s_stop_after=database`: k3s plus empty Clusters and roles, no app. Allowed while compose still runs; only the deploy phase needs 8899 and 8903.
-2. `eval "$(scripts/k3s-connect.sh <host>)"` (add `-e k3s_token_duration=4h` for a large database).
-3. `scripts/k3s-migrate-from-compose.sh <ssh target of the compose host>`: stops the compose writers (Postgres stays up), streams `pg_dump -Fc` of both databases into `pg_restore` in the CNPG primaries, fails on any `pg_restore` message, and compares exact row counts per table. `--dry-run` as the second argument only lists the compose containers; `COMPOSE_SSH_OPTS` passes extra ssh options.
+2. `eval "$(../scripts/k3s-connect.sh <host>)"` (add `-e k3s_token_duration=4h` for a large database).
+3. `../scripts/k3s-migrate-from-compose.sh <ssh target of the compose host>`: stops the compose writers (Postgres stays up), streams `pg_dump -Fc` of both databases into `pg_restore` in the CNPG primaries, fails on any `pg_restore` message, and compares exact row counts per table. `--dry-run` as the second argument only lists the compose containers; `COMPOSE_SSH_OPTS` passes extra ssh options.
 4. Stop compose Postgres (`docker compose -p private-channel stop`), then `ansible-playbook k3s.yml -l <env>`.
 5. Check: the fence and bitmap boot checks pass (indexer and operator logs), a user registered before the move logs in, one deposit and one withdraw land.
 
