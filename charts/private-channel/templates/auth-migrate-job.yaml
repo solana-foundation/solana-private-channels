@@ -1,0 +1,54 @@
+{{- if .Values.auth.enabled }}
+{{- $name := "auth-migrate" }}
+{{- $keys := get .Values.secretKeys $name | default list }}
+# Runs before Helm creates or updates anything else in the release, so auth starts
+# on a migrated schema. The databases already exist: pc-db is installed first.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: auth-migrate
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" $name) | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        {{- include "pc.labels" (dict "root" . "name" $name) | nindent 8 }}
+      annotations:
+        secrets-rev: {{ get .Values.secretsRev $name | default "none" | quote }}
+    spec:
+      restartPolicy: Never
+      {{- include "pc.podSecurity" . | nindent 6 }}
+      {{- include "pc.pullSecrets" . | nindent 6 }}
+      {{- $waits := include "pc.waits" (dict "root" . "name" $name) }}
+      {{- if $waits }}
+      initContainers:
+        {{- $waits | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: auth-migrate
+          image: {{ include "pc.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [ /usr/local/bin/auth-admin, migrate ]
+          env:
+            {{- include "pc.env" (dict "root" . "name" $name) | indent 12 }}
+            {{- include "pc.secretEnv" (dict "root" . "name" $name) | indent 12 }}
+          resources:
+            {{- toYaml (get .Values.apps $name).resources | nindent 12 }}
+          {{- include "pc.containerSecurity" . | nindent 10 }}
+          {{- if $keys }}
+          volumeMounts:
+            - { name: secrets, mountPath: /run/secrets, readOnly: true }
+          {{- end }}
+      {{- if $keys }}
+      volumes:
+        - name: secrets
+          secret: { secretName: pc-auth-migrate, defaultMode: 288 }
+      {{- end }}
+{{- end }}

@@ -1,0 +1,68 @@
+---
+# Render: the config compose bind-mounts becomes ConfigMaps, applied through the tunnel.
+# values.generated.yaml is written by the secrets phase, once it knows the key names.
+- name: Build the worker TOML ConfigMap from the files compose mounts
+  delegate_to: localhost
+  run_once: true
+  vars:
+    _dir: "{{ repo_root ~ ('/indexer/config/local' if network == 'localnet' else '/scripts/devnet/config') }}"
+    _names: [ indexer-solana, indexer-private-channel, operator-solana, operator-private-channel ]
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: { name: pc-worker-config, namespace: "{{ k3s_namespace }}" }
+      data: "{% set d = {} %}{% for n in _names %}{% set _ = d.update({n ~ '.toml': lookup('file', _dir ~ '/' ~ n ~ '.toml')}) %}{% endfor %}{{ d }}"
+
+- name: Build the blackbox config ConfigMap
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    state: present
+    force: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: { name: pc-blackbox-config, namespace: "{{ k3s_namespace }}" }
+      data: { config.yml: "{{ lookup('file', repo_root ~ '/monitoring/blackbox.yml') }}" }
+
+- name: Localnet validator assets
+  when: network == 'localnet'
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Build the BPF programs when missing
+    ansible.builtin.import_tasks: bpf_programs.yml
+
+  # slurp, not the file lookup: the lookup decodes text and would corrupt the ELF.
+  - name: Read the BPF programs
+    ansible.builtin.slurp:
+      src: "{{ repo_root }}/target/deploy/{{ item }}.so"
+    loop: [ private_channel_escrow_program, private_channel_withdraw_program ]
+    register: _k3s_so
+
+  - name: Ship the programs as a binary ConfigMap (well under 1 MiB)
+    kubernetes.core.k8s:
+      kubeconfig: "{{ pc_kubeconfig }}"
+      state: present
+      force: true
+      definition:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: { name: pc-programs, namespace: "{{ k3s_namespace }}" }
+        binaryData: "{{ dict(_k3s_so.results | map(attribute='item') | map('regex_replace', '$', '.so') | zip(_k3s_so.results | map(attribute='content'))) }}"
+
+  - name: Ship the geyser plugin config
+    kubernetes.core.k8s:
+      kubeconfig: "{{ pc_kubeconfig }}"
+      state: present
+      force: true
+      definition:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: { name: pc-yellowstone-config, namespace: "{{ k3s_namespace }}" }
+        data: { yellowstone-config.json: "{{ lookup('file', repo_root ~ '/yellowstone-config.json') }}" }

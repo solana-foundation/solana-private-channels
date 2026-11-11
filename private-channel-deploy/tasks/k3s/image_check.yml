@@ -1,0 +1,49 @@
+---
+# A k3s host has no docker to inspect with, so the control node reads the image
+# config from the registry with crane and refuses an image without with-secrets.
+- name: Check the app image entrypoint with crane
+  delegate_to: localhost
+  run_once: true
+  vars:
+    _k3s_app_ref: >-
+      {{ image_registry }}/private-channel-app{{ ('@' ~ pc_app_image_digest) if (verify_image_signature | default(false) | bool) else (':' ~ image_tag) }}
+    _k3s_insecure: "{{ _registry_host in k3s_insecure_registries }}"
+  block:
+  # A throwaway DOCKER_CONFIG, so the PAT never lands in ~/.docker/config.json.
+  - name: Create a throwaway docker config dir for crane
+    ansible.builtin.tempfile:
+      state: directory
+      suffix: .pc-crane
+    register: _k3s_crane_cfg
+
+  - name: Write the GHCR login into the throwaway config
+    when: _registry_host == 'ghcr.io'
+    ansible.builtin.copy:
+      dest: "{{ _k3s_crane_cfg.path }}/config.json"
+      mode: "0600"
+      content: "{{ {'auths': {'ghcr.io': {'auth': (ghcr_user ~ ':' ~ ghcr_token) | b64encode}}} | to_json }}"
+    no_log: true
+
+  - name: Read the app image config from the registry
+    ansible.builtin.command:
+      argv: "{{ ['crane', 'config'] + (['--insecure'] if _k3s_insecure | bool else []) + [_k3s_app_ref | trim] }}"
+    environment:
+      DOCKER_CONFIG: "{{ _k3s_crane_cfg.path }}"
+    register: _k3s_app_config
+    changed_when: false
+    check_mode: false
+
+  - name: Refuse an app image without the with-secrets entrypoint
+    ansible.builtin.assert:
+      that: ((_k3s_app_config.stdout | from_json).config.Entrypoint | default([])) == ['/usr/local/bin/with-secrets']
+      fail_msg: >-
+        The app image {{ _k3s_app_ref | trim }} has entrypoint
+        {{ (_k3s_app_config.stdout | from_json).config.Entrypoint | default('none') }}, not
+        /usr/local/bin/with-secrets. Secrets are delivered as files, so it would start with blank
+        secrets. Nothing was installed or upgraded.
+  always:
+  - name: Remove the throwaway docker config
+    when: _k3s_crane_cfg.path is defined
+    ansible.builtin.file:
+      path: "{{ _k3s_crane_cfg.path }}"
+      state: absent

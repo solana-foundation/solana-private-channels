@@ -1,0 +1,57 @@
+---
+# Operator PDA check; imported by deploy.yml and k3s.yml.
+
+- name: Probe the solana CLI
+  ansible.builtin.command: solana --version
+  register: _solana_cli
+  changed_when: false
+  failed_when: false
+
+- name: Assert the solana CLI is present
+  ansible.builtin.assert:
+    that: _solana_cli.rc == 0
+    fail_msg: "The solana CLI is needed on the control node to derive the Operator PDA. Install it (make install-toolchain)."
+
+- name: Derive the Operator PDA
+  ansible.builtin.command:
+    argv: [ solana, find-program-derived-address, "{{ compiled_escrow_program_id }}", "string:operator",
+            "pubkey:{{ _escrow_instance }}", "pubkey:{{ pc_operator_pubkey }}" ]
+  register: _operator_pda
+  changed_when: false
+
+# rpc_url carries the provider API key. A localnet rpc_url points at the target's validator.
+# pc_pda_rpc_url and pc_pda_rpc_delegate override the URL and the host that reads it.
+- name: Read the Operator PDA
+  delegate_to: "{{ pc_pda_rpc_delegate | default(inventory_hostname if network == 'localnet' else 'localhost') }}"
+  ansible.builtin.uri:
+    url: "{{ pc_pda_rpc_url | default(rpc_url) }}"
+    method: POST
+    body_format: json
+    body:
+      jsonrpc: "2.0"
+      id: 1
+      method: getAccountInfo
+      params: [ "{{ _operator_pda.stdout | trim }}", { encoding: base64 } ]
+    timeout: 15
+  register: _pda_info
+  failed_when: false
+  no_log: true
+
+- name: Warn when the Operator PDA cannot be read
+  when: _pda_info.status | default(-1) | int != 200 or _pda_info.json.result is not defined
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not check the Operator PDA for operator {{ pc_operator_pubkey }}
+      (RPC status {{ _pda_info.status | default(-1) }}). Continuing.
+
+- name: Refuse an operator that was never added
+  when: _pda_info.status | default(-1) | int == 200 and _pda_info.json.result is defined
+  ansible.builtin.assert:
+    that:
+    - _pda_info.json.result.value is not none
+    - _pda_info.json.result.value.owner == compiled_escrow_program_id
+    fail_msg: >-
+      {% if _pda_info.json.result.value is none %}No Operator PDA for operator {{ pc_operator_pubkey }} on instance {{ _escrow_instance }}:
+      every ReleaseFunds would fail.
+      {% else %}The Operator PDA for {{ pc_operator_pubkey }} is owned by {{ _pda_info.json.result.value.owner }}, not the escrow program.
+      {% endif %}Fix: run add_operator for {{ pc_operator_pubkey }} with the Instance.admin key, then redeploy.

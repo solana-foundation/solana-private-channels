@@ -1,0 +1,113 @@
+# Rendered by Ansible (k3s bootstrap). kube-prometheus-stack runs Prometheus, Grafana,
+# node-exporter and the kubelet scrape; our scrape jobs, provisioning, dashboards and
+# alert rules load on top unchanged. Image tags are pinned to the compose versions.
+fullnameOverride: pc-kps
+alertmanager:
+  enabled: false
+defaultRules:
+  create: false
+# k3s embeds these in one process; their stock scrapes would only show as down.
+kubeControllerManager: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeProxy: { enabled: false }
+kubeEtcd: { enabled: false }
+
+prometheus:
+  prometheusSpec:
+    image:
+      tag: v2.55.1
+    scrapeInterval: 10s
+    scrapeTimeout: 5s
+    evaluationInterval: 15s
+    retention: {{ k3s_prometheus_retention }}
+    # Our compose scrape jobs, written from the host (never by the deploy token).
+    additionalScrapeConfigsSecret:
+      enabled: true
+      name: pc-prometheus-scrape
+      key: scrape.yaml
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: pc-retain
+          accessModes: [ ReadWriteOnce ]
+          resources: { requests: { storage: {{ k3s_prometheus_storage }} } }
+
+prometheus-node-exporter:
+  image:
+    tag: v1.8.2
+    # No distroless v1.8.2 exists.
+    distroless: false
+
+kubelet:
+  serviceMonitor:
+    # Replaces the chart defaults, so they are copied first, then the compose labels
+    # are rebuilt for our namespace so the Docker-label dashboard queries keep working.
+    cAdvisorMetricRelabelings:
+      - { sourceLabels: [ __name__ ], action: drop, regex: 'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)' }
+      - { sourceLabels: [ __name__ ], action: drop, regex: 'container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)' }
+      - { sourceLabels: [ __name__ ], action: drop, regex: 'container_memory_mapped_file' }
+      - { sourceLabels: [ __name__ ], action: drop, regex: 'container_(file_descriptors|tasks_state|threads_max)' }
+      - { sourceLabels: [ __name__, scope ], action: drop, regex: 'container_memory_failures_total;hierarchy' }
+      - { sourceLabels: [ __name__, interface ], action: drop, regex: 'container_network_.*;(cali|cilium|cni|lxc|nodelocaldns|tunl).*' }
+      - { sourceLabels: [ __name__ ], action: drop, regex: 'container_spec.*' }
+      - { sourceLabels: [ id, pod ], action: drop, regex: '.+;' }
+      # Pod-level (container="") and pause (POD) series would double-count CPU and memory
+      # per name; network exists only at pod level, so it is kept.
+      - { sourceLabels: [ __name__, container ], action: drop, regex: 'container_(cpu|memory)_.+;(|POD)' }
+      # Compose service from the pod name: StatefulSet (name-N), then Deployment (name-rs-pod).
+      - { sourceLabels: [ pod ], regex: '(.+)-[0-9]+', targetLabel: __tmp_pc_svc, replacement: '$1' }
+      - { sourceLabels: [ pod ], regex: '(.+)-[a-z0-9]{6,10}-[a-z0-9]{5}', targetLabel: __tmp_pc_svc, replacement: '$1' }
+      - { sourceLabels: [ namespace, __tmp_pc_svc ], regex: '{{ k3s_namespace }};(.+)', targetLabel: container_label_com_docker_compose_service, replacement: '$1' }
+      - { sourceLabels: [ namespace, __tmp_pc_svc ], regex: '{{ k3s_namespace }};(.+)', targetLabel: name, replacement: 'private-channel-$1' }
+      - { action: labeldrop, regex: __tmp_pc_svc }
+
+grafana:
+  image:
+    tag: 11.3.0
+  testFramework:
+    enabled: false
+  defaultDashboardsEnabled: false
+  # Grafana's service account may only read this namespace.
+  rbac:
+    namespaced: true
+  admin:
+    existingSecret: pc-mon-grafana
+    userKey: admin-user
+    passwordKey: admin-password
+  # Not /run/secrets: on the Alpine image /var/run links to /run, next to the token mount.
+  extraSecretMounts:
+    - name: pc-mon-grafana
+      secretName: pc-mon-grafana
+      mountPath: /etc/grafana/secrets
+      readOnly: true
+  env:
+    PROMETHEUS_URL: http://pc-kps-prometheus.{{ k3s_monitoring_namespace }}:9090
+    POSTGRES_INDEXER_HOST: postgres-indexer.{{ k3s_namespace }}
+    POSTGRES_INDEXER_DB: {{ postgres_indexer_db }}
+    ALERT_CONTACT_TYPE: {{ alert_contact_type | default('webhook') }}
+    GF_SERVER_ROOT_URL: {{ grafana_root_url | default('http://localhost:3000') }}
+    GF_USERS_ALLOW_SIGN_UP: "false"
+    GF_AUTH_ANONYMOUS_ENABLED: "false"
+  persistence:
+    enabled: true
+    storageClassName: pc-retain
+    size: {{ k3s_grafana_storage }}
+  sidecar:
+    datasources:
+      enabled: true
+      # Ours has uid prometheus too; two defaults would collide.
+      defaultDatasourceEnabled: false
+      searchNamespace: null
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: null
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    alerts:
+      enabled: true
+      label: grafana_alert
+      labelValue: "1"
+      searchNamespace: null

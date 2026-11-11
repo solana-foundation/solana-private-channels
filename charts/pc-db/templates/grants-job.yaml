@@ -1,0 +1,78 @@
+{{- $root := . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pc-db-grants-sql
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-1"
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  ledger-grants.sql: |
+    {{- .Files.Get "files/ledger-grants.sql" | nindent 4 }}
+  indexer-grants.sql: |
+    {{- .Files.Get "files/indexer-grants.sql" | nindent 4 }}
+---
+# A finished Job is never re-run by helm upgrade, so this is a hook recreated on every
+# install or upgrade (any pc-db values or chart file change).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pc-db-grants
+  labels:
+    app.kubernetes.io/name: pc-db-grants
+    app.kubernetes.io/part-of: private-channel
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 1200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pc-db-grants
+        app.kubernetes.io/part-of: private-channel
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 26, runAsGroup: 26 }
+      containers:
+        {{- range $db := list "ledger" "indexer" }}
+        {{- $c := get $root.Values $db }}
+        {{- $roles := list }}
+        {{- range $r := $c.roles }}{{ $roles = append $roles $r.name }}{{ end }}
+        - name: {{ $db }}
+          image: {{ $root.Values.imageName }}
+          command: [ /bin/bash, -c ]
+          args:
+            - |
+              set -euo pipefail
+              # Ready, not running: wait until Postgres accepts connections.
+              until pg_isready -q; do echo "waiting for $PGHOST"; sleep 2; done
+              # CNPG creates the managed roles after the Cluster is up; grants need them.
+              deadline=$((SECONDS + {{ $root.Values.grants.roleWaitSeconds }}))
+              for r in $ROLES; do
+                until [ "$(psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '$r'")" = 1 ]; do
+                  [ $SECONDS -lt $deadline ] || { echo "role $r never appeared" >&2; exit 1; }
+                  sleep 3
+                done
+              done
+              psql -v ON_ERROR_STOP=1 -q -v app_db="$PGDATABASE" -v replication_user=replicator -f /sql/{{ $db }}-grants.sql
+              echo "{{ $db }} grants applied"
+          env:
+            - { name: PGHOST, value: {{ printf "%s-rw" $c.name }} }
+            - { name: PGDATABASE, value: {{ $c.database }} }
+            - { name: PGUSER, value: postgres }
+            - { name: PGCONNECT_TIMEOUT, value: "5" }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: {{ $c.superuserSecret }}, key: password } }
+            - { name: ROLES, value: {{ join " " $roles | quote }} }
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 256Mi } }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ ALL ] } }
+          volumeMounts: [ { name: sql, mountPath: /sql, readOnly: true } ]
+        {{- end }}
+      volumes:
+        - name: sql
+          configMap: { name: pc-db-grants-sql }

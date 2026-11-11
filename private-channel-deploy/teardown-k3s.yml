@@ -1,0 +1,77 @@
+---
+# Removes the stack and all its data from a host (with -e k3s_uninstall=true, k3s too).
+# Confirm with the host name, so a mistyped -l cannot tear down the wrong host:
+#   ansible-playbook teardown-k3s.yml -l <host> -e confirm_teardown=<host>
+- name: Tear down Solana Private Channels on k3s
+  hosts: all
+  gather_facts: false
+  serial: 1
+  vars_files:
+  - vars/common.yml
+  - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
+  - vars/k3s.yml
+  tasks:
+  - name: Refuse without the host name as confirmation
+    ansible.builtin.assert:
+      that: confirm_teardown | default('') == inventory_hostname
+      fail_msg: >-
+        teardown-k3s.yml deletes every database and volume on {{ inventory_hostname }}.
+        Confirm with -e confirm_teardown={{ inventory_hostname }}.
+
+  - name: Refuse a host not marked as an e2e host unless allowed explicitly
+    ansible.builtin.assert:
+      that: (e2e_host | default(false) | bool) or (teardown_allow_non_e2e | default(false) | bool)
+      fail_msg: >-
+        {{ inventory_hostname }} is not an e2e host (e2e_host is false). To tear down a real
+        host, add -e teardown_allow_non_e2e=true after taking a backup.
+
+  - name: Remove releases, Clusters, namespaces, volumes and data directories
+    become: true
+    ansible.builtin.shell: |
+      set -o pipefail
+      set -u
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      k="k3s kubectl"
+      command -v k3s >/dev/null || { echo "k3s not installed"; exit 0; }
+      for r in "{{ k3s_namespace }} private-channel" "{{ k3s_namespace }} pc-db" "{{ k3s_monitoring_namespace }} pc-kps" \
+               "{{ k3s_cnpg_namespace }} barman-cloud" "{{ k3s_cnpg_namespace }} cnpg" "{{ k3s_cert_manager_namespace }} cert-manager"; do
+        set -- $r; helm -n "$1" uninstall "$2" --wait 2>/dev/null && echo "uninstalled $2"
+      done
+      $k -n {{ k3s_namespace }} delete cluster.postgresql.cnpg.io --all --wait --timeout=5m 2>/dev/null
+      for ns in {{ k3s_namespace }} {{ k3s_monitoring_namespace }} {{ k3s_cnpg_namespace }} {{ k3s_cert_manager_namespace }}; do
+        $k delete namespace "$ns" --ignore-not-found --wait --timeout=10m && echo "deleted namespace $ns"
+      done
+      $k get pv -o json | python3 -c '
+      import json, sys
+      for pv in json.load(sys.stdin)["items"]:
+          ref = pv["spec"].get("claimRef") or {}
+          if ref.get("namespace") in sys.argv[1:]:
+              print(pv["metadata"]["name"], (pv["spec"].get("hostPath") or pv["spec"].get("local") or {}).get("path", ""))
+      ' {{ k3s_namespace }} {{ k3s_monitoring_namespace }} | while read -r pv path; do
+        $k delete pv "$pv" --wait --timeout=2m
+        case "$path" in /var/lib/rancher/k3s/storage/*) rm -rf -- "$path" ;; esac
+        echo "deleted $pv $path"
+      done
+      $k delete storageclass pc-retain --ignore-not-found
+      $k delete validatingadmissionpolicybinding,validatingadmissionpolicy pc-deployer-guard --ignore-not-found
+      true
+    args:
+      executable: /bin/bash
+    register: _td
+    changed_when: true
+
+  - name: Report the teardown
+    ansible.builtin.debug:
+      var: _td.stdout_lines
+
+  - name: Uninstall k3s and the API guard
+    when: k3s_uninstall | default(false) | bool
+    become: true
+    ansible.builtin.shell: |
+      [ -x /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh
+      systemctl disable --now pc-k3s-guard.service 2>/dev/null
+      nft delete table inet pc_k3s_guard 2>/dev/null
+      rm -f /etc/systemd/system/pc-k3s-guard.service /etc/pc-k3s-guard.nft /usr/local/bin/k3s-install.sh
+      systemctl daemon-reload
+      true
+    changed_when: true

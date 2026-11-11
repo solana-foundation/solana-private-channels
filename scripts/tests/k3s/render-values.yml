@@ -1,0 +1,31 @@
+# Test helper: renders values.generated.yaml for the chart tests from the deploy vars,
+# with no cluster. Run with -e out=<file> -e secrets_file=<file> [-e network=devnet ...].
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+  - "{{ deploy_dir }}/vars/common.yml"
+  - "{{ deploy_dir }}/vars/dev.yml"
+  - "{{ deploy_dir }}/vars/k3s.yml"
+  - "{{ secrets_file }}"
+  vars:
+    _k3s_salt: fixed-test-salt
+    pc_admin_pubkey: AdminPub1111111111111111111111111111111111
+    pc_operator_pubkey: OperPub11111111111111111111111111111111111
+    image_tag: t
+  tasks:
+  - name: Default the memory signer keys
+    ansible.builtin.set_fact:
+      pc_admin_private_key: "{{ pc_admin_private_key | default('SNTLadminkey') }}"
+      pc_operator_private_key: "{{ pc_operator_private_key | default('SNTLoperatorkey') }}"
+  - name: Secret sets
+    ansible.builtin.import_tasks: "{{ deploy_dir }}/tasks/k3s/secret_sets.yml"
+  - name: Values
+    ansible.builtin.template:
+      src: "{{ deploy_dir }}/templates/k3s/values.generated.yaml.j2"
+      dest: "{{ out }}"
+      mode: "0600"
+  - name: Hashes for the secrets-rev table (Grafana included)
+    ansible.builtin.copy:
+      dest: "{{ out }}.rev.json"
+      mode: "0600"
+      content: "{{ _k3s_secrets_rev | combine({'grafana': _k3s_grafana_rev ~ _k3s_grafana_admin_rev}) | to_json }}"

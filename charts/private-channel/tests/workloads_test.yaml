@@ -1,0 +1,152 @@
+suite: workloads
+templates:
+  - templates/workloads.yaml
+tests:
+  - it: runs the single writers as one Recreate copy
+    documentSelector: { path: metadata.name, value: write-node }
+    asserts:
+      - isKind: { of: Deployment }
+      - equal: { path: spec.replicas, value: 1 }
+      - equal: { path: spec.strategy.type, value: Recreate }
+  - it: runs operator-solana as one Recreate copy
+    documentSelector: { path: metadata.name, value: operator-solana }
+    asserts:
+      - isKind: { of: Deployment }
+      - equal: { path: spec.replicas, value: 1 }
+      - equal: { path: spec.strategy.type, value: Recreate }
+  - it: runs operator-private-channel as one Recreate copy
+    documentSelector: { path: metadata.name, value: operator-private-channel }
+    asserts:
+      - isKind: { of: Deployment }
+      - equal: { path: spec.replicas, value: 1 }
+      - equal: { path: spec.strategy.type, value: Recreate }
+  - it: runs the streamer as one Recreate copy when enabled
+    set: { streamer.enabled: true }
+    documentSelector: { path: metadata.name, value: streamer }
+    asserts:
+      - isKind: { of: Deployment }
+      - equal: { path: spec.replicas, value: 1 }
+      - equal: { path: spec.strategy.type, value: Recreate }
+  - it: runs indexer-solana as a one-replica StatefulSet
+    documentSelector: { path: metadata.name, value: indexer-solana }
+    asserts:
+      - isKind: { of: StatefulSet }
+      - equal: { path: spec.replicas, value: 1 }
+  - it: runs indexer-private-channel as a one-replica StatefulSet
+    documentSelector: { path: metadata.name, value: indexer-private-channel }
+    asserts:
+      - isKind: { of: StatefulSet }
+      - equal: { path: spec.replicas, value: 1 }
+  - it: rolls read-node with RollingUpdate
+    documentSelector: { path: metadata.name, value: read-node }
+    asserts:
+      - equal: { path: spec.strategy.type, value: RollingUpdate }
+  - it: drops indexer-solana and both operators without workers but keeps indexer-private-channel
+    set: { workers.enabled: false }
+    asserts:
+      - hasDocuments: { count: 5 }
+  - it: renders indexer-private-channel without workers
+    set: { workers.enabled: false }
+    documentSelector: { path: metadata.name, value: indexer-private-channel }
+    asserts:
+      - isKind: { of: StatefulSet }
+  - it: renders no auth without gateway_enforce_jwt
+    set: { auth.enabled: false }
+    asserts:
+      - hasDocuments: { count: 7 }
+  - it: renders every workload by default except the streamer
+    asserts:
+      - hasDocuments: { count: 8 }
+  - it: starts workers with exec so the binary replaces the shell and gets SIGTERM itself
+    documentSelector: { path: metadata.name, value: indexer-solana }
+    asserts:
+      - matchRegex: { path: "spec.template.spec.containers[0].args[2]", pattern: '^exec /usr/local/bin/indexer --config /config/local/indexer-solana.toml -v indexer$' }
+  - it: uses the devnet TOMLs off localnet
+    set: { network: devnet, escrow.instanceId: X }
+    documentSelector: { path: metadata.name, value: operator-private-channel }
+    asserts:
+      - matchRegex: { path: "spec.template.spec.containers[0].args[2]", pattern: '--config /config/devnet/operator-private-channel.toml -v operator$' }
+  - it: probes readiness on /health and liveness on the TCP port only
+    documentSelector: { path: metadata.name, value: operator-solana }
+    asserts:
+      - equal: { path: "spec.template.spec.containers[0].readinessProbe.httpGet.path", value: /health }
+      - equal: { path: "spec.template.spec.containers[0].readinessProbe.httpGet.port", value: 9102 }
+      - equal: { path: "spec.template.spec.containers[0].livenessProbe.tcpSocket.port", value: 9102 }
+      - notExists: { path: "spec.template.spec.containers[0].livenessProbe.httpGet" }
+      - exists: { path: "spec.template.spec.containers[0].startupProbe" }
+  - it: pins the digest when one is given
+    set: { image.digest: "sha256:abc" }
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - equal: { path: "spec.template.spec.containers[0].image", value: "ghcr.io/solana-foundation/private-channel-app@sha256:abc" }
+  - it: annotates pods with their secrets-rev
+    set: { secretsRev: { gateway: deadbeef } }
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - equal: { path: "spec.template.metadata.annotations.secrets-rev", value: deadbeef }
+  - it: passes the gateway timeout and read limits through from config
+    set: { config: { gatewayUpstreamTimeoutSecs: 45, gatewayMaxForwardedReads: 100, gatewayWhitelistReadsPerSecond: 5 } }
+    documentSelector: { path: metadata.name, value: gateway }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_UPSTREAM_TIMEOUT_SECS, value: "45" } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_MAX_FORWARDED_READS, value: "100" } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: GATEWAY_WHITELIST_READS_PER_SECOND, value: "5" } }
+  - it: names the container after the compose service
+    documentSelector: { path: metadata.name, value: read-node }
+    asserts:
+      - equal: { path: "spec.template.spec.containers[0].name", value: read-node }
+      - equal: { path: "spec.template.metadata.labels['app.kubernetes.io/name']", value: read-node }
+  - it: turns node metrics on in every env
+    set: { network: devnet, escrow.instanceId: X }
+    documentSelector: { path: metadata.name, value: read-node }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: PRIVATE_CHANNEL_METRICS, value: "true" } }
+  - it: gives operator-solana no operator signer env
+    set: { config.operatorSigner: vault, config.operatorSignerEnv: { OPERATOR_VAULT_ADDR: "https://v" }, config.adminSignerEnv: { ADMIN_VAULT_ADDR: "https://a" }, config.adminSigner: vault }
+    documentSelector: { path: metadata.name, value: operator-solana }
+    asserts:
+      - notContains: { path: "spec.template.spec.containers[0].env", content: { name: OPERATOR_VAULT_ADDR, value: "https://v" } }
+      - notContains: { path: "spec.template.spec.containers[0].env", content: { name: OPERATOR_SIGNER, value: vault } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: ADMIN_VAULT_ADDR, value: "https://a" } }
+  - it: gives the withdraw operator both signer roles
+    set: { config.operatorSigner: vault, config.operatorSignerEnv: { OPERATOR_VAULT_ADDR: "https://v" } }
+    documentSelector: { path: metadata.name, value: operator-private-channel }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: OPERATOR_VAULT_ADDR, value: "https://v" } }
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: OPERATOR_SIGNER, value: vault } }
+  - it: passes the confidential pubkey as plain env
+    set: { escrow.confidentialPubkey: "AAAA=" }
+    documentSelector: { path: metadata.name, value: indexer-solana }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: ESCROW_CONFIDENTIAL_PUBKEY, value: "AAAA=" } }
+  - it: points the operators at the internal gateway Service
+    documentSelector: { path: metadata.name, value: operator-solana }
+    asserts:
+      - contains: { path: "spec.template.spec.containers[0].env", content: { name: COMMON_RPC_URL, value: "http://gateway-internal:8904" } }
+  - it: sets the termination grace period from values
+    set: { apps.write-node.terminationGracePeriodSeconds: 77 }
+    documentSelector: { path: metadata.name, value: write-node }
+    asserts:
+      - equal: { path: spec.template.spec.terminationGracePeriodSeconds, value: 77 }
+  - it: sets memory limits only
+    documentSelector: { path: metadata.name, value: write-node }
+    asserts:
+      - notExists: { path: "spec.template.spec.containers[0].resources.limits.cpu" }
+      - exists: { path: "spec.template.spec.containers[0].resources.limits.memory" }
+  - it: never overrides the with-secrets entrypoint
+    documentSelector: { path: metadata.name, value: indexer-solana }
+    asserts:
+      - notExists: { path: "spec.template.spec.containers[0].command" }
+  - it: shares the process namespace so a binary is never PID 1
+    documentSelector: { path: metadata.name, value: indexer-solana }
+    asserts:
+      - equal: { path: spec.template.spec.shareProcessNamespace, value: true }
+  - it: holds operator-solana until gateway-internal answers (it reads the channel tip there at start)
+    documentSelector: { path: metadata.name, value: operator-solana }
+    asserts:
+      - matchRegex: { path: "spec.template.spec.initContainers[1].env[0].value", pattern: 'started:gateway-internal:8904' }
+  - it: holds operator-private-channel until gateway-internal answers, on devnet too
+    set: { network: devnet, escrow.instanceId: X }
+    documentSelector: { path: metadata.name, value: operator-private-channel }
+    asserts:
+      - matchRegex: { path: "spec.template.spec.initContainers[1].env[0].value", pattern: 'started:gateway-internal:8904' }

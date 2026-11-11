@@ -21,6 +21,37 @@ INDEXER_LAG_MAX="${INDEXER_LAG_MAX:-50}"            # slots
 OPERATOR_BACKLOG_MAX="${OPERATOR_BACKLOG_MAX:-100}" # tx
 GATEWAY_ERROR_RATIO_MAX="${GATEWAY_ERROR_RATIO_MAX:-0.05}"
 PIPELINE_OBSERVE_SECS="${PIPELINE_OBSERVE_SECS:-10}"
+# docker (compose host) or k8s (control node, through kubectl and port-forwards).
+RUNTIME="${RUNTIME:-docker}"
+K8S_NAMESPACE="${K8S_NAMESPACE:-private-channel}"
+# Set by both deploy paths: check 5 counts only requests since this epoch, so a
+# restart's lifetime counters cannot false-alarm, and skips below SANITY_MIN_REQUESTS.
+SANITY_WINDOW_START="${SANITY_WINDOW_START:-}"
+SANITY_MIN_REQUESTS="${SANITY_MIN_REQUESTS:-20}"
+
+# The workload kind each worker runs as on k8s.
+k8s_ref() {
+  case "$1" in
+    indexer-*) echo "statefulset/$1" ;;
+    *) echo "deployment/$1" ;;
+  esac
+}
+svc_present() {
+  if [[ "$RUNTIME" == k8s ]]; then
+    kubectl -n "$K8S_NAMESPACE" get "$(k8s_ref "$1")" >/dev/null 2>&1
+  else
+    docker inspect "private-channel-$1" >/dev/null 2>&1
+  fi
+}
+svc_exec() {
+  local svc="$1"
+  shift
+  if [[ "$RUNTIME" == k8s ]]; then
+    kubectl -n "$K8S_NAMESPACE" exec "$(k8s_ref "$svc")" -c "$svc" -- "$@"
+  else
+    docker exec "private-channel-$svc" "$@"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -90,12 +121,12 @@ probe_http "read-node"  "${READ_URL}/health"
 for svc in indexer-solana indexer-private-channel operator-solana operator-private-channel; do
   # A localnet first boot without an escrow instance does not deploy these three.
   if [[ "${SANITY_WORKERS_EXPECTED:-true}" == false && "$svc" != indexer-private-channel ]] \
-    && ! docker inspect "private-channel-$svc" >/dev/null 2>&1; then
+    && ! svc_present "$svc"; then
     sk "$svc not deployed (no escrow instance yet)"
     continue
   fi
-  port=$(docker exec "private-channel-$svc" sh -c 'echo "${METRICS_PORT:-9100}"' 2>/dev/null || echo 9100)
-  if docker exec "private-channel-$svc" curl -fsS -m 3 "http://localhost:${port}/health" >/dev/null 2>&1; then
+  port=$(svc_exec "$svc" sh -c 'echo "${METRICS_PORT:-9100}"' 2>/dev/null || echo 9100)
+  if svc_exec "$svc" curl -fsS -m 3 "http://localhost:${port}/health" >/dev/null 2>&1; then
     ok "$svc → 200 (in-container :${port}/health)"
   else
     no "$svc → /health not reachable on :${port}"
@@ -103,8 +134,20 @@ for svc in indexer-solana indexer-private-channel operator-solana operator-priva
 done
 
 # Postgres pg_isready
+pg_ready() {
+  if [[ "$RUNTIME" == k8s ]]; then
+    # CNPG primaries: the pod with the primary role in each database's Cluster.
+    local db pod
+    db=$([[ "$1" == postgres-primary ]] && echo ledger || echo indexer)
+    pod=$(kubectl -n "$K8S_NAMESPACE" get pods -l "private-channel.io/db=$db,cnpg.io/instanceRole=primary" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [[ -n "$pod" ]] && kubectl -n "$K8S_NAMESPACE" exec "$pod" -c postgres -- pg_isready -q
+  else
+    docker exec "private-channel-$1" pg_isready -U "$POSTGRES_USER"
+  fi
+}
 for pg in postgres-primary postgres-indexer; do
-  if docker exec "private-channel-$pg" pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; then
+  if pg_ready "$pg" >/dev/null 2>&1; then
     ok "$pg → pg_isready OK"
   else
     no "$pg → pg_isready failed"
@@ -170,12 +213,25 @@ fi
 # ---------------------------------------------------------------------------
 banner 5 "gateway error ratio (< ${GATEWAY_ERROR_RATIO_MAX})"
 
-reqs=$(prom "sum(private_channel_gateway_requests_total)")
 # Refused tokens and whitelist-refused withdrawals are client errors, not gateway
 # faults, and the deploy's own unauthenticated probe makes one on every JWT-on deploy.
-errs=$(prom 'sum(private_channel_gateway_errors_total{error_type!~"auth_rejected|wallet_not_allowed"})')
+err_sel='private_channel_gateway_errors_total{error_type!~"auth_rejected|wallet_not_allowed"}'
+min_reqs=1
+if [[ -n "$SANITY_WINDOW_START" ]]; then
+  window=$(( $(date +%s) - SANITY_WINDOW_START ))
+  # increase() needs about 60 s of scrapes; wait for them, never look back past the start.
+  if (( window < 60 )); then sleep $(( 60 - window )); window=60; fi
+  reqs=$(prom "sum(increase(private_channel_gateway_requests_total[${window}s]))")
+  errs=$(prom "sum(increase(${err_sel}[${window}s]))")
+  min_reqs="$SANITY_MIN_REQUESTS"
+else
+  reqs=$(prom "sum(private_channel_gateway_requests_total)")
+  errs=$(prom "sum(${err_sel})")
+fi
 
-if [ -z "$reqs" ] || [ "${reqs%.*}" = "0" ]; then
+if [[ -n "$SANITY_WINDOW_START" ]] && [ -n "$reqs" ] && lt "$reqs" "$min_reqs"; then
+  sk "only ${reqs} gateway requests since the rollout (< ${min_reqs}); too few to judge"
+elif [ -z "$reqs" ] || [ "${reqs%.*}" = "0" ]; then
   sk "no gateway requests yet (fresh deploy; cannot compute error ratio)"
 elif [ -z "$errs" ] || [ "${errs%.*}" = "0" ]; then
   ok "$reqs requests, 0 errors"

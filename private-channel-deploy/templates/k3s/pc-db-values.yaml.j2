@@ -1,0 +1,32 @@
+# Rendered by Ansible (k3s.yml database phase). No secret: passwords are in the role Secrets.
+{{ {
+  'imageName': k3s_postgres_image,
+  'ledger': {
+    'instances': k3s_ledger_instances | int,
+    'database': postgres_db,
+    'owner': postgres_user,
+    'size': k3s_ledger_storage,
+    'failoverDelay': k3s_failover_delay | int,
+    'synchronous': {'enabled': k3s_sync_replication | bool, 'dataDurability': 'preferred'},
+    'parameters': {
+      'shared_buffers': k3s_pg_shared_buffers, 'synchronous_commit': 'on', 'wal_compression': 'lz4',
+      'max_wal_size': k3s_pg_max_wal_size, 'hot_standby_feedback': 'on',
+    },
+    'nologinRoles': [postgres_user, postgres_replication_user],
+  } | combine(k3s_ledger_overrides | default({})),
+  'indexer': {
+    'database': postgres_indexer_db,
+    'owner': postgres_indexer_user,
+    'size': k3s_indexer_storage,
+    'nologinRoles': [postgres_user],
+  } | combine(k3s_indexer_overrides | default({})),
+  'backup': {
+    'enabled': k3s_backup_enabled | bool,
+    'destinationPath': k3s_backup_destination_path,
+    'endpointURL': k3s_backup_endpoint_url,
+    'encryption': k3s_backup_encryption,
+    'retentionPolicy': k3s_backup_retention,
+    'schedule': k3s_backup_schedule,
+    'endpointCASecret': k3s_backup_endpoint_ca_secret,
+  },
+} | to_nice_yaml(indent=2) }}

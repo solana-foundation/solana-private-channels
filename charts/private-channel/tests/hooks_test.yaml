@@ -1,0 +1,14 @@
+suite: hooks
+templates:
+  - templates/auth-migrate-job.yaml
+tests:
+  - it: runs auth-migrate as a pre-install and pre-upgrade hook
+    asserts:
+      - isKind: { of: Job }
+      - equal: { path: "metadata.annotations['helm.sh/hook']", value: "pre-install,pre-upgrade" }
+      - equal: { path: "metadata.annotations['helm.sh/hook-delete-policy']", value: before-hook-creation }
+      - equal: { path: "spec.template.spec.containers[0].args", value: [ /usr/local/bin/auth-admin, migrate ] }
+  - it: renders no auth-migrate without gateway_enforce_jwt
+    set: { auth.enabled: false }
+    asserts:
+      - hasDocuments: { count: 0 }

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: private-channel
+description: Solana Private Channels app stack (nodes, gateway, auth, indexers, operators, monitoring helpers)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"

@@ -1,0 +1,47 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- /* A cluster network is flat by default; this rebuilds compose's per-network boundary (gateway 8904 above all). */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pc-default-deny
+  labels: { app.kubernetes.io/part-of: private-channel }
+spec:
+  podSelector: {}
+  policyTypes: [ Ingress ]
+{{- range $row := concat $np.allow $np.extraRules }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "pc-allow-%s" $row.name }}
+  labels: { app.kubernetes.io/part-of: private-channel }
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pc.npSelector" $row.to | nindent 6 }}
+  policyTypes: [ Ingress ]
+  ingress:
+    - ports:
+        {{- range $p := $row.ports }}
+        {{- if kindIs "string" $p }}
+        {{- $p = required (printf "networkPolicy port %q is not a key of .Values.ports" $p) (get $.Values.ports $p) }}
+        {{- end }}
+        - { protocol: TCP, port: {{ $p }} }
+        {{- end }}
+      {{- if not (has "public" $row.from) }}
+      from:
+        {{- range $src := $row.from }}
+        {{- if has $src (list "prometheus" "grafana" "cnpg-operator") }}
+        {{- $x := get $np (ternary "cnpgOperator" $src (eq $src "cnpg-operator")) }}
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $x.namespace }} } }
+          podSelector: { matchLabels: {{ toJson $x.podLabels }} }
+        {{- else }}
+        - podSelector:
+            matchLabels:
+              {{- include "pc.npSelector" $src | nindent 14 }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}

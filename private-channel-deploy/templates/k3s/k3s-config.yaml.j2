@@ -1,0 +1,12 @@
+# Rendered by Ansible (k3s bootstrap). A change restarts k3s.
+secrets-encryption: true
+# Nothing uses an Ingress; ServiceLB stays on for the gateway and auth LoadBalancer Services.
+disable:
+  - traefik
+write-kubeconfig-mode: "0600"
+kubelet-arg:
+  - container-log-max-size=100Mi
+  - container-log-max-files=5
+{% for k, v in (k3s_extra_config | default({})).items() %}
+{{ {k: v} | to_nice_yaml }}
+{%- endfor %}

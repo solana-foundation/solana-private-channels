@@ -1,0 +1,106 @@
+{{- if and .Values.validator.enabled (eq .Values.network "localnet") }}
+{{- $v := .Values.validator }}
+# Localnet only. No seccompProfile on purpose: k3s keeps the kubelet's seccomp-default
+# off, so this pod runs unconfined (io_uring) while baseline only forbids an explicit Unconfined.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: validator
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "validator") | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: validator
+  selector: { matchLabels: { app.kubernetes.io/name: validator } }
+  template:
+    metadata:
+      labels:
+        {{- include "pc.labels" (dict "root" . "name" "validator") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "pc.pullSecrets" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: validator
+          image: {{ required "validator.image is required on localnet" $v.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: RUST_LOG, value: info }
+            - { name: ESCROW_PROGRAM_ID, value: {{ $v.escrowProgramId }} }
+            - { name: WITHDRAW_PROGRAM_ID, value: {{ $v.withdrawProgramId }} }
+          args:
+            - solana-test-validator
+            {{- if $v.resetFlag }}
+            - {{ $v.resetFlag }}
+            {{- end }}
+            - --limit-ledger-size
+            - "1000000"
+            - --bpf-program
+            - {{ $v.escrowProgramId }}
+            - /programs/private_channel_escrow_program.so
+            - --bpf-program
+            - {{ $v.withdrawProgramId }}
+            - /programs/private_channel_withdraw_program.so
+            - --clone-upgradeable-program
+            - TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+            - --clone-upgradeable-program
+            - TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+            - --clone
+            - ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+            - --url
+            - https://api.mainnet-beta.solana.com
+            - --geyser-plugin-config
+            - /config/yellowstone-config.json
+          ports:
+            - { name: rpc, containerPort: 8899 }
+            - { name: ws, containerPort: 8900 }
+            - { name: grpc, containerPort: 10000 }
+            - { name: faucet, containerPort: 8999 }
+          startupProbe:
+            exec: { command: [ solana, -u, "http://127.0.0.1:8899", cluster-version ] }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            exec: { command: [ solana, -u, "http://127.0.0.1:8899", cluster-version ] }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 8899 }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /validator-data }
+            - { name: programs, mountPath: /programs, readOnly: true }
+            - { name: yellowstone, mountPath: /config, readOnly: true }
+      volumes:
+        - name: programs
+          configMap: { name: {{ $v.programsConfigMap }} }
+        - name: yellowstone
+          configMap: { name: {{ $v.yellowstoneConfigMap }} }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ ReadWriteOnce ]
+        storageClassName: {{ .Values.infra.storageClass }}
+        resources: { requests: { storage: {{ $v.storage }} } }
+{{- range $svc := list "validator" "validator-fallback" }}
+---
+# Two Services on one selector: the workers' short names validator and validator-fallback.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  labels:
+    {{- include "pc.labels" (dict "root" $ "name" "validator") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: validator }
+  ports:
+    - { name: rpc, port: 8899, targetPort: 8899 }
+    - { name: ws, port: 8900, targetPort: 8900 }
+    - { name: grpc, port: 10000, targetPort: 10000 }
+    - { name: faucet, port: 8999, targetPort: 8999 }
+{{- end }}
+{{- end }}

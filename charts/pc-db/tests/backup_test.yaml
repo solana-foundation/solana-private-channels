@@ -1,0 +1,33 @@
+suite: backups
+templates:
+  - templates/backups.yaml
+set: { backup.enabled: true, backup.destinationPath: "s3://bucket/pc", backup.endpointURL: "https://r2.example" }
+tests:
+  - it: renders one ObjectStore and one six-field ScheduledBackup per Cluster
+    asserts:
+      - hasDocuments: { count: 4 }
+  - it: points the ledger store at its own path with 7d retention
+    documentSelector: { path: metadata.name, value: pc-ledger-store }
+    asserts:
+      - isKind: { of: ObjectStore }
+      - equal: { path: spec.configuration.destinationPath, value: "s3://bucket/pc" }
+      - equal: { path: spec.configuration.endpointURL, value: "https://r2.example" }
+      - equal: { path: spec.retentionPolicy, value: 7d }
+      - notExists: { path: spec.configuration.data.encryption }
+  - it: sets SSE only when asked (AWS)
+    set: { backup.encryption: AES256 }
+    documentSelector: { path: metadata.name, value: pc-ledger-store }
+    asserts:
+      - equal: { path: spec.configuration.data.encryption, value: AES256 }
+      - equal: { path: spec.configuration.wal.encryption, value: AES256 }
+  - it: schedules plugin backups every 6h
+    documentSelector: { path: metadata.name, value: pc-ledger-every-6h }
+    asserts:
+      - isKind: { of: ScheduledBackup }
+      - equal: { path: spec.schedule, value: "0 0 */6 * * *" }
+      - equal: { path: spec.method, value: plugin }
+      - equal: { path: spec.pluginConfiguration.name, value: barman-cloud.cloudnative-pg.io }
+  - it: renders nothing with backups off
+    set: { backup.enabled: false }
+    asserts:
+      - hasDocuments: { count: 0 }

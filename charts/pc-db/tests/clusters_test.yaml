@@ -1,0 +1,87 @@
+suite: CNPG clusters
+templates:
+  - templates/clusters.yaml
+tests:
+  - it: creates the compose database and owner on pc-ledger
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - isKind: { of: Cluster }
+      - equal: { path: spec.instances, value: 2 }
+      - equal: { path: spec.bootstrap.initdb.database, value: private_channel }
+      - equal: { path: spec.bootstrap.initdb.owner, value: private_channel }
+  - it: replicates synchronously with preferred durability and a failover delay
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - equal: { path: spec.postgresql.synchronous.method, value: any }
+      - equal: { path: spec.postgresql.synchronous.number, value: 1 }
+      - equal: { path: spec.postgresql.synchronous.dataDurability, value: preferred }
+      - equal: { path: spec.failoverDelay, value: 60 }
+      - equal: { path: spec.postgresql.parameters.shared_buffers, value: 4GB }
+  - it: gives pc-indexer none of the ledger tuning flags
+    documentSelector: { path: metadata.name, value: pc-indexer }
+    asserts:
+      - notExists: { path: spec.postgresql.parameters.shared_buffers }
+      - notExists: { path: spec.postgresql.synchronous }
+      - equal: { path: spec.bootstrap.initdb.owner, value: private_channel_indexer }
+  - it: keeps the compose DNS names through managed services
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - contains: { path: spec.managed.services.additional, content: { selectorType: rw, serviceTemplate: { metadata: { name: postgres-primary } } } }
+      - contains: { path: spec.managed.services.additional, content: { selectorType: ro, serviceTemplate: { metadata: { name: postgres-replica } } } }
+  - it: names postgres-indexer on pc-indexer
+    documentSelector: { path: metadata.name, value: pc-indexer }
+    asserts:
+      - contains: { path: spec.managed.services.additional, content: { selectorType: rw, serviceTemplate: { metadata: { name: postgres-indexer } } } }
+  - it: declares every login with a reloadable password Secret
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - contains: { path: spec.managed.roles, content: { name: private_channel_runtime, ensure: present, login: true, superuser: false, inherit: true, passwordSecret: { name: pc-db-role-private-channel-runtime } } }
+      - contains: { path: spec.managed.roles, content: { name: replicator, ensure: present, login: false } }
+      - contains: { path: spec.managed.roles, content: { name: private_channel, ensure: present, login: false } }
+  - it: keeps the indexer login a superuser
+    documentSelector: { path: metadata.name, value: pc-indexer }
+    asserts:
+      - contains: { path: spec.managed.roles, content: { name: private_channel_indexer, ensure: present, login: true, superuser: true, inherit: true, passwordSecret: { name: pc-db-role-private-channel-indexer } } }
+  - it: never lets helm delete a Cluster and labels instance pods for NetworkPolicy
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - equal: { path: "metadata.annotations['helm.sh/resource-policy']", value: keep }
+      - equal: { path: "spec.inheritedMetadata.labels['private-channel.io/db']", value: ledger }
+      - equal: { path: spec.enableSuperuserAccess, value: true }
+      - equal: { path: spec.superuserSecret.name, value: pc-db-superuser-ledger }
+  - it: drops the role Services on a recovery Cluster that waits for the old one
+    set: { ledger.services: false }
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - notExists: { path: spec.managed.services }
+  - it: recovers from the object store to a target time
+    set: { backup.enabled: true, backup.destinationPath: "s3://b/p", ledger.name: pc-ledger-r1, ledger.recovery: { serverName: pc-ledger-20260101t000000, targetTime: "2026-11-09T10:00:00Z" } }
+    documentSelector: { path: metadata.name, value: pc-ledger-r1 }
+    asserts:
+      - notExists: { path: spec.bootstrap.initdb }
+      - equal: { path: spec.bootstrap.recovery.source, value: origin }
+      - equal: { path: spec.bootstrap.recovery.recoveryTarget.targetTime, value: "2026-11-09T10:00:00Z" }
+      - contains: { path: spec.externalClusters, content: { name: origin, plugin: { name: barman-cloud.cloudnative-pg.io, parameters: { barmanObjectName: pc-ledger-store, serverName: pc-ledger-20260101t000000 } } } }
+  - it: archives WAL through the barman plugin when backups are on
+    set: { backup.enabled: true, backup.destinationPath: "s3://b/p" }
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - equal: { path: "spec.plugins[0].name", value: barman-cloud.cloudnative-pg.io }
+      - equal: { path: "spec.plugins[0].isWALArchiver", value: true }
+      - matchRegex: { path: "spec.plugins[0].parameters.serverName", pattern: '^pc-ledger-[0-9]{8}t[0-9]{6}$' }
+  - it: reuses the serverName of the live Cluster
+    set: { backup.enabled: true, backup.destinationPath: "s3://b/p" }
+    kubernetesProvider:
+      scheme:
+        "postgresql.cnpg.io/v1/Cluster": { gvr: { group: postgresql.cnpg.io, version: v1, resource: clusters }, namespaced: true }
+      objects:
+        - apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata: { name: pc-ledger, namespace: NAMESPACE }
+          spec:
+            plugins:
+              - { name: barman-cloud.cloudnative-pg.io, isWALArchiver: true, parameters: { barmanObjectName: pc-ledger-store, serverName: pc-ledger-20250101t000000 } }
+    release: { namespace: NAMESPACE }
+    documentSelector: { path: metadata.name, value: pc-ledger }
+    asserts:
+      - equal: { path: "spec.plugins[0].parameters.serverName", value: pc-ledger-20250101t000000 }

@@ -1,0 +1,76 @@
+{{- $root := . -}}
+{{- $apps := include "pc.apps" . | fromYaml -}}
+{{- $pub := .Values.infra.publicService -}}
+{{- /* Only gateway 8899 and auth 8903 are public; ServiceLB would publish every port of a LoadBalancer Service, so internal ports live on ClusterIP Services. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "gateway") | nindent 4 }}
+  {{- with $pub.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $pub.type }}
+  {{- if ne $pub.type "ClusterIP" }}
+  externalTrafficPolicy: {{ $pub.externalTrafficPolicy }}
+  {{- end }}
+  selector: { app.kubernetes.io/name: gateway }
+  ports:
+    - { name: http, port: {{ .Values.ports.gateway }}, targetPort: {{ .Values.ports.gateway }} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-internal
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: gateway }
+  ports:
+    - { name: internal, port: {{ .Values.ports.gatewayInternal }}, targetPort: {{ .Values.ports.gatewayInternal }} }
+    - { name: metrics, port: {{ .Values.ports.gatewayMetrics }}, targetPort: {{ .Values.ports.gatewayMetrics }} }
+{{- if .Values.auth.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+  labels:
+    {{- include "pc.labels" (dict "root" . "name" "auth") | nindent 4 }}
+  {{- with $pub.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $pub.type }}
+  {{- if ne $pub.type "ClusterIP" }}
+  externalTrafficPolicy: {{ $pub.externalTrafficPolicy }}
+  {{- end }}
+  selector: { app.kubernetes.io/name: auth }
+  ports:
+    - { name: http, port: {{ .Values.ports.auth }}, targetPort: {{ .Values.ports.auth }} }
+{{- end }}
+{{- range $name := list "write-node" "read-node" "streamer" "indexer-solana" "indexer-private-channel" "operator-solana" "operator-private-channel" }}
+{{- $a := get $apps $name }}
+{{- if include "pc.enabled" (dict "root" $root "gate" ($a.gate | default "")) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pc.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: {{ $name }} }
+  ports:
+    - { name: http, port: {{ $a.port }}, targetPort: {{ $a.port }} }
+    {{- range $pn, $pp := $a.extraPorts }}
+    - { name: {{ $pn }}, port: {{ $pp }}, targetPort: {{ $pp }} }
+    {{- end }}
+{{- end }}
+{{- end }}

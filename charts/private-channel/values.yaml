@@ -1,0 +1,181 @@
+# Defaults mirror private-channel-deploy/vars/common.yml. Ansible renders
+# values.generated.yaml per env on top of this file; it never holds a secret.
+
+# localnet, devnet or mainnet. devnet and mainnet share the devnet compose shape.
+network: localnet
+
+image:
+  registry: ghcr.io/solana-foundation
+  repository: private-channel-app
+  tag: latest
+  # When set, pods run image@digest (the cosign-verified one) instead of the tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Pull secret for our GHCR images only; Docker Hub images pull without it. "" disables.
+imagePullSecret: pc-ghcr
+
+# Off on a localnet first boot with no escrow instance.
+workers:
+  enabled: true
+
+# gateway_enforce_jwt: renders auth and auth-migrate and sets GATEWAY_REQUIRE_JWT.
+auth:
+  enabled: true
+  corsAllowedOrigin: "*"
+
+# Localnet only and off by default, as in the compose deploy.
+streamer:
+  enabled: false
+
+escrow:
+  instanceId: ""
+  confidentialPubkey: ""
+
+# Plain (non-secret) settings shared by several workloads.
+config:
+  adminKeys: ""
+  permanentDelegate: ""
+  complianceOwner: ""
+  yellowstoneEndpoint: ""
+  gatewayWhitelistInstance: ""
+  gatewayUpstreamTimeoutSecs: 30
+  gatewayMaxForwardedReads: 768
+  gatewayWhitelistReadsPerSecond: 20
+  adminSigner: memory
+  operatorSigner: memory
+  # Non-secret signer env per role, e.g. ADMIN_VAULT_ADDR. Secret parts are Secret keys.
+  adminSignerEnv: {}
+  operatorSignerEnv: {}
+
+ports:
+  gateway: 8899
+  gatewayInternal: 8904
+  gatewayMetrics: 9101
+  write: 8900
+  read: 8901
+  streamer: 8902
+  auth: 8903
+  nodeMetrics: 9090
+
+# Key names (never values) of each pc-<service> Secret, from secret_files. Every key
+# becomes KEY_FILE=/run/secrets/KEY on that service only.
+secretKeys: {}
+# Per-service hash of the restart-relevant secret values; a change rolls that workload.
+secretsRev: {}
+
+# Worker TOMLs; Ansible creates this ConfigMap from the files compose mounts.
+workerConfigMap: pc-worker-config
+
+# Each workload's initContainer waits for exactly its compose depends_on.
+# healthy: GET /health 200. started: the Service answers. postgres: pg_isready.
+# Beyond compose: both operators also wait for gateway-internal, which they read at start.
+waits:
+  localnet:
+    write-node: { postgres: [ postgres-primary ] }
+    read-node: { postgres: [ postgres-replica ], healthy: [ write-node ] }
+    gateway: { started: [ write-node, read-node ] }
+    auth-migrate: { postgres: [ postgres-primary ] }
+    auth: { postgres: [ postgres-primary ] }
+    streamer: { postgres: [ postgres-replica, postgres-indexer ], healthy: [ write-node ] }
+    indexer-solana: { postgres: [ postgres-indexer ], healthy: [ validator ] }
+    indexer-private-channel: { postgres: [ postgres-indexer ], started: [ gateway ] }
+    operator-solana: { postgres: [ postgres-indexer ], healthy: [ write-node ], started: [ gateway-internal ] }
+    operator-private-channel: { postgres: [ postgres-indexer ], started: [ gateway-internal ] }
+  devnet:
+    write-node: { postgres: [ postgres-primary ] }
+    read-node: { postgres: [ postgres-replica ], started: [ write-node ] }
+    gateway: { started: [ write-node, read-node ] }
+    auth-migrate: { postgres: [ postgres-primary ] }
+    auth: { postgres: [ postgres-primary ] }
+    indexer-solana: { postgres: [ postgres-indexer ] }
+    indexer-private-channel: { postgres: [ postgres-indexer ], started: [ read-node ] }
+    operator-solana: { postgres: [ postgres-indexer ], started: [ gateway-internal ] }
+    operator-private-channel: { postgres: [ postgres-indexer ], healthy: [ write-node ], started: [ gateway-internal ] }
+
+# Image with pg_isready for the postgres waits (the CNPG operand image, public).
+waitImages:
+  postgres: ghcr.io/cloudnative-pg/postgresql:16.10
+
+# Per-workload knobs. Single writers are pinned to one copy by the schema.
+apps:
+  write-node: { replicas: 1, terminationGracePeriodSeconds: 60, resources: { requests: { cpu: 500m, memory: 1Gi }, limits: { memory: 8Gi } } }
+  read-node: { replicas: 1, terminationGracePeriodSeconds: 30, resources: { requests: { cpu: 250m, memory: 512Mi }, limits: { memory: 4Gi } } }
+  gateway: { replicas: 1, terminationGracePeriodSeconds: 30, resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 2Gi } } }
+  auth: { replicas: 1, terminationGracePeriodSeconds: 30, resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 1Gi } } }
+  auth-migrate: { resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 512Mi } } }
+  streamer: { replicas: 1, terminationGracePeriodSeconds: 30, resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 1Gi } } }
+  indexer-solana: { replicas: 1, terminationGracePeriodSeconds: 60, resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 2Gi } } }
+  indexer-private-channel: { replicas: 1, terminationGracePeriodSeconds: 60, resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 2Gi } } }
+  operator-solana: { replicas: 1, terminationGracePeriodSeconds: 60, resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 1Gi } } }
+  operator-private-channel: { replicas: 1, terminationGracePeriodSeconds: 60, resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 1Gi } } }
+
+# Startup budget (period x failures) for slow boots: write-node cache load, indexer backfill.
+probes:
+  startupPeriodSeconds: 10
+  startupFailureThreshold: 60
+  readinessPeriodSeconds: 10
+  livenessPeriodSeconds: 20
+  livenessFailureThreshold: 6
+
+# Monitoring helpers that live next to the app (compose parity).
+blackbox:
+  image: prom/blackbox-exporter:v0.25.0
+postgresExporter:
+  image: prometheuscommunity/postgres-exporter:v0.16.0
+  primary: { user: private_channel_monitoring, database: private_channel, host: postgres-primary }
+  indexer: { user: private_channel_indexer, database: indexer, host: postgres-indexer }
+
+# Localnet validator (StatefulSet in this namespace, so workers keep the short names).
+validator:
+  enabled: false
+  image: ""
+  resetFlag: "--reset"
+  storage: 20Gi
+  escrowProgramId: 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
+  withdrawProgramId: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
+  programsConfigMap: pc-programs
+  yellowstoneConfigMap: pc-yellowstone-config
+  resources: { requests: { cpu: "1", memory: 2Gi }, limits: { memory: 8Gi } }
+
+# Infra-specific settings: the only block a managed cluster changes.
+infra:
+  storageClass: pc-retain
+  publicService:
+    type: LoadBalancer
+    externalTrafficPolicy: Local
+    annotations: {}
+
+networkPolicy:
+  enabled: true
+  # Cross-namespace sources are matched by namespace AND pod labels, never namespace alone.
+  prometheus: { namespace: pc-monitoring, podLabels: { app.kubernetes.io/name: prometheus } }
+  grafana: { namespace: pc-monitoring, podLabels: { app.kubernetes.io/name: grafana } }
+  cnpgOperator: { namespace: cnpg-system, podLabels: { app.kubernetes.io/name: cloudnative-pg } }
+  # The allow list: one NetworkPolicy per row, on top of a default deny.
+  # ports: a number or a key of .Values.ports, so a custom port moves its rule too.
+  # to/from: an app name, db:<ledger|indexer>[:primary|replica], public, prometheus, grafana or cnpg-operator.
+  allow:
+    - { name: gateway-public, to: gateway, ports: [ gateway ], from: [ public ] }
+    - { name: auth-public, to: auth, ports: [ auth ], from: [ public ] }
+    - { name: gateway-internal, to: gateway, ports: [ gatewayInternal ], from: [ operator-solana, operator-private-channel ] }
+    - { name: gateway-metrics, to: gateway, ports: [ gatewayMetrics ], from: [ prometheus ] }
+    - { name: write-node, to: write-node, ports: [ write ], from: [ gateway, read-node, operator-solana, operator-private-channel, streamer, blackbox-exporter ] }
+    - { name: read-node, to: read-node, ports: [ read ], from: [ gateway, indexer-solana, indexer-private-channel, blackbox-exporter ] }
+    - { name: write-node-metrics, to: write-node, ports: [ nodeMetrics ], from: [ prometheus ] }
+    - { name: read-node-metrics, to: read-node, ports: [ nodeMetrics ], from: [ prometheus ] }
+    - { name: indexer-solana, to: indexer-solana, ports: [ 9100 ], from: [ prometheus, blackbox-exporter ] }
+    - { name: indexer-private-channel, to: indexer-private-channel, ports: [ 9100 ], from: [ prometheus, blackbox-exporter ] }
+    - { name: operator-solana, to: operator-solana, ports: [ 9102 ], from: [ prometheus, blackbox-exporter ] }
+    - { name: operator-private-channel, to: operator-private-channel, ports: [ 9103 ], from: [ prometheus, blackbox-exporter ] }
+    - { name: postgres-primary, to: "db:ledger:primary", ports: [ 5432 ], from: [ write-node, gateway, auth, auth-migrate, pc-db-grants, postgres-exporter-primary, pc-truncate ] }
+    - { name: postgres-replica, to: "db:ledger:replica", ports: [ 5432 ], from: [ read-node, streamer ] }
+    - { name: postgres-indexer, to: "db:indexer", ports: [ 5432 ], from: [ indexer-solana, indexer-private-channel, operator-solana, operator-private-channel, streamer, pc-db-grants, postgres-exporter-indexer, grafana, pc-truncate ] }
+    - { name: pc-ledger-instances, to: "db:ledger", ports: [ 8000, 5432 ], from: [ cnpg-operator, "db:ledger" ] }
+    - { name: pc-indexer-instances, to: "db:indexer", ports: [ 8000, 5432 ], from: [ cnpg-operator, "db:indexer" ] }
+    - { name: validator, to: validator, ports: [ 8899, 8900, 10000, 8999 ], from: [ indexer-solana, operator-solana, operator-private-channel, streamer, gateway ] }
+    - { name: postgres-exporter-primary, to: postgres-exporter-primary, ports: [ 9187 ], from: [ prometheus ] }
+    - { name: postgres-exporter-indexer, to: postgres-exporter-indexer, ports: [ 9187 ], from: [ prometheus ] }
+    - { name: blackbox-exporter, to: blackbox-exporter, ports: [ 9115 ], from: [ prometheus ] }
+  # Extra rows for e2e only (test receivers, bench, truncate); empty in every real env.
+  extraRules: []

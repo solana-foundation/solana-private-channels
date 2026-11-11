@@ -1,0 +1,193 @@
+---
+# k3s preflight: control-node tooling and host checks that need no cluster access.
+# Runs before connect, so every refusal here leaves the host and the cluster untouched.
+
+# ---- Control node: Ansible and its Kubernetes collection ----
+- name: Assert ansible >= 2.16 on control node
+  tags: [ k3s_tools ]
+  ansible.builtin.assert:
+    that: ansible_version.full is version('2.16', '>=')
+    fail_msg: "Ansible {{ ansible_version.full }} < 2.16 on the control node. Fix: pip install -U 'ansible-core>=2.16'"
+  delegate_to: localhost
+  run_once: true
+
+- name: Probe the kubernetes.core collection and its Python client
+  tags: [ k3s_pylib ]
+  ansible.builtin.command:
+    argv: [ "{{ ansible_playbook_python }}", -c, "import kubernetes; print(kubernetes.__version__)" ]
+  register: _k3s_pyk8s
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the Python kubernetes client is importable
+  tags: [ k3s_pylib ]
+  ansible.builtin.assert:
+    that: _k3s_pyk8s.rc == 0
+    fail_msg: |
+      The Python `kubernetes` package is missing for {{ ansible_playbook_python }}. kubernetes.core needs it.
+      Fix: {{ ansible_playbook_python }} -m pip install kubernetes  (and: ansible-galaxy collection install kubernetes.core)
+  delegate_to: localhost
+  run_once: true
+
+- name: Probe the kubernetes.core collection
+  tags: [ k3s_tools ]
+  ansible.builtin.command: ansible-galaxy collection list kubernetes.core
+  register: _k3s_coll
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert the kubernetes.core collection is installed
+  tags: [ k3s_tools ]
+  ansible.builtin.assert:
+    that: _k3s_coll.rc == 0 and 'kubernetes.core' in _k3s_coll.stdout
+    fail_msg: "Ansible collection kubernetes.core is missing. Fix: ansible-galaxy collection install kubernetes.core"
+  delegate_to: localhost
+  run_once: true
+
+# ---- Control node: helm, kubectl and crane at the pinned versions ----
+- name: Read the helm, kubectl and crane versions
+  tags: [ k3s_tools ]
+  ansible.builtin.shell: |
+    set -o pipefail
+    case "{{ item }}" in
+      helm) helm version --template '{{ "{{" }} .Version {{ "}}" }}' ;;
+      kubectl) kubectl version --client -o json | python3 -c 'import json,sys; print(json.load(sys.stdin)["clientVersion"]["gitVersion"])' ;;
+      crane) crane version ;;
+    esac
+  args:
+    executable: /bin/bash
+  register: _k3s_tools
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop: [ helm, kubectl, crane ]
+  delegate_to: localhost
+  run_once: true
+
+- name: Assert each tool is present at its pinned version
+  tags: [ k3s_tools ]
+  vars:
+    _want: { helm: "{{ k3s_helm_version }}", kubectl: "{{ k3s_kubectl_version }}", crane: "{{ k3s_crane_version }}" }
+  ansible.builtin.assert:
+    that:
+    - item.rc == 0
+    - (item.stdout | trim | regex_replace('^v', '')) == (_want[item.item] | regex_replace('^v', ''))
+    fail_msg: >-
+      {{ item.item }} {{ 'is missing' if item.rc != 0 else 'is ' ~ (item.stdout | trim) }} on the control node; the
+      deploy is pinned to {{ _want[item.item] }} (versions.env). Install that exact version and put it on PATH.
+  loop: "{{ _k3s_tools.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: Lint both charts
+  tags: [ k3s_tools ]
+  ansible.builtin.command:
+    argv: [ helm, lint, "{{ repo_root }}/charts/{{ item }}" ]
+  changed_when: false
+  check_mode: false
+  loop: [ pc-db, private-channel ]
+  delegate_to: localhost
+  run_once: true
+
+# ---- Destructive switches: refused before anything connects ----
+# Each guard also carries its action's tags, so `--tags <action>` alone still runs it.
+- name: Refuse reset_state off localnet
+  tags: [ k3s_host, reset_state ]
+  ansible.builtin.assert:
+    that: network == 'localnet' or not (reset_state | default(false) | bool)
+    fail_msg: >-
+      reset_state=true is refused for network={{ network }}: on k3s it deletes the ledger and
+      indexer Clusters with their volumes. It exists only to keep a localnet validator and
+      its indexer in lockstep.
+
+- name: Refuse reset_state on a host not marked as an e2e host when asked to require it
+  tags: [ k3s_host, reset_state ]
+  when:
+  - reset_state | default(false) | bool
+  - k3s_reset_requires_e2e_host | default(false) | bool
+  ansible.builtin.assert:
+    that: e2e_host | default(false) | bool
+    fail_msg: "reset_state on {{ inventory_hostname }} needs e2e_host=true in the inventory."
+
+- name: Refuse a token lifetime above the cap
+  tags: [ k3s_host, connect, render, secrets, database, deploy, health, monitoring, sanity, report ]
+  ansible.builtin.assert:
+    that:
+    - k3s_token_duration is match('^[0-9]+[hm]$')
+    - (k3s_token_duration[:-1] | int) * (60 if k3s_token_duration[-1] == 'h' else 1) <= (k3s_token_duration_max_hours | int) * 60
+    fail_msg: "k3s_token_duration={{ k3s_token_duration }} must look like 1h or 90m and be at most {{ k3s_token_duration_max_hours }}h."
+
+# ---- Backups ----
+- name: Assert the backup destination and credentials when backups are on
+  tags: [ k3s_host ]
+  when: k3s_backup_enabled | bool
+  ansible.builtin.assert:
+    that:
+    - k3s_backup_destination_path is match('^s3://[^/]+')
+    - backup_s3_access_key_id | default('') | length > 0
+    - backup_s3_secret_access_key | default('') | length > 0
+    fail_msg: >-
+      k3s_backup_enabled needs k3s_backup_destination_path (s3://bucket/path) plus
+      backup_s3_access_key_id and backup_s3_secret_access_key in secrets.yml or Doppler
+      (BACKUP_S3_ACCESS_KEY_ID, BACKUP_S3_SECRET_ACCESS_KEY).
+    quiet: true
+
+# ---- Target host: k3s version, disk and io_uring (probed, then asserted) ----
+# _k3s_host_override is a test hook for the contract tests; a real run probes the host.
+- name: Probe the target host
+  tags: [ k3s_host, bootstrap ]
+  when: _k3s_host_override is not defined
+  become: true
+  ansible.builtin.shell: |
+    set -o pipefail
+    set -u
+    v=$( (k3s --version 2>/dev/null || true) | awk 'NR==1 {print $3}')
+    d=/var/lib/rancher; [ -d "$d" ] || d=/var/lib
+    free=$(df -Pk "$d" | awk 'NR==2 {print int($4/1048576)}')
+    iou=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
+    printf '{"k3s_version": "%s", "free_gb": %s, "io_uring_disabled": %s, "kernel": "%s"}\n' "$v" "$free" "$iou" "$(uname -r)"
+  args:
+    executable: /bin/bash
+  register: _k3s_probe
+  changed_when: false
+  check_mode: false
+
+- name: Record the host facts
+  tags: [ k3s_host, bootstrap ]
+  ansible.builtin.set_fact:
+    _k3s_host: "{{ _k3s_host_override if _k3s_host_override is defined else (_k3s_probe.stdout | from_json) }}"
+
+- name: Refuse a k3s newer than the pinned version (no downgrades)
+  tags: [ k3s_host, bootstrap ]
+  when: _k3s_host.k3s_version | length > 0
+  ansible.builtin.assert:
+    # v1.35.9+k3s2 compares as 1.35.9.2, so a +k3sN step back counts as a downgrade.
+    that: (_k3s_host.k3s_version | regex_replace('^v', '') | regex_replace('\\+k3s', '.')) is version(k3s_version | regex_replace('^v', '') | regex_replace('\\+k3s', '.'), '<=')
+    fail_msg: >-
+      The host runs k3s {{ _k3s_host.k3s_version }}, newer than the pinned {{ k3s_version }}.
+      k3s does not support downgrades. Fix: bump K3S_VERSION in versions.env instead.
+
+- name: Refuse a host with too little free disk under /var/lib/rancher
+  tags: [ k3s_host ]
+  ansible.builtin.assert:
+    that: _k3s_host.free_gb | int >= k3s_min_free_gb | int
+    fail_msg: >-
+      Only {{ _k3s_host.free_gb }} GB free under /var/lib/rancher on {{ inventory_hostname }};
+      k3s images, Postgres and Prometheus need at least {{ k3s_min_free_gb }} GB.
+
+- name: Refuse a localnet host where io_uring is disabled (the validator needs it)
+  tags: [ k3s_host ]
+  when: network == 'localnet'
+  ansible.builtin.assert:
+    that: _k3s_host.io_uring_disabled | int == 0
+    fail_msg: >-
+      kernel.io_uring_disabled={{ _k3s_host.io_uring_disabled }} on {{ inventory_hostname }}. The localnet
+      validator needs io_uring. Fix: sysctl -w kernel.io_uring_disabled=0 (and persist it).

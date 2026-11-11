@@ -1,0 +1,26 @@
+suite: networkpolicies
+templates:
+  - templates/networkpolicies.yaml
+tests:
+  - it: takes allow-list ports from .Values.ports
+    set: { ports.write: 18900, ports.gateway: 18899 }
+    asserts:
+      - contains:
+          path: spec.ingress[0].ports
+          content: { protocol: TCP, port: 18900 }
+        documentSelector: { path: metadata.name, value: pc-allow-write-node }
+      - contains:
+          path: spec.ingress[0].ports
+          content: { protocol: TCP, port: 18899 }
+        documentSelector: { path: metadata.name, value: pc-allow-gateway-public }
+  - it: keeps numeric ports as they are
+    asserts:
+      - contains:
+          path: spec.ingress[0].ports
+          content: { protocol: TCP, port: 5432 }
+        documentSelector: { path: metadata.name, value: pc-allow-postgres-primary }
+  - it: fails on a port name that is not a key of .Values.ports
+    set:
+      networkPolicy.extraRules: [ { name: bad, to: gateway, ports: [ nope ], from: [ public ] } ]
+    asserts:
+      - failedTemplate: { errorPattern: 'networkPolicy port "nope" is not a key of .Values.ports' }

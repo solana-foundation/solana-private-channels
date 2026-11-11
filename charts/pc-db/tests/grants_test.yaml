@@ -1,0 +1,15 @@
+suite: grants hook
+templates:
+  - templates/grants-job.yaml
+tests:
+  - it: is a post-install and post-upgrade hook recreated on every deploy
+    documentSelector: { path: kind, value: Job }
+    asserts:
+      - isKind: { of: Job }
+      - equal: { path: "metadata.annotations['helm.sh/hook']", value: "post-install,post-upgrade" }
+      - equal: { path: "metadata.annotations['helm.sh/hook-delete-policy']", value: before-hook-creation }
+  - it: runs as the grants pod label the NetworkPolicy admits, without a service account token
+    documentSelector: { path: kind, value: Job }
+    asserts:
+      - equal: { path: "spec.template.metadata.labels['app.kubernetes.io/name']", value: pc-db-grants }
+      - equal: { path: spec.template.spec.automountServiceAccountToken, value: false }

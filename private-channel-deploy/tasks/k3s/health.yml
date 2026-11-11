@@ -1,0 +1,203 @@
+---
+# Health: the compose health checks, from the control node through port-forwards and
+# exec, plus the k3s-only proofs (published ports, NetworkPolicy enforcement).
+- name: Probe /health through port-forwards
+  delegate_to: localhost
+  run_once: true
+  block:
+  - name: Forward gateway, write-node and read-node
+    ansible.builtin.shell: |
+      set -e
+      for spec in gateway:{{ gateway_port }} write-node:{{ write_port }} read-node:{{ read_port }}; do
+        svc=${spec%%:*}; port=${spec#*:}
+        local=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+        "{{ playbook_dir }}/scripts/k3s-port-forward.sh" start {{ k3s_namespace }} "svc/$svc" "$local:$port" "{{ pc_tmp }}/pf-$svc.pid"
+        echo "$svc $local"
+      done
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    register: _k3s_pf
+    changed_when: false
+
+  - name: GET /health on each
+    ansible.builtin.uri:
+      url: "http://127.0.0.1:{{ item.split()[1] }}/health"
+      status_code: [ 200 ]
+      timeout: 5
+    register: _k3s_health
+    until: _k3s_health.status == 200
+    retries: "{{ health_retries }}"
+    delay: "{{ health_delay }}"
+    loop: "{{ _k3s_pf.stdout_lines }}"
+    loop_control:
+      label: "{{ item.split()[0] }}"
+  always:
+  - name: Stop the health port-forwards
+    ansible.builtin.shell: |
+      for s in gateway write-node read-node; do "{{ playbook_dir }}/scripts/k3s-port-forward.sh" stop "{{ pc_tmp }}/pf-$s.pid"; done
+    changed_when: false
+
+# Same pair as compose: the internal port serves a gated read with no JWT, and the public
+# port refuses it without a token. getBlock is operator-only, the strictest gate.
+- name: Gated reads succeed on the gateway internal port and the read-node
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.command:
+    argv: [ kubectl, -n, "{{ k3s_namespace }}", exec, deploy/gateway, -c, gateway, --,
+            curl, -sS, -o, /dev/null, -w, "%{http_code}", -X, POST, "{{ item.url }}",
+            -H, "Content-Type: application/json", -d, "{{ item.body }}" ]
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  loop:
+  - { url: "http://localhost:{{ gateway_internal_port }}", body: '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}' }
+  - { url: "http://localhost:{{ gateway_internal_port }}", body: '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["11111111111111111111111111111111"]}' }
+  - { url: "http://read-node:{{ read_port }}", body: '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}' }
+  loop_control:
+    label: "{{ item.url }} {{ (item.body | from_json).method }}"
+  register: _k3s_gated
+  changed_when: false
+  failed_when: _k3s_gated.stdout | trim != '200'
+
+- name: Gated read is rejected on the node's public 8899 without a token
+  when: gateway_enforce_jwt | default(true) | bool
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host | default(inventory_hostname) }}:{{ gateway_port }}"
+    method: POST
+    body_format: json
+    body: { jsonrpc: "2.0", id: 1, method: getBlock, params: [ 1 ] }
+    status_code: [ 401 ]
+    timeout: 5
+  register: _k3s_public
+  until: _k3s_public.status == 401
+  retries: 10
+  delay: 3
+
+- name: The gateway internal port is not reachable on the node
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default(inventory_hostname) }}"
+    port: "{{ gateway_internal_port }}"
+    state: stopped
+    timeout: 5
+
+- name: List the Services the deploy can see
+  delegate_to: localhost
+  run_once: true
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pc_kubeconfig }}"
+    kind: Service
+    namespace: "{{ item }}"
+  loop: [ "{{ k3s_namespace }}", "{{ k3s_monitoring_namespace }}" ]
+  register: _k3s_svcs
+
+- name: Only gateway and auth are LoadBalancer or NodePort
+  delegate_to: localhost
+  run_once: true
+  vars:
+    _public: >-
+      {{ _k3s_svcs.results | map(attribute='resources') | flatten
+         | selectattr('spec.type', 'in', ['LoadBalancer', 'NodePort'])
+         | map(attribute='metadata') | map(attribute='name') | list }}
+  ansible.builtin.assert:
+    that: _public | difference(['gateway', 'auth'] + (k3s_health_public_extra | default([]))) | length == 0
+    fail_msg: "Unexpected public Services: {{ _public }}"
+
+# A pod with no allowed label must be refused by the NetworkPolicies on every guarded port.
+- name: Prove NetworkPolicy is enforced
+  delegate_to: localhost
+  run_once: true
+  block:
+  # Fixed once: a vars: lookup would draw a new random name on every use.
+  - name: Name the probe pod
+    ansible.builtin.set_fact:
+      _probe: "pc-np-probe-{{ lookup('community.general.random_string', length=6, upper=false, special=false) }}"
+
+  - name: Delete probe pods a killed run left
+    kubernetes.core.k8s:
+      kubeconfig: "{{ pc_kubeconfig }}"
+      state: absent
+      kind: Pod
+      namespace: "{{ k3s_namespace }}"
+      label_selectors: [ app.kubernetes.io/name=pc-np-probe ]
+
+  - name: Run a throwaway pod with no allowed label
+    kubernetes.core.k8s:
+      kubeconfig: "{{ pc_kubeconfig }}"
+      state: present
+      wait: true
+      wait_condition: { type: Ready, status: "True" }
+      wait_timeout: 300
+      definition:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: "{{ _probe }}"
+          namespace: "{{ k3s_namespace }}"
+          labels: { app.kubernetes.io/name: pc-np-probe }
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext: { runAsNonRoot: true, runAsUser: 1000 }
+          imagePullSecrets: "{{ [{'name': 'pc-ghcr'}] if _registry_host == 'ghcr.io' else [] }}"
+          containers:
+          - name: probe
+            image: "{{ image_registry }}/private-channel-app{{ ('@' ~ pc_app_image_digest) if (verify_image_signature | default(false) | bool) else (':' ~ image_tag) }}"
+            command: [ sleep, "600" ]
+            securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ ALL ] } }
+
+  # Positive controls through the same Services: an allowed pod connects, so a refusal
+  # below is the policy and not a closed port. read-node is proven by the gated reads above.
+  - name: Allowed pods reach the guarded ports
+    ansible.builtin.shell: |
+      set -eu
+      # SSLRequest: Postgres answers one byte (N or S); a silent connect would prove nothing.
+      b=$(kubectl -n {{ k3s_namespace }} exec deploy/gateway -c gateway -- sh -c \
+        "printf '\\0\\0\\0\\10\\4\\322\\26\\57' | curl -s -m 4 telnet://postgres-primary:5432 | head -c1 | wc -c" || true)
+      [ "$b" = 1 ] || { echo "gateway got no answer from postgres-primary:5432"; exit 1; }
+      {% if _workers_enabled | default(true) | bool %}
+      kubectl -n {{ k3s_namespace }} exec deploy/operator-solana -c operator-solana -- \
+        curl -s -o /dev/null -m 4 "http://gateway-internal:{{ gateway_internal_port }}/" \
+        || { echo "operator-solana cannot reach gateway-internal"; exit 1; }
+      {% endif %}
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    changed_when: false
+
+  # curl rejects (7) or drops (28); for Postgres also no reply byte, since a connect alone
+  # times out (28) too while Postgres waits for a startup packet.
+  - name: The probe pod cannot reach the guarded ports
+    ansible.builtin.command:
+      argv: [ kubectl, -n, "{{ k3s_namespace }}", exec, "{{ _probe }}", --, sh, -c, "{{ item }}" ]
+    environment:
+      KUBECONFIG: "{{ pc_kubeconfig }}"
+    loop:
+    - "curl -s -o /dev/null -m 4 http://gateway-internal:{{ gateway_internal_port }}/"
+    - "curl -s -o /dev/null -m 4 http://read-node:{{ read_port }}/"
+    - "printf '\\0\\0\\0\\10\\4\\322\\26\\57' | curl -s -m 4 telnet://postgres-primary:5432 | head -c1 | wc -c | grep -qx 0 && exit 28"
+    register: _k3s_np
+    changed_when: false
+    failed_when: _k3s_np.rc not in [7, 28]
+  always:
+  - name: Delete the probe pod
+    kubernetes.core.k8s:
+      kubeconfig: "{{ pc_kubeconfig }}"
+      state: absent
+      kind: Pod
+      namespace: "{{ k3s_namespace }}"
+      name: "{{ _probe }}"
+
+- name: Check pg_isready inside both CNPG primaries
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    set -e
+    for db in ledger indexer; do
+      pod=$(kubectl -n {{ k3s_namespace }} get pods -l "private-channel.io/db=$db,cnpg.io/instanceRole=primary" -o jsonpath='{.items[0].metadata.name}')
+      kubectl -n {{ k3s_namespace }} exec "$pod" -c postgres -- pg_isready -q
+    done
+  environment:
+    KUBECONFIG: "{{ pc_kubeconfig }}"
+  changed_when: false

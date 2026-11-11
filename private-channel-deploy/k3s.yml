@@ -1,0 +1,145 @@
+---
+# Solana Private Channels on k3s: same inventory, env vars and secrets as deploy.yml.
+#   ansible-playbook k3s.yml -l <env>
+# helm and kubectl run here, through an SSH tunnel with a short-lived deployer token.
+- name: Deploy Solana Private Channels on k3s
+  hosts: all
+  gather_facts: true
+  serial: 1
+  vars_files:
+  - vars/common.yml
+  # Same env selection as deploy.yml; k3s adds no inventory group.
+  - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
+  - vars/k3s.yml
+
+  pre_tasks:
+  - name: Load secrets (file or Doppler)
+    ansible.builtin.import_tasks: tasks/secrets_load.yml
+
+  - name: Capture deploy start time
+    ansible.builtin.set_fact:
+      deploy_start_ts: "{{ ansible_date_time.iso8601 }}"
+      deploy_start_epoch: "{{ ansible_date_time.epoch }}"
+    tags: [ always ]
+
+  - name: Resolve the admin and operator signers
+    ansible.builtin.include_tasks:
+      file: tasks/resolve_signer.yml
+      apply:
+        tags: [ always ]
+        delegate_to: localhost
+        run_once: true
+    loop: [ admin, operator ]
+    loop_control:
+      loop_var: _role
+    tags: [ always ]
+
+  tasks:
+  # ===========================================================================
+  # PREFLIGHT: no cluster access; every refusal leaves host and cluster untouched.
+  # ===========================================================================
+  - name: "==== PREFLIGHT ===="
+    ansible.builtin.debug:
+      msg: "k3s {{ k3s_version }}, network={{ network }}, image_tag={{ image_tag }}"
+    tags: [ always, preflight ]
+
+  - name: Deployment config asserts
+    tags: [ always, config_asserts ]
+    block:
+    - name: Shared config asserts
+      ansible.builtin.import_tasks: tasks/config_asserts.yml
+
+  - name: Preflight checks
+    tags: [ preflight ]
+    block:
+    - name: Run the k3s preflight
+      ansible.builtin.import_tasks: tasks/k3s/preflight.yml
+
+    # CNPG streams with TLS client certificates, so the replication password is unused here.
+    - name: Shared secret asserts
+      vars:
+        pc_require_replication_password: false
+      ansible.builtin.import_tasks: tasks/secret_asserts.yml
+
+  - name: Image signature and entrypoint
+    tags: [ preflight, deploy ]
+    block:
+    - name: Verify the image signature (when verify_image_signature)
+      ansible.builtin.import_tasks: tasks/cosign_verify.yml
+
+    - name: Check the image entrypoint with crane
+      ansible.builtin.import_tasks: tasks/k3s/image_check.yml
+
+  # ===========================================================================
+  # BOOTSTRAP and RESET_STATE: on the host, as root, with the admin kubeconfig.
+  # ===========================================================================
+  - name: "==== BOOTSTRAP ===="
+    ansible.builtin.debug:
+      msg: "Install or upgrade k3s, the firewall rule, RBAC, admission policy and add-ons."
+    tags: [ always, bootstrap ]
+
+  - name: Bootstrap the k3s host
+    tags: [ bootstrap ]
+    become: true
+    block:
+    - name: Run the k3s bootstrap
+      ansible.builtin.import_tasks: tasks/k3s/bootstrap.yml
+
+  - name: Reset localnet state
+    when: reset_state | default(false) | bool
+    tags: [ reset_state ]
+    block:
+    - name: Run the k3s reset_state
+      ansible.builtin.import_tasks: tasks/k3s/reset_state.yml
+
+  # After connect only the tunnel and the deployer token are used. A single-phase run
+  # (--tags health) still connects and disconnects; secrets also runs for deploy and
+  # monitoring, which need its outputs.
+  - name: Deploy through the tunnel
+    block:
+    - name: "==== CONNECT ===="
+      ansible.builtin.import_tasks: tasks/k3s/connect.yml
+      tags: &k3s_cluster_phases [ connect, render, secrets, database, deploy, health, monitoring, sanity, report ]
+
+    - name: Cluster checks (escrow instance, Operator PDA)
+      ansible.builtin.import_tasks: tasks/k3s/cluster_checks.yml
+      tags: *k3s_cluster_phases
+
+    - name: "==== RENDER ===="
+      ansible.builtin.import_tasks: tasks/k3s/render.yml
+      tags: [ render, deploy ]
+
+    - name: "==== SECRETS ===="
+      ansible.builtin.import_tasks: tasks/k3s/secrets.yml
+      tags: [ secrets, deploy, monitoring ]
+
+    - name: "==== DATABASE ===="
+      ansible.builtin.import_tasks: tasks/k3s/database.yml
+      tags: [ database ]
+
+    - name: Stop after the database phase (migration)
+      when: k3s_stop_after != 'database'
+      block:
+      - name: "==== DEPLOY ===="
+        ansible.builtin.import_tasks: tasks/k3s/deploy.yml
+        tags: [ deploy ]
+
+      - name: "==== HEALTH ===="
+        ansible.builtin.import_tasks: tasks/k3s/health.yml
+        tags: [ health ]
+
+      - name: "==== MONITORING ===="
+        ansible.builtin.import_tasks: tasks/k3s/monitoring.yml
+        tags: [ monitoring ]
+
+      - name: "==== SANITY ===="
+        ansible.builtin.import_tasks: tasks/k3s/sanity.yml
+        tags: [ sanity ]
+
+      - name: "==== REPORT ===="
+        ansible.builtin.import_tasks: tasks/k3s/report.yml
+        tags: [ report ]
+    always:
+    - name: "==== DISCONNECT ===="
+      ansible.builtin.import_tasks: tasks/k3s/disconnect.yml
+      tags: *k3s_cluster_phases
