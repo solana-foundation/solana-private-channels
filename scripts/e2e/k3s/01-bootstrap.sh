@@ -74,7 +74,8 @@ if [[ -z "${SKIP_REBOOT:-}" ]]; then
   docker restart "k3s-e2e-$E2E_PROFILE" >/dev/null
   sleep 20
 wait_for 300 hk wait --for=condition=Ready node --all --timeout=10s || die "node not Ready after reboot"
-  wait_for 600 bash -c "$(declare -f hk); E2E_HOST='$E2E_HOST'; hk -n $NS wait --for=condition=Ready pod -l app.kubernetes.io/part-of=private-channel --timeout=10s" \
+  # Finished hook Job pods are never Ready and would use up the wait timeout.
+  wait_for 600 bash -c "$(declare -f hk); E2E_HOST='$E2E_HOST'; hk -n $NS wait --for=condition=Ready pod -l app.kubernetes.io/part-of=private-channel --field-selector=status.phase!=Succeeded --timeout=10s" \
     || die "app pods not Ready after reboot"
   onhost "nft list table inet pc_k3s_guard" | tee -a "$LOG" | grep -q 8472 || die "guard table (with the VXLAN drop) missing after reboot"
   ctl "nc -z -w 3 $E2E_HOST_IP 6443" && die "6443 open after reboot"

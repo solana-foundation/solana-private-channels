@@ -27,6 +27,17 @@
   changed_when: false
   check_mode: false
 
+# A values file, not release_values: with values files the module compares only them.
+- name: Write the private-channel chart checksum values file
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.copy:
+    dest: "{{ pc_tmp }}/private-channel-checksum.yaml"
+    content: "chartChecksum: {{ _k3s_chart_sum.stdout }}\n"
+    mode: "0600"
+  changed_when: false
+  check_mode: false
+
 - name: Install or upgrade the app release
   delegate_to: localhost
   run_once: true
@@ -35,8 +46,7 @@
     name: private-channel
     chart_ref: "{{ repo_root }}/charts/private-channel"
     release_namespace: "{{ k3s_namespace }}"
-    values_files: [ "{{ pc_tmp }}/values.generated.yaml" ]
-    release_values: { chartChecksum: "{{ _k3s_chart_sum.stdout }}" }
+    values_files: [ "{{ pc_tmp }}/values.generated.yaml", "{{ pc_tmp }}/private-channel-checksum.yaml" ]
     # No --wait: a StatefulSet pod stuck on a bad revision is replaced below, then the
     # rollouts are awaited. The pre-upgrade auth-migrate hook is still awaited.
     wait: false

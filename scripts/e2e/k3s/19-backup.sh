@@ -39,7 +39,8 @@ Y
   chmod 600 "$RUN/e2e-$E2E_PROFILE-secrets.rpc.yml"
 fi
 sleep 10
-hk -n pc-e2e-s3 exec deploy/s3 -- sh -c 'echo "s3.bucket.create -name pc-backups" | weed shell' >>"$LOG" 2>&1 || die "bucket"
+# Create only if absent, so a rerun of this step works.
+hk -n pc-e2e-s3 exec deploy/s3 -- sh -c 'echo s3.bucket.list | weed shell | grep -qw pc-backups || echo "s3.bucket.create -name pc-backups" | weed shell' >>"$LOG" 2>&1 || die "bucket"
 sync_repo
 inst_args=(-e reset_state=false -e validator_reset=false -e k3s_backup_enabled=true
   -e k3s_backup_destination_path=s3://pc-backups/local -e k3s_backup_endpoint_url=http://s3.pc-e2e-s3:9000)

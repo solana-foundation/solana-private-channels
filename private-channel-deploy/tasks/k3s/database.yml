@@ -97,6 +97,17 @@
   changed_when: false
   check_mode: false
 
+# A values file, not release_values: with values files the module compares only them.
+- name: Write the pc-db chart checksum values file
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.copy:
+    dest: "{{ pc_tmp }}/pc-db-checksum.yaml"
+    content: "chartChecksum: {{ _k3s_chart_sum.stdout }}\n"
+    mode: "0600"
+  changed_when: false
+  check_mode: false
+
 # --wait also waits for the post-install/post-upgrade grants hook to finish.
 - name: Install or upgrade the pc-db release
   delegate_to: localhost
@@ -106,8 +117,7 @@
     name: pc-db
     chart_ref: "{{ repo_root }}/charts/pc-db"
     release_namespace: "{{ k3s_namespace }}"
-    values_files: [ "{{ pc_tmp }}/pc-db-values.yaml" ]
-    release_values: { chartChecksum: "{{ _k3s_chart_sum.stdout }}" }
+    values_files: [ "{{ pc_tmp }}/pc-db-values.yaml", "{{ pc_tmp }}/pc-db-checksum.yaml" ]
     wait: true
     wait_timeout: "{{ k3s_helm_timeout }}"
     atomic: false

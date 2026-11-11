@@ -142,6 +142,16 @@ test_tools() {
 for t in test_syntax test_host_checks test_tools; do
   if [[ -z "${PC_TEST_ONLY:-}" || "$t" =~ $PC_TEST_ONLY ]]; then "$t"; fi
 done
+# With values_files, kubernetes.core.helm compares the release only to the files, so a
+# release_values key would differ on every run and upgrade a release that did not change.
+python3 - "$REPO"/private-channel-deploy/tasks/k3s/*.yml <<'PY' || fail "a helm task mixes values_files with release_values"
+import sys, yaml
+bad = [f for f in sys.argv[1:] for t in (yaml.safe_load(open(f)) or [])
+       if isinstance(t, dict) and isinstance(t.get("kubernetes.core.helm"), dict)
+       and t["kubernetes.core.helm"].get("values_files") and t["kubernetes.core.helm"].get("release_values")]
+print("\n".join(bad)); sys.exit(1 if bad else 0)
+PY
+
 if [[ $failures -gt 0 ]]; then
   echo "$failures failure(s)" >&2
   exit 1

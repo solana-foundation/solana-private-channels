@@ -36,7 +36,9 @@
     cut=$(date -u -d "-{{ k3s_token_duration_max_hours }} hours" +%Y-%m-%dT%H:%M:%SZ)
     k3s kubectl -n {{ k3s_namespace }} get secret -l private-channel.io/token-session=true \
       -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.creationTimestamp}{"\n"}{end}' \
-      | while read -r n t; do [ "$t" \< "$cut" ] && k3s kubectl -n {{ k3s_namespace }} delete secret "$n"; done; true
+      | while read -r n t; do if [[ "$t" < "$cut" ]]; then k3s kubectl -n {{ k3s_namespace }} delete secret "$n"; fi; done
+  args:
+    executable: /bin/bash
   register: _k3s_stale_sessions
   changed_when: "'deleted' in _k3s_stale_sessions.stdout"
 
