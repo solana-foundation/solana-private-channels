@@ -1,16 +1,16 @@
 # Solana Private Channels on k3s (single host)
 
-A second deploy target next to the compose deploy in [`private-channel-deploy/`](../private-channel-deploy/README.md). It runs the same stack on one host with k3s, from the same inventory, env vars and secrets. The compose deploy is unchanged.
+A second deploy target next to the compose deploy in [`private-channel-deploy/`](./README.md). It runs the same stack on one host with k3s, from the same inventory, env vars and secrets. The compose deploy is unchanged.
 
 **Phases** (fail-fast, idempotent): preflight, bootstrap, reset_state (localnet only), connect, cluster checks, render, secrets, database, deploy, health, monitoring, sanity, report, disconnect.
 
 ## Deploy targets
 
-Two targets share the same inventory, `vars/<env>.yml` and secrets (or Doppler). This guide covers k3s; compose has the [operator runbook](../private-channel-deploy/README.md).
+Two targets share the same inventory, `vars/<env>.yml` and secrets (or Doppler). This guide covers k3s; compose has the [operator runbook](./README.md).
 
 | Target | Deploy | Guide |
 | --- | --- | --- |
-| Docker Compose (default) | `ansible-playbook deploy.yml -l <env>` | [private-channel-deploy/README.md](../private-channel-deploy/README.md) |
+| Docker Compose (default) | `ansible-playbook deploy.yml -l <env>` | [private-channel-deploy/README.md](./README.md) |
 | k3s (single-host Kubernetes, Helm, CloudNativePG) | `ansible-playbook k3s.yml -l <env>` | This guide |
 
 ## How it fits together
@@ -19,8 +19,8 @@ Two targets share the same inventory, `vars/<env>.yml` and secrets (or Doppler).
 | --- | --- | --- |
 | [`charts/private-channel`](../charts/private-channel/) | control node | The app: nodes, gateway, auth, indexers, operators, validator (localnet), blackbox and the Postgres exporters, NetworkPolicies. |
 | [`charts/pc-db`](../charts/pc-db/) | control node | The ledger (`pc-ledger`, primary plus synchronous replica) and indexer (`pc-indexer`) CloudNativePG (CNPG) Clusters, their logins, the grants hook, backups. |
-| [`private-channel-deploy/k3s.yml`](../private-channel-deploy/k3s.yml) | control node | The playbook. helm and kubectl run on the control node through an SSH tunnel with a 1h, namespace-scoped `deployer` token. |
-| bootstrap ([`tasks/k3s/bootstrap.yml`](../private-channel-deploy/tasks/k3s/bootstrap.yml)) | host, as root | k3s at the pinned version, the firewall rule below, the `pc-retain` StorageClass, namespaces, deployer RBAC, an admission policy, cert-manager, CNPG, the Barman plugin and kube-prometheus-stack. |
+| [`private-channel-deploy/k3s.yml`](./k3s.yml) | control node | The playbook. helm and kubectl run on the control node through an SSH tunnel with a 1h, namespace-scoped `deployer` token. |
+| bootstrap ([`tasks/k3s/bootstrap.yml`](./tasks/k3s/bootstrap.yml)) | host, as root | k3s at the pinned version, the firewall rule below, the `pc-retain` StorageClass, namespaces, deployer RBAC, an admission policy, cert-manager, CNPG, the Barman plugin and kube-prometheus-stack. |
 
 Firewall rule (nftables table `pc_k3s_guard`, loaded before k3s by `pc-k3s-guard.service`): on the public interface it drops TCP 6443 (API), 10250 (kubelet), 9100 (node-exporter), the NodePort range 30000-32767 (TCP and UDP), and flannel's UDP 8472 (VXLAN), 51820 and 51821 (WireGuard). Pods still reach all of these. The interface is the default route's unless `k3s_public_iface` is set.
 
@@ -36,7 +36,7 @@ Versions are pinned in [`versions.env`](../versions.env): `K3S_VERSION`, `HELM_V
 - `helm`, `kubectl` and `crane` on `PATH`, at exactly the pinned versions
 - the `kubernetes.core` collection and the Python `kubernetes` package
 
-[`scripts/install-prereqs.sh --k3s`](../private-channel-deploy/scripts/install-prereqs.sh) installs all of these on Ubuntu or Debian (amd64 or arm64), each checked against its published checksum. It is idempotent:
+[`scripts/install-prereqs.sh --k3s`](./scripts/install-prereqs.sh) installs all of these on Ubuntu or Debian (amd64 or arm64), each checked against its published checksum. It is idempotent:
 
 ```bash
 cd private-channel-deploy
@@ -54,9 +54,9 @@ k3s itself is installed by bootstrap from the pinned release, checksum verified.
 
 ## Initial environment setup
 
-Same files as compose: [`inventory.ini`](../private-channel-deploy/inventory.example.ini), `vars/<group>.yml`, and `secrets.yml` or Doppler (`export DOPPLER_TOKEN=...`). Follow [Initial environment setup](../private-channel-deploy/README.md#initial-environment-setup) there. k3s adds no inventory group.
+Same files as compose: [`inventory.ini`](./inventory.example.ini), `vars/<group>.yml`, and `secrets.yml` or Doppler (`export DOPPLER_TOKEN=...`). Follow [Initial environment setup](./README.md#initial-environment-setup) there. k3s adds no inventory group.
 
-k3s-only defaults live in [`vars/k3s.yml`](../private-channel-deploy/vars/k3s.yml). Override any key in `vars/<env>.yml` or with `-e`. The ones you are most likely to touch:
+k3s-only defaults live in [`vars/k3s.yml`](./vars/k3s.yml). Override any key in `vars/<env>.yml` or with `-e`. The ones you are most likely to touch:
 
 | Var | Default | What |
 | --- | --- | --- |
@@ -74,7 +74,7 @@ Secrets come from `secrets.yml` or Doppler exactly as for compose and become one
 
 ## Operating
 
-All commands run from `private-channel-deploy/`. The group picks the env, as for compose: `-l dev` is localnet ([`vars/dev.yml`](../private-channel-deploy/vars/dev.yml)), `-l devnet` and `-l mainnet` need their `vars/<env>.yml`.
+All commands run from `private-channel-deploy/`. The group picks the env, as for compose: `-l dev` is localnet ([`vars/dev.yml`](./vars/dev.yml)), `-l devnet` and `-l mainnet` need their `vars/<env>.yml`.
 
 ```bash
 cd private-channel-deploy
@@ -100,7 +100,7 @@ ansible-playbook k3s.yml -l devnet
 | --- | --- | --- |
 | Run one phase | `ansible-playbook k3s.yml -l <env> --tags <phase>` | Cluster phases (render to report) always add connect and disconnect. `--tags deploy` also runs render and secrets; `--tags monitoring` also runs secrets. |
 | Re-run health only | `ansible-playbook k3s.yml -l <env> --tags health` | `/health` on gateway, write-node and read-node, gated reads, only gateway and auth exposed, a NetworkPolicy probe pod, `pg_isready` in both CNPG primaries. |
-| Re-run sanity only | `ansible-playbook k3s.yml -l <env> --tags sanity` | [`scripts/sanity.sh`](../private-channel-deploy/scripts/sanity.sh) with `RUNTIME=k8s`, through port-forwards. Same checks as [compose sanity](../private-channel-deploy/README.md#sanity-check). |
+| Re-run sanity only | `ansible-playbook k3s.yml -l <env> --tags sanity` | [`scripts/sanity.sh`](./scripts/sanity.sh) with `RUNTIME=k8s`, through port-forwards. Same checks as [compose sanity](./README.md#sanity-check). |
 | Tail the run log | `tail -f ansible.log` | Same log as compose. |
 
 ### Localnet first boot
@@ -112,7 +112,7 @@ ansible-playbook k3s.yml -l devnet
    kubectl -n private-channel port-forward svc/validator 18899:8899 18900:8900 &
    # create_instance and add_operator as in docs/DEVNET_QUICKSTART.md, with --url http://127.0.0.1:18899
    ```
-   See [`docs/DEVNET_QUICKSTART.md`](DEVNET_QUICKSTART.md).
+   See [`docs/DEVNET_QUICKSTART.md`](../docs/DEVNET_QUICKSTART.md).
 3. Redeploy with the instance and without the ledger reset (the default `--reset` would wipe it):
    ```bash
    ansible-playbook k3s.yml -l dev -e escrow_instance_id=<pda> -e reset_state=false -e validator_reset=false
@@ -131,7 +131,7 @@ k3s_backup_encryption: AES256      # AWS S3 only; leave "" on R2
 
 and the secrets `backup_s3_access_key_id`, `backup_s3_secret_access_key` in `secrets.yml` (Doppler `BACKUP_S3_ACCESS_KEY_ID`, `BACKUP_S3_SECRET_ACCESS_KEY`). Preflight refuses `k3s_backup_enabled` without all three.
 
-The Barman Cloud plugin archives WAL continuously and takes a base backup every 6h (`k3s_backup_schedule`). Retention is `30d` on mainnet, `7d` elsewhere (`k3s_backup_retention`). Restore: [PITR on k3s](PITR.md#pitr-on-k3s-cloudnativepg).
+The Barman Cloud plugin archives WAL continuously and takes a base backup every 6h (`k3s_backup_schedule`). Retention is `30d` on mainnet, `7d` elsewhere (`k3s_backup_retention`). Restore: [PITR on k3s](../docs/PITR.md#pitr-on-k3s-cloudnativepg).
 
 ## Monitoring
 
@@ -157,7 +157,7 @@ kubectl -n pc-monitoring port-forward svc/pc-kps-prometheus 9090:9090
 
 ## Ad hoc access
 
-[`scripts/k3s-connect.sh`](../scripts/k3s-connect.sh) opens the same tunnel and token a deploy uses (via [`k3s-connect.yml`](../private-channel-deploy/k3s-connect.yml)) and prints the `export KUBECONFIG=...` line plus the command to close it.
+[`scripts/k3s-connect.sh`](../scripts/k3s-connect.sh) opens the same tunnel and token a deploy uses (via [`k3s-connect.yml`](./k3s-connect.yml)) and prints the `export KUBECONFIG=...` line plus the command to close it.
 
 ```bash
 scripts/k3s-connect.sh <inventory host>      # prints export KUBECONFIG=... and how to close
