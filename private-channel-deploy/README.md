@@ -4,6 +4,17 @@ Single-host deployment automation for Solana Private Channels. Wraps `docker-com
 
 **Phases** (fail-fast, idempotent): preflight → bootstrap → reset-state → render → deploy → health → monitoring → sanity → report.
 
+## Deploy targets
+
+Two targets share the same inventory, `vars/<env>.yml` and secrets (or Doppler). This runbook covers compose; k3s has its own guide.
+
+| Target | Deploy | Guide |
+| --- | --- | --- |
+| Docker Compose (default) | `ansible-playbook deploy.yml -l <env>` | This runbook |
+| k3s (single-host Kubernetes, Helm, CloudNativePG) | `ansible-playbook k3s.yml -l <env>` | [docs/K3S_DEPLOY.md](../docs/K3S_DEPLOY.md) |
+
+Moving a running compose host to k3s: [Compose to k3s migration](../docs/K3S_DEPLOY.md#compose-to-k3s-migration-dump-and-restore).
+
 ## Prerequisites
 
 Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once **on both the control node and the target host** (Ubuntu/Debian, idempotent). Preflight re-verifies them on every run and fails fast with an actionable message before touching the host.
