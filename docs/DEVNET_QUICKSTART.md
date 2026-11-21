@@ -307,6 +307,27 @@ The indexer will detect the deposit and the operator will mint equivalent tokens
 
 Transfers happen *inside* the payment channel, so they go through the local gateway RPC (`http://localhost:8899`) rather than Devnet. To demonstrate a transfer with a browser wallet, point the wallet's RPC at **Localnet** or **Custom** `http://localhost:8899`, then send the whitelisted token to another user's address. Check the recipient's channel balance to confirm the funds moved.
 
+For a client integration, use the same mint address as the deposit and the
+participants' **Token-2022 associated token accounts on the channel**. Once
+the sender's deposit has been credited and the recipient's token account
+exists:
+
+1. Fetch a recent blockhash from the channel gateway with `getLatestBlockhash`.
+2. Build a Token-2022 transfer between the two token accounts and sign it with
+   the sender's key. Submit the signed transaction to the same gateway with
+   `sendTransaction`. This changes the channel balances; the tokens backing
+   them stay in escrow on Devnet.
+3. After confirmation, each participant can check their own token account
+   with `getTokenAccountBalance` on the gateway. The sender's balance should
+   decrease and the recipient's increase by the transferred amount.
+
+The [deposit, transfer, and withdrawal integration test](../integration/tests/private-channel/rpc/test_spl_token.rs)
+shows the full sequence. In `setup_private_channel_accounts`, the test waits
+for the operator to credit the deposits, transfers 100,000 base units from
+Alice to Charlie, and checks both resulting balances. The
+[`transfer_tokens_transaction` helper](../integration/tests/setup.rs) shows how
+to derive the channel token accounts and sign the instruction in Rust.
+
 ### Withdraw (Solana Private Channels → Solana)
 
 Run `withdraw` against the local gateway (`http://localhost:8899`):
