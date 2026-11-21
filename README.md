@@ -312,12 +312,15 @@ make integration-test
 
 ### Docker stack
 
-The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: the nine `POSTGRES_*` passwords and `GF_ADMIN_PASSWORD` MUST all be set, and the nine database passwords MUST each differ from one another (`JWT_SECRET` too if you enable auth), or the stack refuses to start and names what is missing or shared. See [`docs/ENV_CONTRACT.md`](docs/ENV_CONTRACT.md#required-secrets-fail-closed) for the list. Generate each with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`. `COMMON_ESCROW_INSTANCE_ID` is blank in the template, and a blank value overrides the instance in the indexer TOML. Until you create the instance (`create_instance` in `scripts/devnet`) and set it, `indexer-solana` and both operators refuse to start and keep restarting; the rest of the stack runs.
+The local stack loads `versions.env`, the checked-in `.env.local` preset, and then the gitignored `.env` for local overrides. Keep the preset in place. Add the nine distinct Postgres passwords and the Grafana admin password to `.env`. The [required secrets list](docs/ENV_CONTRACT.md#required-secrets-fail-closed) gives the variable names. Generate each value with `openssl rand -hex 32`.
 
-**Run `make build-localnet` once before the first `make docker-up`.** It generates an operator keypair and patches the real `PRIVATE_CHANNEL_ADMIN_KEYS` / `ADMIN_PRIVATE_KEY` and program IDs into `.env.local`, replacing the template placeholders. Skipping it leaves `PRIVATE_CHANNEL_ADMIN_KEYS=your_admin_public_key`, which the write-node rejects at startup (`Invalid admin key … Invalid Base58 string`).
+**Run `make build-localnet` once before the first `make docker-up`.** It writes the channel admin public key to `.env.local` and the private key to `.env`. The local preset already contains the escrow and withdraw program IDs. The indexer uses its configured local instance ID unless you set `COMMON_ESCROW_INSTANCE_ID` for a different instance.
 
 ```bash
-# First run only: bootstrap .env.local (admin key + program IDs)
+# Check the configured passwords before building images
+make check-env-local
+
+# First run only: build the programs and configure the channel admin
 make build-localnet
 
 # Build all images
@@ -351,15 +354,9 @@ ports have **no node-side authentication** of their own, so the reference compos
 internal listener (`GATEWAY_INTERNAL_PORT`) carries no RBAC either and is never published, so it is
 reachable only from the Docker network, where the operator's own services run.
 
-To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` profile:
+After completing the [local Docker setup](#docker-stack), add `JWT_SECRET` to the gitignored `.env` using a fresh value from `openssl rand -hex 32`. Start the stack with the `auth` profile:
 
 ```bash
-# Copy and configure env
-cp .env.example .env.local
-# Required (no defaults shipped): set POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD in .env.local
-# Set JWT_SECRET=<your-secret> in .env.local to enable auth
-# Generate strong values with: openssl rand -hex 32
-
 # Start full stack including the auth service (PROFILE=auth adds the auth profile;
 # omit it for the non-auth stack). Tear down with the same profile: make docker-down PROFILE=auth
 make docker-up PROFILE=auth
