@@ -72,7 +72,8 @@ gateway_enforce_jwt: true
 # gateway_whitelist_instance: <escrow instance PDA>
 
 # gateway_whitelist_reads_per_second: max Mainnet reads per second the check makes;
-# past it, withdrawals go unchecked. Keep it below the RPC key's plan. Default 20 in
+# past it, or past one client IP's tenth of it, withdrawals go unchecked. Keep it
+# below the RPC key's plan. Default 20 in
 # vars/common.yml.
 # gateway_whitelist_reads_per_second: 20
 

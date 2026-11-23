@@ -195,7 +195,8 @@ pub struct Args {
     pub whitelist_instance: Option<String>,
 
     /// Most Mainnet reads per second the withdraw whitelist check makes, across all
-    /// clients. Past it, a withdrawal that needs a read is forwarded unchecked.
+    /// clients, of which one client IP gets a tenth (at least 1). Past either, a
+    /// withdrawal that needs a read is forwarded unchecked.
     #[arg(long, env = "GATEWAY_WHITELIST_READS_PER_SECOND", default_value = "20")]
     pub whitelist_reads_per_second: NonZeroU32,
 
@@ -2037,7 +2038,7 @@ impl Gateway {
         if access == Access::Public && method == "sendTransaction" {
             if let Some(withdraw_whitelist) = &self.withdraw_whitelist {
                 match withdraw_whitelist
-                    .check(&self.client, &params, deadline)
+                    .check(&self.client, &params, deadline, rate_key)
                     .await
                 {
                     Verdict::Allowed => {}
@@ -2312,12 +2313,17 @@ pub async fn serve(
     // Prune IPs that have fully replenished so the keyed store stays bounded.
     // retain_recent only reclaims replenished keys, so run it often to shed
     // entries soon after churning IPs go quiet.
+    // The whitelist's per-client share too; each listener prunes it, which is harmless.
     let pruner = Arc::clone(&rate_limiter);
+    let whitelist_pruner = Arc::clone(&gateway);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(10));
         loop {
             ticker.tick().await;
             pruner.retain_recent();
+            if let Some(withdraw_whitelist) = &whitelist_pruner.withdraw_whitelist {
+                withdraw_whitelist.retain_recent();
+            }
         }
     });
 
@@ -2485,6 +2491,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.whitelist_rpc_url.as_deref(),
         args.whitelist_instance.as_deref(),
         Quota::per_second(args.whitelist_reads_per_second),
+        // One client IP gets a tenth of the budget, at least 1.
+        Quota::per_second(
+            NonZeroU32::new(args.whitelist_reads_per_second.get() / 10).unwrap_or(NonZeroU32::MIN),
+        ),
     )?;
     info!(
         "  Withdraw whitelist check: {}",
@@ -2848,9 +2858,14 @@ mod tests {
             .ok();
 
         let instance = Pubkey::new_unique().to_string();
-        let withdraw_whitelist =
-            WithdrawWhitelist::from_config(Some(mainnet_url), Some(instance.as_str()), reads)
-                .expect("the whitelist settings are valid");
+        // A per-client share that never binds here, so `reads` is what runs out.
+        let withdraw_whitelist = WithdrawWhitelist::from_config(
+            Some(mainnet_url),
+            Some(instance.as_str()),
+            reads,
+            Quota::per_second(NonZeroU32::new(20).unwrap()),
+        )
+        .expect("the whitelist settings are valid");
         let gateway = Arc::new(
             Gateway::new(
                 write_url.to_string(),
@@ -2874,6 +2889,21 @@ mod tests {
 
     /// A raw `sendTransaction` carrying one WithdrawFunds signed by `withdrawer`.
     fn withdraw_request(withdrawer: &Keypair) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": withdraw_params(withdrawer),
+        })
+        .to_string();
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// `sendTransaction` params carrying one WithdrawFunds signed by `withdrawer`.
+    fn withdraw_params(withdrawer: &Keypair) -> Value {
         let instruction = WithdrawFundsBuilder::new()
             .user(withdrawer.pubkey())
             .mint(Pubkey::new_unique())
@@ -2894,13 +2924,7 @@ mod tests {
             wincode::serialize(&VersionedTransaction::from(transaction))
                 .expect("the transaction serializes"),
         );
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{encoded}",{{"encoding":"base64"}}]}}"#
-        );
-        format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
+        json!([encoded, { "encoding": "base64" }])
     }
 
     /// A Mainnet `getMultipleAccounts` answer: the instance, then the withdrawer's entry,
@@ -3082,6 +3106,100 @@ mod tests {
         assert!(response.contains("forwarded"), "got: {response}");
 
         assert_eq!(mainnet_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A Mainnet stub answering `instance` with an instance that whitelists
+    /// withdrawals, and every other key with no account.
+    async fn start_mainnet_stub(instance: Pubkey) -> SocketAddr {
+        let accounts: Value = serde_json::from_str(mainnet_accounts(true, false)).unwrap();
+        let instance_account = accounts["result"]["value"][0].clone();
+        let instance = instance.to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            {
+                let mut buf = vec![0u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let body: Value = request
+                    .split_once("\r\n\r\n")
+                    .and_then(|(_, body)| serde_json::from_str(body).ok())
+                    .unwrap_or(Value::Null);
+                let answers: Vec<Value> = body["params"][0]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|key| {
+                        if key.as_str() == Some(instance.as_str()) {
+                            instance_account.clone()
+                        } else {
+                            Value::Null
+                        }
+                    })
+                    .collect();
+                let answer = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "context": { "slot": 1 }, "value": answers },
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        addr
+    }
+
+    // A client past its share of the reads cannot spend another client's: its fresh
+    // wallet goes unchecked, while another client's unlisted wallet is still refused.
+    #[tokio::test]
+    async fn one_client_cannot_spend_another_clients_reads() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let instance = Pubkey::new_unique();
+        let mainnet = start_mainnet_stub(instance).await;
+        let whitelist = WithdrawWhitelist::from_config(
+            Some(&format!("http://{mainnet}")),
+            Some(&instance.to_string()),
+            Quota::per_hour(NonZeroU32::new(2).unwrap()),
+            Quota::per_hour(NonZeroU32::new(1).unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        let client =
+            Gateway::new("http://w".into(), "http://r".into(), "*".into(), None, None).client;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let first_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let second_ip: IpAddr = "10.0.0.2".parse().unwrap();
+
+        let first = Keypair::new();
+        let verdict = whitelist
+            .check(&client, &withdraw_params(&first), deadline, first_ip)
+            .await;
+        assert_eq!(verdict, Verdict::Refused(first.pubkey()));
+        let verdict = whitelist
+            .check(
+                &client,
+                &withdraw_params(&Keypair::new()),
+                deadline,
+                first_ip,
+            )
+            .await;
+        assert!(matches!(verdict, Verdict::Unchecked(_)), "got: {verdict:?}");
+
+        let second = Keypair::new();
+        let verdict = whitelist
+            .check(&client, &withdraw_params(&second), deadline, second_ip)
+            .await;
+        assert_eq!(verdict, Verdict::Refused(second.pubkey()));
     }
 
     /// A method missing from KNOWN_RPC_METHODS still routes, but its RPC metrics

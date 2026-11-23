@@ -80,7 +80,7 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | `--jwt-public-key` | `JWT_PUBLIC_KEY` | none | Base58 Ed25519 public key of auth's signing key; only EdDSA tokens are accepted. Set: RBAC on the public port; unset or empty: RBAC off. A value that does not decode to 32 bytes, whitespace-only included, is refused |
 | `--jwt-public-key-previous` | `JWT_PUBLIC_KEY_PREVIOUS` | none | Optional, only during a rotation: the previous `JWT_PUBLIC_KEY`, accepted for verification after the current one. Refused when malformed, equal to `JWT_PUBLIC_KEY`, or without it. Must match auth's |
 | `--require-jwt` | `GATEWAY_REQUIRE_JWT` | none | `1` refuses to start on a blank `JWT_PUBLIC_KEY` instead of running with RBAC off. The Ansible deploy sets it whenever `gateway_enforce_jwt` is on |
-| `--whitelist-reads-per-second` | `GATEWAY_WHITELIST_READS_PER_SECOND` | `20` | Most Mainnet reads per second the withdraw whitelist check makes, across all clients. Past it, a withdrawal that needs a read is forwarded unchecked. Size it below the RPC key's plan |
+| `--whitelist-reads-per-second` | `GATEWAY_WHITELIST_READS_PER_SECOND` | `20` | Most Mainnet reads per second the withdraw whitelist check makes, across all clients, of which one client IP (an IPv6 /64) gets a tenth, at least 1. Past either, a withdrawal that needs a read is forwarded unchecked. Size it below the RPC key's plan |
 
 Routes `sendTransaction` and `isBlockhashValid` to the write node; all other RPC methods go to the read node.
 

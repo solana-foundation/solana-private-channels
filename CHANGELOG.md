@@ -22,7 +22,7 @@
 
 ### Gateway and auth
 - Tells a channel mint from a token account by the account type byte at offset 165 (`2` for an account), not by size
-- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second; past that, withdrawals are forwarded unchecked
+- Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second, and one client IP gets a tenth of that (at least 1), so one client cannot spend the budget for everyone; past either, withdrawals are forwarded unchecked
 - JWT rotation without logging everyone out: optional `JWT_PUBLIC_KEY_PREVIOUS`, read by the gateway and auth, verified after `JWT_PUBLIC_KEY`. Refused at startup when equal to `JWT_PUBLIC_KEY` or set without it, without echoing the value
 - The gateway's database login reads only `id, role` of `users` and `user_id, pubkey` of `verified_wallets`, never password hashes. Ansible and k3s narrow it on the next deploy; a plain compose stack narrows when `scripts/migrate-stack.sh` or `auth-admin migrate` runs
 - `GATEWAY_REQUIRE_JWT=1` makes the gateway refuse to start on a blank `JWT_PUBLIC_KEY` instead of running with RBAC off. Unset keeps the old behaviour
