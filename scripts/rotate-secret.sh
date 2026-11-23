@@ -178,6 +178,13 @@ doppler_get() {
   rm -f "$err"
 }
 
+# A failed write mid-stage leaves keys that do not match. In this write order,
+# --finish and a fresh stage always end in a matching pair.
+partial() {
+  echo "ERROR: the rotation was only partly written to Doppler. Do not deploy: run $0 jwt_signing_key --finish if JWT_PUBLIC_KEY_PREVIOUS is set, then stage again." >&2
+  exit 1
+}
+
 case "$backend" in
   file)
     if [[ ! -f "$secrets_file" ]]; then
@@ -208,10 +215,10 @@ case "$backend" in
         # A first keypair has no old key to keep verifying.
         current="$(doppler_get JWT_PUBLIC_KEY)"
         if [[ -n "$current" ]]; then
-          printf '%s' "$current" | doppler_run secrets set JWT_PUBLIC_KEY_PREVIOUS --silent
+          printf '%s' "$current" | doppler_run secrets set JWT_PUBLIC_KEY_PREVIOUS --silent || partial
         fi
-        printf '%s' "${value% *}" | doppler_run secrets set JWT_SIGNING_KEY --silent
-        printf '%s' "${value#* }" | doppler_run secrets set JWT_PUBLIC_KEY --silent
+        printf '%s' "${value% *}" | doppler_run secrets set JWT_SIGNING_KEY --silent || partial
+        printf '%s' "${value#* }" | doppler_run secrets set JWT_PUBLIC_KEY --silent || partial
       fi
     else
       printf '%s' "$value" | doppler_run secrets set "$(doppler_name "$key")" --silent
