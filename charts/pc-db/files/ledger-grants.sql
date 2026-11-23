@@ -89,11 +89,14 @@ DO $$
 BEGIN
     GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_gateway;
 
+    -- Only the columns it checks; the revokes narrow an older table-wide grant.
     IF to_regclass('private_channel_auth.users') IS NOT NULL THEN
-        GRANT SELECT ON private_channel_auth.users TO private_channel_gateway;
+        REVOKE SELECT ON private_channel_auth.users FROM private_channel_gateway;
+        GRANT SELECT (id, role) ON private_channel_auth.users TO private_channel_gateway;
     END IF;
 
     IF to_regclass('private_channel_auth.verified_wallets') IS NOT NULL THEN
-        GRANT SELECT ON private_channel_auth.verified_wallets TO private_channel_gateway;
+        REVOKE SELECT ON private_channel_auth.verified_wallets FROM private_channel_gateway;
+        GRANT SELECT (user_id, pubkey) ON private_channel_auth.verified_wallets TO private_channel_gateway;
     END IF;
 END $$;

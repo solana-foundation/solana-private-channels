@@ -6,8 +6,9 @@
 --   private_channel_auth_runtime  auth service. Its grants on the auth tables
 --                                 come from the auth service's schema init.
 --   private_channel_gateway       gateway. Reads only: the same schema init
---                                 grants it SELECT on two auth tables, and core's
---                                 accountsdb init the two ledger tables it reads.
+--                                 grants it the role and wallet columns of two auth
+--                                 tables, and core's accountsdb init the two ledger
+--                                 tables it reads.
 --   private_channel_auth_owner    owns private_channel_auth. Held only by the
 --                                 migration one-shot and the admin CLI, never by
 --                                 a long-lived service.
@@ -163,11 +164,14 @@ DO $$
 BEGIN
     GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_gateway;
 
+    -- Only the columns it checks; the revokes narrow an older table-wide grant.
     IF to_regclass('private_channel_auth.users') IS NOT NULL THEN
-        GRANT SELECT ON private_channel_auth.users TO private_channel_gateway;
+        REVOKE SELECT ON private_channel_auth.users FROM private_channel_gateway;
+        GRANT SELECT (id, role) ON private_channel_auth.users TO private_channel_gateway;
     END IF;
 
     IF to_regclass('private_channel_auth.verified_wallets') IS NOT NULL THEN
-        GRANT SELECT ON private_channel_auth.verified_wallets TO private_channel_gateway;
+        REVOKE SELECT ON private_channel_auth.verified_wallets FROM private_channel_gateway;
+        GRANT SELECT (user_id, pubkey) ON private_channel_auth.verified_wallets TO private_channel_gateway;
     END IF;
 END $$;

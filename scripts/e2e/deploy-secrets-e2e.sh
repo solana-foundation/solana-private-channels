@@ -43,6 +43,13 @@ pg_login() {
     psql -h 127.0.0.1 -U "$2" -d private_channel -c 'SELECT 1' >/dev/null 2>&1
 }
 pg_refused() { ! pg_login "$@"; }
+# pg_denied <password> <role> <sql>: the login works, the statement is refused for lack of privilege.
+pg_denied() {
+  local out
+  out="$(PGPASSWORD="$1" docker exec -e PGPASSWORD private-channel-postgres-primary \
+    psql -h 127.0.0.1 -U "$2" -d private_channel -c "$3" 2>&1)" && return 1
+  grep -q 'permission denied for table users' <<<"$out"
+}
 
 step1() {
   say "step 1: deploy with separate admin and operator keys"
@@ -138,6 +145,8 @@ step5() {
   check "postgres-primary not recreated by role-password rotations" test "$(cid private-channel-postgres-primary)" = "$p"
   check "gateway recreated" test "$(cid private-channel-gateway)" != "$g"
   check "the gateway role logs in with the new password" pg_login "$(secret postgres_gateway_password)" private_channel_gateway
+  check "the gateway login cannot read password hashes" pg_denied "$(secret postgres_gateway_password)" \
+    private_channel_gateway 'SELECT password_hash FROM private_channel_auth.users LIMIT 0'
   check "the old gateway password is refused" pg_refused "$oldgw" private_channel_gateway
   grafana_checks "after rotation"
 }
