@@ -31,6 +31,11 @@ use private_channel_auth::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// A fixed test keypair, so a test can mint tokens the app accepts.
+const TEST_JWT_SIGNING_KEY: &str =
+    "2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD";
+const TEST_JWT_PUBLIC_KEY: &str = "6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM";
+
 /// Spin up a Postgres container and return the connection URL.
 /// The container is returned to keep it alive for the duration of the test.
 async fn start_postgres() -> (String, testcontainers::ContainerAsync<Postgres>) {
@@ -75,7 +80,7 @@ async fn start_throttled_app(
 
     let state = AppState {
         pool,
-        jwt: Arc::new(JwtConfig::new("test-secret")),
+        jwt: Arc::new(JwtConfig::new(TEST_JWT_SIGNING_KEY, TEST_JWT_PUBLIC_KEY, None).unwrap()),
         pool_status: private_channel_auth::pool_status::PoolStatus::new_healthy(),
         // Well above any test's concurrency. Argon2 is much slower unoptimized,
         // so a production-sized cap would shed here on the permit wait and mask
@@ -1355,7 +1360,7 @@ async fn challenge_issuance_over_budget_ip_is_shed_across_accounts() {
         .connect(&db_url)
         .await
         .expect("failed to connect to test db");
-    let jwt = JwtConfig::new("test-secret");
+    let jwt = JwtConfig::new(TEST_JWT_SIGNING_KEY, TEST_JWT_PUBLIC_KEY, None).unwrap();
     let mut tokens = Vec::new();
     for account in 0..burst.get() + 3 {
         let user = db::insert_user(&pool, &format!("account{account}"), "fakehash")

@@ -60,7 +60,8 @@ write_secrets() {
     postgres_monitoring_password postgres_grafana_password postgres_indexer_password grafana_admin_password; do
     printf '%s: %s\n' "$k" "$(openssl rand -hex 16)" >>"$f"
   done
-  printf 'jwt_secret: %s\n' "$(openssl rand -hex 32)" >>"$f"
+  "$(dirname "${BASH_SOURCE[0]}")/../jwt-keypair.sh" \
+    | sed 's/^JWT_SIGNING_KEY=/jwt_signing_key: /; s/^JWT_PUBLIC_KEY=/jwt_public_key: /' >>"$f"
   printf 'notify_webhook: http://e2e-hook-%s.invalid/notify\n' "$(openssl rand -hex 12)" >>"$f"
   printf 'alert_webhook_url: http://e2e-grafana-hook-%s.invalid/hook\n' "$(openssl rand -hex 12)" >>"$f"
   printf 'ghcr_user: ""\nghcr_token: ""\n' >>"$f"

@@ -222,6 +222,7 @@
 
     - name: Assert the required secrets
       ansible.builtin.import_tasks: tasks/secret_asserts.yml
+      tags: [ secret_asserts ]
 
     # Compose file must be present on the control node — render copies it to
     # the target during PHASE 3, so this check is the source-of-truth gate.
@@ -1271,7 +1272,7 @@
     # RBAC is on or off. The two checks below are a pair:
     #   1. the internal port still serves a gated read, with no JWT
     #   2. the public port rejects that same read without a token
-    # Check 1 on its own proves nothing: with JWT_SECRET blank it passes because
+    # Check 1 on its own proves nothing: with JWT_PUBLIC_KEY blank it passes because
     # nothing is enforced anywhere. Check 2 rules that out.
     #
     # getBlock is operator-only, the strictest gate the gateway has, so a read

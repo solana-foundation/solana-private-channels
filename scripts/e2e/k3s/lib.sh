@@ -62,7 +62,7 @@ INV
         postgres_indexer_password grafana_admin_password; do
         echo "$k: e2e$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
       done
-      echo "jwt_secret: e2e$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+      "$REPO/scripts/jwt-keypair.sh" | sed 's/^JWT_SIGNING_KEY=/jwt_signing_key: /; s/^JWT_PUBLIC_KEY=/jwt_public_key: /'
       echo "ghcr_user: e2e"
       echo "ghcr_token: unused"
     ) >"$sec"

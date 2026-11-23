@@ -56,7 +56,7 @@ started by hand in this order:
 docker compose up -d write-node
 docker compose logs -f write-node                 # wait for "Redis cache aligned with Postgres"
 docker compose up -d read-node gateway
-docker compose --profile auth up -d auth          # only when JWT_SECRET is set (gateway enforces JWT)
+docker compose --profile auth up -d auth          # only when JWT_PUBLIC_KEY is set (gateway enforces JWT)
 docker compose up -d operator-private-channel
 docker compose logs -f operator-private-channel   # wait for "Withdrawal bitmap verification passed"
 docker compose up -d indexer-solana indexer-private-channel operator-solana
@@ -166,6 +166,23 @@ The secret files live under `{{ host_data_dir }}/secrets/<service>/`, root-owned
 them with `sudo`; the rendered `.env` keeps their keys empty. Rotation:
 [docs/runbooks/secret_rotation.md](docs/runbooks/secret_rotation.md) and
 [docs/runbooks/key_rotation.md](docs/runbooks/key_rotation.md).
+
+## JWT keypair
+
+Login tokens are now signed with an Ed25519 key only auth holds, and the gateway verifies
+them with its public key. `JWT_SECRET` and `JWT_SECRET_PREVIOUS` are no longer read.
+
+1. Create the keypair: `scripts/rotate-secret.sh jwt_signing_key` (add
+   `--backend doppler --project P --config C` for Doppler). It writes `jwt_signing_key`
+   and `jwt_public_key`. Raw compose: paste the two lines `scripts/jwt-keypair.sh` prints
+   into `.env`.
+2. Delete `jwt_secret` and `jwt_secret_previous` (`JWT_SECRET`, `JWT_SECRET_PREVIOUS`).
+   Nothing reads them. In raw compose a leftover `JWT_SECRET` makes the gateway refuse to
+   start until `JWT_PUBLIC_KEY` is set.
+3. Deploy auth and the gateway together.
+
+Every issued token stops verifying, so users log in again. Internal services carry no
+token and are unaffected.
 
 ## Rehearsal
 

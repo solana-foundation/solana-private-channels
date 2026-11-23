@@ -23,7 +23,7 @@
 # Optional env vars:
 #   PRIVATE_CHANNEL_GATEWAY_URL      - Solana Private Channels gateway URL (default: http://localhost:8899)
 #   PRIVATE_CHANNEL_READ_RPC_URL     - Channel URL for account reads (default: the read node when
-#                                      JWT_SECRET is set, since the gateway then refuses them; else the gateway)
+#                                      JWT_PUBLIC_KEY is set, since the gateway then refuses them; else the gateway)
 #   ESCROW_ADMIN_KEYPAIR    - Path to escrow admin keypair (default: ./keypairs/escrow-admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
@@ -54,7 +54,7 @@ export ADMIN_SIGNER="${ADMIN_SIGNER:-memory}" OPERATOR_SIGNER="${OPERATOR_SIGNER
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
 PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
 # With JWT on, the gateway refuses account reads without a token; the read node does not.
-if [ -n "${JWT_SECRET:-}" ]; then
+if [ -n "${JWT_PUBLIC_KEY:-}" ]; then
   PRIVATE_CHANNEL_READ_RPC_URL="${PRIVATE_CHANNEL_READ_RPC_URL:-http://localhost:${PRIVATE_CHANNEL_READ_PORT:-8901}}"
 else
   PRIVATE_CHANNEL_READ_RPC_URL="${PRIVATE_CHANNEL_READ_RPC_URL:-$PRIVATE_CHANNEL_GATEWAY_URL}"

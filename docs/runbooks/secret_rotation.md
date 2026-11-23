@@ -35,7 +35,7 @@ scripts/rotate-secret.sh <key> [--backend file|doppler --project P --config C]
 ```
 
 - **Generated keys** get a fresh random value: `openssl rand -hex 16` for the Postgres
-  passwords and `grafana_admin_password`, `openssl rand -hex 32` for `jwt_secret`.
+  passwords and `grafana_admin_password`, `scripts/jwt-keypair.sh` for `jwt_signing_key`.
 - **Supplied keys** (tokens, webhooks, provider URLs, signer secrets) are refused without
   `--value-stdin`. The value is read from stdin, and refused if empty or containing a
   newline.
@@ -77,8 +77,9 @@ read -rs NEW && printf '%s' "$NEW" | scripts/rotate-secret.sh ghcr_token --value
 | `postgres_monitoring_password` | generated | primary postgres-exporter | |
 | `postgres_grafana_password` | generated | Grafana datasource | Indexer cluster |
 | `postgres_indexer_password` | generated | indexers, operators, streamer (localnet), `pg-backup-indexer`, indexer exporter | Indexer cluster superuser |
-| `jwt_secret` (`JWT_SECRET`) | generated | gateway, auth | See [JWT](#jwt) |
-| `jwt_secret_previous` (`JWT_SECRET_PREVIOUS`) | set by the script | gateway, auth | Only during a JWT rotation |
+| `jwt_signing_key` (`JWT_SIGNING_KEY`) | generated | auth | See [JWT](#jwt) |
+| `jwt_public_key` (`JWT_PUBLIC_KEY`) | set by the script | gateway, auth | Generated with `jwt_signing_key` |
+| `jwt_public_key_previous` (`JWT_PUBLIC_KEY_PREVIOUS`) | set by the script | gateway, auth | Only during a JWT rotation |
 | `grafana_admin_password` | generated | Grafana | See [Grafana](#grafana-admin) |
 | `ghcr_token` | supplied | control node and the pull only | See [GHCR](#ghcr-pat) |
 | `notify_webhook` (`ALERT_WEBHOOK_URL`) | supplied | indexers, operators, report phase | See [Webhooks](#webhooks) |
@@ -131,45 +132,48 @@ there for the service logins.
 
 ## JWT
 
-Auth signs tokens with `jwt_secret` (HS256, 24 h lifetime). During a rotation
-`jwt_secret_previous` holds the old secret, and both auth and the gateway accept tokens
-signed with either.
+Auth signs tokens with `jwt_signing_key` (Ed25519, 24 h lifetime); auth and the gateway
+verify them with `jwt_public_key`. Only auth holds the signing key. During a rotation
+`jwt_public_key_previous` holds the old public key, and tokens signed for either are
+accepted.
 
 **Routine rotation** (nobody is logged out):
 
-1. Stage it. The current secret moves to `jwt_secret_previous` and a new one is generated.
-   Refused if a previous secret is already set.
+1. Stage it. A new keypair is generated and the current public key moves to
+   `jwt_public_key_previous`. Refused if a previous key is already set.
 
    ```bash
-   scripts/rotate-secret.sh jwt_secret [--backend doppler --project P --config C]
+   scripts/rotate-secret.sh jwt_signing_key [--backend doppler --project P --config C]
    cd private-channel-deploy && ansible-playbook deploy.yml -l <group>
    ```
 
-2. Wait at least 24 hours, so every token signed with the old secret has expired.
-3. Finish it. `jwt_secret_previous` is cleared (deleted in Doppler). Refused if it is
+2. Wait at least 24 hours, so every token signed with the old key has expired.
+3. Finish it. `jwt_public_key_previous` is cleared (deleted in Doppler). Refused if it is
    already empty.
 
    ```bash
-   scripts/rotate-secret.sh jwt_secret --finish [--backend doppler --project P --config C]
+   scripts/rotate-secret.sh jwt_signing_key --finish [--backend doppler --project P --config C]
    cd private-channel-deploy && ansible-playbook deploy.yml -l <group>
    ```
 
-Until step 3, any token signed with the previous secret is accepted, including tokens
-newly forged with it if it leaked. Roles are still checked against the database, but a
-forger can claim any user.
+Until step 3, any token signed with the old signing key is accepted, including tokens
+newly forged with it if it leaked.
 
-**After a compromise** of `jwt_secret` or `jwt_secret_previous`, do a hard cut instead:
-replace `jwt_secret` and leave `jwt_secret_previous` empty, then redeploy. Every issued
-token stops working at once and users log in again.
+**After a signing key leak**, do a hard cut, with no deploy until the last step:
 
-- File backend: if a rotation is in progress, run `--finish` first. Then set
-  `jwt_secret` in `secrets.yml` by hand to a new `openssl rand -hex 32` value.
-- Doppler backend: `scripts/rotate-secret.sh jwt_secret --finish --backend doppler ...`
-  if a rotation is in progress, then
-  `openssl rand -hex 32 | tr -d '\n' | env -u DOPPLER_TOKEN doppler secrets set JWT_SECRET --silent --project P --config C`.
+1. `--finish`, if a rotation is in progress (the stage refuses to run otherwise).
+2. Stage a new keypair.
+3. `--finish`, so the leaked key is not kept as the previous one.
+4. Deploy once.
 
-Preflight, auth and the gateway refuse a previous secret under 32 bytes, equal to the
-current one, or without a current one.
+A deploy after the stage alone would keep accepting tokens signed with the leaked key.
+Every issued token stops working at once and users log in again.
+
+After a gateway compromise, do a hard cut too. The gateway holds no signing key, but it
+saw every live token it relayed, and those stay valid for up to 24 hours.
+
+Preflight, auth and the gateway refuse a previous key equal to the current one, or
+without a current one.
 
 ## Grafana admin
 

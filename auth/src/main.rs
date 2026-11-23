@@ -27,6 +27,12 @@ async fn main() {
     if let Err(e) = config.validate() {
         panic!("invalid configuration: {e}");
     }
+    let jwt = JwtConfig::new(
+        &config.jwt_signing_key,
+        &config.jwt_public_key,
+        config.jwt_public_key_previous(),
+    )
+    .unwrap_or_else(|e| panic!("invalid configuration: {e}"));
 
     info!("Starting private-channel-auth on port {}", config.port);
 
@@ -52,10 +58,7 @@ async fn main() {
 
     let state = AppState {
         pool,
-        jwt: Arc::new(JwtConfig::with_previous(
-            &config.jwt_secret,
-            config.jwt_secret_previous(),
-        )),
+        jwt: Arc::new(jwt),
         pool_status: pool_status.clone(),
         passwords: PasswordWorker::new(config.argon2_max_concurrency),
         throttle: auth_throttle,

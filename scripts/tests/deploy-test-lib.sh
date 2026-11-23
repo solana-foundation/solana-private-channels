@@ -152,16 +152,10 @@ sentinel_secrets() {
   for key in postgres_password postgres_replication_password postgres_runtime_password \
     postgres_auth_runtime_password postgres_auth_owner_password postgres_gateway_password \
     postgres_monitoring_password postgres_grafana_password postgres_indexer_password \
-    grafana_admin_password ghcr_token yellowstone_token \
-    admin_vault_token operator_vault_token admin_turnkey_api_private_key \
+    grafana_admin_password ghcr_token yellowstone_token jwt_signing_key jwt_public_key \
+    jwt_public_key_previous admin_vault_token operator_vault_token admin_turnkey_api_private_key \
     operator_turnkey_api_private_key admin_privy_app_secret operator_privy_app_secret; do
     val="SNTL${tag}x${key}"
-    printf '%s: %s\n' "$key" "$val" >>"$out"
-    printf '%s\n' "$val" >>"$TMP/sentinels.txt"
-  done
-  # 32+ bytes so the JWT asserts accept them.
-  for key in jwt_secret jwt_secret_previous; do
-    val="SNTL${tag}x${key}xxxxxxxxxxxxxxxxxxxxxxxx"
     printf '%s: %s\n' "$key" "$val" >>"$out"
     printf '%s\n' "$val" >>"$TMP/sentinels.txt"
   done

@@ -108,16 +108,17 @@ secret_files:
   read-node:
   - { key: PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL, value: "postgres://private_channel_runtime:{{ postgres_runtime_password }}@postgres-replica:5432/{{ postgres_db }}" }
   gateway:
-  - { key: JWT_SECRET, value: "{{ jwt_secret if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
-  - { key: JWT_SECRET_PREVIOUS, value: "{{ jwt_secret_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_PUBLIC_KEY, value: "{{ jwt_public_key if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_PUBLIC_KEY_PREVIOUS, value: "{{ jwt_public_key_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
   - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_gateway:{{ postgres_gateway_password }}@postgres-primary:5432/{{ postgres_db }}" }
   - { key: GATEWAY_WHITELIST_RPC_URL, value: "{{ gateway_whitelist_rpc_url | default('') }}" }
   auth-migrate:
   - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_auth_owner:{{ postgres_auth_owner_password }}@postgres-primary:5432/{{ postgres_db }}" }
   auth:
   - { key: AUTH_DATABASE_URL, value: "postgres://private_channel_auth_runtime:{{ postgres_auth_runtime_password }}@postgres-primary:5432/{{ postgres_db }}" }
-  - { key: JWT_SECRET, value: "{{ jwt_secret if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
-  - { key: JWT_SECRET_PREVIOUS, value: "{{ jwt_secret_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_SIGNING_KEY, value: "{{ jwt_signing_key if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_PUBLIC_KEY, value: "{{ jwt_public_key if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
+  - { key: JWT_PUBLIC_KEY_PREVIOUS, value: "{{ jwt_public_key_previous | default('', true) if (gateway_enforce_jwt | default(true) | bool) else '' }}" }
   indexer-solana:
   - { key: DATABASE_URL, value: "{{ _pc_indexer_db_url }}" }
   - { key: COMMON_RPC_URL, value: "{{ rpc_url if (_pc_remote_rpc | bool) else '' }}" }

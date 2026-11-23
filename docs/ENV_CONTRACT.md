@@ -51,7 +51,7 @@ world-readable file:
   read `X_FILE` when set and `X` otherwise (so raw compose still works), Grafana uses
   `__FILE` and `$__file{}`, and the exporters `DATA_SOURCE_PASS_FILE`.
 - Secrets in files: the nine Postgres passwords (and the DB URLs built from them),
-  `JWT_SECRET`, `JWT_SECRET_PREVIOUS`, Grafana's admin password, both webhooks, the
+  `JWT_SIGNING_KEY`, `JWT_PUBLIC_KEY`, `JWT_PUBLIC_KEY_PREVIOUS`, Grafana's admin password, both webhooks, the
   signer secrets (`*_PRIVATE_KEY`, `*_VAULT_TOKEN`, `*_TURNKEY_API_PRIVATE_KEY`,
   `*_PRIVY_APP_SECRET`), `INDEXER_YELLOWSTONE_TOKEN`, and off localnet the provider RPC
   URLs (`COMMON_RPC_URL`, `COMMON_SOURCE_RPC_URL`, `COMMON_FALLBACK_RPC_URL`,
@@ -94,7 +94,7 @@ so a blank secret is caught identically on both surfaces. Currently required:
 - `GF_ADMIN_PASSWORD` — Grafana's admin login; the literal `admin` is rejected
 
 No working defaults ship for these. Generate each with `openssl rand -hex 32`.
-`JWT_SECRET` is required only when auth/RBAC is enabled (see `.env.example`). When set it must be at least 32 bytes after trimming; the gateway treats an empty value as auth off and refuses a whitespace-only one, and auth refuses an empty one. `GATEWAY_REQUIRE_JWT=1` (rendered by the Ansible deploy whenever RBAC is on) makes the gateway refuse a blank `JWT_SECRET` instead. `JWT_SECRET_PREVIOUS` is optional and set only during a rotation; the gateway and auth refuse it under 32 bytes, equal to `JWT_SECRET`, or without `JWT_SECRET`.
+`JWT_SIGNING_KEY` and `JWT_PUBLIC_KEY` are required only when auth/RBAC is enabled (see `.env.example`); `scripts/jwt-keypair.sh` makes both. Only auth gets the signing key. The gateway treats an empty `JWT_PUBLIC_KEY` as auth off and refuses a malformed or whitespace-only one, and auth refuses a keypair whose public key does not match. `GATEWAY_REQUIRE_JWT=1` (rendered by the Ansible deploy whenever RBAC is on) makes the gateway refuse a blank `JWT_PUBLIC_KEY` instead. `JWT_PUBLIC_KEY_PREVIOUS` is optional and set only during a rotation; the gateway and auth refuse it when equal to `JWT_PUBLIC_KEY` or without it.
 
 The Ansible deploy runs `check-required-env.sh` on its rendered `.env` with the secret
 values passed in the checker's own process environment, which wins over the file, so the

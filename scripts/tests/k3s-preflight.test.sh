@@ -27,7 +27,8 @@ postgres_gateway_password: p6
 postgres_monitoring_password: p7
 postgres_grafana_password: p8
 postgres_indexer_password: p9
-jwt_secret: 0123456789abcdef0123456789abcdef
+jwt_signing_key: 2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD
+jwt_public_key: 6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM
 grafana_admin_password: g
 ghcr_user: u
 ghcr_token: t

@@ -155,24 +155,24 @@ pub struct Args {
     #[arg(long, default_value = "*", env = "GATEWAY_CORS_ALLOWED_ORIGIN")]
     pub cors_allowed_origin: String,
 
-    /// Shared JWT secret used to verify tokens issued by the auth service.
-    /// If absent, auth enforcement is disabled (useful for local dev).
-    /// Must match the JWT_SECRET configured in the auth service.
-    #[arg(long, env = "JWT_SECRET")]
-    pub jwt_secret: Option<String>,
+    /// Base58 Ed25519 public key that verifies tokens issued by the auth service, the
+    /// same value as auth's JWT_PUBLIC_KEY. If absent, auth enforcement is disabled
+    /// (useful for local dev).
+    #[arg(long, env = "JWT_PUBLIC_KEY")]
+    pub jwt_public_key: Option<String>,
 
-    /// The secret JWT_SECRET replaced, accepted for verification only while tokens
-    /// signed with it are still live. Blank means off.
-    #[arg(long, env = "JWT_SECRET_PREVIOUS")]
-    pub jwt_secret_previous: Option<String>,
+    /// The public key JWT_PUBLIC_KEY replaced, accepted for verification only while
+    /// tokens signed for it are still live. Blank means off.
+    #[arg(long, env = "JWT_PUBLIC_KEY_PREVIOUS")]
+    pub jwt_public_key_previous: Option<String>,
 
-    /// When `1`, refuse to start with a blank JWT_SECRET instead of running with
-    /// auth off, so a secret lost in deployment cannot silently disable RBAC.
+    /// When `1`, refuse to start with a blank JWT_PUBLIC_KEY instead of running with
+    /// auth off, so a key lost in deployment cannot silently disable RBAC.
     #[arg(long, env = "GATEWAY_REQUIRE_JWT")]
     pub require_jwt: Option<String>,
 
     /// Connection URL for the auth service's Postgres database.
-    /// Required when JWT_SECRET is set (used for wallet ownership checks).
+    /// Required when JWT_PUBLIC_KEY is set (used for wallet ownership checks).
     #[arg(long, env = "AUTH_DATABASE_URL")]
     pub auth_database_url: Option<String>,
 
@@ -386,7 +386,7 @@ pub struct Gateway {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
     >,
-    /// Decoding keys built from JWT_SECRET, then JWT_SECRET_PREVIOUS, at startup.
+    /// Decoding keys built from JWT_PUBLIC_KEY, then JWT_PUBLIC_KEY_PREVIOUS, at startup.
     /// Empty means auth enforcement is disabled.
     jwt_keys: Vec<DecodingKey>,
     /// Connection pool to the auth service's Postgres database.
@@ -814,68 +814,62 @@ fn check_cors_origin(origin: &str) -> Result<(), String> {
 }
 
 /// Lenient trim used by `Gateway::new`, which is not a validated entry point: a library
-/// caller handing it a blank or whitespace-only secret gets RBAC off. `run` applies the
-/// strict rule in `resolve_jwt_secret` before any `Gateway` is built.
-fn configured_secret(secret: Option<&str>) -> Option<&str> {
-    secret.filter(|s| !s.trim().is_empty())
+/// caller handing it a blank or whitespace-only key gets RBAC off. `run` applies the
+/// strict rule in `resolve_jwt_public_key` before any `Gateway` is built.
+fn configured_key(key: Option<&str>) -> Option<&str> {
+    key.filter(|s| !s.trim().is_empty())
 }
 
-/// Shortest accepted JWT signing secret, measured after trimming whitespace.
-const MIN_JWT_SECRET_BYTES: usize = 32;
+/// A base58 Ed25519 public key, trimmed like the auth service trims it (auth is only
+/// a dev-dependency here, so the rule is repeated). The error never includes the value.
+fn decode_public_key(name: &str, value: &str) -> Result<DecodingKey, String> {
+    bs58::decode(value.trim())
+        .into_vec()
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .map(|bytes| DecodingKey::from_ed_der(&bytes))
+        .ok_or_else(|| format!("{name} must be a base58 32-byte Ed25519 public key"))
+}
 
-/// Startup rule for `JWT_SECRET`, identical to the auth service's (auth is only a
-/// dev-dependency here, so the rule is repeated and both sides pin the same vectors).
-/// An absent or empty value means RBAC off. Anything else must be at least 32 bytes after
-/// trimming, so a whitespace-only value cannot silently disable auth while auth signs
-/// with it. The key stays the raw value. The error never includes the secret.
-fn resolve_jwt_secret(secret: Option<&str>) -> Result<Option<&str>, String> {
-    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+/// Startup rule for `JWT_PUBLIC_KEY`. An absent or empty value means RBAC off. Anything
+/// else must decode, so a whitespace-only value cannot silently disable auth.
+fn resolve_jwt_public_key(key: Option<&str>) -> Result<Option<&str>, String> {
+    let Some(key) = key.filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let trimmed_len = secret.trim().len();
-    if trimmed_len < MIN_JWT_SECRET_BYTES {
-        return Err(format!(
-            "JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes after trimming \
-             whitespace (got {trimmed_len}); leave it empty to run without auth, or \
-             generate one with `openssl rand -hex 32`"
-        ));
-    }
-    Ok(Some(secret))
+    decode_public_key("JWT_PUBLIC_KEY", key)?;
+    Ok(Some(key))
 }
 
-/// Startup rule for `JWT_SECRET_PREVIOUS`, given the already resolved current secret and
-/// pinned to the same vectors as the auth service. Blank means off. The error never
-/// includes either secret.
-fn resolve_jwt_secret_previous<'a>(
+/// Startup rule for `JWT_PUBLIC_KEY_PREVIOUS`, given the already resolved current key.
+/// Blank means off.
+fn resolve_jwt_public_key_previous<'a>(
     current: Option<&str>,
     previous: Option<&'a str>,
 ) -> Result<Option<&'a str>, String> {
-    let Some(previous) = previous.filter(|s| !s.trim().is_empty()) else {
+    let Some(previous) = configured_key(previous) else {
         return Ok(None);
     };
     let Some(current) = current else {
-        return Err("JWT_SECRET_PREVIOUS is set but JWT_SECRET is blank; \
+        return Err(
+            "JWT_PUBLIC_KEY_PREVIOUS is set but JWT_PUBLIC_KEY is blank; \
                     a previous key only makes sense during a rotation"
-            .to_string());
+                .to_string(),
+        );
     };
-    let trimmed_len = previous.trim().len();
-    if trimmed_len < MIN_JWT_SECRET_BYTES {
-        return Err(format!(
-            "JWT_SECRET_PREVIOUS must be at least {MIN_JWT_SECRET_BYTES} bytes after \
-             trimming whitespace (got {trimmed_len})"
-        ));
-    }
+    decode_public_key("JWT_PUBLIC_KEY_PREVIOUS", previous)?;
+    // Base58 has one spelling per key, so equal text is an equal key.
     if previous.trim() == current.trim() {
-        return Err("JWT_SECRET_PREVIOUS must differ from JWT_SECRET".to_string());
+        return Err("JWT_PUBLIC_KEY_PREVIOUS must differ from JWT_PUBLIC_KEY".to_string());
     }
     Ok(Some(previous))
 }
 
-/// `GATEWAY_REQUIRE_JWT=1` turns a blank `JWT_SECRET` from "RBAC off" into a startup error.
+/// `GATEWAY_REQUIRE_JWT=1` turns a blank `JWT_PUBLIC_KEY` from "RBAC off" into a startup error.
 fn check_require_jwt(require: Option<&str>, auth_enabled: bool) -> Result<(), String> {
     if require == Some("1") && !auth_enabled {
         return Err(
-            "GATEWAY_REQUIRE_JWT=1 but JWT_SECRET is blank; refusing to start without auth"
+            "GATEWAY_REQUIRE_JWT=1 but JWT_PUBLIC_KEY is blank; refusing to start without auth"
                 .to_string(),
         );
     }
@@ -883,7 +877,7 @@ fn check_require_jwt(require: Option<&str>, auth_enabled: bool) -> Result<(), St
 }
 
 /// A blank `GATEWAY_INTERNAL_PORT` means "no internal listener", the same way a
-/// blank `JWT_SECRET` means "no auth". Compose substitutes an unset variable as
+/// blank `JWT_PUBLIC_KEY` means "no auth". Compose substitutes an unset variable as
 /// the empty string, so an env file that predates the internal listener must
 /// leave the gateway running without one rather than fail to start.
 fn configured_internal_port(port: Option<&str>) -> Result<Option<u16>, Box<dyn std::error::Error>> {
@@ -987,7 +981,7 @@ impl Gateway {
         write_url: String,
         read_url: String,
         cors_allowed_origin: String,
-        jwt_secret: Option<String>,
+        jwt_public_key: Option<String>,
         auth_db: Option<PgPool>,
     ) -> Self {
         let https = HttpsConnectorBuilder::new()
@@ -996,10 +990,9 @@ impl Gateway {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        // Treat an empty or whitespace-only JWT_SECRET as "not set"; key is built from the
-        // untrimmed bytes so it stays identical to the auth service's signing key.
-        let jwt_keys = configured_secret(jwt_secret.as_deref())
-            .map(|s| DecodingKey::from_secret(s.as_bytes()))
+        // A malformed key panics rather than leaving RBAC off; `run` validates it first.
+        let jwt_keys = configured_key(jwt_public_key.as_deref())
+            .map(|key| decode_public_key("JWT_PUBLIC_KEY", key).unwrap())
             .into_iter()
             .collect();
         Self {
@@ -1021,15 +1014,15 @@ impl Gateway {
         }
     }
 
-    /// Also accepts tokens signed with the previous secret, checked after the current one.
-    /// Lenient like `new`: ignored when blank or when there is no current secret.
-    pub fn with_previous_jwt_secret(mut self, previous: Option<String>) -> Self {
+    /// Also accepts tokens signed for the previous key, checked after the current one.
+    /// Like `new`: ignored when blank or when there is no current key.
+    pub fn with_previous_jwt_public_key(mut self, previous: Option<String>) -> Self {
         if let (false, Some(previous)) = (
             self.jwt_keys.is_empty(),
-            configured_secret(previous.as_deref()),
+            configured_key(previous.as_deref()),
         ) {
             self.jwt_keys
-                .push(DecodingKey::from_secret(previous.as_bytes()));
+                .push(decode_public_key("JWT_PUBLIC_KEY_PREVIOUS", previous).unwrap());
         }
         self
     }
@@ -2438,11 +2431,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
 
     // Config rules run before anything connects, so a bad value never opens the pool.
-    let current_secret = resolve_jwt_secret(args.jwt_secret.as_deref())?;
-    let auth_enabled = current_secret.is_some();
+    let current_key = resolve_jwt_public_key(args.jwt_public_key.as_deref())?;
+    let auth_enabled = current_key.is_some();
     check_require_jwt(args.require_jwt.as_deref(), auth_enabled)?;
     let rotating =
-        resolve_jwt_secret_previous(current_secret, args.jwt_secret_previous.as_deref())?.is_some();
+        resolve_jwt_public_key_previous(current_key, args.jwt_public_key_previous.as_deref())?
+            .is_some();
     info!(
         "  Auth enforcement: {}",
         if auth_enabled { "enabled" } else { "disabled" }
@@ -2468,20 +2462,20 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     check_limits(&limits)?;
 
-    // Refuse to start if JWT_SECRET is set without AUTH_DATABASE_URL.
+    // Refuse to start if JWT_PUBLIC_KEY is set without AUTH_DATABASE_URL.
     //
     // Auth is intentionally optional: both absent means "run without auth" and
-    // is valid for local dev. But JWT_SECRET present without AUTH_DATABASE_URL
+    // is valid for local dev. But JWT_PUBLIC_KEY present without AUTH_DATABASE_URL
     // is a misconfiguration: enforce_auth silently falls through to its wildcard
     // arm and returns None, disabling all enforcement with no indication. An
-    // operator who sets JWT_SECRET believes auth is active; failing here at boot
+    // operator who sets JWT_PUBLIC_KEY believes auth is active; failing here at boot
     // ensures that belief is correct rather than every request passing through
     // unguarded at runtime.
     if auth_enabled && args.auth_database_url.is_none() {
         return Err(
-            "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
+            "JWT_PUBLIC_KEY is set but AUTH_DATABASE_URL is not configured. \
              Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
-             or unset JWT_SECRET to run without auth."
+             or unset JWT_PUBLIC_KEY to run without auth."
                 .into(),
         );
     }
@@ -2527,10 +2521,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.write_url,
             args.read_url,
             args.cors_allowed_origin,
-            args.jwt_secret,
+            args.jwt_public_key,
             auth_db,
         )
-        .with_previous_jwt_secret(args.jwt_secret_previous)
+        .with_previous_jwt_public_key(args.jwt_public_key_previous)
         .with_limits(limits)
         .with_withdraw_whitelist(withdraw_whitelist),
     );
@@ -2553,7 +2547,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{encode, Algorithm, Header};
+    use private_channel_auth::jwt::encoding_key;
     use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
     use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
     use serde_json::json;
@@ -3611,7 +3606,7 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             "http://127.0.0.1:1".to_string(),
             "*".to_string(),
-            Some(TEST_JWT_SECRET.to_string()),
+            Some(TEST_JWT_PUBLIC_KEY.to_string()),
             Some(unreachable),
         );
 
@@ -3757,9 +3752,11 @@ mod tests {
         assert!(entries[3].is_null(), "an unknown signature stays null");
     }
 
-    /// Shared secret for the ownership-fetch tests below, used by both the token
-    /// minter and the gateway under test.
-    const TEST_JWT_SECRET: &str = "test-gateway-secret";
+    /// Test keypair for the ownership-fetch tests below: tokens are signed with the
+    /// first, the gateway under test verifies with the second.
+    const TEST_JWT_SIGNING_KEY: &str =
+        "2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD";
+    const TEST_JWT_PUBLIC_KEY: &str = "6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM";
 
     /// Start a gateway with auth enforcement on. The auth pool is lazy and never
     /// connects: every path these tests exercise rejects before any DB query.
@@ -3788,7 +3785,7 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 read_url.to_string(),
                 "*".to_string(),
-                Some(TEST_JWT_SECRET.to_string()),
+                Some(TEST_JWT_PUBLIC_KEY.to_string()),
                 Some(auth_db),
             )
             .with_limits(limits),
@@ -3819,9 +3816,9 @@ mod tests {
             "aud": "private-channel-gateway",
         });
         encode(
-            &Header::default(),
+            &Header::new(Algorithm::EdDSA),
             &claims,
-            &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+            &encoding_key(TEST_JWT_SIGNING_KEY).unwrap(),
         )
         .unwrap()
     }
@@ -4954,78 +4951,58 @@ mod tests {
         }
     }
 
-    /// The same vectors are pinned in the auth service's config tests.
     #[test]
-    fn jwt_secret_rule_matches_the_auth_service() {
-        let thirty_one = "a".repeat(31);
-        let thirty_two = "a".repeat(32);
+    fn jwt_public_key_rule() {
         for off in [None, Some("")] {
-            assert_eq!(resolve_jwt_secret(off), Ok(None), "blank means RBAC off");
+            assert_eq!(
+                resolve_jwt_public_key(off),
+                Ok(None),
+                "blank means RBAC off"
+            );
         }
-        for bad in [
-            "   \t\n".to_string(),
-            "secret".to_string(),
-            thirty_one.clone(),
-            format!("{thirty_one}\n"),
-            format!("  {thirty_one}  "),
+        for bad in ["   \t\n", "LEAKMARKER-xyz", TEST_JWT_SIGNING_KEY] {
+            let err = resolve_jwt_public_key(Some(bad)).expect_err("must be rejected");
+            assert!(err.contains("JWT_PUBLIC_KEY"), "got: {err}");
+            assert!(
+                !err.contains("LEAK") && !err.contains(TEST_JWT_SIGNING_KEY),
+                "leaked: {err}"
+            );
+        }
+        for good in [
+            TEST_JWT_PUBLIC_KEY.to_string(),
+            format!(" {TEST_JWT_PUBLIC_KEY}\n"),
         ] {
-            let err = resolve_jwt_secret(Some(&bad)).expect_err("must be rejected");
-            assert!(err.contains("JWT_SECRET"), "got: {err}");
-        }
-        for good in [thirty_two.clone(), format!(" {thirty_two}\n")] {
-            assert_eq!(resolve_jwt_secret(Some(&good)), Ok(Some(good.as_str())));
+            assert_eq!(resolve_jwt_public_key(Some(&good)), Ok(Some(good.as_str())));
         }
     }
 
-    /// The same vectors are pinned in the auth service's config tests.
     #[test]
-    fn previous_jwt_secret_rule_matches_the_auth_service() {
-        let current = "c".repeat(32);
-        let previous = "p".repeat(32);
+    fn jwt_public_key_previous_rule() {
+        let current = TEST_JWT_PUBLIC_KEY;
+        let previous = Keypair::new().pubkey().to_string();
         for off in [None, Some(""), Some("  \t\n")] {
-            assert_eq!(resolve_jwt_secret_previous(Some(&current), off), Ok(None));
-            assert_eq!(resolve_jwt_secret_previous(None, off), Ok(None));
+            assert_eq!(
+                resolve_jwt_public_key_previous(Some(current), off),
+                Ok(None)
+            );
+            assert_eq!(resolve_jwt_public_key_previous(None, off), Ok(None));
         }
-        let err = resolve_jwt_secret_previous(None, Some(&previous))
-            .expect_err("previous without a current must be refused");
-        assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
-        for short in ["p".repeat(31), format!("  {}  ", "p".repeat(31))] {
-            let err = resolve_jwt_secret_previous(Some(&current), Some(&short))
-                .expect_err("a short previous must be refused");
-            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
-        }
-        for same in [current.clone(), format!(" {current}\n")] {
-            let err = resolve_jwt_secret_previous(Some(&current), Some(&same))
-                .expect_err("previous equal to current must be refused");
-            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
+        for (current, bad) in [
+            (None, previous.clone()),
+            (Some(current), "LEAKMARKER-xyz".to_string()),
+            (Some(current), current.to_string()),
+            (Some(current), format!(" {current}\n")),
+        ] {
+            let err = resolve_jwt_public_key_previous(current, Some(&bad))
+                .expect_err("previous must be refused");
+            assert!(err.contains("JWT_PUBLIC_KEY_PREVIOUS"), "got: {err}");
+            assert!(!err.contains("LEAK"), "leaked: {err}");
         }
         for good in [previous.clone(), format!(" {previous}\n")] {
             assert_eq!(
-                resolve_jwt_secret_previous(Some(&current), Some(&good)),
+                resolve_jwt_public_key_previous(Some(current), Some(&good)),
                 Ok(Some(good.as_str()))
             );
-        }
-    }
-
-    #[test]
-    fn a_rejected_jwt_secret_is_never_echoed() {
-        let marker = "LEAKMARKER-xyz";
-        let err = resolve_jwt_secret(Some(marker)).expect_err("short secret");
-        assert!(
-            !err.contains(marker) && !err.contains("LEAK"),
-            "leaked: {err}"
-        );
-
-        let long_marker = "LEAKMARKER-0123456789abcdef0123456789";
-        let current = "c".repeat(32);
-        for (current, previous) in [
-            (Some(current.as_str()), marker),
-            (None, long_marker),
-            (Some(long_marker), long_marker),
-        ] {
-            let err = resolve_jwt_secret_previous(current, Some(previous))
-                .expect_err("previous must be refused");
-            assert!(!err.contains("LEAK"), "leaked: {err}");
         }
     }
 
@@ -5040,20 +5017,22 @@ mod tests {
                 current.map(str::to_string),
                 None,
             )
-            .with_previous_jwt_secret(previous.map(str::to_string))
+            .with_previous_jwt_public_key(previous.map(str::to_string))
         };
-        assert_eq!(gateway(Some("current"), None).jwt_keys.len(), 1);
-        assert_eq!(gateway(Some("current"), Some(" ")).jwt_keys.len(), 1);
-        assert_eq!(gateway(Some("current"), Some("previous")).jwt_keys.len(), 2);
-        assert_eq!(gateway(None, Some("previous")).jwt_keys.len(), 0);
-        assert_eq!(gateway(Some(" "), Some("previous")).jwt_keys.len(), 0);
+        let current = Some(TEST_JWT_PUBLIC_KEY);
+        let previous = Keypair::new().pubkey().to_string();
+        assert_eq!(gateway(current, None).jwt_keys.len(), 1);
+        assert_eq!(gateway(current, Some(" ")).jwt_keys.len(), 1);
+        assert_eq!(gateway(current, Some(&previous)).jwt_keys.len(), 2);
+        assert_eq!(gateway(None, Some(&previous)).jwt_keys.len(), 0);
+        assert_eq!(gateway(Some(" "), Some(&previous)).jwt_keys.len(), 0);
     }
 
     #[test]
-    fn require_jwt_refuses_only_a_blank_secret_when_set_to_one() {
-        let err = check_require_jwt(Some("1"), false).expect_err("blank secret with 1");
+    fn require_jwt_refuses_only_a_blank_key_when_set_to_one() {
+        let err = check_require_jwt(Some("1"), false).expect_err("blank key with 1");
         assert!(err.contains("GATEWAY_REQUIRE_JWT"), "got: {err}");
-        assert!(err.contains("JWT_SECRET"), "got: {err}");
+        assert!(err.contains("JWT_PUBLIC_KEY"), "got: {err}");
         assert_eq!(check_require_jwt(Some("1"), true), Ok(()));
         for off in [None, Some(""), Some("0")] {
             assert_eq!(check_require_jwt(off, false), Ok(()), "{off:?}");
@@ -5074,27 +5053,27 @@ mod tests {
         assert!(parsed.is_err(), "a zero pool panics in sqlx pool creation");
     }
 
-    /// `run` must refuse a bad secret before it builds the pool, so the error is the
+    /// `run` must refuse a bad key before it builds the pool, so the error is the
     /// validation message and not a connection failure to the unreachable database.
     #[tokio::test]
-    async fn run_refuses_a_weak_or_whitespace_secret_before_connecting() {
+    async fn run_refuses_a_malformed_or_whitespace_key_before_connecting() {
         let marker = "LEAKMARKER-xyz";
-        for secret in [marker, "   ", "short-secret"] {
+        for key in [marker, "   ", TEST_JWT_SIGNING_KEY] {
             let args = parse_args(&[
                 "--port",
                 "0",
-                "--jwt-secret",
-                secret,
+                "--jwt-public-key",
+                key,
                 "--auth-database-url",
                 UNREACHABLE_AUTH_DB,
             ]);
             let err = tokio::time::timeout(Duration::from_secs(5), run(args))
                 .await
-                .expect("a bad secret must be refused, not served")
-                .expect_err("a bad secret must be refused");
+                .expect("a bad key must be refused, not served")
+                .expect_err("a bad key must be refused");
             let msg = err.to_string();
-            assert!(msg.contains("JWT_SECRET"), "got: {msg}");
-            assert!(!msg.contains(marker), "secret leaked: {msg}");
+            assert!(msg.contains("JWT_PUBLIC_KEY"), "got: {msg}");
+            assert!(!msg.contains(marker), "value leaked: {msg}");
         }
     }
 
@@ -5103,7 +5082,7 @@ mod tests {
         let args = parse_args(&[
             "--port",
             "0",
-            "--jwt-secret",
+            "--jwt-public-key",
             "",
             "--auth-database-url",
             UNREACHABLE_AUTH_DB,
@@ -5131,7 +5110,7 @@ mod tests {
         let args = parse_args(&[
             "--port",
             "0",
-            "--jwt-secret",
+            "--jwt-public-key",
             "",
             "--auth-database-url",
             UNREACHABLE_AUTH_DB,
@@ -5148,18 +5127,17 @@ mod tests {
         );
     }
 
-    /// A strong secret passes the strength rule and reaches the next check, which wants
-    /// the auth database next to it.
+    /// A valid key passes and reaches the next check, which wants the auth database
+    /// next to it.
     #[tokio::test]
-    async fn run_accepts_a_strong_secret_and_moves_on_to_the_database_check() {
-        let strong = "0123456789abcdef0123456789abcdef01234567";
-        let mut args = parse_args(&["--port", "0", "--jwt-secret", strong]);
+    async fn run_accepts_a_valid_key_and_moves_on_to_the_database_check() {
+        let mut args = parse_args(&["--port", "0", "--jwt-public-key", TEST_JWT_PUBLIC_KEY]);
         // The flag also reads AUTH_DATABASE_URL from the environment.
         args.auth_database_url = None;
         let err = tokio::time::timeout(Duration::from_secs(5), run(args))
             .await
             .expect("a missing auth database must be refused, not served")
-            .expect_err("a secret without an auth database is refused");
+            .expect_err("a key without an auth database is refused");
         assert!(
             err.to_string()
                 .contains("AUTH_DATABASE_URL is not configured"),
@@ -5168,39 +5146,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_refuses_a_bad_previous_secret_before_connecting() {
-        let current = "0123456789abcdef0123456789abcdef01234567";
+    async fn run_refuses_a_bad_previous_key_before_connecting() {
+        let current = TEST_JWT_PUBLIC_KEY;
         let marker = "LEAKMARKER-xyz";
         for (current, previous) in [(current, marker), (current, current), ("", current)] {
             let args = parse_args(&[
                 "--port",
                 "0",
-                "--jwt-secret",
+                "--jwt-public-key",
                 current,
-                "--jwt-secret-previous",
+                "--jwt-public-key-previous",
                 previous,
                 "--auth-database-url",
                 UNREACHABLE_AUTH_DB,
             ]);
             let err = tokio::time::timeout(Duration::from_secs(5), run(args))
                 .await
-                .expect("a bad previous secret must be refused, not served")
-                .expect_err("a bad previous secret must be refused");
+                .expect("a bad previous key must be refused, not served")
+                .expect_err("a bad previous key must be refused");
             let msg = err.to_string();
-            assert!(msg.contains("JWT_SECRET_PREVIOUS"), "got: {msg}");
-            assert!(!msg.contains(marker), "secret leaked: {msg}");
+            assert!(msg.contains("JWT_PUBLIC_KEY_PREVIOUS"), "got: {msg}");
+            assert!(!msg.contains(marker), "value leaked: {msg}");
         }
     }
 
     #[tokio::test]
-    async fn run_refuses_a_blank_secret_when_jwt_is_required() {
-        let mut args = parse_args(&["--port", "0", "--jwt-secret", "", "--require-jwt", "1"]);
-        args.jwt_secret_previous = None;
+    async fn run_refuses_a_blank_key_when_jwt_is_required() {
+        let mut args = parse_args(&["--port", "0", "--jwt-public-key", "", "--require-jwt", "1"]);
+        args.jwt_public_key_previous = None;
         args.auth_database_url = None;
         let err = tokio::time::timeout(Duration::from_secs(5), run(args))
             .await
-            .expect("a required but blank secret must be refused, not served")
-            .expect_err("a required but blank secret must be refused");
+            .expect("a required but blank key must be refused, not served")
+            .expect_err("a required but blank key must be refused");
         assert!(
             err.to_string().contains("GATEWAY_REQUIRE_JWT"),
             "got: {err}"
@@ -5209,16 +5187,16 @@ mod tests {
 
     /// Blank means RBAC off, so the gateway keeps serving.
     #[tokio::test]
-    async fn run_serves_with_a_blank_secret() {
-        let mut args = parse_args(&["--port", "0", "--jwt-secret", ""]);
+    async fn run_serves_with_a_blank_key() {
+        let mut args = parse_args(&["--port", "0", "--jwt-public-key", ""]);
         args.auth_database_url = None;
         // Both also read the environment; unset is the case under test.
         args.require_jwt = None;
-        args.jwt_secret_previous = None;
+        args.jwt_public_key_previous = None;
         let outcome = tokio::time::timeout(Duration::from_millis(500), run(args)).await;
         assert!(
             outcome.is_err(),
-            "a blank secret must leave the gateway serving"
+            "a blank key must leave the gateway serving"
         );
     }
 }

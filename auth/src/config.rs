@@ -2,9 +2,6 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
-/// Shortest accepted JWT signing secret, measured after trimming whitespace.
-pub const MIN_JWT_SECRET_BYTES: usize = 32;
-
 /// How long a handler waits for a pool connection.
 ///
 /// Must stay below the request timeout. sqlx defaults this to 30s, so a request
@@ -24,13 +21,18 @@ pub struct Config {
     #[arg(long, env = "AUTH_DATABASE_URL")]
     pub database_url: String,
 
-    #[arg(long, env = "JWT_SECRET")]
-    pub jwt_secret: String,
+    /// Base58 64-byte Ed25519 keypair that signs tokens. Only auth holds it.
+    #[arg(long, env = "JWT_SIGNING_KEY")]
+    pub jwt_signing_key: String,
 
-    /// The secret JWT_SECRET replaced, accepted for verification only during a
-    /// rotation. Tokens are always signed with JWT_SECRET. Blank means off.
-    #[arg(long, env = "JWT_SECRET_PREVIOUS")]
-    pub jwt_secret_previous: Option<String>,
+    /// Base58 public key of JWT_SIGNING_KEY, the same value the gateway verifies with.
+    #[arg(long, env = "JWT_PUBLIC_KEY")]
+    pub jwt_public_key: String,
+
+    /// The public key JWT_PUBLIC_KEY replaced, accepted for verification only during
+    /// a rotation. Blank means off.
+    #[arg(long, env = "JWT_PUBLIC_KEY_PREVIOUS")]
+    pub jwt_public_key_previous: Option<String>,
 
     /// Value for the Access-Control-Allow-Origin header.
     /// Set to the frontend origin in production (e.g. "https://app.private_channel.xyz").
@@ -119,9 +121,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Rejects values that parse fine but leave a control inert or a key weak. These fail
-    /// silently at runtime, which is worse than not starting. Auth has no disabled mode,
-    /// so an empty secret is rejected here (the gateway alone treats empty as "off").
+    /// Rejects values that parse fine but leave a control inert. These fail silently at
+    /// runtime, which is worse than not starting. `JwtConfig::new` checks the JWT keys.
     pub fn validate(&self) -> Result<(), String> {
         if Duration::from_secs(self.request_timeout_secs) <= POOL_ACQUIRE_TIMEOUT {
             return Err(format!(
@@ -141,37 +142,12 @@ impl Config {
             ));
         }
 
-        // Only the variable name and lengths may appear here: the value is a signing key
-        // and `Config` derives Debug, so it must never be formatted into an error.
-        let trimmed_len = self.jwt_secret.trim().len();
-        if trimmed_len < MIN_JWT_SECRET_BYTES {
-            return Err(format!(
-                "JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes after trimming \
-                 whitespace (got {trimmed_len}); the key used for signing is the exact value, \
-                 so generate one with `openssl rand -hex 32`",
-            ));
-        }
-
-        // Same rules as the gateway's, and likewise never formats a value.
-        if let Some(previous) = self.jwt_secret_previous() {
-            let trimmed_len = previous.trim().len();
-            if trimmed_len < MIN_JWT_SECRET_BYTES {
-                return Err(format!(
-                    "JWT_SECRET_PREVIOUS must be at least {MIN_JWT_SECRET_BYTES} bytes after \
-                     trimming whitespace (got {trimmed_len})",
-                ));
-            }
-            if previous.trim() == self.jwt_secret.trim() {
-                return Err("JWT_SECRET_PREVIOUS must differ from JWT_SECRET".to_string());
-            }
-        }
-
         Ok(())
     }
 
-    /// The previous JWT secret, or `None` when unset or blank.
-    pub fn jwt_secret_previous(&self) -> Option<&str> {
-        self.jwt_secret_previous
+    /// The previous JWT public key, or `None` when unset or blank.
+    pub fn jwt_public_key_previous(&self) -> Option<&str> {
+        self.jwt_public_key_previous
             .as_deref()
             .filter(|s| !s.trim().is_empty())
     }
@@ -187,18 +163,11 @@ mod tests {
             "auth",
             "--database-url",
             "postgres://localhost/auth",
-            "--jwt-secret",
-            STRONG_SECRET,
+            "--jwt-signing-key",
+            "signing-key",
+            "--jwt-public-key",
+            "public-key",
         ])
-    }
-
-    /// 40 characters, comfortably over the 32 byte floor.
-    const STRONG_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
-
-    fn with_secret(secret: &str) -> Config {
-        let mut config = valid_config();
-        config.jwt_secret = secret.to_string();
-        config
     }
 
     #[test]
@@ -236,106 +205,13 @@ mod tests {
             "auth",
             "--database-url",
             "postgres://localhost/auth",
-            "--jwt-secret",
-            STRONG_SECRET,
+            "--jwt-signing-key",
+            "signing-key",
+            "--jwt-public-key",
+            "public-key",
             "--database-max-connections",
             "0",
         ]);
         assert!(parsed.is_err(), "a zero pool panics in sqlx pool creation");
-    }
-
-    /// The check is on the trimmed length, so padding cannot satisfy it. The key itself
-    /// stays the raw string, so a valid secret with surrounding whitespace is accepted.
-    #[test]
-    fn the_jwt_secret_must_be_32_bytes_after_trimming() {
-        let thirty_one = "a".repeat(31);
-        let thirty_two = "a".repeat(32);
-        let rejected = [
-            "".to_string(),
-            "   \t\n".to_string(),
-            "secret".to_string(),
-            thirty_one.clone(),
-            format!("{thirty_one}\n"),
-            format!("  {thirty_one}  "),
-        ];
-        for secret in rejected {
-            let err = with_secret(&secret)
-                .validate()
-                .expect_err("a weak or blank secret must be rejected");
-            assert!(err.contains("JWT_SECRET"), "must name the variable: {err}");
-        }
-        for secret in [thirty_two.clone(), format!(" {thirty_two}\n")] {
-            with_secret(&secret)
-                .validate()
-                .expect("32 trimmed bytes is enough");
-        }
-    }
-
-    fn with_previous(previous: Option<&str>) -> Config {
-        let mut config = valid_config();
-        config.jwt_secret_previous = previous.map(str::to_string);
-        config
-    }
-
-    /// The same vectors are pinned in the gateway's startup tests.
-    #[test]
-    fn the_previous_jwt_secret_rule_matches_the_gateway() {
-        for off in [None, Some(""), Some("  \t\n")] {
-            let config = with_previous(off);
-            config.validate().expect("unset or blank previous is off");
-            assert_eq!(config.jwt_secret_previous(), None);
-        }
-
-        // Auth refuses a blank current secret outright, so a previous without a current
-        // is caught by that rule here; the gateway needs its own check for it.
-        let previous = "p".repeat(32);
-        let mut config = with_previous(Some(&previous));
-        config.jwt_secret = String::new();
-        let err = config.validate().expect_err("previous without a current");
-        assert!(err.starts_with("JWT_SECRET must be at least"), "got: {err}");
-
-        for short in ["p".repeat(31), format!("  {}  ", "p".repeat(31))] {
-            let err = with_previous(Some(&short))
-                .validate()
-                .expect_err("a short previous must be refused");
-            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
-        }
-        for same in [STRONG_SECRET.to_string(), format!(" {STRONG_SECRET}\n")] {
-            let err = with_previous(Some(&same))
-                .validate()
-                .expect_err("previous equal to current must be refused");
-            assert!(err.contains("JWT_SECRET_PREVIOUS"), "got: {err}");
-        }
-        for good in [previous.clone(), format!(" {previous}\n")] {
-            let config = with_previous(Some(&good));
-            config
-                .validate()
-                .expect("a distinct 32 byte previous is valid");
-            assert_eq!(config.jwt_secret_previous(), Some(good.as_str()));
-        }
-    }
-
-    #[test]
-    fn a_rejected_previous_jwt_secret_is_never_echoed() {
-        let long_marker = "LEAKMARKER-0123456789abcdef0123456789";
-        let mut blank_current = with_previous(Some(long_marker));
-        blank_current.jwt_secret = String::new();
-        let mut equal = with_previous(Some(long_marker));
-        equal.jwt_secret = long_marker.to_string();
-        for config in [with_previous(Some("LEAKMARKER-xyz")), blank_current, equal] {
-            let err = config.validate().expect_err("previous must be refused");
-            assert!(!err.contains("LEAK"), "secret leaked: {err}");
-        }
-    }
-
-    /// The rejection text may name the variable and lengths, never the value or a prefix.
-    #[test]
-    fn a_rejected_jwt_secret_is_never_echoed() {
-        let marker = "LEAKMARKER-xyz";
-        let err = with_secret(marker)
-            .validate()
-            .expect_err("a short secret must be rejected");
-        assert!(!err.contains(marker), "secret leaked: {err}");
-        assert!(!err.contains("LEAK"), "secret prefix leaked: {err}");
     }
 }

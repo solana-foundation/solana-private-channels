@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Step 12: an image without the with-secrets entrypoint stops k3s.yml before helm upgrade
 # and the release revision is unchanged; the gateway with GATEWAY_REQUIRE_JWT=1 and a
-# blank JWT secret exits non-zero.
+# blank JWT public key exits non-zero.
 . "$(dirname "$0")/lib.sh"
 progress "STEP $STEP ($E2E_PROFILE) fail closed"
 sync_repo
@@ -15,11 +15,14 @@ img="$(hk -n $NS get deploy gateway -o jsonpath='{.spec.template.spec.containers
 hk -n $NS delete pod pc-e2e-nojwt --ignore-not-found >/dev/null
 hk -n $NS run pc-e2e-nojwt --image="$img" --restart=Never --labels=app.kubernetes.io/name=pc-e2e-nojwt \
   --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":1000},"automountServiceAccountToken":false}}' \
-  --env=GATEWAY_REQUIRE_JWT=1 --env=JWT_SECRET= --env=GATEWAY_WRITE_URL=http://write-node:8900 --env=GATEWAY_READ_URL=http://read-node:8901 \
+  --env=GATEWAY_REQUIRE_JWT=1 --env=JWT_PUBLIC_KEY= --env=GATEWAY_WRITE_URL=http://write-node:8900 --env=GATEWAY_READ_URL=http://read-node:8901 \
   -- /usr/local/bin/gateway >>"$LOG" 2>&1
 wait_for 120 bash -c "$(declare -f hk); E2E_HOST='$E2E_HOST'; hk -n $NS get pod pc-e2e-nojwt -o jsonpath='{.status.phase}' | grep -qx Failed" \
-  || die "gateway with GATEWAY_REQUIRE_JWT=1 and blank JWT_SECRET did not exit non-zero"
-hk -n $NS logs pc-e2e-nojwt | tail -3 | tee -a "$LOG"
+  || die "gateway with GATEWAY_REQUIRE_JWT=1 and blank JWT_PUBLIC_KEY did not exit non-zero"
+logs="$(hk -n $NS logs pc-e2e-nojwt)"
+printf '%s\n' "$logs" | tail -3 | tee -a "$LOG"
 hk -n $NS delete pod pc-e2e-nojwt >/dev/null
-ok "gateway refuses to start on a blank JWT_SECRET"
+grep -qF "GATEWAY_REQUIRE_JWT=1 but JWT_PUBLIC_KEY is blank" <<<"$logs" \
+  || die "the gateway exited, but not on the blank JWT_PUBLIC_KEY"
+ok "gateway refuses to start on a blank JWT_PUBLIC_KEY"
 pass

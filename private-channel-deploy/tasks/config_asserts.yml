@@ -96,20 +96,20 @@
       WARNING: operator_signer is memory while admin_signer is {{ admin_signer }}. The operator
       key alone can release escrow funds, so protect it at least as well as the admin key.
 
-# Same rules as the gateway and auth apply at startup. No value is echoed.
-- name: Assert jwt_secret_previous is usable when set
+# The key format is checked in secret_asserts.yml, and again by the gateway and auth at
+# startup. No value is echoed.
+- name: Assert jwt_public_key_previous is usable when set
   when:
   - gateway_enforce_jwt | default(true) | bool
-  - jwt_secret_previous | default('', true) | trim | length > 0
+  - jwt_public_key_previous | default('', true) | trim | length > 0
   ansible.builtin.assert:
     that:
-    - jwt_secret | default('', true) | trim | length > 0
-    - jwt_secret_previous | trim | length >= 32
-    - jwt_secret_previous | trim != jwt_secret | default('', true) | trim
+    - jwt_public_key | default('', true) | trim | length > 0
+    - jwt_public_key_previous | trim != jwt_public_key | default('', true) | trim
     fail_msg: >-
-      jwt_secret_previous is refused: it needs a non-blank jwt_secret, at least 32 bytes after
-      trimming, and a value different from jwt_secret. Stage a rotation with
-      scripts/rotate-secret.sh jwt_secret, which sets both.
+      jwt_public_key_previous is refused: it needs a non-blank jwt_public_key and a value
+      different from it. Stage a rotation with scripts/rotate-secret.sh jwt_signing_key,
+      which sets both.
 
 # Optional until an escrow account is configured; a malformed value would only
 # surface as the indexer and operators refusing to start. The message never shows it.

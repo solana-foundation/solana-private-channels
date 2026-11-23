@@ -131,8 +131,8 @@ normalize() {
   jq -S 'walk(if type == "object" then del(.create_host_path) else . end)
     | del(.services["postgres-replica"].command)
     | del(.services["operator-solana"].environment.OPERATOR_SIGNER, .services["operator-solana"].environment.OPERATOR_PRIVATE_KEY)
-    | del(.services.gateway.environment.JWT_SECRET_PREVIOUS, .services.gateway.environment.GATEWAY_REQUIRE_JWT)
-    | del(.services.auth.environment.JWT_SECRET_PREVIOUS)' "$1"
+    | del(.services.gateway.environment | .JWT_SECRET, .JWT_SECRET_PREVIOUS, .JWT_PUBLIC_KEY, .JWT_PUBLIC_KEY_PREVIOUS, .GATEWAY_REQUIRE_JWT)
+    | del(.services.auth.environment | .JWT_SECRET, .JWT_SECRET_PREVIOUS, .JWT_SIGNING_KEY, .JWT_PUBLIC_KEY, .JWT_PUBLIC_KEY_PREVIOUS)' "$1"
 }
 for name in local devnet; do
   file=docker-compose.yml
@@ -149,9 +149,14 @@ for name in local devnet; do
   # The withdraw operator still signs with the admin key in a single-key env.
   [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' "$TMP/now-$name.json")" == GOLDENadminkey ]] \
     || fail "raw $name: OPERATOR_PRIVATE_KEY does not fall back to ADMIN_PRIVATE_KEY"
-  for k in JWT_SECRET_PREVIOUS GATEWAY_REQUIRE_JWT; do
+  for k in JWT_PUBLIC_KEY JWT_PUBLIC_KEY_PREVIOUS GATEWAY_REQUIRE_JWT; do
     [[ "$(jq -r ".services.gateway.environment.$k" "$TMP/now-$name.json")" == "" ]] || fail "raw $name: gateway $k is not blank"
   done
+  # An env file from before key pairs still sets JWT_SECRET: the gateway must refuse to
+  # start without JWT_PUBLIC_KEY rather than serve with RBAC off.
+  required="$(cd "$REPO" && env -i PATH="$PATH" HOME="$HOME" JWT_SECRET=leftover docker compose -f "$file" \
+    --env-file "$FIX/$name.env" --profile auth config --format json 2>/dev/null | jq -r '.services.gateway.environment.GATEWAY_REQUIRE_JWT')"
+  [[ "$required" == 1 ]] || fail "raw $name: a leftover JWT_SECRET left GATEWAY_REQUIRE_JWT '$required'"
   # Raw mode reads the replica passwords from env at runtime, as before.
   jq -r '.services["postgres-replica"].command[2]' "$TMP/now-$name.json" | sed 's/\$\$/$/g' >"$TMP/raw-replica.sh"
   bash -n "$TMP/raw-replica.sh" || fail "raw $name: replica command does not parse"

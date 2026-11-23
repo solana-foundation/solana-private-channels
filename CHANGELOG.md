@@ -9,6 +9,7 @@
 - Ownership handoffs (`SetAuthority(AccountOwner)`) of channel token accounts now fail on chain (`ImmutableOwner`)
 - The upgrade is a channel reset, not a migration: every channel mint's supply must be 0 and nothing pending. See [docs/runbooks/t22_channel_reset.md](docs/runbooks/t22_channel_reset.md)
 - Write and aio nodes and both operators refuse to start without a permanent delegate (`PRIVATE_CHANNEL_PERMANENT_DELEGATE`, `OPERATOR_PERMANENT_DELEGATE`) or with the zero key; it is never derived from the admin keys
+- Login tokens are signed with an Ed25519 key only auth holds (`JWT_SIGNING_KEY`); auth and the gateway verify with its public key (`JWT_PUBLIC_KEY`, `JWT_PUBLIC_KEY_PREVIOUS`) and accept EdDSA tokens only. `JWT_SECRET` and `JWT_SECRET_PREVIOUS` are gone, and every user logs in again. See [UPGRADING.md](UPGRADING.md#jwt-keypair)
 
 ### Core node and RPC
 - The permanent delegate can seize a holder's balance, but only with a `TransferChecked` into the compliance ATA of `PRIVATE_CHANNEL_COMPLIANCE_OWNER`. Delegate burns and moves anywhere else are refused (`seize_target`), and all of them are refused when no compliance owner is set (the node logs `seize disabled: no compliance owner configured` at startup)
@@ -22,8 +23,8 @@
 ### Gateway and auth
 - Tells a channel mint from a token account by the account type byte at offset 165 (`2` for an account), not by size
 - Optional withdraw whitelist check: with `GATEWAY_WHITELIST_RPC_URL` and `GATEWAY_WHITELIST_INSTANCE` set, a public withdrawal the escrow whitelist would refuse gets a 403 before anything is burned. It reads Mainnet at most `GATEWAY_WHITELIST_READS_PER_SECOND` (default 20) times a second; past that, withdrawals are forwarded unchecked
-- JWT rotation without logging everyone out: optional `JWT_SECRET_PREVIOUS`, read by the gateway and auth. Auth signs with `JWT_SECRET` only; both verify with `JWT_SECRET`, then the previous one. Refused at startup when under 32 bytes after trimming, equal to `JWT_SECRET`, or set without `JWT_SECRET`, without echoing the value
-- `GATEWAY_REQUIRE_JWT=1` makes the gateway refuse to start on a blank `JWT_SECRET` instead of running with RBAC off. Unset keeps the old behaviour
+- JWT rotation without logging everyone out: optional `JWT_PUBLIC_KEY_PREVIOUS`, read by the gateway and auth, verified after `JWT_PUBLIC_KEY`. Refused at startup when equal to `JWT_PUBLIC_KEY` or set without it, without echoing the value
+- `GATEWAY_REQUIRE_JWT=1` makes the gateway refuse to start on a blank `JWT_PUBLIC_KEY` instead of running with RBAC off. Unset keeps the old behaviour
 
 ### Programs
 - The withdraw program runs on Token-2022: `token_program` must be the Token-2022 id, with the same account order, and the treasury ATA derives under Token-2022. The generated clients default `token_program` to Token-2022

@@ -8,7 +8,7 @@
 //! - Bootstrap the schema using `private_channel_auth::db::init_schema` — the same
 //!   function the auth service uses, so tests stay in sync with schema changes.
 //! - Insert test users and wallets directly via sqlx (no auth HTTP service needed).
-//! - Mint JWTs directly with `jsonwebtoken` using a known test secret.
+//! - Mint JWTs directly with `jsonwebtoken` using a known test keypair.
 //! - Start the gateway with auth enforcement enabled, pointing at a mock backend.
 //!
 //! Run with:
@@ -20,10 +20,12 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use private_channel_auth::db;
+use private_channel_auth::jwt::encoding_key;
 use reqwest::Client;
 use serde_json::json;
+use solana_sdk::signature::{Keypair, Signer};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::runners::AsyncRunner;
@@ -37,8 +39,10 @@ use private_channel_gateway::{serve, Access, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-/// Shared JWT secret used by both the token minter and the gateway under test.
-const TEST_JWT_SECRET: &str = "test-gateway-secret";
+/// Test keypair: tokens are signed with the first, the gateway verifies with the second.
+const TEST_JWT_SIGNING_KEY: &str =
+    "2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD";
+const TEST_JWT_PUBLIC_KEY: &str = "6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM";
 
 // ── Infrastructure helpers ─────────────────────────────────────────────────────
 
@@ -102,13 +106,13 @@ async fn insert_wallet(pool: &PgPool, user_id: Uuid, pubkey: &str) {
     .unwrap();
 }
 
-/// Generate a signed JWT for the given user and role using TEST_JWT_SECRET.
+/// Generate a signed JWT for the given user and role using TEST_JWT_SIGNING_KEY.
 /// Expires in 1 hour — sufficient for any test run.
 fn generate_token(user_id: Uuid, role: &str) -> String {
-    generate_token_with_secret(user_id, role, TEST_JWT_SECRET)
+    generate_token_with_key(user_id, role, TEST_JWT_SIGNING_KEY)
 }
 
-fn generate_token_with_secret(user_id: Uuid, role: &str, secret: &str) -> String {
+fn generate_token_with_key(user_id: Uuid, role: &str, signing_key: &str) -> String {
     let claims = json!({
         "sub": user_id.to_string(),
         "role": role,
@@ -117,9 +121,9 @@ fn generate_token_with_secret(user_id: Uuid, role: &str, secret: &str) -> String
         "aud": "private-channel-gateway",
     });
     encode(
-        &Header::default(),
+        &Header::new(Algorithm::EdDSA),
         &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
+        &encoding_key(signing_key).unwrap(),
     )
     .unwrap()
 }
@@ -135,9 +139,9 @@ fn generate_expired_token(user_id: Uuid, role: &str) -> String {
         "aud": "private-channel-gateway",
     });
     encode(
-        &Header::default(),
+        &Header::new(Algorithm::EdDSA),
         &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        &encoding_key(TEST_JWT_SIGNING_KEY).unwrap(),
     )
     .unwrap()
 }
@@ -249,7 +253,7 @@ async fn start_gateway(auth_db: PgPool, write_url: String, read_url: String) -> 
         write_url,
         read_url,
         "*".to_string(),
-        Some(TEST_JWT_SECRET.to_string()),
+        Some(TEST_JWT_PUBLIC_KEY.to_string()),
         Some(auth_db),
     ));
 
@@ -263,7 +267,7 @@ async fn start_gateway(auth_db: PgPool, write_url: String, read_url: String) -> 
     addr
 }
 
-/// Start a gateway that verifies with `TEST_JWT_SECRET`, then `previous`.
+/// Start a gateway that verifies with `TEST_JWT_PUBLIC_KEY`, then `previous`.
 async fn start_gateway_with_previous(
     auth_db: PgPool,
     read_url: String,
@@ -278,10 +282,10 @@ async fn start_gateway_with_previous(
             "http://127.0.0.1:1".to_string(),
             read_url,
             "*".to_string(),
-            Some(TEST_JWT_SECRET.to_string()),
+            Some(TEST_JWT_PUBLIC_KEY.to_string()),
             Some(auth_db),
         )
-        .with_previous_jwt_secret(Some(previous.to_string())),
+        .with_previous_jwt_public_key(Some(previous.to_string())),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -309,7 +313,7 @@ async fn start_internal_gateway(
         write_url,
         read_url,
         "*".to_string(),
-        Some(TEST_JWT_SECRET.to_string()),
+        Some(TEST_JWT_PUBLIC_KEY.to_string()),
         Some(auth_db),
     ));
 
@@ -752,9 +756,9 @@ async fn test_get_account_info_expired_token_returns_401() {
     assert_eq!(res.status(), 401);
 }
 
-/// `getAccountInfo` with a JWT signed by a different secret must return 401.
+/// `getAccountInfo` with a JWT signed by a different key must return 401.
 ///
-/// Ensures the gateway rejects tokens it did not issue (wrong secret = tampered
+/// Ensures the gateway rejects tokens it did not issue (wrong key = tampered
 /// or from a different environment).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_account_info_invalid_token_returns_401() {
@@ -768,16 +772,8 @@ async fn test_get_account_info_invalid_token_returns_401() {
     )
     .await;
 
-    let bad_token = encode(
-        &Header::default(),
-        &json!({
-            "sub": Uuid::new_v4().to_string(),
-            "role": "user",
-            "exp": (Utc::now().timestamp() + 3600) as usize,
-        }),
-        &EncodingKey::from_secret(b"wrong-secret"),
-    )
-    .unwrap();
+    let bad_token =
+        generate_token_with_key(Uuid::new_v4(), "user", &Keypair::new().to_base58_string());
 
     let res = Client::new()
         .post(format!("http://{}", addr))
@@ -839,21 +835,30 @@ async fn test_previous_key_token_is_accepted_and_an_unknown_key_is_401() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
 
-    let previous = "test-gateway-previous-secret";
+    let previous = Keypair::new();
     let pubkey = "So11111111111111111111111111111111111111112";
     let user_id = insert_user(&pool, "user").await;
     insert_wallet(&pool, user_id, pubkey).await;
 
     let backend = start_mock_backend_with_body(system_account_response()).await;
-    let addr = start_gateway_with_previous(pool, format!("http://{}", backend), previous).await;
+    let addr = start_gateway_with_previous(
+        pool,
+        format!("http://{}", backend),
+        &previous.pubkey().to_string(),
+    )
+    .await;
 
-    for (name, secret, expected) in [
+    for (name, signer, expected) in [
         ("previous", previous, 200),
-        ("unknown", "some-unknown-secret", 401),
+        ("unknown", Keypair::new(), 401),
     ] {
         let res = Client::new()
             .post(format!("http://{}", addr))
-            .bearer_auth(generate_token_with_secret(user_id, "user", secret))
+            .bearer_auth(generate_token_with_key(
+                user_id,
+                "user",
+                &signer.to_base58_string(),
+            ))
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1999,6 +2004,47 @@ async fn test_operator_only_method_expired_token_returns_401() {
     assert_eq!(res.status(), 401);
 }
 
+/// The gateway holds only a public key, so a token signed by using that key as an
+/// HMAC secret must not pass for an operator.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_operator_token_hmac_signed_with_the_gateway_key_returns_401() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let operator_id = insert_user(&pool, "operator").await;
+    let forged = encode(
+        &Header::new(Algorithm::HS256),
+        &json!({
+            "sub": operator_id.to_string(),
+            "role": "operator",
+            "exp": (Utc::now().timestamp() + 3600) as usize,
+            "iss": "private-channel-auth",
+            "aud": "private-channel-gateway",
+        }),
+        &EncodingKey::from_secret(TEST_JWT_PUBLIC_KEY.as_bytes()),
+    )
+    .unwrap();
+
+    let generic_response = json!({"jsonrpc":"2.0","id":1,"result":null}).to_string();
+    let backend = start_mock_backend_with_body(generic_response).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(forged)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getBlock","params":[]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 401);
+}
+
 /// A Token-2022 channel ATA (170 bytes, account type 2 at byte 165) is treated
 /// the same as a standard token account: owner/delegate check at fixed offsets.
 #[tokio::test(flavor = "multi_thread")]
@@ -2314,8 +2360,8 @@ async fn test_public_methods_pass_through_without_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_empty_jwt_secret_disables_auth() {
-    // A gateway configured with JWT_SECRET="" and a real auth DB should still disable
+async fn test_empty_jwt_public_key_disables_auth() {
+    // A gateway configured with JWT_PUBLIC_KEY="" and a real auth DB should still disable
     // auth enforcement — the empty string must be treated as "not set".
     // Passing a real DB ensures the test isn't passing just because auth_db is None.
     rustls::crypto::aws_lc_rs::default_provider()
@@ -2370,7 +2416,7 @@ async fn test_empty_jwt_secret_disables_auth() {
     assert_eq!(
         res.status(),
         200,
-        "empty JWT_SECRET should disable auth enforcement"
+        "empty JWT_PUBLIC_KEY should disable auth enforcement"
     );
 }
 
