@@ -116,7 +116,10 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 2. Forces its `/health` to 503 (pages orchestration) before any database write,
    so a flag write stuck behind a lock cannot keep the service green: the breach
    is proven either way.
-3. Sets the durable `reconciliation_halt` flag (reason recorded).
+3. Sets the durable `reconciliation_halt` flag (reason recorded). A failed write
+   is retried every 5 s while this process runs. A restart drops the retry, and
+   the next boot refuses on the shortfall without setting the flag. While the
+   flag is unset the withdraw operator keeps releasing: stop it by hand.
 4. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
    `manual_review`.
 5. Posts the halt webhook. This webhook is the only alert - there is no separate

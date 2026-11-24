@@ -70,6 +70,13 @@ const FENCE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How soon an insolvency flag that missed its tick is written again. The withdraw operator
+/// has no fence of its own and stops only on that row.
+#[cfg(not(test))]
+const HALT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const HALT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Checkpoint poll interval while waiting for the ledger to cover the custody slot.
 #[cfg(not(test))]
 const LEDGER_CATCHUP_POLL_MS: u64 = 500;
@@ -88,6 +95,8 @@ struct BreachCounters {
     announced_mints: HashSet<Pubkey>,
     /// An insolvency halt is in force; only that suppresses a new breach trip.
     insolvency_halted: bool,
+    /// Reason of a confirmed insolvency whose flag has not landed; retried between ticks.
+    unwritten_halt: Option<String>,
     /// When each configured mint's current alert-only hold began, and its reason, for the age alert.
     held_since: HashMap<Pubkey, (&'static str, tokio::time::Instant)>,
 }
@@ -174,7 +183,8 @@ pub async fn run_reconciliation(
 
     // Counted ticks keep the configured cadence; a closed fence is probed in between. A probe
     // pages nothing and counts nothing, so it is held back whenever one more tick could
-    // cross a threshold, leaving every halt and alert to a counted tick.
+    // cross a threshold, leaving every halt and alert to a counted tick. An unwritten insolvency
+    // flag is retried in between the same way, and that wake does nothing else.
     let quiet_alerts = MaskedAlerts::default();
     let mut next_counted = tokio::time::Instant::now();
     loop {
@@ -188,33 +198,36 @@ pub async fn run_reconciliation(
             next_counted = tokio::time::Instant::now() + config.reconciliation_interval;
         }
 
-        // Perform reconciliation check
-        match perform_reconciliation_check(
-            &storage,
-            &config,
-            &rpc_client,
-            &channel_rpc,
-            escrow_instance_id,
-            confidential_keys.as_deref(),
-            &webhook_client,
-            if probe { &quiet_alerts } else { &masked_alerts },
-            &health,
-            &mut previously_alerted_orphans,
-            &mut breach_counters,
-            &mut halted,
-            &mut liability_dark_ticks,
-            &mut input_dark_ticks,
-            &cancellation_token,
-            &fence,
-            probe,
-        )
-        .await
-        {
-            Ok(_) => {
-                // Reconciliation check completed successfully
-            }
-            Err(e) => {
-                warn!("Failed to perform reconciliation check: {}", e);
+        if probe && breach_counters.unwritten_halt.is_some() {
+            retry_unwritten_halt(&storage, &health, &mut breach_counters, &mut halted).await;
+        } else {
+            match perform_reconciliation_check(
+                &storage,
+                &config,
+                &rpc_client,
+                &channel_rpc,
+                escrow_instance_id,
+                confidential_keys.as_deref(),
+                &webhook_client,
+                if probe { &quiet_alerts } else { &masked_alerts },
+                &health,
+                &mut previously_alerted_orphans,
+                &mut breach_counters,
+                &mut halted,
+                &mut liability_dark_ticks,
+                &mut input_dark_ticks,
+                &cancellation_token,
+                &fence,
+                probe,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // Reconciliation check completed successfully
+                }
+                Err(e) => {
+                    warn!("Failed to perform reconciliation check: {}", e);
+                }
             }
         }
 
@@ -222,6 +235,8 @@ pub async fn run_reconciliation(
             && one_more_tick_is_safe(&breach_counters, liability_dark_ticks, input_dark_ticks);
         let next_tick = if can_probe {
             next_counted.min(tokio::time::Instant::now() + FENCE_PROBE_INTERVAL)
+        } else if breach_counters.unwritten_halt.is_some() {
+            next_counted.min(tokio::time::Instant::now() + HALT_RETRY_INTERVAL)
         } else {
             next_counted
         };
@@ -1088,6 +1103,7 @@ async fn evaluate_and_maybe_halt(
         announced_outage: breach_counters.announced_outage,
         announced_mints: std::mem::take(&mut breach_counters.announced_mints),
         insolvency_halted: breach_counters.insolvency_halted,
+        unwritten_halt: breach_counters.unwritten_halt.take(),
         held_since: std::mem::take(&mut breach_counters.held_since),
         ..Default::default()
     };
@@ -1149,7 +1165,7 @@ async fn evaluate_and_maybe_halt(
         }
 
         // Confirmed insolvency: the fence trips at once, the guard waits for the flag, and a
-        // failed write retries next tick.
+        // failed write retries between ticks.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
              envelope {} (adjustment {}) tolerance {} over {} consecutive finalized ticks",
@@ -1173,6 +1189,9 @@ async fn evaluate_and_maybe_halt(
         {
             *halted = true;
             next_counters.insolvency_halted = true;
+            next_counters.unwritten_halt = None;
+        } else {
+            next_counters.unwritten_halt = Some(reason);
         }
     }
 
@@ -1246,6 +1265,9 @@ async fn evaluate_and_maybe_halt(
         {
             *halted = true;
             next_counters.insolvency_halted = true;
+            next_counters.unwritten_halt = None;
+        } else {
+            next_counters.unwritten_halt = Some(reason);
         }
     }
 
@@ -1349,6 +1371,28 @@ async fn freeze_pipelines(
         h.force_unhealthy_provisional(reason.to_string());
     }
     in_force
+}
+
+/// Between ticks, write an insolvency flag that missed its tick. Pages nothing: the tick
+/// that confirmed the breach already did.
+async fn retry_unwritten_halt(
+    storage: &Arc<Storage>,
+    health: &Option<Arc<HealthState>>,
+    breach_counters: &mut BreachCounters,
+    halted: &mut bool,
+) {
+    let Some(reason) = breach_counters.unwritten_halt.clone() else {
+        return;
+    };
+    if freeze_pipelines(storage, health, &reason, HaltKind::Insolvency)
+        .await
+        .is_some()
+    {
+        info!("Insolvency halt flag landed on retry");
+        *halted = true;
+        breach_counters.insolvency_halted = true;
+        breach_counters.unwritten_halt = None;
+    }
 }
 
 /// A supply breach that only the envelope adjustment explained.
@@ -5187,6 +5231,10 @@ mod tests {
         }
 
         assert!(!halted, "the guard still waits for the row");
+        assert!(
+            counters.unwritten_halt.is_some(),
+            "the reason is kept for the retry between ticks"
+        );
         assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
         assert_eq!(
             mock.calls("set_reconciliation_halt"),
@@ -5725,6 +5773,78 @@ mod tests {
             "a probe opened the fence inside the interval"
         );
         assert_eq!(fence.closed_ticks(), 1, "only the counted tick closed");
+    }
+
+    /// The withdraw operator stops only on the row, so a flag write that failed in its tick
+    /// lands as soon as the database recovers, not at the next tick, and is not written again.
+    #[tokio::test]
+    async fn an_unwritten_insolvency_halt_lands_before_the_next_interval() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 900, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let interval = Duration::from_secs(1);
+        let config = OperatorConfig {
+            reconciliation_interval: interval,
+            ..recon_config_zero_tolerance()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_reconciliation(
+            env.storage.clone(),
+            config,
+            fast_rpc(env.custody.url()),
+            fast_rpc(env.channel.url()),
+            test_instance(),
+            None,
+            None,
+            token.clone(),
+            env.fence.clone(),
+        ));
+
+        // The fence trips before the write, so wait for every attempt of the confirming tick.
+        let started = std::time::Instant::now();
+        while env.mock.calls("set_reconciliation_halt") < HALT_WRITE_ATTEMPTS as usize
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(env.fence.state(), FenceState::Tripped);
+
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        let recovered = std::time::Instant::now();
+        while env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none()
+            && recovered.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let landed_after = recovered.elapsed();
+        // A write after landing would reset halted_at, re-quarantine and undo a manual clear.
+        let writes_at_landing = env.mock.calls("set_reconciliation_halt");
+        tokio::time::sleep(4 * HALT_RETRY_INTERVAL).await;
+        let writes_after_wait = env.mock.calls("set_reconciliation_halt");
+        token.cancel();
+        task.await.unwrap().unwrap();
+
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag landed");
+        assert!(halt.insolvency);
+        assert!(
+            landed_after < interval / 2,
+            "landed {landed_after:?} after the database recovered, not before the next tick"
+        );
+        assert_eq!(
+            writes_after_wait, writes_at_landing,
+            "the retry stops once the flag lands"
+        );
     }
 
     #[tokio::test]

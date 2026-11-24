@@ -43,6 +43,7 @@
 ### Indexer and operators
 - The escrow operator creates channel mints with `InitializePermanentDelegate(OPERATOR_PERMANENT_DELEGATE)` and `InitializeMint2`, and never mints into a channel mint whose delegate is missing or another key (manual review, `permanent delegate mismatch`)
 - Solvency reconciliation reads channel supply from Token-2022 mints
+- A confirmed insolvency whose halt flag write fails is retried every 5 s instead of at the next tick, so the withdraw operator stops within seconds of the database recovering
 
 ### Deploy, compose and scripts
 - New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node, required), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, required). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`
