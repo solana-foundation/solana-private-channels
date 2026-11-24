@@ -159,8 +159,9 @@ POSTGRES_INDEXER_PASSWORD=<indexer cluster superuser>
 # Grafana's admin login. The literal `admin` is rejected.
 GF_ADMIN_PASSWORD=<openssl rand -hex 32>
 
-# Only when enabling auth (gateway RBAC)
-JWT_SECRET=<openssl rand -hex 32>
+# Only when enabling auth (gateway RBAC): the two lines scripts/jwt-keypair.sh prints
+JWT_SIGNING_KEY=<base58 keypair>
+JWT_PUBLIC_KEY=<base58 public key>
 
 # Operator keypair (written to `.env` automatically by `make build-devnet`)
 ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>

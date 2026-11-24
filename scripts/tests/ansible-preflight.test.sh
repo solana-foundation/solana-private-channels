@@ -37,7 +37,8 @@ postgres_gateway_password: p6
 postgres_monitoring_password: p7
 postgres_grafana_password: p8
 postgres_indexer_password: p9
-jwt_secret: 0123456789abcdef0123456789abcdef
+jwt_signing_key: 2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD
+jwt_public_key: 6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM
 grafana_admin_password: g
 ghcr_user: u
 ghcr_token: t
@@ -446,27 +447,29 @@ test_render_signers() {
   echo "ok: signer render"
 }
 
-# JWT_SECRET_PREVIOUS follows the same rules as gateway and auth, and stays blank
-# whenever RBAC is off.
+# JWT_PUBLIC_KEY_PREVIOUS needs a different current key, and stays blank whenever
+# RBAC is off.
 test_jwt_previous() {
   if ! command -v solana-keygen >/dev/null; then
     skip "JWT previous cases (solana-keygen missing)"
     return
   fi
   signer_setup
-  local cur=0123456789abcdef0123456789abcdef
-  expect_refused jwt_previous_short "jwt_secret_previous" "${SIG_BASE[@]}" -e jwt_secret_previous=short
+  local previous=previous
   # Equal after trimming, so the surrounding spaces must not make it pass.
-  expect_refused jwt_previous_equal "jwt_secret_previous" "${SIG_BASE[@]}" -e "{\"jwt_secret_previous\": \" $cur \"}"
-  expect_refused jwt_previous_blank_current "jwt_secret_previous" "${SIG_BASE[@]}" -e jwt_secret= \
-    -e jwt_secret_previous=fedcba9876543210fedcba9876543210
+  expect_refused jwt_previous_equal "jwt_public_key_previous" "${SIG_BASE[@]}" \
+    -e '{"jwt_public_key_previous": " 6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM "}'
+  # Hex has a 0, which base58 lacks.
+  expect_refused jwt_public_key_format "not base58" "${SIG_BASE[@]}" --tags secret_asserts \
+    -e jwt_public_key=0123456789abcdef0123456789abcdef
+  expect_refused jwt_previous_blank_current "jwt_public_key_previous" "${SIG_BASE[@]}" -e jwt_public_key= \
+    -e jwt_public_key_previous=$previous
   expect_pass jwt_previous_unset "${SIG_BASE[@]}"
-  expect_pass jwt_previous_ok "${SIG_BASE[@]}" -e jwt_secret_previous=fedcba9876543210fedcba9876543210
-  grep -q fedcba9876543210 "$TMP/jwt_previous_ok.log" "$TMP/jwt_previous_short.log" && fail "jwt previous leaked"
-  render "$TMP/jwt-off.env" -e gateway_enforce_jwt=false -e jwt_secret_previous=fedcba9876543210fedcba9876543210
-  grep -qx 'JWT_SECRET_PREVIOUS=' "$TMP/jwt-off.env" || fail "JWT_SECRET_PREVIOUS must render blank with RBAC off"
+  expect_pass jwt_previous_ok "${SIG_BASE[@]}" -e jwt_public_key_previous=$previous
+  render "$TMP/jwt-off.env" -e gateway_enforce_jwt=false -e jwt_public_key_previous=$previous
+  grep -qx 'JWT_PUBLIC_KEY_PREVIOUS=' "$TMP/jwt-off.env" || fail "JWT_PUBLIC_KEY_PREVIOUS must render blank with RBAC off"
   grep -qx 'GATEWAY_REQUIRE_JWT=' "$TMP/jwt-off.env" || fail "GATEWAY_REQUIRE_JWT must render blank with RBAC off"
-  render "$TMP/jwt-on.env" -e jwt_secret_previous=fedcba9876543210fedcba9876543210
+  render "$TMP/jwt-on.env" -e jwt_public_key_previous=$previous
   grep -qx 'GATEWAY_REQUIRE_JWT=1' "$TMP/jwt-on.env" || fail "GATEWAY_REQUIRE_JWT=1 not rendered with RBAC on"
   echo "ok: jwt previous render"
 }
@@ -521,7 +524,9 @@ test_secrets_render() {
   local sv
   sv() { grep -E "^$1:" "$D/secrets.yml" | sed -E "s/^$1: '?([^']*)'?$/\1/"; }
   [[ "$(asroot cat "$host/secrets/postgres-primary/POSTGRES_PASSWORD")" == "$(sv postgres_password)" ]] || fail "postgres-primary POSTGRES_PASSWORD value"
-  [[ "$(asroot cat "$host/secrets/gateway/JWT_SECRET")" == "$(sv jwt_secret)" ]] || fail "gateway JWT_SECRET value"
+  [[ "$(asroot cat "$host/secrets/auth/JWT_SIGNING_KEY")" == "$(sv jwt_signing_key)" ]] || fail "auth JWT_SIGNING_KEY value"
+  [[ "$(asroot cat "$host/secrets/gateway/JWT_PUBLIC_KEY")" == "$(sv jwt_public_key)" ]] || fail "gateway JWT_PUBLIC_KEY value"
+  asroot test -e "$host/secrets/gateway/JWT_SIGNING_KEY" && fail "the gateway got the JWT signing key"
   [[ "$(asroot cat "$host/secrets/operator-solana/COMMON_SOURCE_RPC_URL")" == "$(sv rpc_url)" ]] || fail "operator-solana rpc value"
   [[ "$(asroot cat "$host/secrets/write-node/PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")" == \
      "postgres://private_channel_runtime:$(sv postgres_runtime_password)@postgres-primary:5432/private_channel" ]] || fail "write-node DB URL"
@@ -541,7 +546,7 @@ test_secrets_render() {
   # Completeness: every secret the base compose interpolates for a service has a file.
   asroot python3 - "$REPO/docker-compose.devnet.yml" "$host" <<'PY' || fail "secret_files is incomplete (see above)"
 import os, re, sys, yaml
-SECRET = re.compile(r'\$\{(POSTGRES_PASSWORD|POSTGRES_\w*_PASSWORD|JWT_SECRET\w*|ADMIN_PRIVATE_KEY|OPERATOR_PRIVATE_KEY|INDEXER_YELLOWSTONE_TOKEN|ALERT_WEBHOOK_URL|RECONCILIATION_WEBHOOK_URL|GF_ADMIN_PASSWORD|LOCAL_VALIDATOR_RPC_URL|DEVNET_RPC_URL|DEVNET_FALLBACK_RPC_URL|GATEWAY_WHITELIST_RPC_URL|ESCROW_CONFIDENTIAL_KEYS)')
+SECRET = re.compile(r'\$\{(POSTGRES_PASSWORD|POSTGRES_\w*_PASSWORD|JWT_SIGNING_KEY|JWT_PUBLIC_KEY\w*|ADMIN_PRIVATE_KEY|OPERATOR_PRIVATE_KEY|INDEXER_YELLOWSTONE_TOKEN|ALERT_WEBHOOK_URL|RECONCILIATION_WEBHOOK_URL|GF_ADMIN_PASSWORD|LOCAL_VALIDATOR_RPC_URL|DEVNET_RPC_URL|DEVNET_FALLBACK_RPC_URL|GATEWAY_WHITELIST_RPC_URL|ESCROW_CONFIDENTIAL_KEYS)')
 compose, host = sys.argv[1], sys.argv[2]
 missing = []
 for svc, c in yaml.safe_load(open(compose))["services"].items():

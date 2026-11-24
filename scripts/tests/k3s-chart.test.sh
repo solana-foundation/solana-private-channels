@@ -110,7 +110,7 @@ test_grants_sql() {
 # secret var -> the workloads whose pods must roll when it changes, per env.
 REV_VARS="postgres_password postgres_replication_password postgres_runtime_password postgres_auth_runtime_password
 postgres_auth_owner_password postgres_gateway_password postgres_monitoring_password postgres_grafana_password
-postgres_indexer_password jwt_secret jwt_secret_previous grafana_admin_password ghcr_token yellowstone_token
+postgres_indexer_password jwt_signing_key jwt_public_key jwt_public_key_previous grafana_admin_password ghcr_token yellowstone_token
 escrow_confidential_keys notify_webhook alert_webhook_url rpc_url fallback_rpc_url gateway_whitelist_rpc_url
 pc_admin_private_key pc_operator_private_key"
 

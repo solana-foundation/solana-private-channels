@@ -156,7 +156,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     // What the auth service's login may do: register and authenticate users,
     // and manage their wallets. Changing a role and writing the audit trail are
     // the admin CLI's, which connects as the owner of this schema. The gateway
-    // only ever reads, so it holds none of the writes. Skipped when a role is
+    // only reads the role and wallet columns it checks. Skipped when a role is
     // absent, as both are in tests and in single-login dev setups.
     sqlx::query(
         r#"
@@ -180,8 +180,13 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_gateway') THEN
                 GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_gateway;
-                GRANT SELECT ON private_channel_auth.users TO private_channel_gateway;
-                GRANT SELECT ON private_channel_auth.verified_wallets TO private_channel_gateway;
+                -- Only the columns it checks, never password_hash. The revokes
+                -- narrow an older cluster's table-wide grants.
+                REVOKE SELECT ON private_channel_auth.users FROM private_channel_gateway;
+                GRANT SELECT (id, role) ON private_channel_auth.users TO private_channel_gateway;
+                REVOKE SELECT ON private_channel_auth.verified_wallets FROM private_channel_gateway;
+                GRANT SELECT (user_id, pubkey)
+                    ON private_channel_auth.verified_wallets TO private_channel_gateway;
             END IF;
         END $$;
         "#,

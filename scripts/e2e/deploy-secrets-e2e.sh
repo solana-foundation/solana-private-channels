@@ -43,6 +43,13 @@ pg_login() {
     psql -h 127.0.0.1 -U "$2" -d private_channel -c 'SELECT 1' >/dev/null 2>&1
 }
 pg_refused() { ! pg_login "$@"; }
+# pg_denied <password> <role> <sql>: the login works, the statement is refused for lack of privilege.
+pg_denied() {
+  local out
+  out="$(PGPASSWORD="$1" docker exec -e PGPASSWORD private-channel-postgres-primary \
+    psql -h 127.0.0.1 -U "$2" -d private_channel -c "$3" 2>&1)" && return 1
+  grep -q 'permission denied for table users' <<<"$out"
+}
 
 step1() {
   say "step 1: deploy with separate admin and operator keys"
@@ -97,7 +104,8 @@ step3() {
   check "secrets root is root 0700" test "$(stat -c '%a %U' "$s")" = "700 root"
   check "service dirs are root 0755" test -z "$(find "$s" -mindepth 1 -maxdepth 1 -type d \( ! -perm 0755 -o ! -user root \))"
   check "files are root 0444" test -z "$(find "$s" -mindepth 2 -type f \( ! -perm 0444 -o ! -user root \))"
-  check "a non-root user cannot read a secret" bash -c "! sudo -u nobody cat '$s/gateway/JWT_SECRET' 2>/dev/null"
+  check "a non-root user cannot read a secret" bash -c "! sudo -u nobody cat '$s/auth/JWT_SIGNING_KEY' 2>/dev/null"
+  check "the gateway has no JWT signing key" test ! -e "$s/gateway/JWT_SIGNING_KEY"
   check "~/.docker/config.json unchanged" bash -c \
     "[[ \"\$(sha256sum '$HOME/.docker/config.json' 2>/dev/null)\" == \"\$(cat '$E2E_WORK/docker-config.sha')\" ]]"
   check "no throwaway docker config left" test -z "$(find "${TMPDIR:-/tmp}" -maxdepth 2 -name '*.pc-docker' 2>/dev/null)"
@@ -137,6 +145,8 @@ step5() {
   check "postgres-primary not recreated by role-password rotations" test "$(cid private-channel-postgres-primary)" = "$p"
   check "gateway recreated" test "$(cid private-channel-gateway)" != "$g"
   check "the gateway role logs in with the new password" pg_login "$(secret postgres_gateway_password)" private_channel_gateway
+  check "the gateway login cannot read password hashes" pg_denied "$(secret postgres_gateway_password)" \
+    private_channel_gateway 'SELECT password_hash FROM private_channel_auth.users LIMIT 0'
   check "the old gateway password is refused" pg_refused "$oldgw" private_channel_gateway
   grafana_checks "after rotation"
 }
@@ -192,13 +202,13 @@ step7() {
   a="$(auth_token "$user" "$pw")"
   # A valid User-role token gets 403 on getBlock (operator only); an invalid one 401.
   check "token A valid before rotation" test "$(gated_status "$a")" = 403
-  "$REPO/scripts/rotate-secret.sh" jwt_secret --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
+  "$REPO/scripts/rotate-secret.sh" jwt_signing_key --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   deploy deploy7a -e "escrow_instance_id=$INSTANCE" -e validator_reset=false -e reset_state=false || die "stage deploy failed"
   b="$(auth_token "$user" "$pw")"
   check "token A still valid at the gateway while staged" test "$(gated_status "$a")" = 403
   check "token B valid at the gateway" test "$(gated_status "$b")" = 403
   check "auth accepts token A while staged" test "$(wallets_status "$a")" = 200
-  "$REPO/scripts/rotate-secret.sh" jwt_secret --finish --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
+  "$REPO/scripts/rotate-secret.sh" jwt_signing_key --finish --secrets-file "$E2E_WORK/deploy/secrets.yml" >/dev/null
   deploy deploy7b -e "escrow_instance_id=$INSTANCE" -e validator_reset=false -e reset_state=false || die "finish deploy failed"
   check "token A refused by the gateway after finish" test "$(gated_status "$a")" = 401
   check "token A refused by auth after finish" test "$(wallets_status "$a")" = 401
@@ -221,10 +231,10 @@ step8() {
   check "refused at the entrypoint check" grep -q "with-secrets entrypoint" "$E2E_WORK/logs/deploy8.log"
   check "running services untouched" test "$(cid private-channel-gateway)" = "$gw"
   local rc=0
-  docker run --rm --entrypoint /usr/local/bin/gateway -e GATEWAY_REQUIRE_JWT=1 -e JWT_SECRET= \
+  docker run --rm --entrypoint /usr/local/bin/gateway -e GATEWAY_REQUIRE_JWT=1 -e JWT_PUBLIC_KEY= \
     -e GATEWAY_PORT=18999 -e GATEWAY_WRITE_URL=http://127.0.0.1:1 -e GATEWAY_READ_URL=http://127.0.0.1:1 \
     "$E2E_REGISTRY/private-channel-app:$E2E_TAG" >"$E2E_WORK/logs/gateway-require-jwt.log" 2>&1 || rc=$?
-  check "gateway refuses GATEWAY_REQUIRE_JWT=1 with a blank secret" test "$rc" -ne 0
+  check "gateway refuses GATEWAY_REQUIRE_JWT=1 with a blank key" test "$rc" -ne 0
   # Put the override back on the good tag.
   deploy deploy8b -e "escrow_instance_id=$INSTANCE" -e validator_reset=false -e reset_state=false || die "restore deploy failed"
 }

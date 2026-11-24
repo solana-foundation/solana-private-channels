@@ -4,7 +4,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{Request, Uri};
@@ -21,6 +21,7 @@ use solana_pubkey::Pubkey;
 use solana_sdk::message::v1::MAX_TRANSACTION_SIZE;
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -78,6 +79,8 @@ pub struct WithdrawWhitelist {
     /// Mainnet calls across all clients, so fresh wallets from many addresses cannot
     /// multiply them.
     reads: DefaultDirectRateLimiter,
+    /// Each client's share of `reads`, so one client cannot spend them all.
+    reads_per_client: DefaultKeyedRateLimiter<IpAddr>,
 }
 
 impl WithdrawWhitelist {
@@ -87,6 +90,7 @@ impl WithdrawWhitelist {
         rpc_url: Option<&str>,
         instance: Option<&str>,
         reads: Quota,
+        reads_per_client: Quota,
     ) -> Result<Option<Self>, String> {
         let rpc_url = rpc_url.map(str::trim).filter(|value| !value.is_empty());
         let instance = instance.map(str::trim).filter(|value| !value.is_empty());
@@ -101,6 +105,7 @@ impl WithdrawWhitelist {
                 })?,
                 cache: Mutex::new(HashMap::new()),
                 reads: RateLimiter::direct(reads),
+                reads_per_client: RateLimiter::keyed(reads_per_client),
             })),
             _ => Err(
                 "GATEWAY_WHITELIST_RPC_URL and GATEWAY_WHITELIST_INSTANCE must be set together"
@@ -109,13 +114,14 @@ impl WithdrawWhitelist {
         }
     }
 
-    /// Whether the escrow would release the withdrawals in a `sendTransaction`'s params.
-    /// A send with no withdrawal costs no RPC call.
+    /// Whether the escrow would release the withdrawals in a `sendTransaction`'s params,
+    /// sent by `caller`. A send with no withdrawal costs no RPC call.
     pub async fn check(
         &self,
         client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
         params: &Value,
         deadline: Instant,
+        caller: IpAddr,
     ) -> Verdict {
         let wallets = withdraw_wallets(params);
         if wallets.is_empty() {
@@ -142,11 +148,17 @@ impl WithdrawWhitelist {
         }
 
         let check_deadline = deadline.min(Instant::now() + CHECK_TIMEOUT);
-        match tokio::time::timeout_at(check_deadline, self.fetch_cached(client, &keys)).await {
+        let fetch = self.fetch_cached(client, &keys, caller);
+        match tokio::time::timeout_at(check_deadline, fetch).await {
             Ok(Ok(accounts)) => decide(&wallets, &accounts),
             Ok(Err(reason)) => Verdict::Unchecked(reason),
             Err(_) => Verdict::Unchecked("Mainnet RPC did not answer in time".to_string()),
         }
+    }
+
+    /// Drops clients whose share has refilled, so the per-client store stays bounded.
+    pub fn retain_recent(&self) {
+        self.reads_per_client.retain_recent();
     }
 
     /// `key`'s account while its cached read is younger than CACHE_TTL.
@@ -179,11 +191,13 @@ impl WithdrawWhitelist {
     }
 
     /// The accounts at `keys`, from the cache where fresh and the rest in one Mainnet
-    /// call within the read budget. A failed or refused read caches nothing.
+    /// call within `caller`'s share and the read budget. A failed or refused read
+    /// caches nothing.
     async fn fetch_cached(
         &self,
         client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
         keys: &[Pubkey],
+        caller: IpAddr,
     ) -> Result<Vec<Option<FetchedAccount>>, String> {
         let read_at = Instant::now();
         let cached: Vec<Option<Option<FetchedAccount>>> =
@@ -197,6 +211,9 @@ impl WithdrawWhitelist {
         let fetched = if missing.is_empty() {
             Vec::new()
         } else {
+            self.reads_per_client
+                .check_key(&caller)
+                .map_err(|_| format!("{caller} is over its share of the Mainnet reads"))?;
             self.reads
                 .check()
                 .map_err(|_| "Mainnet reads over GATEWAY_WHITELIST_READS_PER_SECOND".to_string())?;
@@ -782,9 +799,10 @@ mod tests {
         ];
 
         for (rpc_url_setting, instance_setting, expected) in cases {
-            let enabled = WithdrawWhitelist::from_config(rpc_url_setting, instance_setting, reads)
-                .map(|whitelist| whitelist.is_some())
-                .ok();
+            let enabled =
+                WithdrawWhitelist::from_config(rpc_url_setting, instance_setting, reads, reads)
+                    .map(|whitelist| whitelist.is_some())
+                    .ok();
             assert_eq!(
                 enabled, expected,
                 "rpc_url={rpc_url_setting:?} instance={instance_setting:?}"
@@ -796,9 +814,14 @@ mod tests {
     fn enabled_whitelist() -> WithdrawWhitelist {
         let instance = Pubkey::new_unique().to_string();
         let reads = Quota::per_second(NonZeroU32::new(20).unwrap());
-        WithdrawWhitelist::from_config(Some("http://127.0.0.1:1"), Some(instance.as_str()), reads)
-            .expect("the whitelist settings are valid")
-            .expect("both settings are set")
+        WithdrawWhitelist::from_config(
+            Some("http://127.0.0.1:1"),
+            Some(instance.as_str()),
+            reads,
+            reads,
+        )
+        .expect("the whitelist settings are valid")
+        .expect("both settings are set")
     }
 
     #[test]

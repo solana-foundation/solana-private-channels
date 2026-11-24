@@ -27,7 +27,7 @@ ok "no-change deploy rolled nothing (salt stable)"
 old_admin="$(e2e_secret grafana_admin_password)"
 fails=0
 for var in ${E2E_REV_VARS:-postgres_runtime_password postgres_gateway_password postgres_monitoring_password postgres_indexer_password \
-  postgres_password jwt_secret grafana_admin_password postgres_grafana_password}; do
+  postgres_password grafana_admin_password postgres_grafana_password}; do
   want="$(python3 -c 'import sys,yaml; print(" ".join(yaml.safe_load(open(sys.argv[1]))[sys.argv[2]][sys.argv[3]]))' "$table" "$envkey" "$var")"
   u0="$(uids)"
   sed -i -E "s/^($var: )(.*)$/\1\2x/" "$sec"

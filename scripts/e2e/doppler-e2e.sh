@@ -25,7 +25,7 @@ rpc_url: 'https://e2e-rpc-$(openssl rand -hex 8).invalid/?api-key=$(openssl rand
 fallback_rpc_url: 'https://e2e-fallback-$(openssl rand -hex 8).invalid/$(openssl rand -hex 16)'
 yellowstone_token: '$(openssl rand -hex 16)'
 alert_webhook_url: 'https://e2e-grafana-$(openssl rand -hex 8).invalid/hook'
-jwt_secret_previous: '$(openssl rand -hex 32)'
+jwt_public_key_previous: '$("$REPO/scripts/jwt-keypair.sh" | sed -n 's/^JWT_PUBLIC_KEY=//p')'
 EOF
 mkdir -p "$E2E_HOST_DATA_DIR/config"
 

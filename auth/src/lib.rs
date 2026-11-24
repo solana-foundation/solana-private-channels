@@ -192,6 +192,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::routing::get;
+    use solana_sdk::signature::{Keypair, Signer};
     use std::net::SocketAddr;
     use std::num::{NonZeroU32, NonZeroUsize};
     use tower::ServiceExt;
@@ -199,11 +200,19 @@ mod tests {
     /// A router over a pool that is never connected. The body cap rejects before
     /// any handler runs, so these tests need no database.
     fn app_without_a_database() -> Router {
+        let keypair = Keypair::new();
         let state = AppState {
             pool: sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://localhost/unused")
                 .unwrap(),
-            jwt: Arc::new(JwtConfig::new("test-secret")),
+            jwt: Arc::new(
+                JwtConfig::new(
+                    &keypair.to_base58_string(),
+                    &keypair.pubkey().to_string(),
+                    None,
+                )
+                .unwrap(),
+            ),
             pool_status: PoolStatus::new_healthy(),
             passwords: PasswordWorker::new(NonZeroUsize::new(1).unwrap()),
             throttle: Arc::new(AuthThrottle::new(

@@ -2,7 +2,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use hyper::body::Bytes;
 use hyper::StatusCode;
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -750,10 +750,11 @@ pub fn decode_account_data(encoded: &str) -> Option<Vec<u8>> {
 
 /// Extracts and verifies a Bearer token from the raw `Authorization` header value.
 /// Returns `Some(Claims)` on success, `None` if missing, malformed, or expired.
-/// Keys are tried in order (current, then previous during a rotation).
+/// Keys are tried in order (current, then previous during a rotation). EdDSA only, so a
+/// token signed any other way is refused before a key is tried.
 pub fn verify_bearer(auth_header: Option<&str>, decoding_keys: &[DecodingKey]) -> Option<Claims> {
     let token = auth_header?.strip_prefix("Bearer ")?;
-    let mut validation = Validation::default();
+    let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[JWT_ISSUER]);
     validation.set_audience(&[JWT_AUDIENCE]);
     decoding_keys.iter().find_map(|key| {
@@ -866,14 +867,19 @@ fn malformed_account_config_body() -> Bytes {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{encode, Header};
+    use private_channel_auth::jwt::encoding_key;
     use serde_json::json;
+    use solana_sdk::signature::{Keypair, Signer};
     use uuid::Uuid;
 
-    const SECRET: &str = "test-secret";
+    /// Test keypair: tokens are signed with the first, verified with the second.
+    const SIGNING_KEY: &str =
+        "2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD";
+    const PUBLIC_KEY: &str = "6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM";
 
     fn decoding_key() -> DecodingKey {
-        DecodingKey::from_secret(SECRET.as_bytes())
+        crate::decode_public_key("JWT_PUBLIC_KEY", PUBLIC_KEY).unwrap()
     }
 
     /// Full claims struct including `iss`/`aud` so forged tokens pass gateway validation.
@@ -887,10 +893,16 @@ mod tests {
     }
 
     fn forge_token(role: Role, exp_offset_secs: i64) -> String {
-        forge_with(SECRET, role, exp_offset_secs, JWT_ISSUER, JWT_AUDIENCE)
+        forge_with(SIGNING_KEY, role, exp_offset_secs, JWT_ISSUER, JWT_AUDIENCE)
     }
 
-    fn forge_with(secret: &str, role: Role, exp_offset_secs: i64, iss: &str, aud: &str) -> String {
+    fn forge_with(
+        signing_key: &str,
+        role: Role,
+        exp_offset_secs: i64,
+        iss: &str,
+        aud: &str,
+    ) -> String {
         let claims = FullClaims {
             sub: Uuid::new_v4().to_string(),
             role,
@@ -899,20 +911,19 @@ mod tests {
             aud: aud.to_string(),
         };
         encode(
-            &Header::default(),
+            &Header::new(Algorithm::EdDSA),
             &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
+            &encoding_key(signing_key).unwrap(),
         )
         .unwrap()
     }
 
-    const PREVIOUS: &str = "test-previous-secret";
-
-    /// Current then previous, the order the gateway stores them in.
-    fn rotation_keys() -> [DecodingKey; 2] {
+    /// Current then `previous`, the order the gateway stores them in.
+    fn rotation_keys(previous: &Keypair) -> [DecodingKey; 2] {
         [
             decoding_key(),
-            DecodingKey::from_secret(PREVIOUS.as_bytes()),
+            crate::decode_public_key("JWT_PUBLIC_KEY_PREVIOUS", &previous.pubkey().to_string())
+                .unwrap(),
         ]
     }
 
@@ -950,17 +961,26 @@ mod tests {
     }
 
     #[test]
-    fn verify_bearer_rejects_wrong_secret() {
-        let token = forge_token(Role::Operator, 3600);
-        let wrong_key = DecodingKey::from_secret(b"wrong-secret");
-        assert!(verify_bearer(Some(&format!("Bearer {token}")), &[wrong_key]).is_none());
+    fn verify_bearer_rejects_another_keypair() {
+        let token = forge_with(
+            &Keypair::new().to_base58_string(),
+            Role::Operator,
+            3600,
+            JWT_ISSUER,
+            JWT_AUDIENCE,
+        );
+        assert!(verify_bearer(Some(&format!("Bearer {token}")), &[decoding_key()]).is_none());
     }
 
     #[test]
     fn verify_bearer_accepts_current_and_previous() {
-        for (name, secret) in [("current", SECRET), ("previous", PREVIOUS)] {
-            let token = forge_with(secret, Role::User, 3600, JWT_ISSUER, JWT_AUDIENCE);
-            let parsed = verify_bearer(Some(&format!("Bearer {token}")), &rotation_keys());
+        let previous = Keypair::new();
+        for (name, signing_key) in [
+            ("current", SIGNING_KEY.to_string()),
+            ("previous", previous.to_base58_string()),
+        ] {
+            let token = forge_with(&signing_key, Role::User, 3600, JWT_ISSUER, JWT_AUDIENCE);
+            let parsed = verify_bearer(Some(&format!("Bearer {token}")), &rotation_keys(&previous));
             assert_eq!(parsed.map(|c| c.role), Some(Role::User), "{name} key");
         }
     }
@@ -968,26 +988,29 @@ mod tests {
     #[test]
     fn verify_bearer_rejects_a_third_key() {
         let token = forge_with(
-            "some-third-secret",
+            &Keypair::new().to_base58_string(),
             Role::User,
             3600,
             JWT_ISSUER,
             JWT_AUDIENCE,
         );
-        assert!(verify_bearer(Some(&format!("Bearer {token}")), &rotation_keys()).is_none());
+        let header = format!("Bearer {token}");
+        assert!(verify_bearer(Some(&header), &rotation_keys(&Keypair::new())).is_none());
     }
 
     /// Expiry, issuer and audience apply to the previous key exactly as to the current.
     #[test]
     fn verify_bearer_keeps_its_checks_under_both_keys() {
-        for secret in [SECRET, PREVIOUS] {
-            for token in [
-                forge_with(secret, Role::Operator, -3600, JWT_ISSUER, JWT_AUDIENCE),
-                forge_with(secret, Role::Operator, 3600, "wrong-issuer", JWT_AUDIENCE),
-                forge_with(secret, Role::Operator, 3600, JWT_ISSUER, "wrong-audience"),
+        let previous = Keypair::new();
+        for signing_key in [SIGNING_KEY.to_string(), previous.to_base58_string()] {
+            for (exp, iss, aud) in [
+                (-3600, JWT_ISSUER, JWT_AUDIENCE),
+                (3600, "wrong-issuer", JWT_AUDIENCE),
+                (3600, JWT_ISSUER, "wrong-audience"),
             ] {
+                let token = forge_with(&signing_key, Role::Operator, exp, iss, aud);
                 let header = format!("Bearer {token}");
-                assert!(verify_bearer(Some(&header), &rotation_keys()).is_none());
+                assert!(verify_bearer(Some(&header), &rotation_keys(&previous)).is_none());
             }
         }
     }
@@ -1422,29 +1445,25 @@ mod tests {
 
     #[test]
     fn a_previous_signed_token_redacts_like_a_current_one() {
+        let previous = Keypair::new();
+        let keys = rotation_keys(&previous);
         let forge = |role, exp| {
-            let token = forge_with(PREVIOUS, role, exp, JWT_ISSUER, JWT_AUDIENCE);
+            let token = forge_with(
+                &previous.to_base58_string(),
+                role,
+                exp,
+                JWT_ISSUER,
+                JWT_AUDIENCE,
+            );
             format!("Bearer {token}")
         };
         let (user, operator) = (forge(Role::User, 3600), forge(Role::Operator, 3600));
         let expired = forge(Role::Operator, -3600);
         for method in ["getSignaturesForAddress", "getSignatureStatuses"] {
-            assert!(redacts_transaction_errors(None, &rotation_keys(), method));
-            assert!(redacts_transaction_errors(
-                Some(&user),
-                &rotation_keys(),
-                method
-            ));
-            assert!(redacts_transaction_errors(
-                Some(&expired),
-                &rotation_keys(),
-                method
-            ));
-            assert!(!redacts_transaction_errors(
-                Some(&operator),
-                &rotation_keys(),
-                method
-            ));
+            assert!(redacts_transaction_errors(None, &keys, method));
+            assert!(redacts_transaction_errors(Some(&user), &keys, method));
+            assert!(redacts_transaction_errors(Some(&expired), &keys, method));
+            assert!(!redacts_transaction_errors(Some(&operator), &keys, method));
             // Without the previous key the same operator token is an anonymous caller.
             assert!(redacts_transaction_errors(
                 Some(&operator),
@@ -1454,7 +1473,7 @@ mod tests {
         }
         assert!(!redacts_transaction_errors(
             Some(&user),
-            &rotation_keys(),
+            &keys,
             "getAccountInfo"
         ));
     }

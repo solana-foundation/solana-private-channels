@@ -12,11 +12,11 @@ That said, divergence shows up in three distinct buckets:
 
 ## 2. Auth Model
 
-### SPC gateway, with auth disabled (`JWT_SECRET` unset)
+### SPC gateway, with auth disabled (`JWT_PUBLIC_KEY` unset)
 
 The gateway acts as a pure HTTP reverse proxy: it inspects the request body to find the `method` field, routes `sendTransaction` and `isBlockhashValid` to the write upstream and everything else to the read upstream, adds CORS headers, and forwards. Liveness via GET `/health` (gateway-only) and readiness via GET `/ready` (probes both upstreams) are gateway-only additions.
 
-### SPC gateway, with auth enabled (`JWT_SECRET` + `AUTH_DATABASE_URL` both set)
+### SPC gateway, with auth enabled (`JWT_PUBLIC_KEY` + `AUTH_DATABASE_URL` both set)
 
 The gateway enforces RBAC on a fixed list of methods (`gateway/src/auth.rs`):
 
@@ -33,7 +33,7 @@ None of this applies on the gateway's internal listener (`GATEWAY_INTERNAL_PORT`
 
 > **Note on `commitment`:** SPC has a single linear timeline - one sequencer, no fork choice - so the Solana commitment levels `processed`/`confirmed`/`finalized` have no meaning here. The parameter is accepted (and serde-validated) on every handler that takes a Solana config, then discarded. Per-row mentions of this are omitted below; assume every method accepts `commitment` and ignores it.
 >
-> **`[auth]` marker:** when gateway auth is enabled (`JWT_SECRET` set), the method requires an `Authorization: Bearer <JWT>` header. See section 2 for the operator-only vs account-gated split. Otherwise the method conforms to Solana's wire contract.
+> **`[auth]` marker:** when gateway auth is enabled (`JWT_PUBLIC_KEY` set), the method requires an `Authorization: Bearer <JWT>` header. See section 2 for the operator-only vs account-gated split. Otherwise the method conforms to Solana's wire contract.
 
 ### 3.1 Methods SPC implements
 

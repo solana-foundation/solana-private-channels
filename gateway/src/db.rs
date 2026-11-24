@@ -110,6 +110,9 @@ pub async fn owner_chain(
 /// Returns the role currently stored for `user_id`, or `None` if the user no
 /// longer exists. The gateway uses this to confirm that a JWT's Operator claim
 /// still matches the DB, since a token can outlive a demotion by up to 24h.
+///
+/// The gateway's login may read only the columns used here: a new one needs a
+/// grant in auth/src/db.rs, init-auth-roles.sql and charts/pc-db/files/ledger-grants.sql.
 pub async fn get_user_role(pool: &PgPool, user_id: Uuid) -> Result<Option<Role>, sqlx::Error> {
     let row: Option<(String,)> =
         sqlx::query_as(r#"SELECT role::text FROM private_channel_auth.users WHERE id = $1"#)
@@ -142,6 +145,9 @@ pub struct OwnerChangeCoverage {
 /// A chain of handoffs can name many wallets, and asking about each one in turn
 /// would put an attacker-controlled number of sequential queries on the pool the
 /// auth service shares.
+///
+/// The gateway's login may read only the columns used here: a new one needs a
+/// grant in auth/src/db.rs, init-auth-roles.sql and charts/pc-db/files/ledger-grants.sql.
 pub async fn owned_wallets(
     pool: &PgPool,
     user_id: Uuid,
@@ -170,6 +176,9 @@ pub async fn owned_wallets(
 ///
 /// This is the ownership check the gateway performs before allowing a User-role
 /// JWT to access account data. Operators bypass this check entirely.
+///
+/// The gateway's login may read only the columns used here: a new one needs a
+/// grant in auth/src/db.rs, init-auth-roles.sql and charts/pc-db/files/ledger-grants.sql.
 pub async fn is_wallet_owned_by_user(
     pool: &PgPool,
     user_id: Uuid,

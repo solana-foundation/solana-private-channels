@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Step 10: JWT rotation in two deploys. After the stage (rotate-secret.sh jwt_secret) a
+# Step 10: JWT rotation in two deploys. After the stage (rotate-secret.sh jwt_signing_key) a
 # token issued before verifies and new logins work; after --finish the old token is
 # rejected (401) and a fresh login works.
 . "$(dirname "$0")/lib.sh"
@@ -29,14 +29,14 @@ deploy() { sync_repo; playbook "$STEP-$1" k3s.yml "${inst_args[@]}" || die "depl
 check() { ctl "python3 /tmp/jwt.py $E2E_HOST_IP \$(cat /tmp/$1.tok)"; }
 ctl "python3 /tmp/jwt.py $E2E_HOST_IP login > /tmp/old.tok"
 [[ "$(check old)" == 403 ]] || die "a fresh token did not verify before the rotation"
-bash "$REPO/scripts/rotate-secret.sh" jwt_secret --secrets-file "$sec" >>"$LOG" 2>&1 || die "stage failed"
-grep -q '^jwt_secret_previous: .\+' "$sec" || die "stage did not set jwt_secret_previous"
+bash "$REPO/scripts/rotate-secret.sh" jwt_signing_key --secrets-file "$sec" >>"$LOG" 2>&1 || die "stage failed"
+grep -q '^jwt_public_key_previous: .\+' "$sec" || die "stage did not set jwt_public_key_previous"
 deploy stage
 c="$(check old)"; [[ "$c" == 403 ]] || die "old token rejected during the stage ($c)"
 ctl "python3 /tmp/jwt.py $E2E_HOST_IP login > /tmp/new.tok"
 [[ "$(check new)" == 403 ]] || die "a token issued during the stage did not verify"
 ok "stage: the old token still verifies, new logins work"
-bash "$REPO/scripts/rotate-secret.sh" jwt_secret --finish --secrets-file "$sec" >>"$LOG" 2>&1 || die "finish failed"
+bash "$REPO/scripts/rotate-secret.sh" jwt_signing_key --finish --secrets-file "$sec" >>"$LOG" 2>&1 || die "finish failed"
 deploy finish
 c="$(check old)"; [[ "$c" == 401 ]] || die "old token still accepted after finish ($c)"
 [[ "$(check new)" == 403 ]] || die "the staged token stopped verifying after finish"

@@ -279,11 +279,12 @@ services:
       - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
       - METRICS_PORT=9101
       # Optional — omit or leave blank to disable RBAC enforcement.
-      - JWT_SECRET=${JWT_SECRET:-}
-      # Optional: the previous secret during a rotation, verified after JWT_SECRET.
-      - JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS:-}
-      # 1 refuses to start on a blank JWT_SECRET rather than run with RBAC off.
-      - GATEWAY_REQUIRE_JWT=${GATEWAY_REQUIRE_JWT:-}
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:-}
+      # Optional: the previous public key during a rotation, verified after JWT_PUBLIC_KEY.
+      - JWT_PUBLIC_KEY_PREVIOUS=${JWT_PUBLIC_KEY_PREVIOUS:-}
+      # 1 refuses to start on a blank JWT_PUBLIC_KEY rather than run with RBAC off. On by
+      # default while an old env file still sets JWT_SECRET, which nothing reads anymore.
+      - GATEWAY_REQUIRE_JWT=${GATEWAY_REQUIRE_JWT:-${JWT_SECRET:+1}}
       # A SELECT-only login: the two auth tables it checks roles and wallets
       # against, and the two ledger tables core grants it. No writes anywhere.
       - AUTH_DATABASE_URL=postgres://private_channel_gateway:${POSTGRES_GATEWAY_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
@@ -292,7 +293,8 @@ services:
       # would refuse. Blank leaves the check off.
       - GATEWAY_WHITELIST_RPC_URL=${GATEWAY_WHITELIST_RPC_URL:-}
       - GATEWAY_WHITELIST_INSTANCE=${GATEWAY_WHITELIST_INSTANCE:-}
-      # Max Mainnet reads per second the check makes; past it, withdrawals go unchecked.
+      # Max Mainnet reads per second the check makes; past it, or past one client IP's
+      # tenth of it, withdrawals go unchecked.
       - GATEWAY_WHITELIST_READS_PER_SECOND=${GATEWAY_WHITELIST_READS_PER_SECOND:-20}
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
@@ -351,8 +353,9 @@ services:
       - RUST_LOG=info
       - AUTH_PORT=${AUTH_PORT}
       - AUTH_DATABASE_URL=postgres://private_channel_auth_runtime:${POSTGRES_AUTH_RUNTIME_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
-      - JWT_SECRET=${JWT_SECRET}
-      - JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS:-}
+      - JWT_SIGNING_KEY=${JWT_SIGNING_KEY}
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - JWT_PUBLIC_KEY_PREVIOUS=${JWT_PUBLIC_KEY_PREVIOUS:-}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
       - AUTH_ARGON2_MAX_CONCURRENCY=${AUTH_ARGON2_MAX_CONCURRENCY:-4}

@@ -31,6 +31,11 @@ use private_channel_auth::{
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// A fixed test keypair, so a test can mint tokens the app accepts.
+const TEST_JWT_SIGNING_KEY: &str =
+    "2ReFNEe1wUYcpYf84RB273u8fk3PdBeECvYyqCStnf9cLo7j7HvmKEvRAKXrBPgmkQVikAAcjkgNDz1qSqC8rpzD";
+const TEST_JWT_PUBLIC_KEY: &str = "6rB8n7nqhEMbN31STXEoxbmYaVvwD5VjX14gXQzzXkiM";
+
 /// Spin up a Postgres container and return the connection URL.
 /// The container is returned to keep it alive for the duration of the test.
 async fn start_postgres() -> (String, testcontainers::ContainerAsync<Postgres>) {
@@ -75,7 +80,7 @@ async fn start_throttled_app(
 
     let state = AppState {
         pool,
-        jwt: Arc::new(JwtConfig::new("test-secret")),
+        jwt: Arc::new(JwtConfig::new(TEST_JWT_SIGNING_KEY, TEST_JWT_PUBLIC_KEY, None).unwrap()),
         pool_status: private_channel_auth::pool_status::PoolStatus::new_healthy(),
         // Well above any test's concurrency. Argon2 is much slower unoptimized,
         // so a production-sized cap would shed here on the permit wait and mask
@@ -1355,7 +1360,7 @@ async fn challenge_issuance_over_budget_ip_is_shed_across_accounts() {
         .connect(&db_url)
         .await
         .expect("failed to connect to test db");
-    let jwt = JwtConfig::new("test-secret");
+    let jwt = JwtConfig::new(TEST_JWT_SIGNING_KEY, TEST_JWT_PUBLIC_KEY, None).unwrap();
     let mut tokens = Vec::new();
     for account in 0..burst.get() + 3 {
         let user = db::insert_user(&pool, &format!("account{account}"), "fakehash")
@@ -1989,10 +1994,11 @@ async fn auth_runtime_login_cannot_forge_roles_or_audit_rows() {
         .expect("challenge cleanup must work");
 }
 
-/// The gateway only ever reads. Its login must not be able to forge a wallet
-/// link, which is the ownership check it exists to enforce.
+/// The gateway only ever reads, and only the columns it checks. Its login must not
+/// forge a wallet link, which is the ownership check it exists to enforce, or read
+/// a password hash.
 #[tokio::test(flavor = "multi_thread")]
-async fn gateway_login_cannot_write_to_the_auth_tables() {
+async fn gateway_login_reads_only_the_columns_it_checks() {
     let gateway_password = "gateway-password";
     let (db_url, container) = start_postgres().await;
     let owner_pool = PgPoolOptions::new()
@@ -2011,6 +2017,17 @@ async fn gateway_login_cannot_write_to_the_auth_tables() {
     db::init_schema(&owner_pool)
         .await
         .expect("failed to init schema");
+    // An older cluster granted the whole tables; the next init must narrow them.
+    sqlx::query(
+        "GRANT SELECT ON private_channel_auth.users, private_channel_auth.verified_wallets \
+         TO private_channel_gateway",
+    )
+    .execute(&owner_pool)
+    .await
+    .expect("failed to grant the old table-wide read");
+    db::init_schema(&owner_pool)
+        .await
+        .expect("failed to re-run init schema");
 
     let user = db::insert_user(&owner_pool, "alice", "$argon2id$placeholder")
         .await
@@ -2028,6 +2045,24 @@ async fn gateway_login_cannot_write_to_the_auth_tables() {
         ))
         .await
         .expect("failed to connect as the gateway role");
+
+    for (table, column) in [
+        ("users", "password_hash"),
+        ("users", "username"),
+        ("verified_wallets", "created_at"),
+    ] {
+        let err = sqlx::query(&format!(
+            "SELECT {column} FROM private_channel_auth.{table}"
+        ))
+        .fetch_all(&gateway_pool)
+        .await
+        .expect_err("must not read a column it does not check");
+        assert!(
+            err.to_string()
+                .contains(&format!("permission denied for table {table}")),
+            "{table}.{column}: {err}"
+        );
+    }
 
     // The two reads the gateway actually performs.
     let (role,): (String,) =

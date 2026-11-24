@@ -5,7 +5,8 @@
 cp .env.example .env
 # Edit .env with your keys
 # Required (no defaults shipped): set POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD
-# (and JWT_SECRET if enabling auth, ADMIN_PRIVATE_KEY for the operator) or services fail to start
+# (and JWT_SIGNING_KEY, JWT_PUBLIC_KEY from scripts/jwt-keypair.sh if enabling auth,
+# ADMIN_PRIVATE_KEY for the operator) or services fail to start
 # Generate strong values with: openssl rand -hex 32
 ```
 
@@ -83,7 +84,7 @@ cargo run --bin withdraw -- \
 ```
 Prints the mint's withdraw fee and minimum before sending, and stops if `<AMOUNT>` is below the minimum. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana. The operator admin withdraws without either.
 
-The tool reads the mint's withdraw config before sending. With JWT on (`JWT_SECRET` set) the public gateway refuses that read without a token, so point it at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`. Sending still goes through the gateway URL.
+The tool reads the mint's withdraw config before sending. With JWT on (`JWT_PUBLIC_KEY` set) the public gateway refuses that read without a token, so point it at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`. Sending still goes through the gateway URL.
 
 ## Seize (permanent delegate, channel only)
 
@@ -106,7 +107,7 @@ balance (or `--amount`) with `TransferChecked`, and freezes the source again. Th
 authority defaults to the delegate key. It simulates with `sigVerify` first, because the node
 drops a refused delegate move without an RPC error.
 
-With JWT on (`JWT_SECRET` set) the public gateway refuses the account reads and the simulation
+With JWT on (`JWT_PUBLIC_KEY` set) the public gateway refuses the account reads and the simulation
 without a token, so point them at the read node: `PRIVATE_CHANNEL_READ_RPC_URL=http://localhost:8901`.
 Sending still goes through the gateway URL.
 

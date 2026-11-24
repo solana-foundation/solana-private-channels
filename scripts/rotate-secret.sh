@@ -6,7 +6,7 @@ set -euo pipefail
 #                         [--value-stdin] [--finish] [--secrets-file PATH]
 # Generated keys get a fresh random value; supplied keys (tokens, webhooks, provider
 # URLs) need --value-stdin. No value ever reaches a command line or the output.
-# jwt_secret stages a rotation (previous keeps verifying) and --finish ends it.
+# jwt_signing_key stages a new keypair (the old public key keeps verifying) and --finish ends it.
 
 usage() {
   sed -n '4,9p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -35,19 +35,23 @@ case "$key" in
   postgres_auth_runtime_password | postgres_auth_owner_password | postgres_gateway_password | \
   postgres_monitoring_password | postgres_grafana_password | postgres_indexer_password | \
   grafana_admin_password) kind=hex16 ;;
-  jwt_secret) kind=hex32 ;;
+  jwt_signing_key) kind=jwt ;;
   ghcr_token | yellowstone_token | notify_webhook | alert_webhook_url | rpc_url | fallback_rpc_url | \
   gateway_whitelist_rpc_url | admin_vault_token | operator_vault_token | admin_turnkey_api_private_key | \
   operator_turnkey_api_private_key | admin_privy_app_secret | operator_privy_app_secret) kind=supplied ;;
   *) echo "ERROR: unknown secret key '$key'" >&2; exit 2 ;;
 esac
 
-if [[ "$finish" == true && "$key" != jwt_secret ]]; then
-  echo "ERROR: --finish only applies to jwt_secret" >&2
+if [[ "$finish" == true && "$key" != jwt_signing_key ]]; then
+  echo "ERROR: --finish only applies to jwt_signing_key" >&2
   exit 2
 fi
 if [[ "$kind" == supplied && "$value_stdin" != true ]]; then
   echo "ERROR: $key is supplied by you, not generated: pipe it in with --value-stdin" >&2
+  exit 2
+fi
+if [[ "$kind" == jwt && "$value_stdin" == true ]]; then
+  echo "ERROR: $key is always generated as a keypair, so --value-stdin does not apply" >&2
   exit 2
 fi
 
@@ -69,7 +73,11 @@ if [[ "$finish" != true ]]; then
   elif [[ "$kind" == hex16 ]]; then
     value="$(openssl rand -hex 16)"
   else
-    value="$(openssl rand -hex 32)"
+    pair="$("$(dirname "${BASH_SOURCE[0]}")/jwt-keypair.sh")"
+    signing="${pair%%$'\n'*}"
+    public="${pair#*$'\n'}"
+    # "signing public" as one value; base58 has no spaces.
+    value="${signing#JWT_SIGNING_KEY=} ${public#JWT_PUBLIC_KEY=}"
   fi
   if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
     echo "ERROR: the value for $key is empty or contains a newline" >&2
@@ -125,16 +133,18 @@ def put(k, v):
 if mode == "set":
     put(key, new)
 elif mode == "jwt-stage":
-    if get("jwt_secret_previous"):
-        sys.exit("ERROR: jwt_secret_previous is already set: finish that rotation first (--finish)")
-    if not get("jwt_secret"):
-        sys.exit("ERROR: jwt_secret is empty, so there is nothing to keep verifying")
-    put("jwt_secret_previous", get("jwt_secret"))
-    put("jwt_secret", new)
+    if get("jwt_public_key_previous"):
+        sys.exit("ERROR: jwt_public_key_previous is already set: finish that rotation first (--finish)")
+    signing, public = new.split(" ")
+    # A first keypair has no old key to keep verifying.
+    if get("jwt_public_key"):
+        put("jwt_public_key_previous", get("jwt_public_key"))
+    put("jwt_signing_key", signing)
+    put("jwt_public_key", public)
 elif mode == "jwt-finish":
-    if not get("jwt_secret_previous"):
-        sys.exit("ERROR: jwt_secret_previous is empty: no rotation to finish")
-    put("jwt_secret_previous", "")
+    if not get("jwt_public_key_previous"):
+        sys.exit("ERROR: jwt_public_key_previous is empty: no rotation to finish")
+    put("jwt_public_key_previous", "")
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".rotate-")
 try:
     with os.fdopen(fd, "w") as f:
@@ -156,15 +166,34 @@ json_value() {
   python3 -c 'import json, sys; print(json.dumps({"value": sys.stdin.read()}))'
 }
 
+# A Doppler secret, or nothing when it does not exist. Any other failure stops, or
+# staging could overwrite a previous key that is still in use.
+doppler_get() {
+  local err="${TMPDIR:-/tmp}/.rotate-doppler-err.$$"
+  if ! doppler_run secrets get "$1" --plain 2>"$err" && ! grep -qi 'could not find' "$err"; then
+    rm -f "$err"
+    echo "ERROR: could not read $1 from Doppler" >&2
+    exit 1
+  fi
+  rm -f "$err"
+}
+
+# A failed write mid-stage leaves keys that do not match. In this write order,
+# --finish and a fresh stage always end in a matching pair.
+partial() {
+  echo "ERROR: the rotation was only partly written to Doppler. Do not deploy: run $0 jwt_signing_key --finish if JWT_PUBLIC_KEY_PREVIOUS is set, then stage again." >&2
+  exit 1
+}
+
 case "$backend" in
   file)
     if [[ ! -f "$secrets_file" ]]; then
       echo "ERROR: $secrets_file not found" >&2
       exit 1
     fi
-    if [[ "$key" == jwt_secret && "$finish" == true ]]; then
+    if [[ "$key" == jwt_signing_key && "$finish" == true ]]; then
       printf '' | json_value | edit_file jwt-finish
-    elif [[ "$key" == jwt_secret ]]; then
+    elif [[ "$key" == jwt_signing_key ]]; then
       printf '%s' "$value" | json_value | edit_file jwt-stage
     else
       printf '%s' "$value" | json_value | edit_file set
@@ -176,27 +205,20 @@ case "$backend" in
       echo "ERROR: the doppler backend needs --project and --config (no directory-scope fallback)" >&2
       exit 2
     fi
-    if [[ "$key" == jwt_secret ]]; then
-      # Only "not found" means empty; any other failure must stop, or staging could
-      # overwrite a previous key that is still in use.
-      if ! previous="$(doppler_run secrets get JWT_SECRET_PREVIOUS --plain 2>"${TMPDIR:-/tmp}/.rotate-doppler-err.$$")"; then
-        if ! grep -qi 'could not find' "${TMPDIR:-/tmp}/.rotate-doppler-err.$$"; then
-          rm -f "${TMPDIR:-/tmp}/.rotate-doppler-err.$$"
-          echo "ERROR: could not read JWT_SECRET_PREVIOUS from Doppler" >&2
-          exit 1
-        fi
-        previous=""
-      fi
-      rm -f "${TMPDIR:-/tmp}/.rotate-doppler-err.$$"
+    if [[ "$key" == jwt_signing_key ]]; then
+      previous="$(doppler_get JWT_PUBLIC_KEY_PREVIOUS)"
       if [[ "$finish" == true ]]; then
-        [[ -n "$previous" ]] || { echo "ERROR: JWT_SECRET_PREVIOUS is empty: no rotation to finish" >&2; exit 1; }
-        doppler_run secrets delete JWT_SECRET_PREVIOUS --yes --silent
+        [[ -n "$previous" ]] || { echo "ERROR: JWT_PUBLIC_KEY_PREVIOUS is empty: no rotation to finish" >&2; exit 1; }
+        doppler_run secrets delete JWT_PUBLIC_KEY_PREVIOUS --yes --silent
       else
-        [[ -z "$previous" ]] || { echo "ERROR: JWT_SECRET_PREVIOUS is already set: finish that rotation first (--finish)" >&2; exit 1; }
-        current="$(doppler_run secrets get JWT_SECRET --plain)"
-        [[ -n "$current" ]] || { echo "ERROR: JWT_SECRET is empty, so there is nothing to keep verifying" >&2; exit 1; }
-        printf '%s' "$current" | doppler_run secrets set JWT_SECRET_PREVIOUS --silent
-        printf '%s' "$value" | doppler_run secrets set JWT_SECRET --silent
+        [[ -z "$previous" ]] || { echo "ERROR: JWT_PUBLIC_KEY_PREVIOUS is already set: finish that rotation first (--finish)" >&2; exit 1; }
+        # A first keypair has no old key to keep verifying.
+        current="$(doppler_get JWT_PUBLIC_KEY)"
+        if [[ -n "$current" ]]; then
+          printf '%s' "$current" | doppler_run secrets set JWT_PUBLIC_KEY_PREVIOUS --silent || partial
+        fi
+        printf '%s' "${value% *}" | doppler_run secrets set JWT_SIGNING_KEY --silent || partial
+        printf '%s' "${value#* }" | doppler_run secrets set JWT_PUBLIC_KEY --silent || partial
       fi
     else
       printf '%s' "$value" | doppler_run secrets set "$(doppler_name "$key")" --silent
@@ -207,7 +229,7 @@ case "$backend" in
 esac
 
 echo "Rotated $key in $where."
-if [[ "$key" == jwt_secret && "$finish" != true ]]; then
-  echo "Old tokens keep verifying until you run: $0 jwt_secret --finish (then redeploy again)."
+if [[ "$key" == jwt_signing_key && "$finish" != true ]]; then
+  echo "Tokens for the old key, if any, keep verifying until: $0 jwt_signing_key --finish (then redeploy again)."
 fi
 echo "Apply it with: cd private-channel-deploy && ansible-playbook deploy.yml -l <group>"
