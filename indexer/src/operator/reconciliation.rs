@@ -63,6 +63,10 @@ const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_millis(500);
 /// so this has to keep firing rather than notify once.
 const LIABILITY_DARK_ALERT_TICKS: u32 = 3;
 
+/// Consecutive ticks the liability check may skip on a lagging escrow checkpoint before the
+/// lag counts as a missing input, so a long stall ends in the inputs-dark halt.
+const LIABILITY_LAG_GRACE_TICKS: u32 = 2 * LIABILITY_DARK_ALERT_TICKS;
+
 /// How soon a closed fence is probed again. A probe re-runs the check without counting it,
 /// so a blip on the first tick costs seconds, not a whole interval.
 #[cfg(not(test))]
@@ -613,9 +617,17 @@ async fn check_invariants(
         }
         LedgerWait::Unknown => {
             *liability_dark_ticks += 1;
+            // Past the grace window the drain check has been off too long to stay alert-only.
+            if *liability_dark_ticks > LIABILITY_LAG_GRACE_TICKS {
+                ledger_missing = Some(format!(
+                    "escrow checkpoint has not reached the custody slot for {} ticks",
+                    liability_dark_ticks
+                ));
+            }
             false
         }
-        // Lag stays alert-only, but a checkpoint that cannot be read at all is a missing input.
+        // Lag is alert-only within the grace window, but a checkpoint that cannot be read at
+        // all is a missing input.
         LedgerWait::Unreadable => {
             *liability_dark_ticks += 1;
             ledger_missing = Some("escrow checkpoint unreadable".to_string());
@@ -6235,8 +6247,8 @@ mod tests {
         assert_eq!(env.fence.state(), FenceState::Closed);
     }
 
-    /// A lagging escrow checkpoint is not a failed read: it stays on the liability-dark
-    /// alert path and never feeds the input-dark halt.
+    /// Within the grace window a lagging escrow checkpoint is not a failed read: it stays on
+    /// the liability-dark alert path and does not feed the input-dark halt.
     #[tokio::test]
     async fn checkpoint_lag_is_not_an_input_failure() {
         let mint = Pubkey::new_unique();
@@ -6257,6 +6269,82 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((liability_dark, input_dark), (1, 0));
+    }
+
+    /// Past the grace window a lagging checkpoint is a missing input, so a long stall halts
+    /// through the inputs-dark path instead of leaving the drain check off for good.
+    #[tokio::test]
+    async fn a_long_checkpoint_lag_halts_through_the_inputs_dark_path() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 100, 0)]);
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+        let (mut liability_dark, mut input_dark) = (0, 0);
+
+        // The report's starting point: a covered clean tick has opened the fence.
+        seed_checkpoint(&env.mock, 1);
+        run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+            &mut liability_dark,
+            &mut input_dark,
+        )
+        .await
+        .unwrap();
+        assert!(env.fence.is_open());
+
+        seed_checkpoint(&env.mock, 0);
+        for _ in 0..LIABILITY_LAG_GRACE_TICKS {
+            run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut liability_dark,
+                &mut input_dark,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            input_dark, 0,
+            "lag stays alert-only inside the grace window"
+        );
+        assert!(!halted);
+
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut liability_dark,
+                &mut input_dark,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(halted, "the inputs-dark halt follows the grace window");
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag is set");
+        assert!(!halt.insolvency, "an outage halt: nothing is proven wrong");
+        assert!(
+            halt.reason
+                .contains("escrow checkpoint has not reached the custody slot"),
+            "{}",
+            halt.reason
+        );
     }
 
     /// Both halt kinds pull the same levers, but only a proven insolvency quarantines.

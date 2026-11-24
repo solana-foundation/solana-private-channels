@@ -44,6 +44,7 @@
 - The escrow operator creates channel mints with `InitializePermanentDelegate(OPERATOR_PERMANENT_DELEGATE)` and `InitializeMint2`, and never mints into a channel mint whose delegate is missing or another key (manual review, `permanent delegate mismatch`)
 - Solvency reconciliation reads channel supply from Token-2022 mints
 - A confirmed insolvency whose halt flag write fails is retried every 5 s instead of at the next tick, so the withdraw operator stops within seconds of the database recovering
+- An escrow indexer checkpoint that stays behind the custody slot for more than six reconciliation ticks now counts as a missing input, so a stall or backfill of nine ticks (about 45 minutes at the default 5 minute interval) halts both operators instead of only alerting; a confidential dust-deposit flood that long halts them too
 
 ### Deploy, compose and scripts
 - New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node, required), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, required). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`

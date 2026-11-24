@@ -499,4 +499,9 @@ slot checkpoints only once all of its deposits are decrypted. 1-unit deposits se
 faster than that delay every deposit behind them, public ones included, and the indexer
 lag alert (`indexer-lag-10s`) fires. No funds are at risk and the backlog drains once
 the flood stops. Do not resync to clear it: a resync decrypts the whole history twice
-while holding the exclusive live-state lock, so every service stays down longer.
+while holding the exclusive live-state lock, so every service stays down longer. A
+flood that keeps the escrow checkpoint behind for nine reconciliation ticks (about 45
+minutes at the default 5 minute interval) ends in the inputs-dark halt, which stops both
+operators until it is cleared. Clear it once
+`private_channel_operator_reconciliation_liability_dark_ticks` is back to 0, as in
+[the inputs-dark halt](reconciliation_halt_runbook.md#inputs-dark-halt).
