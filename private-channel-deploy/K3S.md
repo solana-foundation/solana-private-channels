@@ -171,6 +171,24 @@ Database Services: `postgres-primary` and `postgres-replica` (ledger), `postgres
 
 Each session has its own token and tunnel, so several can stay open side by side. The token has the deployer's scope and expires after 1h. In `private-channel` it manages the app and the Clusters. In `pc-monitoring` it has ConfigMaps, read access to pods and Services, and port-forward; no Secrets, no exec, no pod create. No cluster-wide rights.
 
+### What the deployer token can read (accepted residual)
+
+The deployer token, for a deploy run or an ad hoc session, can read every Secret in `private-channel`. That includes the admin and operator signer credentials, the database passwords, the JWT secrets and `ESCROW_CONFIDENTIAL_KEYS`. It can do so in three ways, and removing one alone does not close the others:
+
+- `get` and `list` on Secrets. The deploy writes Secrets with `kubernetes.core.k8s`, which reads before it writes, and Helm keeps its releases as Secrets in the namespace.
+- `pods/exec` into a running workload reads the Secrets mounted there. The deploy itself execs into `operator-solana` for the network check.
+- Creating a pod, or a CNPG `Cluster`, that mounts any Secret. Pod labels are chosen by whoever creates the pod, and the CNPG controller creates its pods outside the `pc-deployer-guard` policy.
+
+Treat the token like the secrets themselves. What bounds it:
+
+- Minting one needs root on the target host.
+- Each token is bound to a per-run Secret and lives `k3s_token_duration` (1h by default). A deploy deletes that Secret when it ends, which revokes the token at once. Ad hoc session Secrets are swept once older than `k3s_token_duration_max_hours` (4h).
+- Port 6443 is closed on the public interface, so the API is reached over the SSH tunnel. It still answers on the host and from inside the cluster.
+- The kubeconfig sits in a 0700 temporary directory on the control node. A deploy removes it when it ends; an ad hoc session removes it when closed.
+- Secrets are encrypted at rest (`secrets-encryption: true`).
+
+A confidential key read through the token cannot be rotated away once accounts are configured, so a leaked token can decrypt confidential balances for good. Not done yet: a separate identity that only writes Secrets (through `become` and `k3s kubectl` on the host), `HELM_DRIVER=configmap`, and no Secret verbs or `pods/exec` on key-holding pods for the deployer.
+
 ## Truncate
 
 [`scripts/k3s-truncate.sh`](../scripts/k3s-truncate.sh) runs `admin truncate` as a Job: `pg_dump` 16 next to the `admin` CLI copied from the app image. DB URLs are built inside the pod from the CNPG superuser Secrets, never on argv.
