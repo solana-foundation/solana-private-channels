@@ -31,6 +31,7 @@ pub mod postgres;
 pub mod precompiles;
 pub mod redis;
 pub mod redis_coherence;
+pub mod seize_delegate;
 pub mod set_account;
 pub mod store_block;
 pub mod store_performance_sample;

@@ -11,10 +11,25 @@ use std::sync::LazyLock;
 
 /// The keys behind a channel mint's seize power: the permanent delegate written into every
 /// mint, and the owner whose ATA is the only place the delegate may move balances to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SeizePolicy {
     pub delegate: Option<Pubkey>,
+    /// Keys mints may still name after a rotation. Policed like `delegate`, but never
+    /// accepted as a rotation target.
+    pub previous_delegates: Vec<Pubkey>,
     pub compliance_owner: Option<Pubkey>,
+}
+
+impl SeizePolicy {
+    /// Whether `key` is the current or a previous delegate.
+    pub fn policed(&self, key: &Pubkey) -> bool {
+        self.delegate.as_ref() == Some(key) || self.previous_delegates.contains(key)
+    }
+
+    /// Whether any key is policed.
+    pub fn has_delegate(&self) -> bool {
+        self.delegate.is_some() || !self.previous_delegates.is_empty()
+    }
 }
 
 /// What sigverify needs to admit a transaction.
@@ -104,50 +119,61 @@ pub fn is_foreign_delegate_rotation(
     !names_delegate
 }
 
-/// A Token-2022 balance move whose authority is the configured permanent delegate acting
-/// on a source account it does not own.
+/// A Token-2022 balance move whose authority is a policed delegate key acting on a
+/// source account it does not own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegateMove {
     pub instruction_type: u8,
     pub source: Pubkey,
-    pub mint: Pubkey,
+    /// None for a plain Transfer, which names no mint.
+    pub mint: Option<Pubkey>,
     /// Set for TransferChecked only.
     pub destination: Option<Pubkey>,
     pub amount: Option<u64>,
 }
 
+// A plain Transfer names no mint, so the compliance ATA cannot be derived. Refusing
+// it costs a policed key nothing: its own funds still move with TransferChecked.
+const T22_TRANSFER: u8 = 3;
 const T22_BURN: u8 = 8;
 const T22_TRANSFER_CHECKED: u8 = 12;
 const T22_BURN_CHECKED: u8 = 15;
 
 /// The delegate move in one top-level instruction, if any. Token-2022 honours a permanent
-/// delegate only on TransferChecked and the two burns, so these are the only seize paths.
-/// The delegate's own ATA as source is its own balance, not a seize.
+/// delegate only on TransferChecked and the two burns; a plain Transfer spends an allowance
+/// a user approved to the key. The key's own ATA as source is its own balance, not a seize.
 pub fn delegate_move(
     program_id: &Pubkey,
     accounts: &[Pubkey],
     data: &[u8],
     seize: &SeizePolicy,
 ) -> Option<DelegateMove> {
-    let delegate = seize.delegate.as_ref()?;
-    if *program_id != spl_token_2022::id() {
+    if !seize.has_delegate() || *program_id != spl_token_2022::id() {
         return None;
     }
     let instruction_type = *data.first()?;
-    // Layouts: TransferChecked [source, mint, destination, authority], burns [source, mint, authority].
+    // Layouts: TransferChecked [source, mint, destination, authority], burns [source, mint, authority],
+    // Transfer [source, destination, authority].
     let authority_index = match instruction_type {
         T22_TRANSFER_CHECKED => 3,
-        T22_BURN | T22_BURN_CHECKED => 2,
+        T22_BURN | T22_BURN_CHECKED | T22_TRANSFER => 2,
         _ => return None,
     };
     // Checked before the source and compliance ATAs are derived.
-    if accounts.get(authority_index) != Some(delegate) {
+    let authority = accounts.get(authority_index)?;
+    if !seize.policed(authority) {
         return None;
     }
-    let (source, mint) = (*accounts.first()?, *accounts.get(1)?);
-    if source == token_2022_ata(delegate, &mint) {
-        return None;
-    }
+    let source = *accounts.first()?;
+    let mint = if instruction_type == T22_TRANSFER {
+        None
+    } else {
+        let mint = *accounts.get(1)?;
+        if source == token_2022_ata(authority, &mint) {
+            return None;
+        }
+        Some(mint)
+    };
     Some(DelegateMove {
         instruction_type,
         source,
@@ -167,9 +193,10 @@ impl DelegateMove {
     /// instruction's own, which Token-2022 checks against the source, so the derived
     /// compliance ATA is the real one. No compliance owner refuses every move.
     pub fn is_refused(&self, seize: &SeizePolicy) -> bool {
-        let to_compliance = seize
-            .compliance_owner
-            .is_some_and(|owner| self.destination == Some(token_2022_ata(&owner, &self.mint)));
+        let to_compliance = match (seize.compliance_owner, self.mint) {
+            (Some(owner), Some(mint)) => self.destination == Some(token_2022_ata(&owner, &mint)),
+            _ => false,
+        };
         !(self.instruction_type == T22_TRANSFER_CHECKED && to_compliance)
     }
 }
@@ -527,6 +554,7 @@ mod tests {
         Seize {
             policy: SeizePolicy {
                 delegate: Some(delegate),
+                previous_delegates: vec![],
                 compliance_owner: Some(compliance),
             },
             delegate,
@@ -658,23 +686,149 @@ mod tests {
         }
     }
 
-    /// Token-2022 reads the permanent delegate only on TransferChecked and the burns,
-    /// so the delegate signing Transfer or Approve is not a seize.
+    #[allow(deprecated)]
+    fn plain_transfer(
+        source: &Pubkey,
+        dest: &Pubkey,
+        authority: &Pubkey,
+    ) -> (Vec<Pubkey>, Vec<u8>) {
+        let ix =
+            spl_token_2022::instruction::transfer(&t22(), source, dest, authority, &[], 5).unwrap();
+        (ix.accounts.iter().map(|m| m.pubkey).collect(), ix.data)
+    }
+
+    /// A key listed as previous is policed exactly like the current one.
     #[test]
-    fn delegate_as_transfer_or_approve_authority_is_not_a_delegate_move() {
+    fn previous_delegate_is_policed_like_the_current_one() {
+        let mut s = seize();
+        let previous = Pubkey::new_unique();
+        s.policy.previous_delegates = vec![previous];
+        let compliance_ata = ata(&s.compliance, &s.mint);
+        let cases = [
+            (
+                "to compliance",
+                transfer_checked(&s.alice_ata, &s.mint, &compliance_ata, &previous),
+                Some(false),
+            ),
+            (
+                "to another ATA",
+                transfer_checked(
+                    &s.alice_ata,
+                    &s.mint,
+                    &ata(&Pubkey::new_unique(), &s.mint),
+                    &previous,
+                ),
+                Some(true),
+            ),
+            (
+                "Burn",
+                burn(false, &s.alice_ata, &s.mint, &previous),
+                Some(true),
+            ),
+            (
+                "BurnChecked",
+                burn(true, &s.alice_ata, &s.mint, &previous),
+                Some(true),
+            ),
+            (
+                "own ATA",
+                transfer_checked(
+                    &ata(&previous, &s.mint),
+                    &s.mint,
+                    &ata(&Pubkey::new_unique(), &s.mint),
+                    &previous,
+                ),
+                None,
+            ),
+        ];
+        for (label, ix, expected) in cases {
+            assert_eq!(refused(&s, &ix), expected, "{label}");
+        }
+    }
+
+    /// A plain Transfer names no mint, so no policed key may sign one, not even from its own ATA.
+    #[test]
+    fn plain_transfer_by_any_policed_key_is_refused() {
+        let mut s = seize();
+        let previous = Pubkey::new_unique();
+        s.policy.previous_delegates = vec![previous];
+        let dest = ata(&s.compliance, &s.mint);
+        for key in [s.delegate, previous] {
+            for (label, source) in [("victim", s.alice_ata), ("own", ata(&key, &s.mint))] {
+                let ix = plain_transfer(&source, &dest, &key);
+                assert_eq!(refused(&s, &ix), Some(true), "{label} {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_transfer_by_a_user_is_not_a_delegate_move() {
         let s = seize();
-        let dest = ata(&Pubkey::new_unique(), &s.mint);
-        #[allow(deprecated)]
-        let transfer =
-            spl_token_2022::instruction::transfer(&t22(), &s.alice_ata, &dest, &s.delegate, &[], 5)
-                .unwrap();
-        let approve =
-            spl_token_2022::instruction::approve(&t22(), &s.alice_ata, &dest, &s.delegate, &[], 5)
-                .unwrap();
-        for ix in [transfer, approve] {
+        let ix = plain_transfer(
+            &s.alice_ata,
+            &ata(&Pubkey::new_unique(), &s.mint),
+            &Pubkey::new_unique(),
+        );
+        assert_eq!(refused(&s, &ix), None);
+    }
+
+    /// Approve is not policed: the allowance is only spendable through moves that are.
+    #[test]
+    fn approve_naming_the_delegate_is_not_a_delegate_move() {
+        let mut s = seize();
+        let previous = Pubkey::new_unique();
+        s.policy.previous_delegates = vec![previous];
+        let alice = Pubkey::new_unique();
+        for key in [s.delegate, previous] {
+            let ix =
+                spl_token_2022::instruction::approve(&t22(), &s.alice_ata, &key, &alice, &[], 5)
+                    .unwrap();
             let accounts: Vec<Pubkey> = ix.accounts.iter().map(|m| m.pubkey).collect();
+            assert_eq!(accounts[1], key);
             assert_eq!(delegate_move(&t22(), &accounts, &ix.data, &s.policy), None);
         }
+    }
+
+    #[test]
+    fn delegate_move_reports_an_optional_mint() {
+        let s = seize();
+        let dest = ata(&s.compliance, &s.mint);
+        let mint_of = |(accounts, data): (Vec<Pubkey>, Vec<u8>)| {
+            delegate_move(&t22(), &accounts, &data, &s.policy).map(|m| m.mint)
+        };
+        assert_eq!(
+            mint_of(transfer_checked(&s.alice_ata, &s.mint, &dest, &s.delegate)),
+            Some(Some(s.mint))
+        );
+        assert_eq!(
+            mint_of(burn(false, &s.alice_ata, &s.mint, &s.delegate)),
+            Some(Some(s.mint))
+        );
+        assert_eq!(
+            mint_of(burn(true, &s.alice_ata, &s.mint, &s.delegate)),
+            Some(Some(s.mint))
+        );
+        assert_eq!(
+            mint_of(plain_transfer(&s.alice_ata, &dest, &s.delegate)),
+            Some(None)
+        );
+    }
+
+    /// Seize turned off while mints still name an old key: the listed key stays policed.
+    #[test]
+    fn previous_delegates_alone_are_policed() {
+        let mut s = seize();
+        let previous = Pubkey::new_unique();
+        s.policy.delegate = None;
+        s.policy.previous_delegates = vec![previous];
+        let elsewhere = transfer_checked(
+            &s.alice_ata,
+            &s.mint,
+            &ata(&Pubkey::new_unique(), &s.mint),
+            &previous,
+        );
+        assert_eq!(refused(&s, &elsewhere), Some(true));
+        assert!(s.policy.has_delegate());
     }
 
     /// With no compliance owner configured every delegate move is refused.
@@ -718,7 +872,7 @@ mod tests {
             Some(DelegateMove {
                 instruction_type: 12,
                 source: s.alice_ata,
-                mint: s.mint,
+                mint: Some(s.mint),
                 destination: Some(dest),
                 amount: Some(500),
             })

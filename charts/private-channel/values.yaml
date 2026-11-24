@@ -36,7 +36,11 @@ escrow:
 config:
   adminKeys: ""
   permanentDelegate: ""
+  # Comma-separated delegates replaced by a rotation, policed until every mint is rotated.
+  previousDelegates: ""
   complianceOwner: ""
+  # Float-funded account creations the write node allows per block, at least 4.
+  maxFloatFundedCreationsPerBlock: 8
   yellowstoneEndpoint: ""
   gatewayWhitelistInstance: ""
   gatewayUpstreamTimeoutSecs: 30

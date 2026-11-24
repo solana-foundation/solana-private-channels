@@ -144,6 +144,7 @@ imagePullSecrets:
 {{- $c := .Values.config -}}
 - { name: PRIVATE_CHANNEL_ADMIN_KEYS, value: {{ $c.adminKeys | quote }} }
 - { name: PRIVATE_CHANNEL_PERMANENT_DELEGATE, value: {{ $c.permanentDelegate | quote }} }
+- { name: PRIVATE_CHANNEL_PREVIOUS_DELEGATES, value: {{ $c.previousDelegates | default "" | quote }} }
 {{- if $c.complianceOwner }}
 - { name: PRIVATE_CHANNEL_COMPLIANCE_OWNER, value: {{ $c.complianceOwner | quote }} }
 {{- end }}
@@ -173,6 +174,7 @@ imagePullSecrets:
 - { name: PRIVATE_CHANNEL_BATCH_DEADLINE_MS, value: "10" }
 - { name: PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY, value: "16" }
 - { name: PRIVATE_CHANNEL_MAX_SVM_WORKERS, value: "8" }
+- { name: PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK, value: {{ $v.config.maxFloatFundedCreationsPerBlock | default 8 | quote }} }
 {{ include "pc.nodeEnv" $root }}
 {{- else if eq .name "read-node" }}
 - { name: RUST_LOG, value: info }

@@ -122,7 +122,10 @@ operator_keypair_path: "{{ repo_root }}/keypairs/withdraw-operator.json"
 # operator. Required, with no fallback to the admin key; use a dedicated key in production.
 # compliance_owner: owner of the compliance ATAs, the only place the delegate may
 # move balances to. Unset refuses every delegate move. Must differ from the delegate.
+# previous_delegates: comma-separated delegates replaced by a rotation, still policed
+# until every mint names the current one. Drop a key only after the rotation is complete.
 # permanent_delegate: "<delegate_pubkey>"
+# previous_delegates: "<old_delegate_pubkey>"
 # compliance_owner: "<compliance_owner_pubkey>"
 
 # === Public surface ========================================================
@@ -151,3 +154,7 @@ monitoring_postgres_exporter_port: 9187
 # Indexer postgres-exporter needs a distinct host port from the primary
 # exporter (9187) so both can be scraped without colliding.
 monitoring_postgres_exporter_indexer_port: 9188
+
+# Float-funded (gasless) account creations the write node allows per block, at least 4.
+# Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+# max_float_funded_creations_per_block: 8

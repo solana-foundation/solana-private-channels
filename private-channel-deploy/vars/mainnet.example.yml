@@ -61,6 +61,8 @@ extra_admin_keys: []
 # === Seize keys =============================================================
 # A dedicated delegate key, kept offline; never the channel admin.
 permanent_delegate: "<delegate_pubkey>"
+# Delegates replaced by a rotation, comma-separated; keep the old key until every mint is rotated.
+# previous_delegates: "<old_delegate_pubkey>"
 compliance_owner: "<compliance_owner_pubkey>"
 
 # === Public surface ========================================================
@@ -79,3 +81,7 @@ monitoring_cadvisor_port: 8081
 monitoring_node_exporter_port: 9101
 monitoring_postgres_exporter_port: 9187
 monitoring_postgres_exporter_indexer_port: 9188
+
+# Float-funded (gasless) account creations the write node allows per block, at least 4.
+# Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+# max_float_funded_creations_per_block: 8

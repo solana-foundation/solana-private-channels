@@ -50,7 +50,8 @@ fn load_config(db_url: String, port: u16) -> NodeConfig {
         mode: NodeMode::Aio,
         port,
         accountsdb_connection_url: db_url,
-        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        // Fixed across restarts: a writer refuses to boot after a delegate change.
+        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_from_array([0xDE; 32])),
         ..NodeConfig::default()
     }
 }

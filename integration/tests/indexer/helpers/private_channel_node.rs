@@ -31,6 +31,9 @@ pub struct PrivateChannelNode {
     _db: ContainerAsync<Postgres>,
     admin_pubkey: Pubkey,
     delegate: Pubkey,
+    previous_delegates: Vec<Pubkey>,
+    /// Takes effect on the next restart.
+    pub compliance_owner: Option<Pubkey>,
     accountsdb_connection_url: String,
 }
 
@@ -60,15 +63,18 @@ impl PrivateChannelNode {
     }
 
     /// Stop the node and start it again on the same accountsdb with `delegate`
-    /// configured, as an operator does when rotating the permanent delegate.
+    /// configured and `previous` still policed, as an operator does when rotating
+    /// the permanent delegate.
     pub async fn restart_with_delegate(
         &mut self,
         delegate: Pubkey,
+        previous: &[Pubkey],
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(handles) = self.handles.take() {
             handles.shutdown().await;
         }
         self.delegate = delegate;
+        self.previous_delegates = previous.to_vec();
         self.start().await
     }
 
@@ -76,6 +82,8 @@ impl PrivateChannelNode {
         let (url, handles) = run_on(
             self.admin_pubkey,
             self.delegate,
+            self.previous_delegates.clone(),
+            self.compliance_owner,
             self.accountsdb_connection_url.clone(),
         )
         .await?;
@@ -193,7 +201,14 @@ pub async fn start_private_channel_node_with_delegate(
         host, port
     );
 
-    let (url, handles) = run_on(admin_pubkey, delegate, accountsdb_connection_url.clone()).await?;
+    let (url, handles) = run_on(
+        admin_pubkey,
+        delegate,
+        vec![],
+        None,
+        accountsdb_connection_url.clone(),
+    )
+    .await?;
     println!("=== PrivateChannel node started at {} ===", url);
 
     Ok(PrivateChannelNode {
@@ -202,6 +217,8 @@ pub async fn start_private_channel_node_with_delegate(
         _db: db_container,
         admin_pubkey,
         delegate,
+        previous_delegates: vec![],
+        compliance_owner: None,
         accountsdb_connection_url,
     })
 }
@@ -210,6 +227,8 @@ pub async fn start_private_channel_node_with_delegate(
 async fn run_on(
     admin_pubkey: Pubkey,
     delegate: Pubkey,
+    previous_delegates: Vec<Pubkey>,
+    compliance_owner: Option<Pubkey>,
     accountsdb_connection_url: String,
 ) -> Result<(String, NodeHandles), Box<dyn std::error::Error>> {
     let node_port = get_free_port();
@@ -233,9 +252,12 @@ async fn run_on(
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![admin_pubkey],
         permanent_delegate: Some(delegate),
-        compliance_owner: None,
+        previous_delegates,
+        compliance_owner,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
+        max_float_funded_creations_per_block:
+            private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
         blocktime_ms: 100,
         perf_sample_period_secs: 10,
         metrics: Arc::new(NoopMetrics),

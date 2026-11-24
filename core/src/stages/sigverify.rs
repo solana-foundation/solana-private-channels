@@ -108,7 +108,7 @@ fn rotates_delegate_away(transaction: &SanitizedTransaction, policy: &IngressPol
 
 /// Every top-level delegate move in the transaction, with its resolved accounts.
 fn delegate_moves(transaction: &SanitizedTransaction, seize: &SeizePolicy) -> Vec<DelegateMove> {
-    if seize.delegate.is_none() {
+    if !seize.has_delegate() {
         return Vec::new();
     }
     let keys = transaction.message().account_keys();
@@ -254,7 +254,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                     metrics.delegate_moves_admitted();
                                     warn!(
                                         signature = %transaction.signature(),
-                                        mint = %delegate_move.mint,
+                                        mint = ?delegate_move.mint,
                                         source = %delegate_move.source,
                                         amount = ?delegate_move.amount,
                                         "permanent delegate move admitted"
@@ -310,7 +310,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                 {
                                     warn!(
                                         signature = %transaction.signature(),
-                                        mint = %delegate_move.mint,
+                                        mint = ?delegate_move.mint,
                                         source = %delegate_move.source,
                                         destination = ?delegate_move.destination,
                                         "permanent delegate move refused"
@@ -708,6 +708,7 @@ mod tests {
             admin_keys: vec![admin.pubkey()],
             seize: crate::transactions::SeizePolicy {
                 delegate: Some(delegate),
+                previous_delegates: vec![],
                 compliance_owner: None,
             },
         };
@@ -776,6 +777,7 @@ mod tests {
             admin_keys: vec![],
             seize: crate::transactions::SeizePolicy {
                 delegate: Some(delegate.pubkey()),
+                previous_delegates: vec![],
                 compliance_owner: Some(compliance),
             },
         };
@@ -873,6 +875,112 @@ mod tests {
             matches!(result, SigverifyResult::SeizeTargetRefused),
             "{result}"
         );
+    }
+
+    /// A listed previous key is held to the same compliance-ATA rule as the current one.
+    #[tokio::test]
+    async fn previous_delegate_moves_are_refused_unless_into_the_compliance_ata() {
+        let (_, mut policy, compliance, mint, victim) = seize_setup();
+        let previous = Keypair::new();
+        policy.seize.previous_delegates = vec![previous.pubkey()];
+        let to_compliance = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&compliance, &mint),
+            &previous.pubkey(),
+        );
+        let tx = sanitize(&[to_compliance], &previous, &[&previous]);
+        let result = sigverify_transaction(&tx, &policy).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "seize into compliance must pass, got {result}"
+        );
+
+        let elsewhere = seize_ix(
+            &victim,
+            &mint,
+            &t22_ata(&Pubkey::new_unique(), &mint),
+            &previous.pubkey(),
+        );
+        let burn = spl_token_2022::instruction::burn(
+            &spl_token_2022::id(),
+            &victim,
+            &mint,
+            &previous.pubkey(),
+            &[],
+            5,
+        )
+        .unwrap();
+        for (label, ix) in [("to another ATA", elsewhere), ("burn", burn)] {
+            let tx = sanitize(&[ix], &previous, &[&previous]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SeizeTargetRefused),
+                "{label}: expected SeizeTargetRefused, got {result}"
+            );
+        }
+    }
+
+    /// An allowance a user approved to a policed key cannot leave through a plain Transfer.
+    #[tokio::test]
+    async fn plain_transfer_signed_by_a_policed_key_is_refused_at_ingress() {
+        let (delegate, mut policy, compliance, mint, victim) = seize_setup();
+        let previous = Keypair::new();
+        policy.seize.previous_delegates = vec![previous.pubkey()];
+        for key in [&delegate, &previous] {
+            #[allow(deprecated)]
+            let ix = spl_token_2022::instruction::transfer(
+                &spl_token_2022::id(),
+                &victim,
+                &t22_ata(&compliance, &mint),
+                &key.pubkey(),
+                &[],
+                5,
+            )
+            .unwrap();
+            let tx = sanitize(&[ix], key, &[key]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            assert!(
+                matches!(result, SigverifyResult::SeizeTargetRefused),
+                "{}: expected SeizeTargetRefused, got {result}",
+                key.pubkey()
+            );
+        }
+    }
+
+    /// Listing a previous key polices it but never lets mints be rotated back to it.
+    #[tokio::test]
+    async fn rotation_still_accepts_only_the_current_key() {
+        let admin = Keypair::new();
+        let (current, previous, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let policy = IngressPolicy {
+            admin_keys: vec![admin.pubkey()],
+            seize: crate::transactions::SeizePolicy {
+                delegate: Some(current),
+                previous_delegates: vec![previous],
+                compliance_owner: None,
+            },
+        };
+        for (label, new, ok) in [("current", current, true), ("previous", previous, false)] {
+            let ix = spl_token_2022::instruction::set_authority(
+                &spl_token_2022::id(),
+                &mint,
+                Some(&new),
+                AuthorityType::PermanentDelegate,
+                &admin.pubkey(),
+                &[],
+            )
+            .unwrap();
+            let tx = sanitize(&[ix], &admin, &[&admin]);
+            let result = sigverify_transaction(&tx, &policy).await;
+            let passed = matches!(result, SigverifyResult::Valid(TransactionType::Normal));
+            let refused = matches!(result, SigverifyResult::ForeignDelegateRotation);
+            assert!(if ok { passed } else { refused }, "{label}: got {result}");
+        }
     }
 
     /// Refusals raise alerts, so they must only fire once the signatures are proven.

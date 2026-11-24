@@ -248,7 +248,8 @@ async fn case_seize_frozen_account_into_compliance(ctx: &PrivateChannelContext) 
 /// Transfer is not honoured by Token-2022 as a permanent delegate.
 async fn case_delegate_cannot_move_elsewhere(ctx: &PrivateChannelContext) {
     let operator = &ctx.operator_key;
-    let alice = Keypair::new().pubkey();
+    let alice_key = Keypair::new();
+    let alice = alice_key.pubkey();
     let (mint, alice_ata) = mint_with_balance(ctx, &alice).await;
     let program = spl_token_2022::id();
     let elsewhere = setup::get_associated_token_address(&operator.pubkey(), &mint);
@@ -276,6 +277,19 @@ async fn case_delegate_cannot_move_elsewhere(ctx: &PrivateChannelContext) {
     .unwrap();
     assert_refused(ctx, steal, operator, "compliance account").await;
 
+    // An allowance Alice approved to the delegate key must not leave through a plain Transfer.
+    let approve = spl_token_2022::instruction::approve(
+        &program,
+        &alice_ata,
+        &operator.pubkey(),
+        &alice,
+        &[],
+        10,
+    )
+    .unwrap();
+    land(ctx, &[approve], &[&alice_key])
+        .await
+        .expect("Approve lands");
     #[allow(deprecated)]
     let unchecked = spl_token_2022::instruction::transfer(
         &program,
@@ -286,13 +300,7 @@ async fn case_delegate_cannot_move_elsewhere(ctx: &PrivateChannelContext) {
         10,
     )
     .unwrap();
-    let sig = land(ctx, &[unchecked], &[operator])
-        .await
-        .expect("lands as a failed tx");
-    assert!(
-        !meta_err(ctx, &sig).await.is_null(),
-        "Transfer must not honour the delegate"
-    );
+    assert_refused(ctx, unchecked, operator, "compliance account").await;
     assert_eq!(token_account(ctx, &alice_ata).await.amount, BALANCE);
     println!("  ✓ delegate moves outside the compliance ATA are refused");
 }

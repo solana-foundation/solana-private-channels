@@ -67,14 +67,16 @@ pub fn create_ingress_channel(
 ///
 /// Age is not consulted: the last `max_blockhashes` blocks are exactly the hashes
 /// still inside their published `lastValidBlockHeight`, however old they are.
+/// Blocks at or below `floor_slot` are dropped.
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,
+    floor_slot: Option<u64>,
 ) -> Result<DedupState> {
     let live_blockhashes: LinkedList<Hash> = LinkedList::new();
     let dedup_cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
 
-    let blocks = accounts_db.get_last_blocks(max_blockhashes).await?;
+    let mut blocks = accounts_db.get_last_blocks(max_blockhashes).await?;
     if blocks.is_empty() {
         info!("Dedup: no prior blocks found, starting with empty state");
         return Ok((live_blockhashes, dedup_cache));
@@ -88,6 +90,11 @@ pub async fn load_dedup_state(
              unknown inside their published lastValidBlockHeight; retention was cut below the window",
             max_blockhashes - loaded
         );
+    }
+    // Blocks up to the increase floor stay retired on every later restart; the live
+    // window refills with new hashes as blocks arrive.
+    if let Some(floor) = floor_slot {
+        blocks.retain(|block| block.slot > floor);
     }
     let (live_blockhashes, dedup_cache) = build_dedup_state(&blocks)?;
 
@@ -521,6 +528,34 @@ mod tests {
         })
         .await;
 
+        (input_tx, bh_tx, output_rx, live)
+    }
+
+    /// Like `start_test_dedup`, with a window and a state loaded from the ledger.
+    async fn start_loaded_test_dedup(
+        max_blockhashes: usize,
+        (live, cache): DedupState,
+    ) -> (
+        mpsc::Sender<SanitizedTransaction>,
+        mpsc::Sender<Hash>,
+        mpsc::Receiver<SanitizedTransaction>,
+        Arc<RwLock<LinkedList<Hash>>>,
+    ) {
+        let (input_tx, input_rx) = mpsc::channel(TEST_INGRESS_CAP);
+        let (bh_tx, bh_rx) = mpsc::channel(max_blockhashes);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let (_dedup, live) = start_dedup(DedupArgs {
+            max_blockhashes,
+            input_rx,
+            settled_blockhashes_rx: bh_rx,
+            output_tx,
+            initial_live_blockhashes: live,
+            initial_dedup_cache: cache,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+            blockhash_progress: Arc::default(),
+        })
+        .await;
         (input_tx, bh_tx, output_rx, live)
     }
 
@@ -1223,7 +1258,7 @@ mod tests {
 
         delete_block(&db, 20).await;
 
-        let (live, _cache) = load_dedup_state(&db, 150)
+        let (live, _cache) = load_dedup_state(&db, 150, None)
             .await
             .expect("a gap below the tip must restore the suffix above it");
 
@@ -1252,7 +1287,7 @@ mod tests {
 
         delete_block(&db, 40).await;
 
-        let error = load_dedup_state(&db, 150)
+        let error = load_dedup_state(&db, 150, None)
             .await
             .expect_err("a window short of the tip must not restore")
             .to_string();
@@ -1278,7 +1313,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = load_dedup_state(&db, 150)
+        let error = load_dedup_state(&db, 150, None)
             .await
             .expect_err("a window with no durable height must not restore")
             .to_string();
@@ -1299,7 +1334,7 @@ mod tests {
         delete_block(&db, 0).await;
         delete_block(&db, 10).await;
 
-        let (live, _cache) = load_dedup_state(&db, 150)
+        let (live, _cache) = load_dedup_state(&db, 150, None)
             .await
             .expect("a truncated prefix is not a gap");
 
@@ -1321,7 +1356,7 @@ mod tests {
         // One block every ten slots, which is what an idle node produces.
         let chain = store_chain(&mut db, 5).await;
 
-        let (live, _cache) = load_dedup_state(&db, chain.len()).await.unwrap();
+        let (live, _cache) = load_dedup_state(&db, chain.len(), None).await.unwrap();
 
         assert_eq!(
             live.len(),
@@ -1351,7 +1386,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (live, _cache) = load_dedup_state(&db, 8).await.unwrap();
+        let (live, _cache) = load_dedup_state(&db, 8, None).await.unwrap();
 
         assert_eq!(
             live.len(),
@@ -1407,7 +1442,7 @@ mod tests {
         db.store_block(block0).await.unwrap();
         db.store_block(block1).await.unwrap();
 
-        let (live, cache) = load_dedup_state(&db, 8).await.unwrap();
+        let (live, cache) = load_dedup_state(&db, 8, None).await.unwrap();
 
         assert!(live.contains(&bh0), "bh0 must be a live blockhash");
         assert!(live.contains(&bh1), "bh1 must be a live blockhash");
@@ -1484,6 +1519,118 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(output_rx.len(), 1, "the second forward is still parked");
+    }
+
+    /// `store_chain`, with each block carrying one transaction on its own hash.
+    async fn store_chain_with_txs(db: &mut AccountsDB, count: u64) -> Vec<BlockInfo> {
+        let mut stored = Vec::with_capacity(count as usize);
+        for height in 0..count {
+            let slot = height * 10;
+            let blockhash = Hash::new_unique();
+            let tx = (Signature::new_unique(), Hash::new_unique(), blockhash);
+            let mut block = make_block_at(slot, blockhash, &[tx], Some(0));
+            block.block_height = Some(height);
+            block.parent_slot = slot.saturating_sub(10);
+            db.store_block(block.clone()).await.unwrap();
+            stored.push(block);
+        }
+        stored
+    }
+
+    /// Runs `f` under a subscriber and returns what it logged.
+    async fn captured_log<F: std::future::Future>(f: F) -> (F::Output, String) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || CapturedLog(writer.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let output = f.await;
+        drop(guard);
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (output, log)
+    }
+
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The floor drops every block at or below it from the live list and the cache,
+    /// and is applied after the retention check so it never reads as a cut.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_dedup_state_drops_blocks_at_or_below_the_floor() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let chain = store_chain_with_txs(&mut db, 150).await;
+
+        let (state, log) = captured_log(load_dedup_state(&db, 150, Some(chain[120].slot))).await;
+        let (live, cache) = state.unwrap();
+
+        let expected: Vec<Hash> = chain[121..].iter().map(|b| b.blockhash).collect();
+        assert_eq!(live.into_iter().collect::<Vec<_>>(), expected);
+        let cached: HashSet<Hash> = cache.keys().copied().collect();
+        assert_eq!(cached, expected.iter().copied().collect::<HashSet<_>>());
+        assert!(!log.contains("retention was cut"), "{log}");
+    }
+
+    /// After an allowed increase every hash minted before it is refused, both one
+    /// already retired under the old window and one still live at the restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hash_from_before_an_allowed_increase_is_refused() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let chain = store_chain_with_txs(&mut db, 200).await;
+        let tip = chain.len() - 1;
+
+        let state = load_dedup_state(&db, 150, Some(chain[tip].slot))
+            .await
+            .unwrap();
+        let (input_tx, bh_tx, mut output_rx, live) = start_loaded_test_dedup(150, state).await;
+        let payer = Keypair::new();
+        for (label, block) in [("retired", &chain[tip - 120]), ("live", &chain[tip - 50])] {
+            assert!(
+                !live.read().unwrap().contains(&block.blockhash),
+                "{label} hash must not be live"
+            );
+            input_tx
+                .send(make_tx(&payer, block.blockhash))
+                .await
+                .unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
+            assert!(forwarded.is_err(), "{label} hash must be refused");
+        }
+
+        let fresh = Hash::new_unique();
+        bh_tx.send(fresh).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        input_tx.send(make_tx(&payer, fresh)).await.unwrap();
+        let forwarded = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
+        assert!(
+            forwarded.is_ok(),
+            "a hash minted after the increase must pass"
+        );
+        drop(input_tx);
+    }
+
+    /// The live list starts empty after an increase and fills to the new window.
+    #[tokio::test]
+    async fn window_grows_to_the_new_size_as_blocks_arrive() {
+        let (input_tx, bh_tx, _output_rx, live) =
+            start_loaded_test_dedup(150, (LinkedList::new(), HashMap::new())).await;
+        for _ in 0..160 {
+            bh_tx.send(Hash::new_unique()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(live.read().unwrap().len(), 150);
+        drop(input_tx);
     }
 
     /// A window short of `max_blockhashes` is only a truncation problem when the

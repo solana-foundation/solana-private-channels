@@ -5,7 +5,7 @@ use {
             blockhash_window,
             postgres::{ensure_address_signatures_signature_index, PostgresAccountsDB},
             redis::RedisAccountsDB,
-            writer_epoch,
+            seize_delegate, writer_epoch,
             writer_lease::WriterLease,
             AccountsDB,
         },
@@ -98,6 +98,8 @@ pub struct NodeConfig {
     /// Permanent delegate written into every channel mint and the only key the seize
     /// rule polices. Required by write modes, which create mints.
     pub permanent_delegate: Option<Pubkey>,
+    /// Delegates replaced by a rotation, still policed while mints may name them.
+    pub previous_delegates: Vec<Pubkey>,
     /// Owner of the compliance ATAs, the only place the delegate may move balances to.
     /// None refuses every delegate move.
     pub compliance_owner: Option<Pubkey>,
@@ -108,6 +110,9 @@ pub struct NodeConfig {
     pub max_blockhashes: usize,
     /// Let a write node boot with a larger window than the ledger last recorded.
     pub allow_max_blockhashes_increase: bool,
+    /// Float-funded account creations allowed per block, at least the per-tx cap of 4.
+    /// Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+    pub max_float_funded_creations_per_block: u64,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
     pub metrics: SharedMetrics,
@@ -134,15 +139,14 @@ pub fn resolve_max_blockhashes(
     }
 }
 
-/// A warning when an allowed increase took effect: every live hash now outlives the
-/// deadline readers handed out, and hashes just past it are admissible again.
+/// A warning when an allowed increase took effect: every hash handed out before this
+/// boot is retired, so clients holding an unlanded transaction must re-sign it.
 fn window_change_note(previous: Option<u64>, configured: u64) -> Option<String> {
     let previous = previous.filter(|&p| p < configured)?;
     Some(format!(
         "max_blockhashes grew from {previous} to {configured}: every hash handed out before \
-         this boot stays admissible {} blocks past its advertised deadline, so a client that \
-         re-signs at that deadline may see the original land as well",
-        configured - previous
+         this boot is now refused as unknown, so a transaction signed on one and not yet \
+         landed must be re-signed"
     ))
 }
 
@@ -167,9 +171,12 @@ impl Default for NodeConfig {
             redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
             admin_keys: vec![],         // No admin keys by default
             permanent_delegate: None,
+            previous_delegates: vec![],
             compliance_owner: None,
             max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
             allow_max_blockhashes_increase: false,
+            max_float_funded_creations_per_block:
+                crate::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
             blocktime_ms: DEFAULT_BLOCKTIME_MS,
             perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
@@ -337,6 +344,35 @@ pub fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
                 .into(),
         );
     }
+    for key in &config.previous_delegates {
+        let reason = if *key == Pubkey::default() {
+            "is the zero key"
+        } else if Some(*key) == config.permanent_delegate {
+            "is the current permanent delegate; the list is for keys no longer current"
+        } else if Some(*key) == config.compliance_owner {
+            "is the compliance owner, whose own ATA would be exempt from the seize rule"
+        } else {
+            continue;
+        };
+        return Err(format!(
+            "previous_delegates (PRIVATE_CHANNEL_PREVIOUS_DELEGATES): {key} {reason}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a float budget below the per-transaction cap, which no legitimate 4-creation
+/// transaction such as CreateDvp could ever pass.
+pub fn validate_float_budget(config: &NodeConfig) -> Result<(), String> {
+    let cap = crate::stages::execution::MAX_FLOAT_FUNDED_CREATIONS;
+    if config.max_float_funded_creations_per_block < cap {
+        return Err(format!(
+            "max_float_funded_creations_per_block \
+             (PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK) must be at least {cap}, \
+             the per-transaction cap, got {}",
+            config.max_float_funded_creations_per_block
+        ));
+    }
     Ok(())
 }
 
@@ -420,6 +456,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         }
     }
     validate_seize_config(&config)?;
+    validate_float_budget(&config)?;
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
@@ -491,6 +528,7 @@ async fn start_services(
         admin_keys: config.admin_keys.clone(),
         seize: crate::transactions::SeizePolicy {
             delegate: config.permanent_delegate,
+            previous_delegates: config.previous_delegates.clone(),
             compliance_owner: config.compliance_owner,
         },
     };
@@ -560,11 +598,22 @@ async fn start_services(
         if let Some(note) = window_change_note(previous_window, window) {
             warn!("{note}");
         }
+        let blockhash_floor = blockhash_window::read_floor(postgres_db.pool.as_ref()).await?;
+        // Write modes always have a delegate: validate_seize_config refuses to start without one.
+        if let Some(delegate) = config.permanent_delegate.as_ref() {
+            seize_delegate::publish_as_writer(
+                &postgres_db.pool,
+                delegate,
+                &config.previous_delegates,
+                writer_epoch,
+            )
+            .await?;
+        }
         // Before any address_signatures writer starts, so a first build blocks nothing live.
         ensure_address_signatures_signature_index(&postgres_db.pool).await?;
         repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
         let (initial_live_blockhashes, initial_dedup_cache) =
-            load_dedup_state(&db, config.max_blockhashes).await?;
+            load_dedup_state(&db, config.max_blockhashes, blockhash_floor).await?;
         // Seeded before RPC starts so isBlockhashValid never reports slot 0 on a live chain.
         let settled_slot = Arc::new(AtomicU64::new(db.get_current_slot().await?.unwrap_or(0)));
         // All counters start at zero: the window loaded above is already in dedup.
@@ -636,6 +685,8 @@ async fn start_services(
             live_blockhashes: Arc::clone(&live_blockhashes),
             blockhash_progress: Arc::clone(&blockhash_progress),
             permanent_delegate: config.permanent_delegate,
+            max_float_funded_creations_per_block: config.max_float_funded_creations_per_block,
+            admin_keys: config.admin_keys.clone(),
         })
         .await;
         workers.push(execution);
@@ -1340,5 +1391,61 @@ mod tests {
                 validate_seize_config(&seize_config(NodeMode::Aio, delegate, compliance)).is_ok()
             );
         }
+    }
+
+    /// The list is for keys no longer current; the zero key and the compliance owner
+    /// would never be a real delegate or would exempt their own ATA from the rule.
+    #[test]
+    fn previous_delegates_refuse_the_current_key_the_zero_key_and_the_compliance_owner() {
+        let (current, compliance, old) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let with = |previous: Vec<Pubkey>| NodeConfig {
+            previous_delegates: previous,
+            ..seize_config(NodeMode::Aio, Some(current), Some(compliance))
+        };
+        for (label, previous) in [
+            ("current", vec![old, current]),
+            ("zero key", vec![Pubkey::default()]),
+            ("compliance owner", vec![compliance]),
+        ] {
+            let err = validate_seize_config(&with(previous)).expect_err(label);
+            assert!(
+                err.contains("PRIVATE_CHANNEL_PREVIOUS_DELEGATES"),
+                "{label}: {err}"
+            );
+        }
+        assert!(validate_seize_config(&with(vec![old])).is_ok());
+        // Seize turned off on a read node while mints still name an old key.
+        let read = NodeConfig {
+            previous_delegates: vec![old],
+            ..seize_config(NodeMode::Read, None, Some(compliance))
+        };
+        assert!(validate_seize_config(&read).is_ok());
+    }
+
+    /// Below the per-transaction cap a legitimate 4-creation transaction could never pass.
+    #[test]
+    fn float_budget_below_the_per_transaction_cap_is_refused() {
+        for (budget, ok) in [(0, false), (3, false), (4, true), (8, true)] {
+            let config = NodeConfig {
+                max_float_funded_creations_per_block: budget,
+                ..Default::default()
+            };
+            let result = validate_float_budget(&config);
+            assert_eq!(result.is_ok(), ok, "{budget}: {result:?}");
+            if let Err(err) = result {
+                assert!(
+                    err.contains("PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK"),
+                    "{err}"
+                );
+            }
+        }
+        assert_eq!(
+            NodeConfig::default().max_float_funded_creations_per_block,
+            8
+        );
     }
 }

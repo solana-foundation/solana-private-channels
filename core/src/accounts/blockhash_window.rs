@@ -11,9 +11,13 @@ use {
 /// Metadata key holding the writer's `max_blockhashes`, a block count.
 pub const MAX_BLOCKHASHES_KEY: &str = "max_blockhashes";
 
+/// Metadata key holding the slot of the tip at the last allowed window increase.
+/// Blocks at or below it never return to the live window.
+pub const BLOCKHASH_FLOOR_SLOT_KEY: &str = "blockhash_floor_slot";
+
 /// The write node's publish: fenced by its epoch, so a superseded writer cannot overwrite
-/// the window. A larger window keeps every live hash admissible past the deadline readers
-/// already handed out, so it is refused unless the operator allows it explicitly.
+/// the window. A larger window is refused unless the operator allows it explicitly, and an
+/// allowed one retires every hash minted before it.
 pub async fn publish_as_writer(
     pool: &PgPool,
     max_blockhashes: u64,
@@ -41,6 +45,26 @@ pub async fn publish_as_writer(
              deadline of every hash already handed out; pass --allow-max-blockhashes-increase \
              to do it anyway"
         ));
+    }
+    if previous.is_some_and(|p| p < max_blockhashes) {
+        // An increase would keep every handed-out hash admissible past its advertised deadline.
+        // Retiring them all costs in-flight clients one re-sign, but no hash outlives its
+        // deadline, so a transaction and its replacement can never both land.
+        let tip: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(&mut *tx)
+            .await
+            .context("Failed to read the tip for the blockhash floor")?;
+        if let Some(tip) = tip {
+            sqlx::query(
+                "INSERT INTO metadata (key, value) VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(BLOCKHASH_FLOOR_SLOT_KEY)
+            .bind(&counter::encode(tip as u64)[..])
+            .execute(&mut *tx)
+            .await
+            .context("Failed to publish the blockhash floor")?;
+        }
     }
     publish(&mut *tx, max_blockhashes)
         .await
@@ -87,6 +111,19 @@ where
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// The slot at or below which no block's hash is live, if an increase ever set one.
+pub async fn read_floor<'e, E>(executor: E) -> sqlx::Result<Option<u64>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let value =
+        sqlx::query_scalar::<_, Option<Vec<u8>>>("SELECT value FROM metadata WHERE key = $1")
+            .bind(BLOCKHASH_FLOOR_SLOT_KEY)
+            .fetch_optional(executor)
+            .await?;
+    Ok(value.flatten().as_deref().and_then(counter::decode))
 }
 
 /// A writer refuses a zero window, so a stored zero is a hand edit and counts as absent.
@@ -139,6 +176,63 @@ mod tests {
         assert_eq!(
             publish_as_writer(pool, 50, newer, false).await.unwrap(),
             Some(120)
+        );
+    }
+
+    /// Store a block row at `slot` the way the settler does.
+    async fn store_block_at(db: &crate::accounts::postgres::PostgresAccountsDB, slot: u64) {
+        let mut accounts_db = crate::accounts::AccountsDB::Postgres(db.clone());
+        let block = crate::accounts::traits::BlockInfo {
+            slot,
+            blockhash: solana_sdk::hash::Hash::new_unique(),
+            previous_blockhash: solana_sdk::hash::Hash::default(),
+            parent_slot: slot.saturating_sub(1),
+            block_height: Some(slot),
+            block_time: Some(0),
+            transaction_signatures: vec![],
+            transaction_message_hashes: vec![],
+            transaction_recent_blockhashes: vec![],
+        };
+        accounts_db.store_block(block).await.unwrap();
+    }
+
+    /// Only an allowed increase writes the floor, at the slot of the latest block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowed_increase_publishes_the_floor_in_the_same_transaction() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        let epoch = crate::accounts::writer_epoch::bump(&db).await.unwrap();
+        let pool = db.pool.as_ref();
+        for slot in [0, 10, 20] {
+            store_block_at(&db, slot).await;
+        }
+
+        publish_as_writer(pool, 100, epoch, false).await.unwrap();
+        assert_eq!(read_floor(pool).await.unwrap(), None, "first publish");
+        publish_as_writer(pool, 120, epoch, false)
+            .await
+            .unwrap_err();
+        assert_eq!(read_floor(pool).await.unwrap(), None, "refused increase");
+        publish_as_writer(pool, 100, epoch, true).await.unwrap();
+        assert_eq!(read_floor(pool).await.unwrap(), None, "equal window");
+        publish_as_writer(pool, 80, epoch, true).await.unwrap();
+        assert_eq!(read_floor(pool).await.unwrap(), None, "decrease");
+
+        publish_as_writer(pool, 120, epoch, true).await.unwrap();
+        assert_eq!(read_floor(pool).await.unwrap(), Some(20));
+        assert_eq!(read(pool).await.unwrap(), Some(120));
+
+        store_block_at(&db, 30).await;
+        publish_as_writer(pool, 120, epoch, true).await.unwrap();
+        assert_eq!(
+            read_floor(pool).await.unwrap(),
+            Some(20),
+            "restart, same window"
+        );
+        publish_as_writer(pool, 150, epoch, true).await.unwrap();
+        assert_eq!(
+            read_floor(pool).await.unwrap(),
+            Some(30),
+            "a later increase raises it"
         );
     }
 

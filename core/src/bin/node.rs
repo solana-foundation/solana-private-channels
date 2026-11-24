@@ -119,6 +119,11 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
     permanent_delegate: Option<String>,
 
+    /// Delegates replaced by a rotation, still policed until every mint names the current
+    /// one (comma-separated base58). A bad key stops startup, unlike an admin key.
+    #[arg(long, env = "PRIVATE_CHANNEL_PREVIOUS_DELEGATES")]
+    previous_delegates: Option<String>,
+
     /// Owner of the compliance ATAs, the only place the delegate may move balances to
     /// (base58). Unset or blank refuses every delegate move.
     #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER")]
@@ -137,9 +142,18 @@ struct Args {
     max_blockhashes: usize,
 
     /// Let a write node boot with a larger window than the ledger last recorded. Every
-    /// hash already handed out then stays valid past its advertised deadline.
+    /// hash already handed out is then retired, so clients re-sign once.
     #[arg(long, env = "PRIVATE_CHANNEL_ALLOW_MAX_BLOCKHASHES_INCREASE")]
     allow_max_blockhashes_increase: bool,
+
+    /// Float-funded account creations allowed per block, at least the per-tx cap of 4.
+    /// Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+    #[arg(
+        long,
+        default_value_t = private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+        env = "PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK"
+    )]
+    max_float_funded_creations_per_block: u64,
 
     /// Deprecated: transaction expiration as a duration in milliseconds. Mapped
     /// to a block count and removed after the next release.
@@ -191,6 +205,20 @@ fn seize_keys(args: &Args) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
     Ok((permanent_delegate, compliance_owner))
 }
 
+/// Parses the previous delegates list.
+fn previous_delegates(args: &Args) -> Result<Vec<Pubkey>, String> {
+    // Blank means unset, as Helm always renders the variable. Any other bad key fails
+    // startup: a silently dropped key is an unpoliced key.
+    args.previous_delegates
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|item| {
+            optional_pubkey(Some(item), "PRIVATE_CHANNEL_PREVIOUS_DELEGATES").transpose()
+        })
+        .collect()
+}
+
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
@@ -210,13 +238,14 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         })
         .collect();
     let (permanent_delegate, compliance_owner) = seize_keys(&args)?;
+    let previous_delegates = previous_delegates(&args)?;
 
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
     }
     info!(
-        "Permanent delegate: {:?}, compliance owner: {:?}",
-        permanent_delegate, compliance_owner
+        "Permanent delegate: {:?}, previous delegates: {:?}, compliance owner: {:?}",
+        permanent_delegate, previous_delegates, compliance_owner
     );
 
     let metrics: Arc<dyn private_channel_core::stage_metrics::StageMetrics> = if args.metrics {
@@ -261,6 +290,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
         permanent_delegate,
+        previous_delegates,
         compliance_owner,
         max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
             args.max_blockhashes,
@@ -268,6 +298,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             args.blocktime_ms,
         ),
         allow_max_blockhashes_increase: args.allow_max_blockhashes_increase,
+        max_float_funded_creations_per_block: args.max_float_funded_creations_per_block,
         blocktime_ms: args.blocktime_ms,
         perf_sample_period_secs: args.perf_sample_period_secs,
         metrics,
@@ -439,6 +470,26 @@ mod tests {
         let explicit = Pubkey::new_unique();
         let args = parse(&["--permanent-delegate", &explicit.to_string()]).unwrap();
         assert_eq!(seize_keys(&args).unwrap().0, Some(explicit));
+    }
+
+    /// Blank items are skipped; one bad item fails startup, unlike an admin key.
+    #[test]
+    fn previous_delegates_parse_strictly() {
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        for (value, expected) in [
+            (String::new(), vec![]),
+            ("  ".to_string(), vec![]),
+            (format!("{a},"), vec![a]),
+            (format!(" {a} , {b} "), vec![a, b]),
+        ] {
+            let args = parse(&["--previous-delegates", &value]).unwrap();
+            assert_eq!(previous_delegates(&args), Ok(expected), "{value:?}");
+        }
+        assert_eq!(previous_delegates(&parse(&[]).unwrap()), Ok(vec![]));
+        let bad = format!("{a},not-a-key");
+        let err = previous_delegates(&parse(&["--previous-delegates", &bad]).unwrap())
+            .expect_err("a bad key must fail startup");
+        assert!(err.contains("PRIVATE_CHANNEL_PREVIOUS_DELEGATES"), "{err}");
     }
 
     /// Runs `seize_keys` under a subscriber and returns what it logged.

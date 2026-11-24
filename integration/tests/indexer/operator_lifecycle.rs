@@ -527,7 +527,7 @@ async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
         Some(old.pubkey())
     );
 
-    node.restart_with_delegate(new).await?;
+    node.restart_with_delegate(new, &[old.pubkey()]).await?;
     let rotate = spl_token_2022::instruction::set_authority(
         &program,
         &mint,
@@ -538,6 +538,120 @@ async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
     )?;
     send_on_channel(&node.url, &[rotate], &[&admin, &old]).await?;
     assert_eq!(channel_mint_delegate(&node.url, &mint).await?, Some(new));
+
+    node.shutdown().await;
+    Ok(())
+}
+
+/// After a rotation restart the old key is still policed on mints that name it: it can
+/// seize only into the compliance ATA, never move a balance elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_previous_delegate_stays_policed_after_rotation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (admin, old, new) = (Keypair::new(), Keypair::new(), Pubkey::new_unique());
+    let (alice, compliance, elsewhere_owner) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
+    let mut node = start_private_channel_node_with_delegate(admin.pubkey(), old.pubkey()).await?;
+    let program = spl_token_2022::id();
+    let mint = Pubkey::new_unique();
+    let ata = |owner: &Pubkey| {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            owner, &mint, &program,
+        )
+    };
+    let create_ata = |owner: &Pubkey| {
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &admin.pubkey(),
+            owner,
+            &mint,
+            &program,
+        )
+    };
+    let setup = [
+        spl_token_2022::instruction::initialize_permanent_delegate(&program, &mint, &old.pubkey())?,
+        spl_token_2022::instruction::initialize_mint2(&program, &mint, &admin.pubkey(), None, 6)?,
+    ];
+    send_on_channel(&node.url, &setup, &[&admin]).await?;
+    let fund = [
+        create_ata(&alice),
+        spl_token_2022::instruction::mint_to(
+            &program,
+            &mint,
+            &ata(&alice),
+            &admin.pubkey(),
+            &[],
+            1_000,
+        )?,
+    ];
+    send_on_channel(&node.url, &fund, &[&admin]).await?;
+
+    node.compliance_owner = Some(compliance);
+    node.restart_with_delegate(new, &[old.pubkey()]).await?;
+    send_on_channel(
+        &node.url,
+        &[create_ata(&compliance), create_ata(&elsewhere_owner)],
+        &[&admin],
+    )
+    .await?;
+
+    let client = RpcClient::new(node.url.clone());
+    let elsewhere = spl_token_2022::instruction::transfer_checked(
+        &program,
+        &ata(&alice),
+        &mint,
+        &ata(&elsewhere_owner),
+        &old.pubkey(),
+        &[],
+        10,
+        6,
+    )?;
+    let tx = Transaction::new_signed_with_payer(
+        &[elsewhere],
+        Some(&old.pubkey()),
+        &[&old],
+        client.get_latest_blockhash().await?,
+    );
+    let simulation = client
+        .simulate_transaction_with_config(
+            &tx,
+            solana_client::rpc_config::RpcSimulateTransactionConfig {
+                sig_verify: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        format!("{simulation:?}").contains("compliance account"),
+        "the old key moving a balance elsewhere must be refused: {simulation:?}"
+    );
+    if let Ok(sent) = client.send_transaction(&tx).await {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            client.get_signature_status(&sent).await?.is_none(),
+            "a refused move must never land"
+        );
+    }
+
+    let seize = spl_token_2022::instruction::transfer_checked(
+        &program,
+        &ata(&alice),
+        &mint,
+        &ata(&compliance),
+        &old.pubkey(),
+        &[],
+        10,
+        6,
+    )?;
+    send_on_channel(&node.url, &[seize], &[&old]).await?;
+    assert_eq!(get_token_balance(&client, &compliance, &mint).await?, 10);
+    assert_eq!(
+        get_token_balance(&client, &elsewhere_owner, &mint).await?,
+        0
+    );
+    assert_eq!(get_token_balance(&client, &alice, &mint).await?, 990);
 
     node.shutdown().await;
     Ok(())

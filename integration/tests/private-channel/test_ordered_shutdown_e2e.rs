@@ -77,10 +77,14 @@ fn load_config(db_url: String, port: u16) -> NodeConfig {
         accountsdb_connection_url: db_url,
         redis_cache_url: None,
         admin_keys: vec![],
-        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+        // Fixed across restarts: a writer refuses to boot after a delegate change.
+        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_from_array([0xDE; 32])),
+        previous_delegates: vec![],
         compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
+        max_float_funded_creations_per_block:
+            private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
         redis_block_ttl_secs: 3_600,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,
