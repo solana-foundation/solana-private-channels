@@ -315,6 +315,11 @@ test_signers() {
   # The same key in both roles buys no separation; localnet keeps the single-key dev path.
   expect_refused signer_equal_keys "must differ" "${SIG_DEVNET[@]}" -e "operator_keypair_path=$TMP/admin.json"
   expect_pass signer_equal_keys_localnet "${SIG_BASE[@]}" -e "operator_keypair_path=$TMP/admin.json"
+  # The release key listed as an extra admin collapses the roles the same way, list or string form.
+  expect_refused signer_operator_in_extra_admin_keys "must differ" "${SIG_DEVNET[@]}" \
+    -e "{\"extra_admin_keys\": [\"$(solana-keygen pubkey "$TMP/operator.json")\"]}"
+  expect_refused signer_operator_in_extra_admin_keys_string "must differ" "${SIG_DEVNET[@]}" \
+    -e "extra_admin_keys=$(solana-keygen pubkey "$TMP/admin.json"),$(solana-keygen pubkey "$TMP/operator.json")"
 
   signer_vars "$TMP/av.yml" admin vault
   signer_vars "$TMP/ov.yml" operator vault
@@ -407,6 +412,8 @@ test_operator_pda() {
   pda_dir extra "$op_pda" "$extra_pda"
   pda_case extra_admin_pda_present_is_refused "remove_operator" -e "{\"extra_admin_keys\": [\"$extra\"]}"
   pda_case extra_admin_pda_unlisted_passes pass
+  # A comma-separated string, as `-e extra_admin_keys=a,b` passes it, is checked too.
+  pda_case extra_admin_pda_string_form_is_refused "remove_operator" -e "extra_admin_keys=,$extra,,,"
   # The transition override passes and warns on every run.
   pda_dir override "$op_pda" "$admin_pda"
   pda_case admin_pda_override_passes pass -e pc_allow_admin_operator_pda=true

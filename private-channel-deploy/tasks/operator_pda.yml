@@ -63,8 +63,7 @@
   when: network != 'localnet'
   vars:
     _admin_keys: >-
-      {{ ([pc_admin_pubkey | default('')] + (extra_admin_keys | default([])))
-         | map('string') | map('trim') | select | unique | reject('equalto', pc_operator_pubkey) | list }}
+      {{ ([pc_admin_pubkey | default('')] + pc_extra_admin_keys) | map('string') | map('trim') | select | unique | list }}
   block:
   - name: Warn while the admin Operator PDA override is on
     when: pc_allow_admin_operator_pda | default(false) | bool

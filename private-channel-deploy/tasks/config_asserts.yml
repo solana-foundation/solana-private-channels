@@ -81,10 +81,11 @@
 - name: Assert the admin and operator keys differ off localnet
   when: network != 'localnet'
   ansible.builtin.assert:
-    that: pc_admin_pubkey | default('') != pc_operator_pubkey | default('')
+    that: pc_operator_pubkey | default('') not in ([pc_admin_pubkey | default('')] + pc_extra_admin_keys)
     fail_msg: >-
-      The admin and operator keys must differ off localnet (both are {{ pc_admin_pubkey | default('') }}).
-      The withdraw operator signs releases with its own key so each can rotate alone.
+      The admin and operator keys must differ off localnet ({{ pc_operator_pubkey | default('') }} is also
+      pc_admin_pubkey or in extra_admin_keys). The withdraw operator signs releases with its own key so each
+      can rotate alone, and an admin that can release could do so with no burn.
 
 - name: Warn when a memory operator sits beside a remote admin
   when:
