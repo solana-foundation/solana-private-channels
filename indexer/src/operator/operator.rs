@@ -81,6 +81,8 @@ pub async fn run(
     crate::operator::init_signers()
         .await
         .map_err(OperatorError::InvalidConfig)?;
+    crate::operator::SignerUtil::require_operator_signer(common_config.program_type)
+        .map_err(OperatorError::InvalidConfig)?;
 
     // Empty means unset (env renders "") and maps to None.
     let normalized_fallback_url = common_config

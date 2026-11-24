@@ -34,11 +34,12 @@ pub(crate) fn ensure_test_signer() {
     static INIT_TEST_SIGNER: Once = Once::new();
     INIT_TEST_SIGNER.call_once(|| {
         let keypair = solana_sdk::signer::keypair::Keypair::new();
+        let key = bs58::encode(keypair.to_bytes()).into_string();
         std::env::set_var("ADMIN_SIGNER", "memory");
-        std::env::set_var(
-            "ADMIN_PRIVATE_KEY",
-            bs58::encode(keypair.to_bytes()).into_string(),
-        );
+        std::env::set_var("ADMIN_PRIVATE_KEY", &key);
+        // Withdraw code needs an operator signer; one shared key keeps the tests single-key.
+        std::env::set_var("OPERATOR_SIGNER", "memory");
+        std::env::set_var("OPERATOR_PRIVATE_KEY", &key);
         // Not the admin key, so code that uses the admin key as the delegate fails.
         std::env::set_var(
             "OPERATOR_PERMANENT_DELEGATE",

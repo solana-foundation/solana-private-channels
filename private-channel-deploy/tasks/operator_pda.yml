@@ -55,3 +55,91 @@
       every ReleaseFunds would fail.
       {% else %}The Operator PDA for {{ pc_operator_pubkey }} is owned by {{ _pda_info.json.result.value.owner }}, not the escrow program.
       {% endif %}Fix: run add_operator for {{ pc_operator_pubkey }} with the Instance.admin key, then redeploy.
+
+# ReleaseFunds accepts any wallet with an Operator PDA. A 0.1.0 stack registered the channel
+# admin, and nothing removes that, so a leaked admin key could release escrow with no burn.
+# Localnet may share one key for both roles, so the check runs off localnet only.
+- name: Check that no admin key holds an Operator PDA
+  when: network != 'localnet'
+  vars:
+    _admin_keys: >-
+      {{ ([pc_admin_pubkey | default('')] + (extra_admin_keys | default([])))
+         | map('string') | map('trim') | select | unique | reject('equalto', pc_operator_pubkey) | list }}
+  block:
+  - name: Warn while the admin Operator PDA override is on
+    when: pc_allow_admin_operator_pda | default(false) | bool
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: pc_allow_admin_operator_pda is true, so an admin key with an Operator PDA is
+        accepted. Run remove_operator for it (UPGRADING.md, "Retire the admin's Operator PDA")
+        and drop the override.
+
+  - name: Derive the admin Operator PDAs
+    ansible.builtin.command:
+      argv: [ solana, find-program-derived-address, "{{ compiled_escrow_program_id }}", "string:operator",
+              "pubkey:{{ _escrow_instance }}", "pubkey:{{ item }}" ]
+    loop: "{{ _admin_keys }}"
+    register: _admin_pdas
+    changed_when: false
+
+  - name: Read the admin Operator PDAs
+    delegate_to: "{{ pc_pda_rpc_delegate | default('localhost') }}"
+    ansible.builtin.uri:
+      url: "{{ pc_pda_rpc_url | default(rpc_url) }}"
+      method: POST
+      body_format: json
+      body:
+        jsonrpc: "2.0"
+        id: 1
+        method: getAccountInfo
+        params: [ "{{ item.stdout | trim }}", { encoding: base64 } ]
+      timeout: 15
+    loop: "{{ _admin_pdas.results }}"
+    register: _admin_pda_info
+    failed_when: false
+    no_log: true
+
+  # Reduced to key, status and owner, so no later task can print the RPC URL.
+  - name: Reset the admin Operator PDA summary
+    ansible.builtin.set_fact:
+      _admin_pda_seen: []
+
+  - name: Summarise the admin Operator PDA reads
+    ansible.builtin.set_fact:
+      _admin_pda_seen: >-
+        {{ _admin_pda_seen + [{
+             'key': item.item.item,
+             'read': (item.status | default(-1) | int == 200 and item.json.result is defined),
+             'status': item.status | default(-1),
+             'owner': ((item.json.result.value.owner | default('')) if (item.json.result.value | default(none)) is not none else '')
+               if (item.status | default(-1) | int == 200 and item.json.result is defined) else ''
+           }] }}
+    loop: "{{ _admin_pda_info.results }}"
+    no_log: true
+
+  - name: Warn when an admin Operator PDA cannot be read
+    when: not item.read
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: could not check the admin Operator PDA for {{ item.key }}
+        (RPC status {{ item.status }}). Continuing.
+    loop: "{{ _admin_pda_seen }}"
+    loop_control:
+      label: "{{ item.key }}"
+
+  # Fires only on proof: the PDA exists and the escrow program owns it.
+  - name: Refuse an admin key that holds an Operator PDA
+    when:
+    - not (pc_allow_admin_operator_pda | default(false) | bool)
+    - item.read
+    ansible.builtin.assert:
+      that: item.owner != compiled_escrow_program_id
+      fail_msg: >-
+        Admin key {{ item.key }} holds an Operator PDA on instance {{ _escrow_instance }}, so it can sign
+        ReleaseFunds. Fix: run remove_operator for {{ item.key }} with the Instance.admin key
+        (UPGRADING.md, "Retire the admin's Operator PDA"), then redeploy. For one transition run,
+        -e pc_allow_admin_operator_pda=true accepts it with a warning.
+      quiet: true
+    loop: "{{ _admin_pda_seen }}"
+    loop_control:
+      label: "{{ item.key }}"

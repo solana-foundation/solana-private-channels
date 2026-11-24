@@ -131,6 +131,7 @@ normalize() {
   jq -S 'walk(if type == "object" then del(.create_host_path) else . end)
     | del(.services["postgres-replica"].command)
     | del(.services["operator-solana"].environment.OPERATOR_SIGNER, .services["operator-solana"].environment.OPERATOR_PRIVATE_KEY)
+    | del(.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY)
     | del(.services.gateway.environment | .JWT_SECRET, .JWT_SECRET_PREVIOUS, .JWT_PUBLIC_KEY, .JWT_PUBLIC_KEY_PREVIOUS, .GATEWAY_REQUIRE_JWT)
     | del(.services.auth.environment | .JWT_SECRET, .JWT_SECRET_PREVIOUS, .JWT_SIGNING_KEY, .JWT_PUBLIC_KEY, .JWT_PUBLIC_KEY_PREVIOUS)' "$1"
 }
@@ -146,9 +147,11 @@ for name in local devnet; do
     fail "raw $name compose drifted from the golden config:"
     head -40 "$TMP/golden-$name.diff" >&2
   fi
-  # The withdraw operator still signs with the admin key in a single-key env.
-  [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' "$TMP/now-$name.json")" == GOLDENadminkey ]] \
-    || fail "raw $name: OPERATOR_PRIVATE_KEY does not fall back to ADMIN_PRIVATE_KEY"
+  # Localnet keeps one key for both roles; devnet never hands the admin key to the release role.
+  want=GOLDENadminkey
+  [[ $name == devnet ]] && want=""
+  [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' "$TMP/now-$name.json")" == "$want" ]] \
+    || fail "raw $name: withdraw OPERATOR_PRIVATE_KEY is not '$want'"
   for k in JWT_PUBLIC_KEY JWT_PUBLIC_KEY_PREVIOUS GATEWAY_REQUIRE_JWT; do
     [[ "$(jq -r ".services.gateway.environment.$k" "$TMP/now-$name.json")" == "" ]] || fail "raw $name: gateway $k is not blank"
   done

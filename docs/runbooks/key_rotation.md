@@ -180,7 +180,11 @@ keys.
    unset DATABASE_URL
    ```
 
-   Like operator step 5, it refuses while a release is in flight.
+   Like operator step 5, it refuses while a release is in flight. Once the old admin is
+   dropped from `extra_admin_keys` the deploy no longer probes it, so confirm by hand that
+   its Operator PDA is gone: `getAccountInfo` on
+   `solana find-program-derived-address <escrow-program-id> string:operator pubkey:<instance-id> pubkey:<old-admin-pubkey>`
+   must return `null`.
 
 If the old admin key is compromised, the overlap of step 3 lets it keep signing admin
 instructions on the channel until step 6, and it can mint until step 5. Run steps 3 to 6

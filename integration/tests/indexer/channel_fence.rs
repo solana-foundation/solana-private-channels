@@ -253,6 +253,9 @@ async fn escrow_operator_refuses_on_fence_mismatch() {
     let key = bs58::encode(keypair.to_bytes()).into_string();
     std::env::set_var("ADMIN_SIGNER", "memory");
     std::env::set_var("ADMIN_PRIVATE_KEY", &key);
+    // Same binary runs a withdraw operator, which needs its own operator signer.
+    std::env::set_var("OPERATOR_SIGNER", "memory");
+    std::env::set_var("OPERATOR_PRIVATE_KEY", &key);
     std::env::set_var(
         "OPERATOR_PERMANENT_DELEGATE",
         solana_sdk::signer::Signer::pubkey(&keypair).to_string(),

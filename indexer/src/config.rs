@@ -568,7 +568,8 @@ impl IndexerConfig {
 /// - `ADMIN_PRIVATE_KEY`: Private key or key identifier
 ///
 /// ## Operator role (`OPERATOR_SIGNER`):
-/// - Unset or blank, with no other `OPERATOR_*` signer var: the operator role signs with admin.
+/// - Unset or blank, with no other `OPERATOR_*` signer var: no operator signer. The escrow
+///   operator and resync accept that; the withdraw operator refuses to start.
 /// - Set: it must load, or the operator refuses to start. Never falls back to admin.
 /// - `OPERATOR_*` key vars without `OPERATOR_SIGNER`: refused as a half-written config.
 /// - `OPERATOR_PRIVATE_KEY`: Private key or key identifier for operator

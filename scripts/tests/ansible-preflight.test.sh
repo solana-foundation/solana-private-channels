@@ -380,14 +380,44 @@ test_operator_pda() {
   pda_case pda_missing "$op"
   owner="$ESCROW_ID"
   printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"%s","lamports":1,"data":["","base64"],"executable":false}}}' "$owner" >"$TMP/pda-ok.json"
-  stub_http 200 "$TMP/pda-ok.json" "Content-Type: application/json"
+  # Per-PDA answers: only the PDAs given here exist, every other account is null.
+  local admin extra op_pda admin_pda extra_pda
+  admin="$(solana-keygen pubkey "$TMP/admin.json")"
+  [[ -f "$TMP/extra-admin.json" ]] || solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/extra-admin.json" >/dev/null
+  extra="$(solana-keygen pubkey "$TMP/extra-admin.json")"
+  derive() { solana find-program-derived-address "$ESCROW_ID" string:operator "pubkey:$INSTANCE" "pubkey:$1"; }
+  op_pda="$(derive "$op")"
+  admin_pda="$(derive "$admin")"
+  extra_pda="$(derive "$extra")"
+  pda_dir() {
+    local dir="$TMP/pda-dir-$1" k
+    shift
+    rm -rf "$dir" && mkdir -p "$dir"
+    cp "$TMP/pda-null.json" "$dir/default"
+    for k in "$@"; do cp "$TMP/pda-ok.json" "$dir/$k"; done
+    stub_http 200 "$dir" "Content-Type: application/json"
+  }
+  pda_dir present "$op_pda"
   pda_case pda_present pass
+  grep -q "pc_allow_admin_operator_pda" "$TMP/pda_present.log" && fail "pda_present: override warning without the override"
+  # The admin with an Operator PDA can release escrow with no burn, so it is refused.
+  pda_dir admin "$op_pda" "$admin_pda"
+  pda_case admin_pda_present_is_refused "remove_operator"
+  grep -q "$admin" "$TMP/admin_pda_present_is_refused.log" || fail "admin_pda_present_is_refused: admin pubkey not named"
+  pda_dir extra "$op_pda" "$extra_pda"
+  pda_case extra_admin_pda_present_is_refused "remove_operator" -e "{\"extra_admin_keys\": [\"$extra\"]}"
+  pda_case extra_admin_pda_unlisted_passes pass
+  # The transition override passes and warns on every run.
+  pda_dir override "$op_pda" "$admin_pda"
+  pda_case admin_pda_override_passes pass -e pc_allow_admin_operator_pda=true
+  grep -q "WARNING: pc_allow_admin_operator_pda" "$TMP/admin_pda_override_passes.log" || fail "admin_pda_override_passes: no warning"
   printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["","base64"],"executable":false}}}' >"$TMP/pda-bad.json"
   stub_http 200 "$TMP/pda-bad.json" "Content-Type: application/json"
   pda_case pda_wrong_owner "owned by"
   STUB_PORT="$(free_port)"
   pda_case pda_unreachable pass
   grep -q "could not check the Operator PDA" "$TMP/pda_unreachable.log" || fail "pda_unreachable: no warning"
+  grep -q "could not check the admin Operator PDA" "$TMP/pda_unreachable.log" || fail "pda_unreachable: no admin warning"
 
   # Localnet runs the same check whenever an instance is set, explicit or carried over.
   local lnet=("${SIG_BASE[@]}" -e reset_state=false -e validator_reset=false -e image_registry=127.0.0.1:5000/o
