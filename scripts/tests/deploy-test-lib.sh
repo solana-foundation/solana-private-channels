@@ -169,6 +169,7 @@ sentinel_secrets() {
     printf 'SNTL%sx%s\n' "$tag" "$key" >>"$TMP/sentinels.txt"
   done
   printf 'ghcr_user: u\n' >>"$out"
+  chmod 600 "$out"
 }
 
 # Fails when any sentinel from $TMP/sentinels.txt appears in the given files or dirs.

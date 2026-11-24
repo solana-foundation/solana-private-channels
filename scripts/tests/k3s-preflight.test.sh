@@ -33,6 +33,7 @@ grafana_admin_password: g
 ghcr_user: u
 ghcr_token: t
 S
+chmod 600 "$D/secrets.yml"
 solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/admin.json" >/dev/null
 solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/operator.json" >/dev/null
 

@@ -44,6 +44,7 @@ ghcr_user: u
 ghcr_token: t
 yellowstone_token: y
 EOF
+chmod 600 "$D/secrets.yml"
 
 # Expect the config asserts to pass; prints the resolved compose_services.
 expect_services() {
@@ -658,8 +659,59 @@ EOF
   echo "ok: secrets render"
 }
 
+# secrets.yml holds every deploy credential, so a file readable by group or other is refused.
+test_secrets_mode() {
+  if ! command -v solana-keygen >/dev/null; then
+    skip "secrets mode cases (solana-keygen missing)"
+    return
+  fi
+  signer_setup
+  chmod 644 "$D/secrets.yml"
+  expect_refused secrets_file_mode_0644_is_refused "chmod 600" "${SIG_BASE[@]}"
+  # k3s.yml loads the same file through the same tasks.
+  if playbook "$TMP/secrets_mode_k3s.log" "$D/k3s.yml" --tags __no_such_phase__ "${SIG_BASE[@]}"; then
+    fail "secrets_file_mode_0644_k3s: k3s.yml passed, expected refusal"
+  elif ! grep -q "chmod 600" "$TMP/secrets_mode_k3s.log"; then
+    fail "secrets_file_mode_0644_k3s: refused without the chmod hint"
+  else
+    echo "ok: secrets_file_mode_0644_k3s refused"
+  fi
+  chmod 640 "$D/secrets.yml"
+  expect_refused secrets_file_mode_0640_is_refused "chmod 600" "${SIG_BASE[@]}"
+  chmod 600 "$D/secrets.yml"
+  expect_pass secrets_file_mode_0600_loads "${SIG_BASE[@]}"
+  chmod 400 "$D/secrets.yml"
+  expect_pass secrets_file_mode_0400_loads "${SIG_BASE[@]}"
+  # A symlink is judged by its target, the file include_vars reads.
+  mv "$D/secrets.yml" "$TMP/secrets.target.yml"
+  ln -s "$TMP/secrets.target.yml" "$D/secrets.yml"
+  chmod 644 "$TMP/secrets.target.yml"
+  expect_refused secrets_file_symlink_0644_is_refused "chmod 600" "${SIG_BASE[@]}"
+  chmod 600 "$TMP/secrets.target.yml"
+  expect_pass secrets_file_symlink_0600_loads "${SIG_BASE[@]}"
+  rm "$D/secrets.yml"
+  mv "$TMP/secrets.target.yml" "$D/secrets.yml"
+
+  # The Doppler backend never reads the file, so its mode does not matter.
+  mkdir -p "$TMP/dbin"
+  cat >"$TMP/dbin/doppler" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == --version ]] && { echo v3; exit 0; }
+cat "$DOPPLER_FAKE_JSON"
+EOF
+  chmod +x "$TMP/dbin/doppler"
+  python3 - "$D/secrets.yml" >"$TMP/doppler-mode.json" <<'PY2'
+import json, sys, yaml
+print(json.dumps({k.upper(): str(v) for k, v in yaml.safe_load(open(sys.argv[1])).items()}))
+PY2
+  chmod 644 "$D/secrets.yml"
+  PATH="$TMP/dbin:$PATH" DOPPLER_TOKEN=fake DOPPLER_FAKE_JSON="$TMP/doppler-mode.json" \
+    expect_pass doppler_backend_skips_the_mode_check "${SIG_BASE[@]}"
+  chmod 600 "$D/secrets.yml"
+}
+
 # PC_TEST_ONLY=<regex> runs only the matching test functions.
-for t in test_syntax test_preflight_cases test_env_render test_ghcr_scope test_signers test_operator_pda test_render_signers test_jwt_previous test_secrets_render; do
+for t in test_syntax test_preflight_cases test_env_render test_ghcr_scope test_signers test_operator_pda test_render_signers test_jwt_previous test_secrets_render test_secrets_mode; do
   if [[ -z "${PC_TEST_ONLY:-}" || "$t" =~ $PC_TEST_ONLY ]]; then "$t"; fi
 done
 
