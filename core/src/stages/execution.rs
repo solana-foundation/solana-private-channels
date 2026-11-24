@@ -893,6 +893,8 @@ pub struct FloatBudget {
     block: u64,
     used: u64,
     exhausted: bool,
+    /// Whether this block has counted a float-funded creation attempt yet.
+    active: bool,
     summary: FloatBudgetSummary,
 }
 
@@ -915,6 +917,7 @@ impl FloatBudget {
             block: 0,
             used: 0,
             exhausted: false,
+            active: false,
             summary: FloatBudgetSummary::default(),
         }
     }
@@ -932,6 +935,11 @@ impl FloatBudget {
             self.block = announced;
             self.used = 0;
             self.exhausted = false;
+            self.active = false;
+        }
+        if !self.active {
+            self.active = true;
+            metrics.executor_float_budget_block();
         }
         let summary = &mut self.summary;
         summary
@@ -1151,12 +1159,13 @@ fn snapshot_window(live_blockhashes: &RwLock<LinkedList<Hash>>) -> HashSet<Hash>
 /// The final check. Copies the window and, if any tx is still live in that copy,
 /// counts this batch as an admission, both under one read guard. The settler
 /// retires under the write guard, so it either sees this admission or we miss the hash.
+/// Also returns the announced block count read under that guard, the float budget's block.
 fn snapshot_and_admit(
     live_blockhashes: &RwLock<LinkedList<Hash>>,
     transactions: &[SanitizedTransaction],
     oversized: &[SanitizedTransaction],
     progress: &BlockhashProgress,
-) -> (HashSet<Hash>, Option<u64>) {
+) -> (HashSet<Hash>, Option<u64>, u64) {
     let guard = live_blockhashes.read().expect("blockhash lock poisoned");
     let live: HashSet<Hash> = guard.iter().copied().collect();
     let admits = transactions
@@ -1164,8 +1173,11 @@ fn snapshot_and_admit(
         .chain(oversized)
         .any(|tx| live.contains(tx.message().recent_blockhash()));
     let admission = admits.then(|| progress.admissions.fetch_add(1, Ordering::Release) + 1);
+    // The retire bumps this under the write guard and, once the window is full, waits for
+    // every admission before it, so a batch counts against the block its results join.
+    let block = progress.announced.load(Ordering::Acquire);
     drop(guard);
-    (live, admission)
+    (live, admission, block)
 }
 
 /// Keep only the transactions whose recent blockhash is still in the live
@@ -1340,7 +1352,7 @@ pub async fn execute_batch(
     // The window moves during the load, and neither VM rechecks the blockhash.
     // The window can still move right after this check. That is safe because the
     // settler waits for a counted admission before cutting the block that expires it.
-    let (live, admission) = snapshot_and_admit(
+    let (live, admission, budget_block) = snapshot_and_admit(
         &execution_deps.live_blockhashes,
         &all_transactions,
         &oversized_transactions,
@@ -1558,10 +1570,7 @@ pub async fn execute_batch(
             &execution_deps.bob,
             &fee_payers,
             &mut execution_deps.float_budget,
-            execution_deps
-                .blockhash_progress
-                .announced
-                .load(Ordering::SeqCst),
+            budget_block,
             metrics,
         );
 
@@ -3365,6 +3374,34 @@ mod tests {
         assert_eq!(statuses, vec![Ok(()), unbalanced(), unbalanced()]);
     }
 
+    /// A block announced while a batch runs must not give that batch a fresh budget: the
+    /// settler waits for it, so its results join the block it was admitted in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_counts_a_batch_against_the_block_it_was_admitted_in() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 4).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let (first, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        assert_eq!(
+            regular_status(&run_batch(&mut deps, &metrics, vec![first]).await, 0),
+            Ok(())
+        );
+
+        // Announce the next block as soon as the second batch is admitted, while it executes.
+        let progress = Arc::clone(&deps.blockhash_progress);
+        let admitted = progress.admissions.load(Ordering::SeqCst);
+        let announcer = std::thread::spawn(move || {
+            while progress.admissions.load(Ordering::SeqCst) == admitted {
+                std::hint::spin_loop();
+            }
+            progress.announced.fetch_add(1, Ordering::SeqCst);
+        });
+        let (second, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        let result = run_batch(&mut deps, &metrics, vec![second]).await;
+        announcer.join().unwrap();
+        assert_eq!(regular_status(&result, 0), unbalanced());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn float_budget_resets_when_a_block_is_announced() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -3403,11 +3440,12 @@ mod tests {
     /// one test at a time.
     static FLOAT_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn float_counters() -> [f64; 3] {
+    fn float_counters() -> [f64; 4] {
         [
             "private_channel_executor_float_funded_creations_total",
             "private_channel_executor_float_budget_refused_total",
             "private_channel_executor_float_budget_exhausted_blocks_total",
+            "private_channel_executor_float_budget_blocks_total",
         ]
         .map(|name| {
             private_channel_metrics::prometheus::gather()
@@ -3500,10 +3538,11 @@ mod tests {
             [
                 after[0] - before[0],
                 after[1] - before[1],
-                after[2] - before[2]
+                after[2] - before[2],
+                after[3] - before[3]
             ],
-            [4.0, 3.0, 1.0],
-            "creations, refusals, exhausted blocks"
+            [4.0, 3.0, 1.0, 1.0],
+            "creations, refusals, exhausted blocks, blocks with free creation"
         );
     }
 
@@ -5456,7 +5495,7 @@ mod tests {
                 }
             });
             start.wait();
-            let (snapshot, admission) =
+            let (snapshot, admission, _) =
                 snapshot_and_admit(&live, std::slice::from_ref(&tx), &[], &progress);
             let (popped, admissions) = retire.join().unwrap();
 

@@ -40,6 +40,8 @@ pub trait StageMetrics: Send + Sync {
     fn executor_float_budget_refused(&self);
     /// Blocks in which the float budget ran out. Sustained growth means abuse.
     fn executor_float_budget_exhausted_block(&self);
+    /// Blocks with at least one float-funded creation attempt, the base for the exhausted share.
+    fn executor_float_budget_block(&self);
     /// A batch aborted because its accounts could not be loaded. Non-zero means
     /// the executor stopped rather than execute against unknown state.
     fn executor_preload_fatal(&self);
@@ -166,6 +168,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_float_budget_exhausted_block(&self) {
         debug!("executor: float budget exhausted in this block");
+    }
+    fn executor_float_budget_block(&self) {
+        debug!("executor: first float-funded creation attempt in this block");
     }
     fn executor_preload_fatal(&self) {
         debug!("executor: batch aborted, account preload failed");
@@ -408,6 +413,12 @@ counter_vec!(
     EXECUTOR_FLOAT_BUDGET_EXHAUSTED_BLOCKS,
     "private_channel_executor_float_budget_exhausted_blocks_total",
     "Blocks in which the float-funded creation budget ran out",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_FLOAT_BUDGET_BLOCKS,
+    "private_channel_executor_float_budget_blocks_total",
+    "Blocks with at least one float-funded creation attempt",
     &[]
 );
 counter_vec!(
@@ -680,6 +691,11 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn executor_float_budget_block(&self) {
+        EXECUTOR_FLOAT_BUDGET_BLOCKS
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn executor_preload_fatal(&self) {
         EXECUTOR_PRELOAD_FATAL
             .with_label_values(&[] as &[&str])
@@ -853,6 +869,7 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_FLOAT_FUNDED_CREATIONS,
         EXECUTOR_FLOAT_BUDGET_REFUSED,
         EXECUTOR_FLOAT_BUDGET_EXHAUSTED_BLOCKS,
+        EXECUTOR_FLOAT_BUDGET_BLOCKS,
         EXECUTOR_PRELOAD_FATAL,
         EXECUTOR_CORRUPT_ACCOUNT,
         WRITER_LEASE_PROBE,

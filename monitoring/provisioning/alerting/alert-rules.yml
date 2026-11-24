@@ -1750,9 +1750,9 @@ groups:
     folder: Solana Private Channels Alerts
     interval: 1m
     rules:
-      # The write node caps float-funded account creation per block. Honest gasless
-      # traffic almost never fills it, so running out is the abuse signal. Needs
-      # PRIVATE_CHANNEL_METRICS=true on the write node.
+      # Share of blocks with free creation that ran out of budget, so it holds at any block
+      # rate. At least 6 such blocks, so one honest burst on a quiet node does not fire.
+      # Needs PRIVATE_CHANNEL_METRICS=true on the write node.
       - uid: float-budget-exhausted
         title: "Float-funded account creation budget exhausted"
         condition: C
@@ -1760,7 +1760,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "The write node ran out of its float-funded creation budget in {{ $values.A }} blocks in 10 minutes: someone is creating accounts for free at the node's cap. Check the gateway logs for the source IPs; block them or lower PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK. See docs/CONFIG.md."
+          summary: "The write node ran out of its float-funded creation budget in a {{ $values.A }} share of its blocks with free account creation over 10 minutes: someone is creating accounts for free at the node's cap. Check the gateway logs for the source IPs; block them or lower PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK. See docs/CONFIG.md."
         labels:
           severity: warning
         data:
@@ -1770,7 +1770,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: sum(increase(private_channel_executor_float_budget_exhausted_blocks_total[10m]))
+              expr: (sum(increase(private_channel_executor_float_budget_exhausted_blocks_total[10m])) / sum(increase(private_channel_executor_float_budget_blocks_total[10m]))) and (sum(increase(private_channel_executor_float_budget_exhausted_blocks_total[10m])) >= 6)
               instant: true
               refId: A
           - refId: C
@@ -1784,7 +1784,7 @@ groups:
               conditions:
                 - evaluator:
                     type: gt
-                    params: [60]
+                    params: [0.01]
               refId: C
 
       # Half the default cap held for half an hour, about 100M accounts a month. Catches
