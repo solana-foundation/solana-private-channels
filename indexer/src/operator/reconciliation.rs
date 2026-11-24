@@ -188,7 +188,7 @@ pub async fn run_reconciliation(
     // Counted ticks keep the configured cadence; a closed fence is probed in between. A probe
     // pages nothing and counts nothing, so it is held back whenever one more tick could
     // cross a threshold, leaving every halt and alert to a counted tick. An unwritten insolvency
-    // flag is retried in between the same way, and that wake does nothing else.
+    // flag is retried on every wake, and an early wake for it does nothing else.
     let quiet_alerts = MaskedAlerts::default();
     let mut next_counted = tokio::time::Instant::now();
     loop {
@@ -202,9 +202,12 @@ pub async fn run_reconciliation(
             next_counted = tokio::time::Instant::now() + config.reconciliation_interval;
         }
 
-        if probe && breach_counters.unwritten_halt.is_some() {
+        // Retried before the check, since a tick that cannot read its inputs cannot re-trip.
+        let retry_wake = probe && breach_counters.unwritten_halt.is_some();
+        if breach_counters.unwritten_halt.is_some() {
             retry_unwritten_halt(&storage, &health, &mut breach_counters, &mut halted).await;
-        } else {
+        }
+        if !retry_wake {
             match perform_reconciliation_check(
                 &storage,
                 &config,
@@ -5857,6 +5860,68 @@ mod tests {
             writes_after_wait, writes_at_landing,
             "the retry stops once the flag lands"
         );
+    }
+
+    /// Ticks slower than the interval leave no early wake, and a tick that cannot read supply
+    /// cannot re-trip, so a counted wake must retry the flag too.
+    #[tokio::test]
+    async fn an_unwritten_insolvency_halt_is_retried_when_every_wake_is_a_counted_tick() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 900, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        env.mock.set_should_fail("set_outage_halt", true);
+        let interval = HALT_RETRY_INTERVAL / 10;
+        let config = OperatorConfig {
+            reconciliation_interval: interval,
+            ..recon_config_zero_tolerance()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_reconciliation(
+            env.storage.clone(),
+            config,
+            fast_rpc(env.custody.url()),
+            fast_rpc(env.channel.url()),
+            test_instance(),
+            None,
+            None,
+            token.clone(),
+            env.fence.clone(),
+        ));
+
+        let started = std::time::Instant::now();
+        while env.mock.calls("set_reconciliation_halt") < HALT_WRITE_ATTEMPTS as usize
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(env.fence.state(), FenceState::Tripped);
+
+        // Let any tick that still read supply finish before the database recovers.
+        set_input_failing(&mut env, Input::ChannelSupply, true).await;
+        tokio::time::sleep(20 * interval).await;
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        let recovered = std::time::Instant::now();
+        while env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none()
+            && recovered.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        token.cancel();
+        task.await.unwrap().unwrap();
+
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag landed without a tick re-confirming the breach");
+        assert!(halt.insolvency);
     }
 
     #[tokio::test]
