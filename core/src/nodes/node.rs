@@ -2,7 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures,
-            blockhash_window,
+            blockhash_window, mint_delegates,
             postgres::{ensure_address_signatures_signature_index, PostgresAccountsDB},
             redis::RedisAccountsDB,
             writer_epoch,
@@ -29,6 +29,7 @@ use {
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
     std::{
+        collections::BTreeSet,
         sync::{atomic::AtomicU64, Arc},
         time::Duration,
     },
@@ -95,8 +96,8 @@ pub struct NodeConfig {
     /// growth. Zero disables it.
     pub redis_block_ttl_secs: u64,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass token program execution
-    /// Permanent delegate written into every channel mint and the only key the seize
-    /// rule polices. Required by write modes, which create mints.
+    /// Permanent delegate written into every new channel mint. The seize rule polices it
+    /// and every key an existing mint names. Required by write modes, which create mints.
     pub permanent_delegate: Option<Pubkey>,
     /// Owner of the compliance ATAs, the only place the delegate may move balances to.
     /// None refuses every delegate move.
@@ -108,6 +109,9 @@ pub struct NodeConfig {
     pub max_blockhashes: usize,
     /// Let a write node boot with a larger window than the ledger last recorded.
     pub allow_max_blockhashes_increase: bool,
+    /// Float-funded account creations allowed per block, at least the per-tx cap of 4.
+    /// Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+    pub max_float_funded_creations_per_block: u64,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
     pub metrics: SharedMetrics,
@@ -134,15 +138,14 @@ pub fn resolve_max_blockhashes(
     }
 }
 
-/// A warning when an allowed increase took effect: every live hash now outlives the
-/// deadline readers handed out, and hashes just past it are admissible again.
+/// A warning when an allowed increase took effect: every hash handed out before this
+/// boot is retired, so clients holding an unlanded transaction must re-sign it.
 fn window_change_note(previous: Option<u64>, configured: u64) -> Option<String> {
     let previous = previous.filter(|&p| p < configured)?;
     Some(format!(
         "max_blockhashes grew from {previous} to {configured}: every hash handed out before \
-         this boot stays admissible {} blocks past its advertised deadline, so a client that \
-         re-signs at that deadline may see the original land as well",
-        configured - previous
+         this boot is now refused as unknown, so a transaction signed on one and not yet \
+         landed must be re-signed"
     ))
 }
 
@@ -170,6 +173,8 @@ impl Default for NodeConfig {
             compliance_owner: None,
             max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
             allow_max_blockhashes_increase: false,
+            max_float_funded_creations_per_block:
+                crate::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
             blocktime_ms: DEFAULT_BLOCKTIME_MS,
             perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
@@ -340,6 +345,74 @@ pub fn validate_seize_config(config: &NodeConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a float budget below the per-transaction cap, which no legitimate 4-creation
+/// transaction such as CreateDvp could ever pass.
+pub fn validate_float_budget(config: &NodeConfig) -> Result<(), String> {
+    let cap = crate::stages::execution::MAX_FLOAT_FUNDED_CREATIONS;
+    if config.max_float_funded_creations_per_block < cap {
+        return Err(format!(
+            "max_float_funded_creations_per_block \
+             (PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK) must be at least {cap}, \
+             the per-transaction cap, got {}",
+            config.max_float_funded_creations_per_block
+        ));
+    }
+    Ok(())
+}
+
+/// The admission policy. Mints keep naming an old delegate until each is rotated, so every
+/// key a mint names is policed like the configured one, with no list to keep in step.
+pub fn ingress_policy(
+    config: &NodeConfig,
+    mint_delegates: BTreeSet<Pubkey>,
+) -> Result<crate::transactions::IngressPolicy, String> {
+    // Its own ATA is exempt from the seize rule, so it could seize and move funds anywhere.
+    if let Some(owner) = config
+        .compliance_owner
+        .filter(|o| mint_delegates.contains(o))
+    {
+        return Err(format!(
+            "compliance_owner (PRIVATE_CHANNEL_COMPLIANCE_OWNER) {owner} is named as \
+             permanent delegate by a mint; rotate that mint or pick another owner"
+        ));
+    }
+    Ok(crate::transactions::IngressPolicy {
+        admin_keys: config.admin_keys.clone(),
+        seize: crate::transactions::SeizePolicy {
+            delegate: config.permanent_delegate,
+            previous_delegates: mint_delegates
+                .into_iter()
+                .filter(|key| Some(*key) != config.permanent_delegate)
+                .collect(),
+            compliance_owner: config.compliance_owner,
+        },
+    })
+}
+
+/// Signers whose transactions skip the float budget: admins for deposits and every policed
+/// delegate for seizes, which may have to create the compliance ATA.
+pub fn float_exempt_signers(policy: &crate::transactions::IngressPolicy) -> Vec<Pubkey> {
+    let mut keys = policy.admin_keys.clone();
+    keys.extend(policy.seize.delegate);
+    keys.extend(policy.seize.previous_delegates.iter().copied());
+    keys
+}
+
+/// Reads the keys the mints name and builds the policy from them.
+async fn load_ingress_policy(
+    config: &NodeConfig,
+    pool: &sqlx::PgPool,
+) -> Result<crate::transactions::IngressPolicy, Box<dyn std::error::Error>> {
+    let policy = ingress_policy(config, mint_delegates::read(pool).await?)?;
+    if !policy.seize.previous_delegates.is_empty() {
+        warn!(
+            "mints still name earlier delegates, policed until each mint is rotated: {:?}",
+            policy.seize.previous_delegates
+        );
+    }
+    Ok(policy)
+}
+
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
     if config.blocktime_ms == 0 {
@@ -420,6 +493,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         }
     }
     validate_seize_config(&config)?;
+    validate_float_budget(&config)?;
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
@@ -486,14 +560,8 @@ async fn start_services(
     // Set only for Aio with Redis; the read path waits on it below.
     let mut cache_aligned_rx = None;
 
-    // Sigverify and simulate admit transactions under the same keys.
-    let ingress_policy = crate::transactions::IngressPolicy {
-        admin_keys: config.admin_keys.clone(),
-        seize: crate::transactions::SeizePolicy {
-            delegate: config.permanent_delegate,
-            compliance_owner: config.compliance_owner,
-        },
-    };
+    // Sigverify and simulate admit transactions under the same keys. Aio reads them once.
+    let mut write_policy = None;
 
     // Only create write pipeline for Write and Aio modes
     let write_deps = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
@@ -560,11 +628,16 @@ async fn start_services(
         if let Some(note) = window_change_note(previous_window, window) {
             warn!("{note}");
         }
+        let blockhash_floor = blockhash_window::read_floor(postgres_db.pool.as_ref()).await?;
+        // After the epoch bump, so no older writer can still rotate a mint behind this read.
+        mint_delegates::ensure_index(&postgres_db.pool).await?;
+        let policy = load_ingress_policy(&config, &postgres_db.pool).await?;
+        write_policy = Some(policy.clone());
         // Before any address_signatures writer starts, so a first build blocks nothing live.
         ensure_address_signatures_signature_index(&postgres_db.pool).await?;
         repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
         let (initial_live_blockhashes, initial_dedup_cache) =
-            load_dedup_state(&db, config.max_blockhashes).await?;
+            load_dedup_state(&db, config.max_blockhashes, blockhash_floor).await?;
         // Seeded before RPC starts so isBlockhashValid never reports slot 0 on a live chain.
         let settled_slot = Arc::new(AtomicU64::new(db.get_current_slot().await?.unwrap_or(0)));
         // All counters start at zero: the window loaded above is already in dedup.
@@ -587,7 +660,7 @@ async fn start_services(
         // dedup so only verified transactions ever reach the dedup cache.
         let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
             num_workers: config.sigverify_workers,
-            policy: ingress_policy.clone(),
+            policy: policy.clone(),
             rx: ingress_rx,
             output_tx: dedup_tx,
             metrics: Arc::clone(&config.metrics),
@@ -636,6 +709,8 @@ async fn start_services(
             live_blockhashes: Arc::clone(&live_blockhashes),
             blockhash_progress: Arc::clone(&blockhash_progress),
             permanent_delegate: config.permanent_delegate,
+            max_float_funded_creations_per_block: config.max_float_funded_creations_per_block,
+            float_exempt_signers: float_exempt_signers(&policy),
         })
         .await;
         workers.push(execution);
@@ -715,8 +790,16 @@ async fn start_services(
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
+            let ingress = match write_policy {
+                Some(policy) => policy,
+                None => {
+                    let postgres =
+                        PostgresAccountsDB::new(&config.accountsdb_connection_url, true).await?;
+                    load_ingress_policy(&config, &postgres.pool).await?
+                }
+            };
             Some(ReadDeps {
-                ingress: ingress_policy,
+                ingress,
                 accounts_db,
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
@@ -1340,5 +1423,64 @@ mod tests {
                 validate_seize_config(&seize_config(NodeMode::Aio, delegate, compliance)).is_ok()
             );
         }
+    }
+
+    /// Below the per-transaction cap a legitimate 4-creation transaction could never pass.
+    #[test]
+    fn float_budget_below_the_per_transaction_cap_is_refused() {
+        for (budget, ok) in [(0, false), (3, false), (4, true), (8, true)] {
+            let config = NodeConfig {
+                max_float_funded_creations_per_block: budget,
+                ..Default::default()
+            };
+            let result = validate_float_budget(&config);
+            assert_eq!(result.is_ok(), ok, "{budget}: {result:?}");
+            if let Err(err) = result {
+                assert!(
+                    err.contains("PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK"),
+                    "{err}"
+                );
+            }
+        }
+        assert_eq!(
+            NodeConfig::default().max_float_funded_creations_per_block,
+            8
+        );
+    }
+
+    /// Every key a mint names is policed, the configured one once, and all skip the budget.
+    #[test]
+    fn mint_delegates_are_policed_and_skip_the_float_budget() {
+        let (admin, current, old, stranger) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let config = NodeConfig {
+            admin_keys: vec![admin],
+            permanent_delegate: Some(current),
+            ..Default::default()
+        };
+        let policy = ingress_policy(&config, BTreeSet::from([current, old])).unwrap();
+        assert_eq!(policy.seize.delegate, Some(current));
+        assert_eq!(policy.seize.previous_delegates, vec![old]);
+        assert!(policy.seize.policed(&old));
+
+        let exempt = float_exempt_signers(&policy);
+        for key in [admin, current, old] {
+            assert!(exempt.contains(&key), "{key}");
+        }
+        assert!(!exempt.contains(&stranger));
+    }
+
+    /// A mint naming the compliance owner would let that key seize into its own exempt ATA.
+    #[test]
+    fn mint_naming_the_compliance_owner_refuses_to_start() {
+        let (current, old) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let config = seize_config(NodeMode::Aio, Some(current), Some(old));
+        let err = ingress_policy(&config, BTreeSet::from([current, old])).expect_err("must refuse");
+        assert!(err.contains("PRIVATE_CHANNEL_COMPLIANCE_OWNER"), "{err}");
+        assert!(ingress_policy(&config, BTreeSet::from([current])).is_ok());
     }
 }

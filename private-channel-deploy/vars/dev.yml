@@ -151,3 +151,7 @@ monitoring_postgres_exporter_port: 9187
 # Indexer postgres-exporter needs a distinct host port from the primary
 # exporter (9187) so both can be scraped without colliding.
 monitoring_postgres_exporter_indexer_port: 9188
+
+# Float-funded (gasless) account creations the write node allows per block, at least 4.
+# Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+# max_float_funded_creations_per_block: 8

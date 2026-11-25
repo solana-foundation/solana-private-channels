@@ -55,7 +55,7 @@ impl AdminVm {
 
     /// Builds the account the real program leaves after `[InitializePermanentDelegate,
     /// InitializeMint2]`, using the library's own layout code.
-    fn create_mint_account(
+    pub(crate) fn create_mint_account(
         decimals: u8,
         mint_authority: &Pubkey,
         freeze_authority: Option<Pubkey>,

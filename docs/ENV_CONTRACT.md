@@ -157,6 +157,11 @@ required `permanent_delegate`.
 The read node gets the same admin keys, delegate and compliance owner as the write node,
 because it serves `simulateTransaction`.
 
+`PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK` (default 8, at least 4) is read by the
+write node only. Compose and `templates/env.j2` default it to 8 (the Ansible var is
+`max_float_funded_creations_per_block`), and the Helm chart renders it on the write node from
+`config.maxFloatFundedCreationsPerBlock`.
+
 Signers have one key set per role, `ADMIN_*` (the channel admin) and `OPERATOR_*` (the
 withdraw operator's release key). `ADMIN_SIGNER` and `OPERATOR_SIGNER` pick `memory`
 (`*_PRIVATE_KEY`), `vault` (`*_VAULT_ADDR`, `*_VAULT_TOKEN`, `*_VAULT_KEY_NAME`,

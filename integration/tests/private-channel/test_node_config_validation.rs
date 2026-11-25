@@ -41,6 +41,8 @@ fn base_config(mode: NodeMode) -> NodeConfig {
         compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
+        max_float_funded_creations_per_block:
+            private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
         blocktime_ms: 100,
         perf_sample_period_secs: 60,
         metrics: Arc::new(NoopMetrics),

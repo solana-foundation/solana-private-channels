@@ -173,6 +173,7 @@ imagePullSecrets:
 - { name: PRIVATE_CHANNEL_BATCH_DEADLINE_MS, value: "10" }
 - { name: PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY, value: "16" }
 - { name: PRIVATE_CHANNEL_MAX_SVM_WORKERS, value: "8" }
+- { name: PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK, value: {{ $v.config.maxFloatFundedCreationsPerBlock | default 8 | quote }} }
 {{ include "pc.nodeEnv" $root }}
 {{- else if eq .name "read-node" }}
 - { name: RUST_LOG, value: info }

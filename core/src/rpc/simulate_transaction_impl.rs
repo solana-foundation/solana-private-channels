@@ -748,6 +748,7 @@ mod tests {
         let mut deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
         deps.ingress.seize = crate::transactions::SeizePolicy {
             delegate: Some(delegate.pubkey()),
+            previous_delegates: vec![],
             compliance_owner: Some(Pubkey::new_unique()),
         };
         let ix = spl_token_2022::instruction::transfer_checked(

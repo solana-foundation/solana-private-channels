@@ -71,6 +71,10 @@ pub struct ExecutionArgs {
     pub blockhash_progress: Arc<BlockhashProgress>,
     /// Delegate the admin VM writes into every mint it creates; None creates none.
     pub permanent_delegate: Option<Pubkey>,
+    /// Float-funded account creations allowed per block.
+    pub max_float_funded_creations_per_block: u64,
+    /// Admin and delegate keys; a transaction one of them signed skips the float budget.
+    pub float_exempt_signers: Vec<Pubkey>,
 }
 
 pub struct ExecutionDeps {
@@ -95,6 +99,8 @@ pub struct ExecutionDeps {
     pub max_tx_loaded_accounts_bytes: usize,
     /// Account bytes one preload may pull in before the batch is split.
     pub preload_budget_bytes: usize,
+    /// Node-wide float-funded creations per block, keyed on `blockhash_progress.announced`.
+    pub float_budget: FloatBudget,
 
     // Must prevent this from being dropped
     _fork_graph: Arc<RwLock<PrivateChannelForkGraph>>,
@@ -133,6 +139,8 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         live_blockhashes,
         blockhash_progress,
         permanent_delegate,
+        max_float_funded_creations_per_block,
+        float_exempt_signers,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -152,6 +160,9 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         .await;
         execution_deps.blockhash_progress = blockhash_progress;
         execution_deps.admin_vm = AdminVm::new(permanent_delegate);
+        execution_deps.float_budget =
+            FloatBudget::new(max_float_funded_creations_per_block, float_exempt_signers);
+        metrics.executor_float_budget_per_block(max_float_funded_creations_per_block);
 
         // Stage-private: nothing outside the executor takes from this budget.
         let results_budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
@@ -227,6 +238,7 @@ pub async fn get_execution_deps(
         program_runtime_environments: batch_processor.environments,
         max_tx_loaded_accounts_bytes: MAX_TX_LOADED_ACCOUNTS_BYTES,
         preload_budget_bytes: MAX_BATCH_PRELOAD_BYTES,
+        float_budget: FloatBudget::new(DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK, Vec::new()),
         _fork_graph: batch_processor.fork_graph,
     }
 }
@@ -864,7 +876,120 @@ fn execute_parallel(
 }
 
 /// CreateDvp makes 4 accounts, the most any flow here needs from the float.
-const MAX_FLOAT_FUNDED_CREATIONS: u64 = 4;
+pub const MAX_FLOAT_FUNDED_CREATIONS: u64 = 4;
+
+/// Float-funded account creations allowed per block, at least the per-tx cap of 4.
+/// Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+pub const DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK: u64 = 8;
+
+/// How often the float budget summary may be logged.
+const FLOAT_BUDGET_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The node-wide total of float-funded creations in the current block. A block here is
+/// the span between two settler announcements, so the total covers every sub-batch.
+pub struct FloatBudget {
+    per_block: u64,
+    /// Admin and delegate keys; a transaction one of them signed skips the budget.
+    exempt_signers: Vec<Pubkey>,
+    block: u64,
+    used: u64,
+    exhausted: bool,
+    /// Whether this block has counted a float-funded creation attempt yet.
+    active: bool,
+    summary: FloatBudgetSummary,
+}
+
+/// What the budget refused since the last summary line.
+#[derive(Default)]
+struct FloatBudgetSummary {
+    last_logged: Option<Instant>,
+    /// The announced count the window starts after.
+    since_block: Option<u64>,
+    exhausted_blocks: u64,
+    refused: u64,
+    creations: u64,
+}
+
+impl FloatBudget {
+    pub fn new(per_block: u64, exempt_signers: Vec<Pubkey>) -> Self {
+        Self {
+            per_block,
+            exempt_signers,
+            block: 0,
+            used: 0,
+            exhausted: false,
+            active: false,
+            summary: FloatBudgetSummary::default(),
+        }
+    }
+
+    /// Takes `created` from the block's budget. A refusal returns the summary line to
+    /// log, if one is due.
+    fn take(
+        &mut self,
+        announced: u64,
+        created: u64,
+        now: Instant,
+        metrics: &SharedMetrics,
+    ) -> Result<(), Option<String>> {
+        if announced != self.block {
+            self.block = announced;
+            self.used = 0;
+            self.exhausted = false;
+            self.active = false;
+        }
+        if !self.active {
+            self.active = true;
+            metrics.executor_float_budget_block();
+        }
+        let summary = &mut self.summary;
+        summary
+            .since_block
+            .get_or_insert(announced.saturating_sub(1));
+        if self.used + created <= self.per_block {
+            self.used += created;
+            summary.creations += created;
+            metrics.executor_float_funded_creations(created);
+            return Ok(());
+        }
+        metrics.executor_float_budget_refused();
+        summary.refused += 1;
+        if !self.exhausted {
+            self.exhausted = true;
+            summary.exhausted_blocks += 1;
+            metrics.executor_float_budget_exhausted_block();
+        }
+        // One summary a minute, not a line per refusal: under abuse that is ten lines a second.
+        if summary
+            .last_logged
+            .is_some_and(|last| now.duration_since(last) < FLOAT_BUDGET_SUMMARY_INTERVAL)
+        {
+            return Err(None);
+        }
+        let blocks = announced - summary.since_block.unwrap_or(0);
+        let line = format!(
+            "float budget exhausted in {} of {blocks} blocks, {} transactions refused, {} creations \
+             (budget {} per block): someone may be creating accounts for free at the cap",
+            summary.exhausted_blocks, summary.refused, summary.creations, self.per_block
+        );
+        *summary = FloatBudgetSummary {
+            last_logged: Some(now),
+            since_block: Some(announced),
+            ..Default::default()
+        };
+        Err(Some(line))
+    }
+}
+
+/// Whether one of `keys` signed `tx`.
+fn is_signed_by_any(tx: &SanitizedTransaction, keys: &[Pubkey]) -> bool {
+    let message = tx.message();
+    message
+        .account_keys()
+        .iter()
+        .enumerate()
+        .any(|(index, key)| message.is_signer(index) && keys.contains(key))
+}
 
 /// The lamports the gasless callback makes up for an unknown fee payer are the
 /// only money here that nobody deposited. Treat them as a loan the transaction
@@ -884,6 +1009,8 @@ fn enforce_lamport_conservation(
     transactions: &[SanitizedTransaction],
     bob: &BOB,
     fee_payers: &HashSet<Pubkey>,
+    budget: &mut FloatBudget,
+    announced: u64,
     metrics: &SharedMetrics,
 ) {
     // Reused across transactions so the whole batch allocates at most once.
@@ -963,6 +1090,21 @@ fn enforce_lamport_conservation(
             executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
             continue;
         }
+        // Deposits and seizes skip the budget, so filling it cannot block them, and their
+        // bursts neither starve public creation nor fire the abuse alert.
+        let budgeted = shortfall > 0 && !is_signed_by_any(tx, &budget.exempt_signers);
+        // Caps free account creation per block, not over time: storage still grows at budget
+        // x block rate. Anyone can fill it, failing others' gasless creations until they
+        // re-sign; that cost of any shared cap is why its exhaustion alerts.
+        if budgeted {
+            if let Err(summary) = budget.take(announced, created, Instant::now(), metrics) {
+                if let Some(summary) = summary {
+                    warn!("execution: {summary}");
+                }
+                executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
+                continue;
+            }
+        }
         // Nothing is missing, so wipe the made-up payers. BOB and the settler
         // already read an empty account with no money as deleted, so wiping is
         // how they disappear. Nothing else is touched.
@@ -1018,12 +1160,13 @@ fn snapshot_window(live_blockhashes: &RwLock<LinkedList<Hash>>) -> HashSet<Hash>
 /// The final check. Copies the window and, if any tx is still live in that copy,
 /// counts this batch as an admission, both under one read guard. The settler
 /// retires under the write guard, so it either sees this admission or we miss the hash.
+/// Also returns the announced block count read under that guard, the float budget's block.
 fn snapshot_and_admit(
     live_blockhashes: &RwLock<LinkedList<Hash>>,
     transactions: &[SanitizedTransaction],
     oversized: &[SanitizedTransaction],
     progress: &BlockhashProgress,
-) -> (HashSet<Hash>, Option<u64>) {
+) -> (HashSet<Hash>, Option<u64>, u64) {
     let guard = live_blockhashes.read().expect("blockhash lock poisoned");
     let live: HashSet<Hash> = guard.iter().copied().collect();
     let admits = transactions
@@ -1031,8 +1174,11 @@ fn snapshot_and_admit(
         .chain(oversized)
         .any(|tx| live.contains(tx.message().recent_blockhash()));
     let admission = admits.then(|| progress.admissions.fetch_add(1, Ordering::Release) + 1);
+    // The retire bumps this under the write guard and, once the window is full, waits for
+    // every admission before it, so a batch counts against the block its results join.
+    let block = progress.announced.load(Ordering::Acquire);
     drop(guard);
-    (live, admission)
+    (live, admission, block)
 }
 
 /// Keep only the transactions whose recent blockhash is still in the live
@@ -1207,7 +1353,7 @@ pub async fn execute_batch(
     // The window moves during the load, and neither VM rechecks the blockhash.
     // The window can still move right after this check. That is safe because the
     // settler waits for a counted admission before cutting the block that expires it.
-    let (live, admission) = snapshot_and_admit(
+    let (live, admission, budget_block) = snapshot_and_admit(
         &execution_deps.live_blockhashes,
         &all_transactions,
         &oversized_transactions,
@@ -1424,6 +1570,8 @@ pub async fn execute_batch(
             &regular_transactions,
             &execution_deps.bob,
             &fee_payers,
+            &mut execution_deps.float_budget,
+            budget_block,
             metrics,
         );
 
@@ -2258,6 +2406,8 @@ mod tests {
             std::slice::from_ref(&tx),
             &bob,
             &fee_payers.iter().copied().collect(),
+            &mut FloatBudget::new(DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK, vec![]),
+            0,
             &(Arc::new(NoopMetrics) as SharedMetrics),
         );
         let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
@@ -2672,6 +2822,8 @@ mod tests {
             std::slice::from_ref(&tx),
             &bob,
             &HashSet::from([payer]),
+            &mut FloatBudget::new(DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK, vec![]),
+            0,
             &(Arc::new(NoopMetrics) as SharedMetrics),
         );
         let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
@@ -3122,6 +3274,338 @@ mod tests {
         payer_tx(payer, &[ix])
     }
 
+    // ── Float-funded creation budget ──
+
+    /// A tx paid by `payer` creating gasless ATAs for `count` fresh wallets.
+    fn ata_creations_tx(
+        payer: &Keypair,
+        mint: &Pubkey,
+        count: usize,
+    ) -> (SanitizedTransaction, Vec<Pubkey>) {
+        let wallets: Vec<Pubkey> = (0..count).map(|_| Pubkey::new_unique()).collect();
+        let ixs: Vec<_> = wallets
+            .iter()
+            .map(|wallet| {
+                spl_associated_token_account::instruction::create_associated_token_account(
+                    &payer.pubkey(),
+                    wallet,
+                    mint,
+                    &spl_token_2022::id(),
+                )
+            })
+            .collect();
+        let atas = wallets
+            .iter()
+            .map(|wallet| {
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    wallet,
+                    mint,
+                    &spl_token_2022::id(),
+                )
+            })
+            .collect();
+        (payer_tx(payer, &ixs), atas)
+    }
+
+    /// Deps with a float budget of `per_block` and a channel mint already created.
+    async fn budget_deps(
+        accounts_db: crate::accounts::AccountsDB,
+        per_block: u64,
+    ) -> (ExecutionDeps, Pubkey) {
+        let mut deps = test_execution_deps(
+            accounts_db,
+            SettledInbox::new(),
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        deps.float_budget = FloatBudget::new(per_block, vec![]);
+        let (mint_tx, mint) = create_admin_initialize_mint_tx();
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        run_batch(&mut deps, &noop, vec![mint_tx]).await;
+        (deps, mint)
+    }
+
+    fn announce_block(deps: &ExecutionDeps) {
+        deps.blockhash_progress
+            .announced
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_fails_the_transaction_that_crosses_it() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 6).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let txs: Vec<_> = (0..3)
+            .map(|_| ata_creations_tx(&Keypair::new(), &mint, 4))
+            .collect();
+
+        let result = run_batch(
+            &mut deps,
+            &metrics,
+            txs.iter().map(|(tx, _)| tx.clone()).collect(),
+        )
+        .await;
+
+        assert_eq!(regular_status(&result, 0), Ok(()));
+        for i in [1, 2] {
+            assert_eq!(regular_status(&result, i), unbalanced(), "tx {i}");
+            for ata in &txs[i].1 {
+                assert_eq!(bob_balance(&deps.bob, ata), None, "tx {i} persists nothing");
+            }
+        }
+        for ata in &txs[0].1 {
+            assert_eq!(bob_balance(&deps.bob, ata), Some(1));
+        }
+    }
+
+    /// The total spans every sub-batch of a block, so forcing conflicts cannot reset it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_spans_batches_in_one_block() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 6).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let mut statuses = vec![];
+        for _ in 0..3 {
+            let (tx, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+            let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+            statuses.push(regular_status(&result, 0));
+        }
+        assert_eq!(statuses, vec![Ok(()), unbalanced(), unbalanced()]);
+    }
+
+    /// A block announced while a batch runs must not give that batch a fresh budget: the
+    /// settler waits for it, so its results join the block it was admitted in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_counts_a_batch_against_the_block_it_was_admitted_in() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 4).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let (first, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        assert_eq!(
+            regular_status(&run_batch(&mut deps, &metrics, vec![first]).await, 0),
+            Ok(())
+        );
+
+        // Announce the next block as soon as the second batch is admitted, while it executes.
+        // Under the window's write lock, like the settler, so it cannot split the admission.
+        let progress = Arc::clone(&deps.blockhash_progress);
+        let live = Arc::clone(&deps.live_blockhashes);
+        let admitted = progress.admissions.load(Ordering::SeqCst);
+        let announcer = std::thread::spawn(move || {
+            while progress.admissions.load(Ordering::SeqCst) == admitted {
+                std::hint::spin_loop();
+            }
+            let _window = live.write().expect("blockhash lock poisoned");
+            progress.announced.fetch_add(1, Ordering::SeqCst);
+        });
+        let (second, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        let result = run_batch(&mut deps, &metrics, vec![second]).await;
+        announcer.join().unwrap();
+        assert_eq!(regular_status(&result, 0), unbalanced());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_resets_when_a_block_is_announced() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 6).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        for block in 0..3 {
+            let (tx, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+            let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+            assert_eq!(regular_status(&result, 0), Ok(()), "block {block}");
+            announce_block(&deps);
+        }
+    }
+
+    /// A creation paid with real lamports has no shortfall and never touches the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_ignores_transactions_with_no_shortfall() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 4).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let funded = Keypair::new();
+        fund(&mut deps.bob, &funded.pubkey(), 1_000_000);
+
+        let (paid, _) = ata_creations_tx(&funded, &mint, 4);
+        let (float, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        let result = run_batch(&mut deps, &metrics, vec![paid, float]).await;
+
+        assert_eq!(regular_status(&result, 0), Ok(()));
+        assert_eq!(
+            regular_status(&result, 1),
+            Ok(()),
+            "the funded tx used none of the budget"
+        );
+    }
+
+    /// The Prometheus registry is process-global, so budget counter deltas are read
+    /// one test at a time.
+    static FLOAT_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn float_counters() -> [f64; 4] {
+        [
+            "private_channel_executor_float_funded_creations_total",
+            "private_channel_executor_float_budget_refused_total",
+            "private_channel_executor_float_budget_exhausted_blocks_total",
+            "private_channel_executor_float_budget_blocks_total",
+        ]
+        .map(|name| {
+            private_channel_metrics::prometheus::gather()
+                .into_iter()
+                .filter(|mf| mf.name() == name)
+                .flat_map(|mf| mf.get_metric().to_vec())
+                .map(|m| m.get_counter().value())
+                .sum()
+        })
+    }
+
+    /// A deposit: an admin-paid ATA creation and MintTo from the mint authority.
+    fn deposit_tx(admin: &Keypair, mint: &Pubkey) -> SanitizedTransaction {
+        let wallet = Pubkey::new_unique();
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &wallet,
+            mint,
+            &spl_token_2022::id(),
+        );
+        let ixs = [
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &admin.pubkey(),
+                &wallet,
+                mint,
+                &spl_token_2022::id(),
+            ),
+            spl_token_2022::instruction::mint_to(
+                &spl_token_2022::id(),
+                mint,
+                &ata,
+                &admin.pubkey(),
+                &[],
+                10,
+            )
+            .unwrap(),
+        ];
+        payer_tx(admin, &ixs)
+    }
+
+    /// A refused deposit is marked failed, not resent, so admin-signed txs skip the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_skips_admin_signed_transactions() {
+        let _guard = FLOAT_METRIC_LOCK.lock().await;
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, _) = budget_deps(accounts_db, 4).await;
+        let admin = Keypair::new();
+        deps.float_budget = FloatBudget::new(4, vec![admin.pubkey()]);
+        let (mint_tx, mint) = admin_mint_tx(&admin.pubkey());
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        run_batch(&mut deps, &metrics, vec![mint_tx]).await;
+        announce_block(&deps);
+
+        // Fresh block: the deposit uses none of the budget and moves no counter.
+        let before = float_counters();
+        let result = run_batch(&mut deps, &metrics, vec![deposit_tx(&admin, &mint)]).await;
+        assert_eq!(regular_status(&result, 0), Ok(()));
+        assert_eq!(
+            float_counters(),
+            before,
+            "a deposit moves no budget counter"
+        );
+        let (full, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        let result = run_batch(&mut deps, &metrics, vec![full]).await;
+        assert_eq!(
+            regular_status(&result, 0),
+            Ok(()),
+            "the whole budget is still there"
+        );
+
+        // Budget exhausted: the deposit still lands.
+        let result = run_batch(&mut deps, &metrics, vec![deposit_tx(&admin, &mint)]).await;
+        assert_eq!(regular_status(&result, 0), Ok(()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn float_budget_counters_advance() {
+        let _guard = FLOAT_METRIC_LOCK.lock().await;
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (mut deps, mint) = budget_deps(accounts_db, 4).await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = float_counters();
+        let txs = (0..3)
+            .map(|_| ata_creations_tx(&Keypair::new(), &mint, 4).0)
+            .collect();
+        run_batch(&mut deps, &metrics, txs).await;
+        let (tx, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
+        run_batch(&mut deps, &metrics, vec![tx]).await;
+        let after = float_counters();
+        assert_eq!(
+            [
+                after[0] - before[0],
+                after[1] - before[1],
+                after[2] - before[2],
+                after[3] - before[3]
+            ],
+            [4.0, 3.0, 1.0, 1.0],
+            "creations, refusals, exhausted blocks, blocks with free creation"
+        );
+    }
+
+    /// The sustained-creation alert divides creations by budget x announced blocks.
+    #[tokio::test]
+    async fn float_alert_inputs_are_exported() {
+        let _guard = FLOAT_METRIC_LOCK.lock().await;
+        let read = |name: &str| {
+            private_channel_metrics::prometheus::gather()
+                .into_iter()
+                .filter(|mf| mf.name() == name)
+                .flat_map(|mf| mf.get_metric().to_vec())
+                .map(|m| m.get_counter().value() + m.get_gauge().value())
+                .sum::<f64>()
+        };
+        use crate::stage_metrics::StageMetrics;
+        let metrics = PrometheusMetrics;
+        let blocks = "private_channel_settler_blocks_announced_total";
+        let before = read(blocks);
+        metrics.settler_block_announced();
+        metrics.executor_float_budget_per_block(6);
+        assert_eq!(read(blocks) - before, 1.0);
+        assert_eq!(read("private_channel_executor_float_budget_per_block"), 6.0);
+    }
+
+    /// Under abuse every block refuses, yet the summary comes out at most once a minute.
+    #[test]
+    fn float_budget_summary_is_rate_limited() {
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let mut budget = FloatBudget::new(4, vec![]);
+        let start = Instant::now();
+        let mut lines = vec![];
+        for block in 1..=11u64 {
+            let now = if block == 11 {
+                start + Duration::from_secs(61)
+            } else {
+                start + Duration::from_secs(block)
+            };
+            assert!(budget.take(block, 4, now, &metrics).is_ok());
+            for _ in 0..2 {
+                if let Err(Some(line)) = budget.take(block, 4, now, &metrics) {
+                    lines.push(line);
+                }
+            }
+        }
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("exhausted in 1 of 1 blocks, 1 transactions refused, 4 creations"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1]
+                .contains("exhausted in 10 of 10 blocks, 20 transactions refused, 40 creations"),
+            "{}",
+            lines[1]
+        );
+    }
+
     /// The native mint cannot be created, so a gasless native ATA cannot be
     /// born holding its fabricated lamport as wSOL.
     #[tokio::test(flavor = "multi_thread")]
@@ -3436,6 +3920,29 @@ mod tests {
         (sanitized, mint)
     }
 
+    /// An admin-VM mint whose mint authority is `authority`.
+    fn admin_mint_tx(authority: &Pubkey) -> (SanitizedTransaction, Pubkey) {
+        let mint = Pubkey::new_unique();
+        let payer = Keypair::new();
+        let ixs = [
+            spl_token_2022::instruction::initialize_permanent_delegate(
+                &spl_token_2022::id(),
+                &mint,
+                &TEST_DELEGATE,
+            )
+            .unwrap(),
+            spl_token_2022::instruction::initialize_mint2(
+                &spl_token_2022::id(),
+                &mint,
+                authority,
+                None,
+                6,
+            )
+            .unwrap(),
+        ];
+        (payer_tx(&payer, &ixs), mint)
+    }
+
     /// Build a mixed tx: one admin instruction (InitializeMint) + one
     /// non-admin instruction (system transfer). Router must NOT send this to
     /// the Admin VM.
@@ -3673,6 +4180,8 @@ mod tests {
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
+            max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4000,6 +4509,8 @@ mod tests {
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
+            max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4134,6 +4645,8 @@ mod tests {
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::clone(&progress),
             permanent_delegate: None,
+            max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4196,6 +4709,8 @@ mod tests {
             live_blockhashes: default_live_blockhashes(),
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
+            max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -5006,7 +5521,7 @@ mod tests {
                 }
             });
             start.wait();
-            let (snapshot, admission) =
+            let (snapshot, admission, _) =
                 snapshot_and_admit(&live, std::slice::from_ref(&tx), &[], &progress);
             let (popped, admissions) = retire.join().unwrap();
 

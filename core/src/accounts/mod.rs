@@ -25,6 +25,7 @@ pub mod get_signatures_for_address;
 pub mod get_tip;
 pub mod get_transaction;
 pub mod get_transaction_count;
+pub mod mint_delegates;
 pub mod owner_change;
 pub mod pg_dump_proof;
 pub mod postgres;

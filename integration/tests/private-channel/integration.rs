@@ -294,6 +294,8 @@ async fn setup(
         compliance_owner: Some(COMPLIANCE_OWNER),
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,
+        max_float_funded_creations_per_block:
+            private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
         blocktime_ms: 100,
         perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
         metrics: Arc::new(NoopMetrics),

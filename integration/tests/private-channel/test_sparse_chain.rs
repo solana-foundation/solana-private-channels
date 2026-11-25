@@ -98,6 +98,8 @@ fn node_config(pg_url: &str, port: u16, max_blockhashes: usize) -> NodeConfig {
         compliance_owner: None,
         max_blockhashes,
         allow_max_blockhashes_increase: false,
+        max_float_funded_creations_per_block:
+            private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
         blocktime_ms: BLOCKTIME_MS,
         perf_sample_period_secs: 3_600,
         metrics: Arc::new(NoopMetrics),

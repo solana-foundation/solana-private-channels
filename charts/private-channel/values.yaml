@@ -37,6 +37,8 @@ config:
   adminKeys: ""
   permanentDelegate: ""
   complianceOwner: ""
+  # Float-funded account creations the write node allows per block, at least 4.
+  maxFloatFundedCreationsPerBlock: 8
   yellowstoneEndpoint: ""
   gatewayWhitelistInstance: ""
   gatewayUpstreamTimeoutSecs: 30

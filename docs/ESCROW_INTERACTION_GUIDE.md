@@ -332,15 +332,15 @@ The delegate can move any holder's channel balance, but the node admits only a `
 
 **Keys:**
 - `PRIVATE_CHANNEL_PERMANENT_DELEGATE` is required and never derived from `PRIVATE_CHANNEL_ADMIN_KEYS`, so editing the admin list cannot change which key the node polices. Use a dedicated delegate key in production, so the hot admin key cannot seize and the delegate key cannot mint or freeze.
-- The compliance owner must differ from the delegate; the node refuses to start otherwise.
+- The compliance owner must differ from the delegate and from every key a mint names; the node refuses to start otherwise.
 - The compliance wallet withdraws to Mainnet like any holder, through `WithdrawFunds` and `ReleaseFunds`. While withdrawals are [whitelisted](#whitelist), the compliance owner and its Mainnet destination must be allowed to withdraw, so the escrow's destination whitelisting governs where seized funds can leave to.
 
 ### Rotating the delegate
 
-The node polices only the configured delegate. A mint still naming the old key after the restart leaves that key unpoliced on it: it can move those balances anywhere. This is an accepted risk, kept short by rotating every mint right after the restart:
+The node polices the configured delegate and every key a channel mint still names, read from the mints at each boot. Mints keep naming the old key until each is rotated, and a mint can only be rotated after the restart, so the old key stays policed on every mint that names it with nothing to configure, at this and any later restart. It drops out at the first restart after no mint names it.
 
 1. Pause deposits: stop `operator-solana` and keep it stopped until step 4.
-2. Set the new key in `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node) and `OPERATOR_PERMANENT_DELEGATE` (operator). Recreate the containers that read it, since `docker compose restart` keeps the old env:
+2. Set the new key in `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node) and `OPERATOR_PERMANENT_DELEGATE` (operator). The old key can then only seize into the compliance ATA, like the new one. Recreate the containers that read it, since `docker compose restart` keeps the old env:
    - the write node, the read node and `operator-private-channel`: `docker compose up -d --no-deps write-node read-node operator-private-channel`. The read node serves the seize dry run, so it needs the new key too.
    - `operator-solana`, which creates new mints with the delegate, without starting it: `docker compose up --no-start --no-deps operator-solana`.
 3. Immediately, for every channel mint, send a Token-2022 `SetAuthority(PermanentDelegate)` naming the new key. The old delegate signs as the current authority, and a channel admin co-signs, since the node requires an admin signer on every mint-side `SetAuthority`. Send it through the gateway's internal port: it reads from the read node and sends to the write node with no JWT. That port is not published to the host, so use the gateway container's address (`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' private-channel-gateway`, then `http://<ip>:8904`). The read node alone refuses the send, the write node alone serves no account reads, and the public port needs a JWT `spl-token` cannot send:

@@ -137,9 +137,18 @@ struct Args {
     max_blockhashes: usize,
 
     /// Let a write node boot with a larger window than the ledger last recorded. Every
-    /// hash already handed out then stays valid past its advertised deadline.
+    /// hash already handed out is then retired, so clients re-sign once.
     #[arg(long, env = "PRIVATE_CHANNEL_ALLOW_MAX_BLOCKHASHES_INCREASE")]
     allow_max_blockhashes_increase: bool,
+
+    /// Float-funded account creations allowed per block, at least the per-tx cap of 4.
+    /// Lower bounds storage growth under abuse; higher leaves room for gasless bursts.
+    #[arg(
+        long,
+        default_value_t = private_channel_core::stages::execution::DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
+        env = "PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK"
+    )]
+    max_float_funded_creations_per_block: u64,
 
     /// Deprecated: transaction expiration as a duration in milliseconds. Mapped
     /// to a block count and removed after the next release.
@@ -268,6 +277,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
             args.blocktime_ms,
         ),
         allow_max_blockhashes_increase: args.allow_max_blockhashes_increase,
+        max_float_funded_creations_per_block: args.max_float_funded_creations_per_block,
         blocktime_ms: args.blocktime_ms,
         perf_sample_period_secs: args.perf_sample_period_secs,
         metrics,

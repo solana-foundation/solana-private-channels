@@ -856,6 +856,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 max_blockhashes,
                                 &blockhash_progress,
                             );
+                            metrics.settler_block_announced();
                             // Nothing expired means nothing admitted can break the deadline.
                             if popped > 0
                                 && !collect_admitted(
@@ -1049,6 +1050,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         max_blockhashes,
                         &blockhash_progress,
                     );
+                    metrics.settler_block_announced();
                 }
                 let num_results = processing_results.len();
                 match settle_with_retry(
