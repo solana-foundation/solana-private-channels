@@ -73,8 +73,8 @@ pub struct ExecutionArgs {
     pub permanent_delegate: Option<Pubkey>,
     /// Float-funded account creations allowed per block.
     pub max_float_funded_creations_per_block: u64,
-    /// Channel admin keys; a transaction one of them signed skips the float budget.
-    pub admin_keys: Vec<Pubkey>,
+    /// Admin and delegate keys; a transaction one of them signed skips the float budget.
+    pub float_exempt_signers: Vec<Pubkey>,
 }
 
 pub struct ExecutionDeps {
@@ -140,7 +140,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         blockhash_progress,
         permanent_delegate,
         max_float_funded_creations_per_block,
-        admin_keys,
+        float_exempt_signers,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -161,7 +161,8 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         execution_deps.blockhash_progress = blockhash_progress;
         execution_deps.admin_vm = AdminVm::new(permanent_delegate);
         execution_deps.float_budget =
-            FloatBudget::new(max_float_funded_creations_per_block, admin_keys);
+            FloatBudget::new(max_float_funded_creations_per_block, float_exempt_signers);
+        metrics.executor_float_budget_per_block(max_float_funded_creations_per_block);
 
         // Stage-private: nothing outside the executor takes from this budget.
         let results_budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
@@ -888,8 +889,8 @@ const FLOAT_BUDGET_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 /// the span between two settler announcements, so the total covers every sub-batch.
 pub struct FloatBudget {
     per_block: u64,
-    /// Channel admin keys; a transaction one of them signed skips the budget.
-    admin_keys: Vec<Pubkey>,
+    /// Admin and delegate keys; a transaction one of them signed skips the budget.
+    exempt_signers: Vec<Pubkey>,
     block: u64,
     used: u64,
     exhausted: bool,
@@ -910,10 +911,10 @@ struct FloatBudgetSummary {
 }
 
 impl FloatBudget {
-    pub fn new(per_block: u64, admin_keys: Vec<Pubkey>) -> Self {
+    pub fn new(per_block: u64, exempt_signers: Vec<Pubkey>) -> Self {
         Self {
             per_block,
-            admin_keys,
+            exempt_signers,
             block: 0,
             used: 0,
             exhausted: false,
@@ -980,14 +981,14 @@ impl FloatBudget {
     }
 }
 
-/// Whether a configured admin key signed `tx`.
-fn is_admin_signed(tx: &SanitizedTransaction, admin_keys: &[Pubkey]) -> bool {
+/// Whether one of `keys` signed `tx`.
+fn is_signed_by_any(tx: &SanitizedTransaction, keys: &[Pubkey]) -> bool {
     let message = tx.message();
     message
         .account_keys()
         .iter()
         .enumerate()
-        .any(|(index, key)| message.is_signer(index) && admin_keys.contains(key))
+        .any(|(index, key)| message.is_signer(index) && keys.contains(key))
 }
 
 /// The lamports the gasless callback makes up for an unknown fee payer are the
@@ -1089,12 +1090,12 @@ fn enforce_lamport_conservation(
             executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
             continue;
         }
-        // Admin-signed txs skip the budget: a refused deposit is marked failed, not resent,
-        // and a burst of deposits must not starve public creation or fire the abuse alert.
-        let budgeted = shortfall > 0 && !is_admin_signed(tx, &budget.admin_keys);
-        // Caps free account creation per block, not over time: a full budget still adds
-        // budget x block rate accounts. Lower it to bound storage, raise it for bursts of
-        // gasless ATA creation; an attacker who fills it delays those to later blocks.
+        // Deposits and seizes skip the budget, so filling it cannot block them, and their
+        // bursts neither starve public creation nor fire the abuse alert.
+        let budgeted = shortfall > 0 && !is_signed_by_any(tx, &budget.exempt_signers);
+        // Caps free account creation per block, not over time: storage still grows at budget
+        // x block rate. Anyone can fill it, failing others' gasless creations until they
+        // re-sign; that cost of any shared cap is why its exhaustion alerts.
         if budgeted {
             if let Err(summary) = budget.take(announced, created, Instant::now(), metrics) {
                 if let Some(summary) = summary {
@@ -3388,12 +3389,15 @@ mod tests {
         );
 
         // Announce the next block as soon as the second batch is admitted, while it executes.
+        // Under the window's write lock, like the settler, so it cannot split the admission.
         let progress = Arc::clone(&deps.blockhash_progress);
+        let live = Arc::clone(&deps.live_blockhashes);
         let admitted = progress.admissions.load(Ordering::SeqCst);
         let announcer = std::thread::spawn(move || {
             while progress.admissions.load(Ordering::SeqCst) == admitted {
                 std::hint::spin_loop();
             }
+            let _window = live.write().expect("blockhash lock poisoned");
             progress.announced.fetch_add(1, Ordering::SeqCst);
         });
         let (second, _) = ata_creations_tx(&Keypair::new(), &mint, 4);
@@ -3544,6 +3548,28 @@ mod tests {
             [4.0, 3.0, 1.0, 1.0],
             "creations, refusals, exhausted blocks, blocks with free creation"
         );
+    }
+
+    /// The sustained-creation alert divides creations by budget x announced blocks.
+    #[tokio::test]
+    async fn float_alert_inputs_are_exported() {
+        let _guard = FLOAT_METRIC_LOCK.lock().await;
+        let read = |name: &str| {
+            private_channel_metrics::prometheus::gather()
+                .into_iter()
+                .filter(|mf| mf.name() == name)
+                .flat_map(|mf| mf.get_metric().to_vec())
+                .map(|m| m.get_counter().value() + m.get_gauge().value())
+                .sum::<f64>()
+        };
+        use crate::stage_metrics::StageMetrics;
+        let metrics = PrometheusMetrics;
+        let blocks = "private_channel_settler_blocks_announced_total";
+        let before = read(blocks);
+        metrics.settler_block_announced();
+        metrics.executor_float_budget_per_block(6);
+        assert_eq!(read(blocks) - before, 1.0);
+        assert_eq!(read("private_channel_executor_float_budget_per_block"), 6.0);
     }
 
     /// Under abuse every block refuses, yet the summary comes out at most once a minute.
@@ -4155,7 +4181,7 @@ mod tests {
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
             max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
-            admin_keys: vec![],
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4484,7 +4510,7 @@ mod tests {
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
             max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
-            admin_keys: vec![],
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4620,7 +4646,7 @@ mod tests {
             blockhash_progress: Arc::clone(&progress),
             permanent_delegate: None,
             max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
-            admin_keys: vec![],
+            float_exempt_signers: vec![],
         })
         .await;
 
@@ -4684,7 +4710,7 @@ mod tests {
             blockhash_progress: Arc::default(),
             permanent_delegate: None,
             max_float_funded_creations_per_block: DEFAULT_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK,
-            admin_keys: vec![],
+            float_exempt_signers: vec![],
         })
         .await;
 

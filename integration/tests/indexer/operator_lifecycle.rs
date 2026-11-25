@@ -527,7 +527,7 @@ async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
         Some(old.pubkey())
     );
 
-    node.restart_with_delegate(new, &[old.pubkey()]).await?;
+    node.restart_with_delegate(new).await?;
     let rotate = spl_token_2022::instruction::set_authority(
         &program,
         &mint,
@@ -543,8 +543,8 @@ async fn test_permanent_delegate_rotates_to_the_newly_configured_key(
     Ok(())
 }
 
-/// After a rotation restart the old key is still policed on mints that name it: it can
-/// seize only into the compliance ATA, never move a balance elsewhere.
+/// After a rotation restart the old key is still policed on mints that name it, with no
+/// config naming it: it can seize only into the compliance ATA, never move a balance elsewhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_previous_delegate_stays_policed_after_rotation(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -589,7 +589,7 @@ async fn test_previous_delegate_stays_policed_after_rotation(
     send_on_channel(&node.url, &fund, &[&admin]).await?;
 
     node.compliance_owner = Some(compliance);
-    node.restart_with_delegate(new, &[old.pubkey()]).await?;
+    node.restart_with_delegate(new).await?;
     send_on_channel(
         &node.url,
         &[create_ata(&compliance), create_ata(&elsewhere_owner)],
@@ -609,7 +609,7 @@ async fn test_previous_delegate_stays_policed_after_rotation(
         6,
     )?;
     let tx = Transaction::new_signed_with_payer(
-        &[elsewhere],
+        std::slice::from_ref(&elsewhere),
         Some(&old.pubkey()),
         &[&old],
         client.get_latest_blockhash().await?,
@@ -652,6 +652,29 @@ async fn test_previous_delegate_stays_policed_after_rotation(
         0
     );
     assert_eq!(get_token_balance(&client, &alice, &mint).await?, 990);
+
+    // Any later restart reads the mint again, so the old key cannot drop out of policing.
+    node.restart_with_delegate(new).await?;
+    let client = RpcClient::new(node.url.clone());
+    let tx = Transaction::new_signed_with_payer(
+        &[elsewhere],
+        Some(&old.pubkey()),
+        &[&old],
+        client.get_latest_blockhash().await?,
+    );
+    let simulation = client
+        .simulate_transaction_with_config(
+            &tx,
+            solana_client::rpc_config::RpcSimulateTransactionConfig {
+                sig_verify: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        format!("{simulation:?}").contains("compliance account"),
+        "a later restart must still police the old key: {simulation:?}"
+    );
 
     node.shutdown().await;
     Ok(())

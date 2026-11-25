@@ -154,17 +154,13 @@ Neither has a fallback to an admin key: write and aio nodes and both operators r
 start without it. Compose fills a blank operator value from the node's, `make build-*` fills
 a blank node value with the admin pubkey once, and the Ansible deploy renders both from the
 required `permanent_delegate`.
-The read node gets the same admin keys, delegate, previous delegates and compliance owner
-as the write node, because it serves `simulateTransaction`.
+The read node gets the same admin keys, delegate and compliance owner as the write node,
+because it serves `simulateTransaction`.
 
 `PRIVATE_CHANNEL_MAX_FLOAT_FUNDED_CREATIONS_PER_BLOCK` (default 8, at least 4) is read by the
 write node only. Compose and `templates/env.j2` default it to 8 (the Ansible var is
 `max_float_funded_creations_per_block`), and the Helm chart renders it on the write node from
 `config.maxFloatFundedCreationsPerBlock`.
-
-`PRIVATE_CHANNEL_PREVIOUS_DELEGATES` is optional, a comma-separated list; blank items are
-skipped. Compose passes it through only when set, `templates/env.j2` renders it only when
-`previous_delegates` is set, and the Helm chart always renders it (blank when unset).
 
 Signers have one key set per role, `ADMIN_*` (the channel admin) and `OPERATOR_*` (the
 withdraw operator's release key). `ADMIN_SIGNER` and `OPERATOR_SIGNER` pick `memory`

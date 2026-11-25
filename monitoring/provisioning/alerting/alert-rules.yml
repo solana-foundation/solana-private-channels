@@ -1787,8 +1787,8 @@ groups:
                     params: [0.01]
               refId: C
 
-      # Half the default cap held for half an hour, about 100M accounts a month. Catches
-      # an attacker who stays under the budget to avoid the rule above.
+      # Half the configured budget used for half an hour, at any budget or block rate. Catches
+      # an attacker who stays under the budget; the 4/s floor keeps sparse honest blocks out.
       - uid: float-creations-sustained
         title: "Sustained float-funded account creation"
         condition: C
@@ -1796,7 +1796,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "The write node has created {{ $values.A }} float-funded accounts a second for 30 minutes, far above honest gasless traffic. Check the gateway logs for the source IPs and the accounts table size. See docs/CONFIG.md."
+          summary: "The write node has used {{ $values.A }} of its float-funded creation budget for 30 minutes, far above honest gasless traffic. Check the gateway logs for the source IPs and the accounts table size. See docs/CONFIG.md."
         labels:
           severity: warning
         data:
@@ -1806,7 +1806,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: sum(rate(private_channel_executor_float_funded_creations_total[30m]))
+              expr: (sum(rate(private_channel_executor_float_funded_creations_total[30m])) / (sum(rate(private_channel_settler_blocks_announced_total[30m])) * max(private_channel_executor_float_budget_per_block))) and (sum(rate(private_channel_executor_float_funded_creations_total[30m])) > 4)
               instant: true
               refId: A
           - refId: C
@@ -1820,5 +1820,5 @@ groups:
               conditions:
                 - evaluator:
                     type: gt
-                    params: [40]
+                    params: [0.5]
               refId: C

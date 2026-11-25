@@ -38,7 +38,6 @@
   'config': {
     'adminKeys': ([pc_admin_pubkey | default('admin_pubkey', true)] + _extra) | join(','),
     'permanentDelegate': permanent_delegate | default(''),
-    'previousDelegates': previous_delegates | default(''),
     'complianceOwner': compliance_owner | default(''),
     'maxFloatFundedCreationsPerBlock': max_float_funded_creations_per_block | default(8) | int,
     'yellowstoneEndpoint': yellowstone_endpoint | default(''),

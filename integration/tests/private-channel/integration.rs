@@ -85,11 +85,10 @@ async fn test_with_postgres() {
 
         let test_context = setup(node_db_url.clone(), None).await.unwrap();
         test_suite(&test_context.private_channel_ctx, &test_context.solana_ctx).await;
-        let suite_delegate = test_context.private_channel_ctx.operator_key.pubkey();
         shutdown(test_context).await;
 
         // Dedup persistence test runs with its own node instance against the same DB
-        run_dedup_persistence_test(node_db_url, suite_delegate).await;
+        run_dedup_persistence_test(node_db_url).await;
     })
     .await
     .unwrap();
@@ -292,7 +291,6 @@ async fn setup(
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator_key.pubkey()],
         permanent_delegate: Some(operator_key.pubkey()),
-        previous_delegates: vec![],
         compliance_owner: Some(COMPLIANCE_OWNER),
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,

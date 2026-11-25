@@ -55,9 +55,7 @@ fn write_node_config(db_url: String, port: u16) -> NodeConfig {
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![],
-        // Fixed across restarts: a writer refuses to boot after a delegate change.
-        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_from_array([0xDE; 32])),
-        previous_delegates: vec![],
+        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_unique()),
         compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,

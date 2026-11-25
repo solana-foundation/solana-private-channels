@@ -42,6 +42,8 @@ pub trait StageMetrics: Send + Sync {
     fn executor_float_budget_exhausted_block(&self);
     /// Blocks with at least one float-funded creation attempt, the base for the exhausted share.
     fn executor_float_budget_block(&self);
+    /// The configured per-block budget, so alerts scale with it.
+    fn executor_float_budget_per_block(&self, budget: u64);
     /// A batch aborted because its accounts could not be loaded. Non-zero means
     /// the executor stopped rather than execute against unknown state.
     fn executor_preload_fatal(&self);
@@ -74,6 +76,8 @@ pub trait StageMetrics: Send + Sync {
     fn settler_backpressure_engaged(&self);
     fn settler_txs_settled(&self, count: usize);
     fn settler_settle_retried(&self);
+    /// Blocks announced to the executor, each of which resets the float budget.
+    fn settler_block_announced(&self);
     /// Idle-slot publishes that failed or outlived their budget. The next tick
     /// republishes, so a steady rate here is a Postgres that is stalling.
     fn settler_idle_slot_publish_failed(&self);
@@ -172,6 +176,9 @@ impl StageMetrics for NoopMetrics {
     fn executor_float_budget_block(&self) {
         debug!("executor: first float-funded creation attempt in this block");
     }
+    fn executor_float_budget_per_block(&self, budget: u64) {
+        debug!("executor: float budget {} per block", budget);
+    }
     fn executor_preload_fatal(&self) {
         debug!("executor: batch aborted, account preload failed");
     }
@@ -225,6 +232,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn settler_settle_retried(&self) {
         debug!("settler: settle retried");
+    }
+    fn settler_block_announced(&self) {
+        debug!("settler: block announced");
     }
     fn settler_idle_slot_publish_failed(&self) {
         debug!("settler: idle slot publish failed");
@@ -421,6 +431,12 @@ counter_vec!(
     "Blocks with at least one float-funded creation attempt",
     &[]
 );
+gauge_vec!(
+    EXECUTOR_FLOAT_BUDGET_PER_BLOCK,
+    "private_channel_executor_float_budget_per_block",
+    "Configured float-funded account creations allowed per block",
+    &[]
+);
 counter_vec!(
     EXECUTOR_OVERSIZED_TXS,
     "private_channel_executor_oversized_transactions_total",
@@ -473,6 +489,12 @@ counter_vec!(
     SETTLER_SETTLE_RETRIED,
     "private_channel_settler_settle_retried_total",
     "Settle attempts that failed and were retried",
+    &[]
+);
+counter_vec!(
+    SETTLER_BLOCKS_ANNOUNCED,
+    "private_channel_settler_blocks_announced_total",
+    "Blocks announced to the executor, each resetting the float budget",
     &[]
 );
 counter_vec!(
@@ -696,6 +718,11 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn executor_float_budget_per_block(&self, budget: u64) {
+        EXECUTOR_FLOAT_BUDGET_PER_BLOCK
+            .with_label_values(&[] as &[&str])
+            .set(budget as f64);
+    }
     fn executor_preload_fatal(&self) {
         EXECUTOR_PRELOAD_FATAL
             .with_label_values(&[] as &[&str])
@@ -777,6 +804,11 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn settler_settle_retried(&self) {
         SETTLER_SETTLE_RETRIED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn settler_block_announced(&self) {
+        SETTLER_BLOCKS_ANNOUNCED
             .with_label_values(&[] as &[&str])
             .inc();
     }
@@ -870,12 +902,14 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_FLOAT_BUDGET_REFUSED,
         EXECUTOR_FLOAT_BUDGET_EXHAUSTED_BLOCKS,
         EXECUTOR_FLOAT_BUDGET_BLOCKS,
+        EXECUTOR_FLOAT_BUDGET_PER_BLOCK,
         EXECUTOR_PRELOAD_FATAL,
         EXECUTOR_CORRUPT_ACCOUNT,
         WRITER_LEASE_PROBE,
         WRITER_LEASE_LOST,
         SETTLER_TXS_SETTLED,
         SETTLER_BACKPRESSURE_ENGAGED,
+        SETTLER_BLOCKS_ANNOUNCED,
         EXECUTOR_RESULTS_CHUNKED,
         BOB_CACHE_EVICTED,
         BOB_CACHE_ENTRIES,

@@ -94,9 +94,7 @@ fn node_config(pg_url: &str, port: u16, max_blockhashes: usize) -> NodeConfig {
         redis_cache_url: None,
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![Keypair::new().pubkey()],
-        // Fixed across restarts: a writer refuses to boot after a delegate change.
-        permanent_delegate: Some(solana_sdk::pubkey::Pubkey::new_from_array([0xDE; 32])),
-        previous_delegates: vec![],
+        permanent_delegate: Some(Keypair::new().pubkey()),
         compliance_owner: None,
         max_blockhashes,
         allow_max_blockhashes_increase: false,

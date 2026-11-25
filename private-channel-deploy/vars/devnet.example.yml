@@ -61,8 +61,6 @@ extra_admin_keys: []
 
 # === Seize keys =============================================================
 permanent_delegate: "<delegate_pubkey>"
-# Delegates replaced by a rotation, comma-separated; keep the old key until every mint is rotated.
-# previous_delegates: "<old_delegate_pubkey>"
 # compliance_owner: "<compliance_owner_pubkey>"
 
 # === Public surface ========================================================

@@ -4,7 +4,7 @@ use {
     private_channel_core::stage_metrics::NoopMetrics,
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_commitment_config::CommitmentConfig,
-    solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer, transaction::Transaction},
+    solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
     std::{sync::Arc, time::Duration},
     tokio::time::sleep,
 };
@@ -27,8 +27,7 @@ use crate::setup;
 ///   7. Assert balances unchanged and tx count did not increase (dedup works).
 ///   8. Send a new transfer with a fresh blockhash and confirm it succeeds
 ///      (blockhash window was restored and the node can continue processing).
-/// `previous_delegate` is the delegate the last node on `db_url` booted with.
-pub async fn run_dedup_persistence_test(db_url: String, previous_delegate: Pubkey) {
+pub async fn run_dedup_persistence_test(db_url: String) {
     println!("\n=== Dedup Persistence Test ===");
 
     let operator = Keypair::new();
@@ -57,8 +56,6 @@ pub async fn run_dedup_persistence_test(db_url: String, previous_delegate: Pubke
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator.pubkey()],
         permanent_delegate: Some(operator.pubkey()),
-        // A new delegate on this DB, so the old one is listed or the writer refuses to boot.
-        previous_delegates: vec![previous_delegate],
         compliance_owner: None,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,

@@ -119,11 +119,6 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_PERMANENT_DELEGATE")]
     permanent_delegate: Option<String>,
 
-    /// Delegates replaced by a rotation, still policed until every mint names the current
-    /// one (comma-separated base58). A bad key stops startup, unlike an admin key.
-    #[arg(long, env = "PRIVATE_CHANNEL_PREVIOUS_DELEGATES")]
-    previous_delegates: Option<String>,
-
     /// Owner of the compliance ATAs, the only place the delegate may move balances to
     /// (base58). Unset or blank refuses every delegate move.
     #[arg(long, env = "PRIVATE_CHANNEL_COMPLIANCE_OWNER")]
@@ -205,20 +200,6 @@ fn seize_keys(args: &Args) -> Result<(Option<Pubkey>, Option<Pubkey>), String> {
     Ok((permanent_delegate, compliance_owner))
 }
 
-/// Parses the previous delegates list.
-fn previous_delegates(args: &Args) -> Result<Vec<Pubkey>, String> {
-    // Blank means unset, as Helm always renders the variable. Any other bad key fails
-    // startup: a silently dropped key is an unpoliced key.
-    args.previous_delegates
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .filter_map(|item| {
-            optional_pubkey(Some(item), "PRIVATE_CHANNEL_PREVIOUS_DELEGATES").transpose()
-        })
-        .collect()
-}
-
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Parse admin keys from base58 strings to Pubkey
     let admin_keys: Vec<Pubkey> = args
@@ -238,14 +219,13 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         })
         .collect();
     let (permanent_delegate, compliance_owner) = seize_keys(&args)?;
-    let previous_delegates = previous_delegates(&args)?;
 
     if !admin_keys.is_empty() {
         info!("Configured admin keys: {:?}", admin_keys);
     }
     info!(
-        "Permanent delegate: {:?}, previous delegates: {:?}, compliance owner: {:?}",
-        permanent_delegate, previous_delegates, compliance_owner
+        "Permanent delegate: {:?}, compliance owner: {:?}",
+        permanent_delegate, compliance_owner
     );
 
     let metrics: Arc<dyn private_channel_core::stage_metrics::StageMetrics> = if args.metrics {
@@ -290,7 +270,6 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
         permanent_delegate,
-        previous_delegates,
         compliance_owner,
         max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
             args.max_blockhashes,
@@ -470,26 +449,6 @@ mod tests {
         let explicit = Pubkey::new_unique();
         let args = parse(&["--permanent-delegate", &explicit.to_string()]).unwrap();
         assert_eq!(seize_keys(&args).unwrap().0, Some(explicit));
-    }
-
-    /// Blank items are skipped; one bad item fails startup, unlike an admin key.
-    #[test]
-    fn previous_delegates_parse_strictly() {
-        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
-        for (value, expected) in [
-            (String::new(), vec![]),
-            ("  ".to_string(), vec![]),
-            (format!("{a},"), vec![a]),
-            (format!(" {a} , {b} "), vec![a, b]),
-        ] {
-            let args = parse(&["--previous-delegates", &value]).unwrap();
-            assert_eq!(previous_delegates(&args), Ok(expected), "{value:?}");
-        }
-        assert_eq!(previous_delegates(&parse(&[]).unwrap()), Ok(vec![]));
-        let bad = format!("{a},not-a-key");
-        let err = previous_delegates(&parse(&["--previous-delegates", &bad]).unwrap())
-            .expect_err("a bad key must fail startup");
-        assert!(err.contains("PRIVATE_CHANNEL_PREVIOUS_DELEGATES"), "{err}");
     }
 
     /// Runs `seize_keys` under a subscriber and returns what it logged.

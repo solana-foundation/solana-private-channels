@@ -122,10 +122,7 @@ operator_keypair_path: "{{ repo_root }}/keypairs/withdraw-operator.json"
 # operator. Required, with no fallback to the admin key; use a dedicated key in production.
 # compliance_owner: owner of the compliance ATAs, the only place the delegate may
 # move balances to. Unset refuses every delegate move. Must differ from the delegate.
-# previous_delegates: comma-separated delegates replaced by a rotation, still policed
-# until every mint names the current one. Drop a key only after the rotation is complete.
 # permanent_delegate: "<delegate_pubkey>"
-# previous_delegates: "<old_delegate_pubkey>"
 # compliance_owner: "<compliance_owner_pubkey>"
 
 # === Public surface ========================================================

@@ -14,14 +14,14 @@ use std::sync::LazyLock;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SeizePolicy {
     pub delegate: Option<Pubkey>,
-    /// Keys mints may still name after a rotation. Policed like `delegate`, but never
-    /// accepted as a rotation target.
+    /// Other keys the channel's mints still name, read at boot. Policed like `delegate`,
+    /// but never accepted as a rotation target.
     pub previous_delegates: Vec<Pubkey>,
     pub compliance_owner: Option<Pubkey>,
 }
 
 impl SeizePolicy {
-    /// Whether `key` is the current or a previous delegate.
+    /// Whether `key` is the current delegate or one a mint still names.
     pub fn policed(&self, key: &Pubkey) -> bool {
         self.delegate.as_ref() == Some(key) || self.previous_delegates.contains(key)
     }

@@ -877,7 +877,7 @@ mod tests {
         );
     }
 
-    /// A listed previous key is held to the same compliance-ATA rule as the current one.
+    /// An earlier key a mint names is held to the same compliance-ATA rule as the current one.
     #[tokio::test]
     async fn previous_delegate_moves_are_refused_unless_into_the_compliance_ata() {
         let (_, mut policy, compliance, mint, victim) = seize_setup();
@@ -948,7 +948,7 @@ mod tests {
         }
     }
 
-    /// Listing a previous key polices it but never lets mints be rotated back to it.
+    /// Policing an earlier key never lets mints be rotated back to it.
     #[tokio::test]
     async fn rotation_still_accepts_only_the_current_key() {
         let admin = Keypair::new();

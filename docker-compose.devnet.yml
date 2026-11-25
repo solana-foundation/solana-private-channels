@@ -134,7 +134,6 @@ services:
       # Delegate written into every channel mint; required, with no fallback.
       # Compliance owner passes through only when set; blank reads as unset.
       - PRIVATE_CHANNEL_PERMANENT_DELEGATE
-      - PRIVATE_CHANNEL_PREVIOUS_DELEGATES
       - PRIVATE_CHANNEL_COMPLIANCE_OWNER
       - PRIVATE_CHANNEL_METRICS=${PRIVATE_CHANNEL_METRICS:-false}
       - PRIVATE_CHANNEL_METRICS_PORT=${PRIVATE_CHANNEL_METRICS_PORT:-9090}
@@ -228,7 +227,6 @@ services:
       # simulateTransaction is served here, so it applies the same admin and seize rules.
       - PRIVATE_CHANNEL_ADMIN_KEYS=${PRIVATE_CHANNEL_ADMIN_KEYS}
       - PRIVATE_CHANNEL_PERMANENT_DELEGATE
-      - PRIVATE_CHANNEL_PREVIOUS_DELEGATES
       - PRIVATE_CHANNEL_COMPLIANCE_OWNER
     ports:
       - "127.0.0.1:${PRIVATE_CHANNEL_READ_PORT}:${PRIVATE_CHANNEL_READ_PORT}"

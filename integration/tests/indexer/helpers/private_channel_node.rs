@@ -31,7 +31,6 @@ pub struct PrivateChannelNode {
     _db: ContainerAsync<Postgres>,
     admin_pubkey: Pubkey,
     delegate: Pubkey,
-    previous_delegates: Vec<Pubkey>,
     /// Takes effect on the next restart.
     pub compliance_owner: Option<Pubkey>,
     accountsdb_connection_url: String,
@@ -63,18 +62,15 @@ impl PrivateChannelNode {
     }
 
     /// Stop the node and start it again on the same accountsdb with `delegate`
-    /// configured and `previous` still policed, as an operator does when rotating
-    /// the permanent delegate.
+    /// configured, as an operator does when rotating the permanent delegate.
     pub async fn restart_with_delegate(
         &mut self,
         delegate: Pubkey,
-        previous: &[Pubkey],
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(handles) = self.handles.take() {
             handles.shutdown().await;
         }
         self.delegate = delegate;
-        self.previous_delegates = previous.to_vec();
         self.start().await
     }
 
@@ -82,7 +78,6 @@ impl PrivateChannelNode {
         let (url, handles) = run_on(
             self.admin_pubkey,
             self.delegate,
-            self.previous_delegates.clone(),
             self.compliance_owner,
             self.accountsdb_connection_url.clone(),
         )
@@ -204,7 +199,6 @@ pub async fn start_private_channel_node_with_delegate(
     let (url, handles) = run_on(
         admin_pubkey,
         delegate,
-        vec![],
         None,
         accountsdb_connection_url.clone(),
     )
@@ -217,7 +211,6 @@ pub async fn start_private_channel_node_with_delegate(
         _db: db_container,
         admin_pubkey,
         delegate,
-        previous_delegates: vec![],
         compliance_owner: None,
         accountsdb_connection_url,
     })
@@ -227,7 +220,6 @@ pub async fn start_private_channel_node_with_delegate(
 async fn run_on(
     admin_pubkey: Pubkey,
     delegate: Pubkey,
-    previous_delegates: Vec<Pubkey>,
     compliance_owner: Option<Pubkey>,
     accountsdb_connection_url: String,
 ) -> Result<(String, NodeHandles), Box<dyn std::error::Error>> {
@@ -252,7 +244,6 @@ async fn run_on(
         redis_block_ttl_secs: 3_600,
         admin_keys: vec![admin_pubkey],
         permanent_delegate: Some(delegate),
-        previous_delegates,
         compliance_owner,
         max_blockhashes: 150,
         allow_max_blockhashes_increase: false,

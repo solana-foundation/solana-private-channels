@@ -144,7 +144,6 @@ imagePullSecrets:
 {{- $c := .Values.config -}}
 - { name: PRIVATE_CHANNEL_ADMIN_KEYS, value: {{ $c.adminKeys | quote }} }
 - { name: PRIVATE_CHANNEL_PERMANENT_DELEGATE, value: {{ $c.permanentDelegate | quote }} }
-- { name: PRIVATE_CHANNEL_PREVIOUS_DELEGATES, value: {{ $c.previousDelegates | default "" | quote }} }
 {{- if $c.complianceOwner }}
 - { name: PRIVATE_CHANNEL_COMPLIANCE_OWNER, value: {{ $c.complianceOwner | quote }} }
 {{- end }}
