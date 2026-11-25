@@ -98,14 +98,19 @@ if ! CHANNEL_ADMIN=$(printf '%s\n' "$ADMIN_PRIVATE_KEY" | solana-keygen pubkey -
   exit 1
 fi
 
-# The withdraw operator signs releases with its own key when one is set, else with
-# the channel admin key (the compose fallback). That key gets the Operator PDA.
-OPERATOR="$CHANNEL_ADMIN"
-if [ -n "${OPERATOR_PRIVATE_KEY:-}" ]; then
-  if ! OPERATOR=$(printf '%s\n' "$OPERATOR_PRIVATE_KEY" | solana-keygen pubkey -); then
-    echo "ERROR: could not derive a pubkey from OPERATOR_PRIVATE_KEY." >&2
-    exit 1
-  fi
+# The withdraw operator signs releases with its own key, and devnet compose has no
+# admin fallback. Only that key gets the Operator PDA, never the channel admin.
+if [ -z "${OPERATOR_PRIVATE_KEY:-}" ]; then
+  echo "ERROR: OPERATOR_PRIVATE_KEY is empty. Run \`make build-devnet\` to write it to .env." >&2
+  exit 1
+fi
+if ! OPERATOR=$(printf '%s\n' "$OPERATOR_PRIVATE_KEY" | solana-keygen pubkey -); then
+  echo "ERROR: could not derive a pubkey from OPERATOR_PRIVATE_KEY." >&2
+  exit 1
+fi
+if [ "$OPERATOR" = "$CHANNEL_ADMIN" ]; then
+  echo "ERROR: OPERATOR_PRIVATE_KEY is the channel admin key; use a separate withdraw operator key." >&2
+  exit 1
 fi
 
 # Fail closed on the collapsed-key configuration this script used to ship with.

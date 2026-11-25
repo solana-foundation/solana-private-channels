@@ -330,7 +330,7 @@ async fn build(spec: SignerSpec) -> Result<Signer, LoadError> {
     }
 }
 
-/// Both role signers. `operator: None` means the operator role signs with admin.
+/// Both role signers. `operator: None` is allowed only where nothing signs as operator.
 struct Signers {
     admin: Signer,
     operator: Option<Signer>,
