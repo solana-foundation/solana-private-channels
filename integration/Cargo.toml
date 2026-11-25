@@ -191,6 +191,10 @@ path = "tests/indexer/harness_sanity.rs"
 name = "test_operator_signer_refusal"
 path = "tests/indexer/test_operator_signer_refusal.rs"
 
+[[test]]
+name = "withdraw_operator_signer_required"
+path = "tests/indexer/withdraw_operator_signer_required.rs"
+
 # RPC-error + storage-failure fault-injection tests.
 [[test]]
 name = "sender_poll_rpc_error"

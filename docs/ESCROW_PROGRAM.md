@@ -545,10 +545,10 @@ operator key is separate from the channel admin key (the service key that pays
 release fees, signs remints and collects withdraw fees): the deposit operator
 (`operator-solana`) loads only the channel admin, and the withdraw operator
 (`operator-private-channel`) loads both, signing releases with its own operator
-key. The Ansible deploy refuses equal keys off localnet; raw compose falls back to
-the admin key when `OPERATOR_PRIVATE_KEY` is blank, and the process signs as the
-operator with the admin key when `OPERATOR_SIGNER` is unset (a set
-`OPERATOR_SIGNER` that fails to load stops it instead). The split gives
+key. The Ansible deploy refuses equal keys off localnet and refuses an admin key that
+still holds an Operator PDA. The withdraw operator refuses to start without its own
+`OPERATOR_SIGNER` and never signs releases with the admin key; only the localnet
+compose file fills a blank `OPERATOR_PRIVATE_KEY` from the admin key. The split gives
 separation and independent rotation, not containment: the withdraw operator
 process still holds both keys, and `ReleaseFunds` does not tie its fee payer to
 the channel admin, so the operator key alone can release funds. Protect it at

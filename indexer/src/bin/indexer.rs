@@ -699,6 +699,8 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     private_channel_indexer::operator::init_signers()
         .await
         .map_err(|e| format!("Signer configuration error: {}", e))?;
+    private_channel_indexer::operator::SignerUtil::require_operator_signer(common.program_type)
+        .map_err(|e| format!("Signer configuration error: {}", e))?;
 
     // Get DATABASE_URL from environment
     let database_url =

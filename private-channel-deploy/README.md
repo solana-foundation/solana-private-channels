@@ -44,13 +44,13 @@ Three one-time edits per environment, done before the first deploy. They tell th
 
 1. **Point at a host** ([`inventory.ini`](./inventory.ini)): IP, SSH user, key path. [`inventory.example.ini`](./inventory.example.ini) has one group per network (`dev`, `devnet`, `mainnet`).
 2. **Choose what to deploy** ([`vars/dev.yml`](./vars/dev.yml)): image registry/tag, target Solana network, on-host paths. Each option has an inline comment explaining what to pick. The inventory group selects `vars/<group>.yml`; for devnet and mainnet copy [`vars/devnet.example.yml`](./vars/devnet.example.yml) or [`vars/mainnet.example.yml`](./vars/mainnet.example.yml).
-3. **Provide credentials**, via one of the two backends below. For the default file backend, copy the template and fill in real values:
+3. **Provide credentials**, via one of the two backends below. For the default file backend, create a private copy of the template and fill in real values:
 
    ```bash
-   cp secrets.yml.example secrets.yml
+   install -m 0600 secrets.yml.example secrets.yml
    ```
 
-   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value. Doppler-only operators skip this file entirely — preflight does not require it when the doppler backend is selected.
+   `secrets.yml` is plain text and gitignored. The deploy refuses it when group or other can read it; fix with `chmod 600 secrets.yml`. See the file header for required vs optional and how to generate each value. Doppler-only operators skip this file entirely — preflight does not require it when the doppler backend is selected.
 
 Everything else is wired and shouldn't need routine changes.
 
@@ -60,14 +60,14 @@ Pick a network, a secrets backend and a signer backend, copy the files in that r
 
 | Network | Secrets | Signers | Files to copy and fill | Command |
 | --- | --- | --- | --- | --- |
-| localnet | file or Doppler | memory | `secrets.yml.example` to `secrets.yml` (`vars/dev.yml` is shipped) | `ansible-playbook deploy.yml -l dev` |
+| localnet | file or Doppler | memory | `secrets.yml.example` to `secrets.yml` (mode 0600; `vars/dev.yml` is shipped) | `ansible-playbook deploy.yml -l dev` |
 | devnet | file or Doppler | memory | `vars/devnet.example.yml` to `vars/devnet.yml`, `secrets.yml.example` to `secrets.yml` | `ansible-playbook deploy.yml -l devnet` |
 | devnet | file or Doppler | vault, turnkey or privy | as above, plus the backend secret in `secrets.yml` or Doppler | `ansible-playbook deploy.yml -l devnet -e @examples/signers/<backend>.yml` |
 | mainnet | file or Doppler | vault | `vars/mainnet.example.yml` to `vars/mainnet.yml` (Vault already set), `secrets.yml` or Doppler | `ansible-playbook deploy.yml -l mainnet` |
 | mainnet | file or Doppler | turnkey or privy | as above | `ansible-playbook deploy.yml -l mainnet -e @examples/signers/<backend>.yml` |
 
 - **Signers.** The channel admin (`admin_signer`) is fee payer, mint and freeze authority and withdraw fee treasury; the withdraw operator (`operator_signer`) signs `ReleaseFunds` with its own key. Each is `memory`, `vault`, `turnkey` or `privy` (default `memory`). [`examples/signers/`](./examples/signers/) has one file per backend with every var it needs; `-e @file` overrides the vars file. Mainnet refuses `memory` for either role.
-- **Separate keys.** Off localnet the admin and operator pubkeys must differ, and the operator needs an Operator PDA: run `add_operator` for the operator pubkey with the escrow `Instance.admin` key before the deploy, or preflight refuses it. On localnet `keypairs/withdraw-operator.json` is generated next to `keypairs/admin.json`; once the instance exists, run `add_operator` for its pubkey before the deploy that sets `escrow_instance_id`, or preflight refuses it.
+- **Separate keys.** Off localnet the admin and operator pubkeys must differ, and the operator needs an Operator PDA: run `add_operator` for the operator pubkey with the escrow `Instance.admin` key before the deploy, or preflight refuses it. Preflight also refuses an admin key that still holds an Operator PDA; see [UPGRADING.md](../UPGRADING.md) step 7. On localnet `keypairs/withdraw-operator.json` is generated next to `keypairs/admin.json`; once the instance exists, run `add_operator` for its pubkey before the deploy that sets `escrow_instance_id`, or preflight refuses it.
 - **Image.** The app image must have the `with-secrets` entrypoint. The deploy refuses older images, `v0.1.0` included.
 
 Key and secret rotation: [`docs/runbooks/key_rotation.md`](../docs/runbooks/key_rotation.md) and [`docs/runbooks/secret_rotation.md`](../docs/runbooks/secret_rotation.md).

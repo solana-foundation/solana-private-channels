@@ -576,14 +576,14 @@ services:
       - COMMON_ESCROW_INSTANCE_ID=${COMMON_ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack): fee payer, remint mint authority and withdraw fee
-      # treasury. OPERATOR_* is the release key, which needs an Operator PDA. It
-      # falls back to the admin key, so a single-key dev env keeps working.
+      # treasury. OPERATOR_* is the release key, which needs an Operator PDA. No
+      # fallback to the admin key: a blank one stops the withdraw operator at startup.
       # Backend from the env file, no default; presets and Ansible set memory. Other
       # backends also need their ADMIN_*/OPERATOR_* vars passed in an override.
       - ADMIN_SIGNER=${ADMIN_SIGNER:?ADMIN_SIGNER must be set (memory, vault, turnkey or privy)}
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=${OPERATOR_SIGNER:?OPERATOR_SIGNER must be set (memory, vault, turnkey or privy)}
-      - OPERATOR_PRIVATE_KEY=${OPERATOR_PRIVATE_KEY:-${ADMIN_PRIVATE_KEY}}
+      - OPERATOR_PRIVATE_KEY=${OPERATOR_PRIVATE_KEY:-}
       # Delegate for new channel mints; required. Must match the node's.
       - OPERATOR_PERMANENT_DELEGATE=${OPERATOR_PERMANENT_DELEGATE:-${PRIVATE_CHANNEL_PERMANENT_DELEGATE:-}}
       - METRICS_PORT=9103

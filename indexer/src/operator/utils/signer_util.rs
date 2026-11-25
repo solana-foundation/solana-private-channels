@@ -1,3 +1,4 @@
+use crate::config::ProgramType;
 use solana_keychain::{Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
 use std::env;
@@ -170,8 +171,8 @@ impl SignerSpec {
     }
 }
 
-/// Admin must be configured. Operator unset (with no `OPERATOR_*` key var) is `None` and
-/// signs as admin; set means it must load.
+/// Admin must be configured. Operator unset (with no `OPERATOR_*` key var) is `None`, which
+/// only roles that never sign as operator accept; set means it must load.
 fn read_role_spec(role: SignerRole, env: Env) -> Result<Option<SignerSpec>, LoadError> {
     let type_var = match role {
         SignerRole::Admin => ADMIN_SIGNER,
@@ -329,7 +330,7 @@ async fn build(spec: SignerSpec) -> Result<Signer, LoadError> {
     }
 }
 
-/// Both role signers. `operator: None` means the operator role signs with admin.
+/// Both role signers. `operator: None` is allowed only where nothing signs as operator.
 struct Signers {
     admin: Signer,
     operator: Option<Signer>,
@@ -378,11 +379,20 @@ fn log_loaded(role: &str, label: &str, signer: &Signer) {
 
 fn log_operator_role(operator: &Option<Signer>) {
     if operator.is_none() {
-        info!(
-            "{} not set; the operator role signs with the admin signer",
-            OPERATOR_SIGNER
-        );
+        info!("{} not set; no operator signer loaded", OPERATOR_SIGNER);
     }
+}
+
+/// The withdraw operator signs every release as operator, so it needs its own signer.
+/// Never the admin: an admin with an Operator PDA could release escrow with no burn.
+fn check_operator_role(signers: &Signers, program_type: ProgramType) -> Result<(), String> {
+    if program_type == ProgramType::Withdraw && signers.operator.is_none() {
+        return Err(format!(
+            "the withdraw operator needs its own operator signer: set {} and its key vars",
+            OPERATOR_SIGNER
+        ));
+    }
+    Ok(())
 }
 
 async fn load_signers(env: Env<'_>) -> Result<Signers, String> {
@@ -485,9 +495,17 @@ impl SignerUtil {
         &signers().admin
     }
 
+    /// Only withdraw code signs as operator, and the withdraw startup refuses a missing one.
     pub fn operator_signer() -> &'static Signer {
-        let signers = signers();
-        signers.operator.as_ref().unwrap_or(&signers.admin)
+        signers()
+            .operator
+            .as_ref()
+            .expect("no operator signer loaded; the withdraw operator requires OPERATOR_SIGNER")
+    }
+
+    /// Refuses a withdraw operator with no operator signer. Call after `init_signers`.
+    pub fn require_operator_signer(program_type: ProgramType) -> Result<(), String> {
+        check_operator_role(signers(), program_type)
     }
 }
 
@@ -649,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn unset_operator_resolves_to_admin_and_set_operator_loads() {
+    fn unset_operator_is_none_and_set_operator_loads() {
         let admin = Keypair::new();
         let operator = Keypair::new();
         let admin_b58 = b58(&admin);
@@ -673,6 +691,27 @@ mod tests {
             signers.operator.unwrap().pubkey(),
             solana_sdk::signer::Signer::pubkey(&operator)
         );
+    }
+
+    /// Only the withdraw operator signs as operator, so only it refuses a missing one.
+    #[test]
+    fn only_the_withdraw_operator_requires_an_operator_signer() {
+        let admin_b58 = b58(&Keypair::new());
+        let only_admin = signer_env(&[(ADMIN_SIGNER, "memory"), (ADMIN_PRIVATE_KEY, &admin_b58)]);
+        let signers = load_signers_sync(&only_admin).unwrap();
+        let err = check_operator_role(&signers, ProgramType::Withdraw).unwrap_err();
+        assert!(err.contains(OPERATOR_SIGNER), "got: {err}");
+        check_operator_role(&signers, ProgramType::Escrow).unwrap();
+
+        let operator_b58 = b58(&Keypair::new());
+        let both = signer_env(&[
+            (ADMIN_SIGNER, "memory"),
+            (ADMIN_PRIVATE_KEY, &admin_b58),
+            (OPERATOR_SIGNER, "memory"),
+            (OPERATOR_PRIVATE_KEY, &operator_b58),
+        ]);
+        let signers = load_signers_sync(&both).unwrap();
+        check_operator_role(&signers, ProgramType::Withdraw).unwrap();
     }
 
     /// The sync loader returns an error naming `init_signers` for Privy instead of nesting

@@ -138,13 +138,19 @@ test_compose_interpolation() {
     [[ "$got" == "$preserved" ]] || fail "devnet $svc instance is '$got', not the preserved PDA"
   done
 
-  # A single-key env: the release key falls back to the admin key. A separate one wins.
+  # A single-key localnet env: the release key falls back to the admin key. A separate one wins.
   printf 'ADMIN_PRIVATE_KEY=SNTLadmin\n' >"$TMP/admin-key.env"
   printf 'OPERATOR_PRIVATE_KEY=SNTLoperator\n' >"$TMP/operator-key.env"
   local one two
   one="$(compose_json docker-compose.yml --env-file .env.local --env-file "$TMP/admin-key.env")" || fail "single-key config"
   [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' <<<"$one")" == SNTLadmin ]] \
     || fail "OPERATOR_PRIVATE_KEY does not fall back to ADMIN_PRIVATE_KEY"
+  # Devnet is production-capable, so a single-key env leaves the release key blank and the
+  # withdraw operator refuses to start rather than sign releases with the admin key.
+  one="$(compose_json docker-compose.devnet.yml --env-file .env.devnet --env-file "$TMP/instance.env" \
+    --env-file "$TMP/admin-key.env")" || fail "devnet single-key config"
+  [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' <<<"$one")" == "" ]] \
+    || fail "devnet OPERATOR_PRIVATE_KEY falls back to ADMIN_PRIVATE_KEY"
   two="$(compose_json docker-compose.devnet.yml --env-file .env.devnet --env-file "$TMP/instance.env" \
     --env-file "$TMP/admin-key.env" --env-file "$TMP/operator-key.env")" || fail "two-key config"
   [[ "$(jq -r '.services["operator-private-channel"].environment.OPERATOR_PRIVATE_KEY' <<<"$two")" == SNTLoperator ]] \

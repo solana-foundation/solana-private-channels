@@ -113,6 +113,19 @@ cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id
   "$(solana-keygen pubkey keypairs/withdraw-operator.json)"
 ```
 
+A 0.1.0 devnet stack registered the channel admin as operator, and that Operator PDA
+still lets the admin key sign `ReleaseFunds`. Nothing checks it on raw compose. Once a
+withdrawal works with the new key, remove it:
+
+```bash
+# Same values Compose reads: .env overrides .env.devnet.
+pg() { cat .env.devnet .env 2>/dev/null | grep "^$1=" | tail -1 | cut -d= -f2-; }
+export DATABASE_URL="postgres://$(pg POSTGRES_INDEXER_USER):$(pg POSTGRES_INDEXER_PASSWORD)@127.0.0.1:5434/$(pg POSTGRES_INDEXER_DB)"
+cargo run --bin remove_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> \
+  "$(solana-keygen pubkey keypairs/operator-keypair.json)"
+unset DATABASE_URL
+```
+
 1. **Register the new withdraw operator key first.** The withdraw operator now signs
    `ReleaseFunds` with its own key, not the channel admin's. Create it (or set up a remote
    signer, see `private-channel-deploy/examples/signers/`), then add it with the escrow
@@ -149,7 +162,10 @@ cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id
    `gateway_whitelist_rpc_url` too (Doppler `RPC_URL`, `FALLBACK_RPC_URL`,
    `GATEWAY_WHITELIST_RPC_URL`).
 7. **Retire the admin's Operator PDA.** If the channel admin key held the Operator PDA
-   before (the old single-key setup), remove it once withdrawals work with the new key:
+   before (the old single-key setup), remove it once withdrawals work with the new key.
+   Off localnet the deploy refuses while `pc_admin_pubkey` or any `extra_admin_keys`
+   entry still holds one. For the one transition deploy that brings up the new operator
+   key, pass `-e pc_allow_admin_operator_pda=true`; it warns on every run until dropped.
 
    ```bash
    export DATABASE_URL="postgres://<postgres_indexer_user>:$(sudo cat {{ host_data_dir }}/secrets/postgres-indexer/POSTGRES_PASSWORD)@127.0.0.1:5434/<postgres_indexer_db>"
@@ -157,7 +173,11 @@ cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id
    unset DATABASE_URL
    ```
 
-   It reads the indexer database and refuses while a release is in flight.
+   It reads the indexer database and refuses while a release is in flight. The deploy
+   can only probe keys it knows: an Operator account stores no owner key, so a former
+   admin listed in no deploy var must be checked by hand (`solana find-program-derived-address
+   <escrow-program-id> string:operator pubkey:<instance-id> pubkey:<old-admin>`, then
+   `getAccountInfo` on it must return `null`).
 
 A separate operator key also lowers how many transfer-hook accounts a release fits, from
 15 to 12; see the CHANGELOG note before upgrading a stack that allows hook mints.

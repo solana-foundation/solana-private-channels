@@ -66,6 +66,13 @@ admin_signer: memory
 operator_signer: memory
 # Extra channel admin pubkeys the node accepts, for the admin rotation overlap.
 extra_admin_keys: []
+# extra_admin_keys as a list, also from a comma-separated -e string.
+pc_extra_admin_keys: >-
+  {{ (extra_admin_keys.split(',') if extra_admin_keys is string else (extra_admin_keys | default([])))
+     | map('string') | map('trim') | select | list }}
+# Off localnet the deploy refuses while any admin key above holds an Operator PDA. true
+# accepts it with a warning on every run; for one transition deploy only.
+pc_allow_admin_operator_pda: false
 # Vars each backend needs, per role (prefixed with admin_ or operator_).
 signer_backend_vars:
   memory: []

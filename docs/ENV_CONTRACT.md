@@ -168,9 +168,10 @@ withdraw operator's release key). `ADMIN_SIGNER` and `OPERATOR_SIGNER` pick `mem
 `*_VAULT_PUBKEY`), `turnkey` (`*_TURNKEY_API_PUBLIC_KEY`, `*_TURNKEY_API_PRIVATE_KEY`,
 `*_TURNKEY_ORGANIZATION_ID`, `*_TURNKEY_PRIVATE_KEY_ID`, `*_TURNKEY_PUBKEY`) or `privy`
 (`*_PRIVY_APP_ID`, `*_PRIVY_APP_SECRET`, `*_PRIVY_WALLET_ID`). `operator-solana` gets only
-`ADMIN_*`; `operator-private-channel` gets both. In raw compose a blank
-`OPERATOR_PRIVATE_KEY` falls back to `ADMIN_PRIVATE_KEY`, so a single-key dev env keeps
-working; the remote backends' vars reach a container only through an override, which the
+`ADMIN_*`; `operator-private-channel` gets both. In the localnet
+`docker-compose.yml` a blank `OPERATOR_PRIVATE_KEY` falls back to `ADMIN_PRIVATE_KEY`, so a
+single-key dev env keeps working; `docker-compose.devnet.yml` has no fallback, and the
+withdraw operator refuses to start without its own key; the remote backends' vars reach a container only through an override, which the
 Ansible deploy renders for the selected backend. The deploy renders
 `PRIVATE_CHANNEL_ADMIN_KEYS` from the admin pubkey plus `extra_admin_keys`, the overlap
 used during a channel admin rotation.

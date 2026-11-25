@@ -44,6 +44,7 @@ ghcr_user: u
 ghcr_token: t
 yellowstone_token: y
 EOF
+chmod 600 "$D/secrets.yml"
 
 # Expect the config asserts to pass; prints the resolved compose_services.
 expect_services() {
@@ -314,6 +315,11 @@ test_signers() {
   # The same key in both roles buys no separation; localnet keeps the single-key dev path.
   expect_refused signer_equal_keys "must differ" "${SIG_DEVNET[@]}" -e "operator_keypair_path=$TMP/admin.json"
   expect_pass signer_equal_keys_localnet "${SIG_BASE[@]}" -e "operator_keypair_path=$TMP/admin.json"
+  # The release key listed as an extra admin collapses the roles the same way, list or string form.
+  expect_refused signer_operator_in_extra_admin_keys "must differ" "${SIG_DEVNET[@]}" \
+    -e "{\"extra_admin_keys\": [\"$(solana-keygen pubkey "$TMP/operator.json")\"]}"
+  expect_refused signer_operator_in_extra_admin_keys_string "must differ" "${SIG_DEVNET[@]}" \
+    -e "extra_admin_keys=$(solana-keygen pubkey "$TMP/admin.json"),$(solana-keygen pubkey "$TMP/operator.json")"
 
   signer_vars "$TMP/av.yml" admin vault
   signer_vars "$TMP/ov.yml" operator vault
@@ -379,14 +385,46 @@ test_operator_pda() {
   pda_case pda_missing "$op"
   owner="$ESCROW_ID"
   printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"%s","lamports":1,"data":["","base64"],"executable":false}}}' "$owner" >"$TMP/pda-ok.json"
-  stub_http 200 "$TMP/pda-ok.json" "Content-Type: application/json"
+  # Per-PDA answers: only the PDAs given here exist, every other account is null.
+  local admin extra op_pda admin_pda extra_pda
+  admin="$(solana-keygen pubkey "$TMP/admin.json")"
+  [[ -f "$TMP/extra-admin.json" ]] || solana-keygen new --no-bip39-passphrase --silent --outfile "$TMP/extra-admin.json" >/dev/null
+  extra="$(solana-keygen pubkey "$TMP/extra-admin.json")"
+  derive() { solana find-program-derived-address "$ESCROW_ID" string:operator "pubkey:$INSTANCE" "pubkey:$1"; }
+  op_pda="$(derive "$op")"
+  admin_pda="$(derive "$admin")"
+  extra_pda="$(derive "$extra")"
+  pda_dir() {
+    local dir="$TMP/pda-dir-$1" k
+    shift
+    rm -rf "$dir" && mkdir -p "$dir"
+    cp "$TMP/pda-null.json" "$dir/default"
+    for k in "$@"; do cp "$TMP/pda-ok.json" "$dir/$k"; done
+    stub_http 200 "$dir" "Content-Type: application/json"
+  }
+  pda_dir present "$op_pda"
   pda_case pda_present pass
+  grep -q "pc_allow_admin_operator_pda" "$TMP/pda_present.log" && fail "pda_present: override warning without the override"
+  # The admin with an Operator PDA can release escrow with no burn, so it is refused.
+  pda_dir admin "$op_pda" "$admin_pda"
+  pda_case admin_pda_present_is_refused "remove_operator"
+  grep -q "$admin" "$TMP/admin_pda_present_is_refused.log" || fail "admin_pda_present_is_refused: admin pubkey not named"
+  pda_dir extra "$op_pda" "$extra_pda"
+  pda_case extra_admin_pda_present_is_refused "remove_operator" -e "{\"extra_admin_keys\": [\"$extra\"]}"
+  pda_case extra_admin_pda_unlisted_passes pass
+  # A comma-separated string, as `-e extra_admin_keys=a,b` passes it, is checked too.
+  pda_case extra_admin_pda_string_form_is_refused "remove_operator" -e "extra_admin_keys=,$extra,,,"
+  # The transition override passes and warns on every run.
+  pda_dir override "$op_pda" "$admin_pda"
+  pda_case admin_pda_override_passes pass -e pc_allow_admin_operator_pda=true
+  grep -q "WARNING: pc_allow_admin_operator_pda" "$TMP/admin_pda_override_passes.log" || fail "admin_pda_override_passes: no warning"
   printf '{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["","base64"],"executable":false}}}' >"$TMP/pda-bad.json"
   stub_http 200 "$TMP/pda-bad.json" "Content-Type: application/json"
   pda_case pda_wrong_owner "owned by"
   STUB_PORT="$(free_port)"
   pda_case pda_unreachable pass
   grep -q "could not check the Operator PDA" "$TMP/pda_unreachable.log" || fail "pda_unreachable: no warning"
+  grep -q "could not check the admin Operator PDA" "$TMP/pda_unreachable.log" || fail "pda_unreachable: no admin warning"
 
   # Localnet runs the same check whenever an instance is set, explicit or carried over.
   local lnet=("${SIG_BASE[@]}" -e reset_state=false -e validator_reset=false -e image_registry=127.0.0.1:5000/o
@@ -658,8 +696,59 @@ EOF
   echo "ok: secrets render"
 }
 
+# secrets.yml holds every deploy credential, so a file readable by group or other is refused.
+test_secrets_mode() {
+  if ! command -v solana-keygen >/dev/null; then
+    skip "secrets mode cases (solana-keygen missing)"
+    return
+  fi
+  signer_setup
+  chmod 644 "$D/secrets.yml"
+  expect_refused secrets_file_mode_0644_is_refused "chmod 600" "${SIG_BASE[@]}"
+  # k3s.yml loads the same file through the same tasks.
+  if playbook "$TMP/secrets_mode_k3s.log" "$D/k3s.yml" --tags __no_such_phase__ "${SIG_BASE[@]}"; then
+    fail "secrets_file_mode_0644_k3s: k3s.yml passed, expected refusal"
+  elif ! grep -q "chmod 600" "$TMP/secrets_mode_k3s.log"; then
+    fail "secrets_file_mode_0644_k3s: refused without the chmod hint"
+  else
+    echo "ok: secrets_file_mode_0644_k3s refused"
+  fi
+  chmod 640 "$D/secrets.yml"
+  expect_refused secrets_file_mode_0640_is_refused "chmod 600" "${SIG_BASE[@]}"
+  chmod 600 "$D/secrets.yml"
+  expect_pass secrets_file_mode_0600_loads "${SIG_BASE[@]}"
+  chmod 400 "$D/secrets.yml"
+  expect_pass secrets_file_mode_0400_loads "${SIG_BASE[@]}"
+  # A symlink is judged by its target, the file include_vars reads.
+  mv "$D/secrets.yml" "$TMP/secrets.target.yml"
+  ln -s "$TMP/secrets.target.yml" "$D/secrets.yml"
+  chmod 644 "$TMP/secrets.target.yml"
+  expect_refused secrets_file_symlink_0644_is_refused "chmod 600" "${SIG_BASE[@]}"
+  chmod 600 "$TMP/secrets.target.yml"
+  expect_pass secrets_file_symlink_0600_loads "${SIG_BASE[@]}"
+  rm "$D/secrets.yml"
+  mv "$TMP/secrets.target.yml" "$D/secrets.yml"
+
+  # The Doppler backend never reads the file, so its mode does not matter.
+  mkdir -p "$TMP/dbin"
+  cat >"$TMP/dbin/doppler" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == --version ]] && { echo v3; exit 0; }
+cat "$DOPPLER_FAKE_JSON"
+EOF
+  chmod +x "$TMP/dbin/doppler"
+  python3 - "$D/secrets.yml" >"$TMP/doppler-mode.json" <<'PY2'
+import json, sys, yaml
+print(json.dumps({k.upper(): str(v) for k, v in yaml.safe_load(open(sys.argv[1])).items()}))
+PY2
+  chmod 644 "$D/secrets.yml"
+  PATH="$TMP/dbin:$PATH" DOPPLER_TOKEN=fake DOPPLER_FAKE_JSON="$TMP/doppler-mode.json" \
+    expect_pass doppler_backend_skips_the_mode_check "${SIG_BASE[@]}"
+  chmod 600 "$D/secrets.yml"
+}
+
 # PC_TEST_ONLY=<regex> runs only the matching test functions.
-for t in test_syntax test_preflight_cases test_env_render test_ghcr_scope test_signers test_operator_pda test_render_signers test_jwt_previous test_secrets_render; do
+for t in test_syntax test_preflight_cases test_env_render test_ghcr_scope test_signers test_operator_pda test_render_signers test_jwt_previous test_secrets_render test_secrets_mode; do
   if [[ -z "${PC_TEST_ONLY:-}" || "$t" =~ $PC_TEST_ONLY ]]; then "$t"; fi
 done
 

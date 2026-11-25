@@ -99,19 +99,30 @@ render() {
 }
 
 # Starts an HTTP stub answering every request with a canned reply and sets
-# STUB_PORT. Usage: stub_http <status> <body-file|""> [Header: value ...]
+# STUB_PORT. Usage: stub_http <status> <body-file|body-dir|""> [Header: value ...]
+# With a dir, a JSON-RPC request gets <dir>/<params[0]> when present, else <dir>/default.
 stub_http() {
   local status="$1" body="$2"
   shift 2
   cat >"$TMP/stub_http.py" <<'PY'
-import http.server, sys
+import http.server, json, os, sys
 status = int(sys.argv[1])
-body = open(sys.argv[2], "rb").read() if sys.argv[2] else b""
+src = sys.argv[2]
+body = open(src, "rb").read() if src and not os.path.isdir(src) else b""
 headers = [h.split(":", 1) for h in sys.argv[3:]]
+def body_for(raw):
+    if not (src and os.path.isdir(src)):
+        return body
+    try:
+        key = str(json.loads(raw)["params"][0])
+    except Exception:
+        key = ""
+    path = os.path.join(src, os.path.basename(key)) if key else ""
+    return open(path if path and os.path.isfile(path) else os.path.join(src, "default"), "rb").read()
 class H(http.server.BaseHTTPRequestHandler):
     def reply(self):
         n = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(n)
+        body = body_for(self.rfile.read(n))
         self.send_response(status)
         for k, v in headers:
             self.send_header(k.strip(), v.strip())
@@ -169,6 +180,7 @@ sentinel_secrets() {
     printf 'SNTL%sx%s\n' "$tag" "$key" >>"$TMP/sentinels.txt"
   done
   printf 'ghcr_user: u\n' >>"$out"
+  chmod 600 "$out"
 }
 
 # Fails when any sentinel from $TMP/sentinels.txt appears in the given files or dirs.
