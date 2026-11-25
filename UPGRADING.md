@@ -118,7 +118,9 @@ still lets the admin key sign `ReleaseFunds`. Nothing checks it on raw compose. 
 withdrawal works with the new key, remove it:
 
 ```bash
-export DATABASE_URL="postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@127.0.0.1:5434/${POSTGRES_INDEXER_DB}"
+# Same values Compose reads: .env overrides .env.devnet.
+pg() { cat .env.devnet .env 2>/dev/null | grep "^$1=" | tail -1 | cut -d= -f2-; }
+export DATABASE_URL="postgres://$(pg POSTGRES_INDEXER_USER):$(pg POSTGRES_INDEXER_PASSWORD)@127.0.0.1:5434/$(pg POSTGRES_INDEXER_DB)"
 cargo run --bin remove_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> \
   "$(solana-keygen pubkey keypairs/operator-keypair.json)"
 unset DATABASE_URL
