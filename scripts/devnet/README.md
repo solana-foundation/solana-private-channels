@@ -6,7 +6,7 @@ cp .env.example .env
 # Edit .env with your keys
 # Required (no defaults shipped): set POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD
 # (and JWT_SIGNING_KEY, JWT_PUBLIC_KEY from scripts/jwt-keypair.sh if enabling auth,
-# ADMIN_PRIVATE_KEY for the operator) or services fail to start
+# ADMIN_PRIVATE_KEY, and OPERATOR_PRIVATE_KEY for the withdraw operator) or services fail to start
 # Generate strong values with: openssl rand -hex 32
 ```
 
@@ -14,8 +14,8 @@ cp .env.example .env
 
 Steps 1-3 below are escrow governance and are signed by `keypairs/escrow-admin.json`,
 the `Instance.admin` key. The services run as a *different* key, the channel admin in
-`ADMIN_PRIVATE_KEY`, which holds receipt-mint authority and is what step 2 registers as
-the operator. Keep them separate: `SetNewAdmin` only rewrites `Instance.admin`, so a key
+`ADMIN_PRIVATE_KEY`, which holds receipt-mint authority. Step 2 registers the withdraw
+operator, never the channel admin. Keep them separate: `SetNewAdmin` only rewrites `Instance.admin`, so a key
 that is also the channel admin keeps its receipt-mint authority and its Operator PDA
 after a handover and can still drain escrow custody.
 
@@ -40,7 +40,7 @@ cargo run --bin create_instance -- \
 ```
 
 ## 2. Add Operator
-`<OPERATOR_PUBKEY>` is the withdraw operator's key (`solana-keygen pubkey keypairs/withdraw-operator.json` after `make build-devnet`), not the channel admin key.
+`<OPERATOR_PUBKEY>` is the withdraw operator's key (`solana-keygen pubkey keypairs/withdraw-operator.json` after `make build-devnet`), not the channel admin key. An instance set up before this registered the channel admin; remove that Operator PDA as [UPGRADING.md](../../UPGRADING.md#secrets-management-upgrade) describes.
 ```bash
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \

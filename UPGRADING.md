@@ -113,6 +113,17 @@ cargo run --bin add_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id
   "$(solana-keygen pubkey keypairs/withdraw-operator.json)"
 ```
 
+A 0.1.0 devnet stack registered the channel admin as operator, and that Operator PDA
+still lets the admin key sign `ReleaseFunds`. Nothing checks it on raw compose. Once a
+withdrawal works with the new key, remove it:
+
+```bash
+export DATABASE_URL="postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@127.0.0.1:5434/${POSTGRES_INDEXER_DB}"
+cargo run --bin remove_operator -- <solana-rpc> <escrow-admin-keypair> <instance-id> \
+  "$(solana-keygen pubkey keypairs/operator-keypair.json)"
+unset DATABASE_URL
+```
+
 1. **Register the new withdraw operator key first.** The withdraw operator now signs
    `ReleaseFunds` with its own key, not the channel admin's. Create it (or set up a remote
    signer, see `private-channel-deploy/examples/signers/`), then add it with the escrow
