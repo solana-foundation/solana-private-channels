@@ -365,8 +365,18 @@ pub fn validate_float_budget(config: &NodeConfig) -> Result<(), String> {
 pub fn ingress_policy(
     config: &NodeConfig,
     mint_delegates: BTreeSet<Pubkey>,
-) -> crate::transactions::IngressPolicy {
-    crate::transactions::IngressPolicy {
+) -> Result<crate::transactions::IngressPolicy, String> {
+    // Its own ATA is exempt from the seize rule, so it could seize and move funds anywhere.
+    if let Some(owner) = config
+        .compliance_owner
+        .filter(|o| mint_delegates.contains(o))
+    {
+        return Err(format!(
+            "compliance_owner (PRIVATE_CHANNEL_COMPLIANCE_OWNER) {owner} is named as \
+             permanent delegate by a mint; rotate that mint or pick another owner"
+        ));
+    }
+    Ok(crate::transactions::IngressPolicy {
         admin_keys: config.admin_keys.clone(),
         seize: crate::transactions::SeizePolicy {
             delegate: config.permanent_delegate,
@@ -376,7 +386,7 @@ pub fn ingress_policy(
                 .collect(),
             compliance_owner: config.compliance_owner,
         },
-    }
+    })
 }
 
 /// Signers whose transactions skip the float budget: admins for deposits and every policed
@@ -393,7 +403,7 @@ async fn load_ingress_policy(
     config: &NodeConfig,
     pool: &sqlx::PgPool,
 ) -> Result<crate::transactions::IngressPolicy, Box<dyn std::error::Error>> {
-    let policy = ingress_policy(config, mint_delegates::read(pool).await?);
+    let policy = ingress_policy(config, mint_delegates::read(pool).await?)?;
     if !policy.seize.previous_delegates.is_empty() {
         warn!(
             "mints still name earlier delegates, policed until each mint is rotated: {:?}",
@@ -1452,7 +1462,7 @@ mod tests {
             permanent_delegate: Some(current),
             ..Default::default()
         };
-        let policy = ingress_policy(&config, BTreeSet::from([current, old]));
+        let policy = ingress_policy(&config, BTreeSet::from([current, old])).unwrap();
         assert_eq!(policy.seize.delegate, Some(current));
         assert_eq!(policy.seize.previous_delegates, vec![old]);
         assert!(policy.seize.policed(&old));
@@ -1462,5 +1472,15 @@ mod tests {
             assert!(exempt.contains(&key), "{key}");
         }
         assert!(!exempt.contains(&stranger));
+    }
+
+    /// A mint naming the compliance owner would let that key seize into its own exempt ATA.
+    #[test]
+    fn mint_naming_the_compliance_owner_refuses_to_start() {
+        let (current, old) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let config = seize_config(NodeMode::Aio, Some(current), Some(old));
+        let err = ingress_policy(&config, BTreeSet::from([current, old])).expect_err("must refuse");
+        assert!(err.contains("PRIVATE_CHANNEL_COMPLIANCE_OWNER"), "{err}");
+        assert!(ingress_policy(&config, BTreeSet::from([current])).is_ok());
     }
 }

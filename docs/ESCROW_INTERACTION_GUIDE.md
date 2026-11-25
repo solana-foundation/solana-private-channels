@@ -332,7 +332,7 @@ The delegate can move any holder's channel balance, but the node admits only a `
 
 **Keys:**
 - `PRIVATE_CHANNEL_PERMANENT_DELEGATE` is required and never derived from `PRIVATE_CHANNEL_ADMIN_KEYS`, so editing the admin list cannot change which key the node polices. Use a dedicated delegate key in production, so the hot admin key cannot seize and the delegate key cannot mint or freeze.
-- The compliance owner must differ from the delegate; the node refuses to start otherwise.
+- The compliance owner must differ from the delegate and from every key a mint names; the node refuses to start otherwise.
 - The compliance wallet withdraws to Mainnet like any holder, through `WithdrawFunds` and `ReleaseFunds`. While withdrawals are [whitelisted](#whitelist), the compliance owner and its Mainnet destination must be allowed to withdraw, so the escrow's destination whitelisting governs where seized funds can leave to.
 
 ### Rotating the delegate
