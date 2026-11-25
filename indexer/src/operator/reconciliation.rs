@@ -63,12 +63,23 @@ const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_millis(500);
 /// so this has to keep firing rather than notify once.
 const LIABILITY_DARK_ALERT_TICKS: u32 = 3;
 
+/// Consecutive ticks the liability check may skip on a lagging escrow checkpoint before the
+/// lag counts as a missing input, so a long stall ends in the inputs-dark halt.
+const LIABILITY_LAG_GRACE_TICKS: u32 = 2 * LIABILITY_DARK_ALERT_TICKS;
+
 /// How soon a closed fence is probed again. A probe re-runs the check without counting it,
 /// so a blip on the first tick costs seconds, not a whole interval.
 #[cfg(not(test))]
 const FENCE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const FENCE_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How soon an insolvency flag that missed its tick is written again. The withdraw operator
+/// has no fence of its own and stops only on that row.
+#[cfg(not(test))]
+const HALT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const HALT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Checkpoint poll interval while waiting for the ledger to cover the custody slot.
 #[cfg(not(test))]
@@ -88,6 +99,8 @@ struct BreachCounters {
     announced_mints: HashSet<Pubkey>,
     /// An insolvency halt is in force; only that suppresses a new breach trip.
     insolvency_halted: bool,
+    /// Reason of a confirmed insolvency whose flag has not landed; retried between ticks.
+    unwritten_halt: Option<String>,
     /// When each configured mint's current alert-only hold began, and its reason, for the age alert.
     held_since: HashMap<Pubkey, (&'static str, tokio::time::Instant)>,
 }
@@ -174,7 +187,8 @@ pub async fn run_reconciliation(
 
     // Counted ticks keep the configured cadence; a closed fence is probed in between. A probe
     // pages nothing and counts nothing, so it is held back whenever one more tick could
-    // cross a threshold, leaving every halt and alert to a counted tick.
+    // cross a threshold, leaving every halt and alert to a counted tick. An unwritten insolvency
+    // flag is retried on every wake, and an early wake for it does nothing else.
     let quiet_alerts = MaskedAlerts::default();
     let mut next_counted = tokio::time::Instant::now();
     loop {
@@ -188,33 +202,39 @@ pub async fn run_reconciliation(
             next_counted = tokio::time::Instant::now() + config.reconciliation_interval;
         }
 
-        // Perform reconciliation check
-        match perform_reconciliation_check(
-            &storage,
-            &config,
-            &rpc_client,
-            &channel_rpc,
-            escrow_instance_id,
-            confidential_keys.as_deref(),
-            &webhook_client,
-            if probe { &quiet_alerts } else { &masked_alerts },
-            &health,
-            &mut previously_alerted_orphans,
-            &mut breach_counters,
-            &mut halted,
-            &mut liability_dark_ticks,
-            &mut input_dark_ticks,
-            &cancellation_token,
-            &fence,
-            probe,
-        )
-        .await
-        {
-            Ok(_) => {
-                // Reconciliation check completed successfully
-            }
-            Err(e) => {
-                warn!("Failed to perform reconciliation check: {}", e);
+        // Retried before the check, since a tick that cannot read its inputs cannot re-trip.
+        let retry_wake = probe && breach_counters.unwritten_halt.is_some();
+        if breach_counters.unwritten_halt.is_some() {
+            retry_unwritten_halt(&storage, &health, &mut breach_counters, &mut halted).await;
+        }
+        if !retry_wake {
+            match perform_reconciliation_check(
+                &storage,
+                &config,
+                &rpc_client,
+                &channel_rpc,
+                escrow_instance_id,
+                confidential_keys.as_deref(),
+                &webhook_client,
+                if probe { &quiet_alerts } else { &masked_alerts },
+                &health,
+                &mut previously_alerted_orphans,
+                &mut breach_counters,
+                &mut halted,
+                &mut liability_dark_ticks,
+                &mut input_dark_ticks,
+                &cancellation_token,
+                &fence,
+                probe,
+            )
+            .await
+            {
+                Ok(_) => {
+                    // Reconciliation check completed successfully
+                }
+                Err(e) => {
+                    warn!("Failed to perform reconciliation check: {}", e);
+                }
             }
         }
 
@@ -222,6 +242,8 @@ pub async fn run_reconciliation(
             && one_more_tick_is_safe(&breach_counters, liability_dark_ticks, input_dark_ticks);
         let next_tick = if can_probe {
             next_counted.min(tokio::time::Instant::now() + FENCE_PROBE_INTERVAL)
+        } else if breach_counters.unwritten_halt.is_some() {
+            next_counted.min(tokio::time::Instant::now() + HALT_RETRY_INTERVAL)
         } else {
             next_counted
         };
@@ -598,9 +620,17 @@ async fn check_invariants(
         }
         LedgerWait::Unknown => {
             *liability_dark_ticks += 1;
+            // Past the grace window the drain check has been off too long to stay alert-only.
+            if *liability_dark_ticks > LIABILITY_LAG_GRACE_TICKS {
+                ledger_missing = Some(format!(
+                    "escrow checkpoint has not reached the custody slot for {} ticks",
+                    liability_dark_ticks
+                ));
+            }
             false
         }
-        // Lag stays alert-only, but a checkpoint that cannot be read at all is a missing input.
+        // Lag is alert-only within the grace window, but a checkpoint that cannot be read at
+        // all is a missing input.
         LedgerWait::Unreadable => {
             *liability_dark_ticks += 1;
             ledger_missing = Some("escrow checkpoint unreadable".to_string());
@@ -1088,6 +1118,7 @@ async fn evaluate_and_maybe_halt(
         announced_outage: breach_counters.announced_outage,
         announced_mints: std::mem::take(&mut breach_counters.announced_mints),
         insolvency_halted: breach_counters.insolvency_halted,
+        unwritten_halt: breach_counters.unwritten_halt.take(),
         held_since: std::mem::take(&mut breach_counters.held_since),
         ..Default::default()
     };
@@ -1149,7 +1180,7 @@ async fn evaluate_and_maybe_halt(
         }
 
         // Confirmed insolvency: the fence trips at once, the guard waits for the flag, and a
-        // failed write retries next tick.
+        // failed write retries between ticks.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
              envelope {} (adjustment {}) tolerance {} over {} consecutive finalized ticks",
@@ -1173,6 +1204,9 @@ async fn evaluate_and_maybe_halt(
         {
             *halted = true;
             next_counters.insolvency_halted = true;
+            next_counters.unwritten_halt = None;
+        } else {
+            next_counters.unwritten_halt = Some(reason);
         }
     }
 
@@ -1246,6 +1280,9 @@ async fn evaluate_and_maybe_halt(
         {
             *halted = true;
             next_counters.insolvency_halted = true;
+            next_counters.unwritten_halt = None;
+        } else {
+            next_counters.unwritten_halt = Some(reason);
         }
     }
 
@@ -1349,6 +1386,28 @@ async fn freeze_pipelines(
         h.force_unhealthy_provisional(reason.to_string());
     }
     in_force
+}
+
+/// Between ticks, write an insolvency flag that missed its tick. Pages nothing: the tick
+/// that confirmed the breach already did.
+async fn retry_unwritten_halt(
+    storage: &Arc<Storage>,
+    health: &Option<Arc<HealthState>>,
+    breach_counters: &mut BreachCounters,
+    halted: &mut bool,
+) {
+    let Some(reason) = breach_counters.unwritten_halt.clone() else {
+        return;
+    };
+    if freeze_pipelines(storage, health, &reason, HaltKind::Insolvency)
+        .await
+        .is_some()
+    {
+        info!("Insolvency halt flag landed on retry");
+        *halted = true;
+        breach_counters.insolvency_halted = true;
+        breach_counters.unwritten_halt = None;
+    }
 }
 
 /// A supply breach that only the envelope adjustment explained.
@@ -5187,6 +5246,10 @@ mod tests {
         }
 
         assert!(!halted, "the guard still waits for the row");
+        assert!(
+            counters.unwritten_halt.is_some(),
+            "the reason is kept for the retry between ticks"
+        );
         assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
         assert_eq!(
             mock.calls("set_reconciliation_halt"),
@@ -5727,6 +5790,140 @@ mod tests {
         assert_eq!(fence.closed_ticks(), 1, "only the counted tick closed");
     }
 
+    /// The withdraw operator stops only on the row, so a flag write that failed in its tick
+    /// lands as soon as the database recovers, not at the next tick, and is not written again.
+    #[tokio::test]
+    async fn an_unwritten_insolvency_halt_lands_before_the_next_interval() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 900, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let interval = Duration::from_secs(1);
+        let config = OperatorConfig {
+            reconciliation_interval: interval,
+            ..recon_config_zero_tolerance()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_reconciliation(
+            env.storage.clone(),
+            config,
+            fast_rpc(env.custody.url()),
+            fast_rpc(env.channel.url()),
+            test_instance(),
+            None,
+            None,
+            token.clone(),
+            env.fence.clone(),
+        ));
+
+        // The fence trips before the write, so wait for every attempt of the confirming tick.
+        let started = std::time::Instant::now();
+        while env.mock.calls("set_reconciliation_halt") < HALT_WRITE_ATTEMPTS as usize
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(env.fence.state(), FenceState::Tripped);
+
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        let recovered = std::time::Instant::now();
+        while env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none()
+            && recovered.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let landed_after = recovered.elapsed();
+        // A write after landing would reset halted_at, re-quarantine and undo a manual clear.
+        let writes_at_landing = env.mock.calls("set_reconciliation_halt");
+        tokio::time::sleep(4 * HALT_RETRY_INTERVAL).await;
+        let writes_after_wait = env.mock.calls("set_reconciliation_halt");
+        token.cancel();
+        task.await.unwrap().unwrap();
+
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag landed");
+        assert!(halt.insolvency);
+        assert!(
+            landed_after < interval / 2,
+            "landed {landed_after:?} after the database recovered, not before the next tick"
+        );
+        assert_eq!(
+            writes_after_wait, writes_at_landing,
+            "the retry stops once the flag lands"
+        );
+    }
+
+    /// Ticks slower than the interval leave no early wake, and a tick that cannot read supply
+    /// cannot re-trip, so a counted wake must retry the flag too.
+    #[tokio::test]
+    async fn an_unwritten_insolvency_halt_is_retried_when_every_wake_is_a_counted_tick() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 900, 1_200).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        env.mock.set_should_fail("set_outage_halt", true);
+        let interval = HALT_RETRY_INTERVAL / 10;
+        let config = OperatorConfig {
+            reconciliation_interval: interval,
+            ..recon_config_zero_tolerance()
+        };
+        let token = CancellationToken::new();
+        let task = tokio::spawn(run_reconciliation(
+            env.storage.clone(),
+            config,
+            fast_rpc(env.custody.url()),
+            fast_rpc(env.channel.url()),
+            test_instance(),
+            None,
+            None,
+            token.clone(),
+            env.fence.clone(),
+        ));
+
+        let started = std::time::Instant::now();
+        while env.mock.calls("set_reconciliation_halt") < HALT_WRITE_ATTEMPTS as usize
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(env.fence.state(), FenceState::Tripped);
+
+        // Let any tick that still read supply finish before the database recovers.
+        set_input_failing(&mut env, Input::ChannelSupply, true).await;
+        tokio::time::sleep(20 * interval).await;
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        let recovered = std::time::Instant::now();
+        while env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none()
+            && recovered.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        token.cancel();
+        task.await.unwrap().unwrap();
+
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag landed without a tick re-confirming the breach");
+        assert!(halt.insolvency);
+    }
+
     #[tokio::test]
     async fn fence_stays_closed_while_a_breach_is_suspected() {
         let mint = Pubkey::new_unique();
@@ -6115,8 +6312,8 @@ mod tests {
         assert_eq!(env.fence.state(), FenceState::Closed);
     }
 
-    /// A lagging escrow checkpoint is not a failed read: it stays on the liability-dark
-    /// alert path and never feeds the input-dark halt.
+    /// Within the grace window a lagging escrow checkpoint is not a failed read: it stays on
+    /// the liability-dark alert path and does not feed the input-dark halt.
     #[tokio::test]
     async fn checkpoint_lag_is_not_an_input_failure() {
         let mint = Pubkey::new_unique();
@@ -6137,6 +6334,82 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((liability_dark, input_dark), (1, 0));
+    }
+
+    /// Past the grace window a lagging checkpoint is a missing input, so a long stall halts
+    /// through the inputs-dark path instead of leaving the drain check off for good.
+    #[tokio::test]
+    async fn a_long_checkpoint_lag_halts_through_the_inputs_dark_path() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 100, 0)]);
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+        let (mut liability_dark, mut input_dark) = (0, 0);
+
+        // The report's starting point: a covered clean tick has opened the fence.
+        seed_checkpoint(&env.mock, 1);
+        run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+            &mut liability_dark,
+            &mut input_dark,
+        )
+        .await
+        .unwrap();
+        assert!(env.fence.is_open());
+
+        seed_checkpoint(&env.mock, 0);
+        for _ in 0..LIABILITY_LAG_GRACE_TICKS {
+            run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut liability_dark,
+                &mut input_dark,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            input_dark, 0,
+            "lag stays alert-only inside the grace window"
+        );
+        assert!(!halted);
+
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut liability_dark,
+                &mut input_dark,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(halted, "the inputs-dark halt follows the grace window");
+        let halt = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("the flag is set");
+        assert!(!halt.insolvency, "an outage halt: nothing is proven wrong");
+        assert!(
+            halt.reason
+                .contains("escrow checkpoint has not reached the custody slot"),
+            "{}",
+            halt.reason
+        );
     }
 
     /// Both halt kinds pull the same levers, but only a proven insolvency quarantines.

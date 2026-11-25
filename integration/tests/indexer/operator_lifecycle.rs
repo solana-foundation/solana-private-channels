@@ -1366,6 +1366,8 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &mint.to_string()).await?;
+    // A covered ledger, so a lagging checkpoint cannot halt first and only the supply breach can.
+    seed_escrow_checkpoint(&storage, i64::MAX as u64).await?;
 
     // Over-issue: mint supply to a NON-escrow holder so Mint.supply rises while
     // the escrow custody stays 0. This is supply exceeding custody with no

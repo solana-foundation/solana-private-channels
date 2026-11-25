@@ -69,7 +69,9 @@ A tick that cannot pin the ledger leaves the liability check unarmed, so
 `private_channel_operator_reconciliation_liability_dark_ticks` counts how many
 consecutive ticks it has been off (0 when armed) and every third dark tick logs
 `reconciliation_alert` and posts a webhook. An indefinitely frozen escrow
-checkpoint keeps that firing rather than going quiet. A shortfall too small to
+checkpoint keeps that firing rather than going quiet. After six such ticks, each
+further lagging tick counts as a dark tick, so a lag of nine ticks (about 45
+minutes at the default 5 minute interval) ends in the inputs-dark halt below. A shortfall too small to
 halt is still exported per mint as
 `private_channel_operator_reconciliation_liability_shortfall_raw`, because that
 is the state that refuses the next boot.
@@ -116,7 +118,10 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 2. Forces its `/health` to 503 (pages orchestration) before any database write,
    so a flag write stuck behind a lock cannot keep the service green: the breach
    is proven either way.
-3. Sets the durable `reconciliation_halt` flag (reason recorded).
+3. Sets the durable `reconciliation_halt` flag (reason recorded). A failed write
+   is retried every 5 s while this process runs. A restart drops the retry, and
+   the next boot refuses on the shortfall without setting the flag. While the
+   flag is unset the withdraw operator keeps releasing: stop it by hand.
 4. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
    `manual_review`.
 5. Posts the halt webhook. This webhook is the only alert - there is no separate
@@ -165,16 +170,19 @@ with no `mints` row) counts as a dark tick, exported as
 `private_channel_operator_reconciliation_input_dark_ticks`. Three dark ticks in
 a row (about 10 minutes at the default 5 minute interval) halt with the reason
 `reconciliation halt: required inputs unavailable for <N> consecutive ticks (last: <reason>)`.
-Any tick that reads everything resets the count. A lagging escrow checkpoint is
-not a dark tick; it stays on the liability-dark alert described above. A
-checkpoint that cannot be read at all during the wait is a dark tick.
+Any tick that reads everything resets the count. A lagging escrow checkpoint
+stays on the liability-dark alert described above for its first six ticks;
+every lagging tick after that is a dark tick. A checkpoint that cannot be read
+at all during the wait is a dark tick.
 
 This halt sets the flag, forces `/health` to 503 once the flag has been written, and
 posts a webhook with `halt_reason` and `dark_ticks`, but it does **not** quarantine
 withdrawals: nothing is proven wrong, and the flag alone already blocks every send. Typical causes are
 a Solana RPC or DB outage, a channel node that is down, frozen or more than 120 s
 behind, more than 120 s of clock skew either way between the channel write node
-and the operator, or an unreadable `mints` row. Restore the input first. Clearing
+and the operator, an unreadable `mints` row, or an escrow indexer stalled or
+still backfilling for nine ticks (about 45 minutes at the default 5 minute
+interval). Restore the input first. Clearing
 the flag while the input is still unreadable halts again on the next tick. If the
 flag write itself fails, the operator retries it within the tick and again on
 later ticks until it lands. `/health` is only forced to 503 once the flag has
