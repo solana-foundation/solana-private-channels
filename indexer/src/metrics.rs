@@ -482,8 +482,9 @@ counter_vec!(
     &["chain", "outcome"]
 );
 
-// A poisoned mint has a confidential deposit our key could not decrypt, or an escrow
-// account configured with another key. It stays held until `indexer confidential-recover`.
+// A poisoned mint has a confidential deposit our key could not decrypt, an escrow account
+// configured with another key, or a deposit parked because of that key. It stays held until
+// `indexer confidential-recover`.
 gauge_vec!(
     CONFIDENTIAL_MINT_POISONED,
     "private_channel_confidential_mint_poisoned",

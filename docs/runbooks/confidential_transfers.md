@@ -14,7 +14,9 @@ How it works, in short:
 - A confidential deposit becomes a normal deposit row with `confidential = true`.
   A deposit the key cannot decrypt becomes a row flagged `confidential_undecrypted`
   with its raw event bytes, and **poisons** its mint: nothing is minted for it,
-  custody is held, and confidential withdrawals of that mint park.
+  custody is held, and confidential withdrawals of that mint park. A deposit on a mint
+  whose escrow account is under another key is stored the same way even when it
+  decrypts.
 - Custody of a configured mint is the public amount + the decrypted pending balance
   + the available balance, read from the escrow's AES copy and confirmed against the
   on-chain ciphertext. No event history is involved.
@@ -202,8 +204,9 @@ or escrow error 22 on-chain). Nothing was sent, or what was sent failed.
 ### confidential_mint_poisoned
 
 The mint has a confidential deposit the key could not decrypt, or its escrow
-account is configured under a key that is not ours. Custody of the mint is held and
-nothing is minted for its undecrypted deposits.
+account is configured under a key that is not ours, in which case every confidential
+deposit into it is stored undecrypted, even one that decrypts. Custody of the mint is
+held and nothing is minted for its undecrypted deposits.
 
 1. Find the cause:
    ```sql
@@ -218,10 +221,14 @@ nothing is minted for its undecrypted deposits.
      were indexed was wrong or missing. Continue with step 2.
    - **Account under any other key** (a foreign-key mint): it is never recovered
      into the channel. `confidential-recover` refuses it, its confidential
-     deposits stay undecrypted and are never credited, its custody stays held and
+     deposits are parked undecrypted when they are indexed and are never credited,
+     its custody stays held and
      its confidential withdrawals keep parking (release them publicly if the
      public balance covers them, or remint on a confidential-only mint). No instance key can move or verify its
-     confidential balance. [Escalate](_escalation.md) (Tier 1) and stop here.
+     confidential balance. A `resync` of such a mint whose decrypting deposit was
+     credited by an earlier release refuses with `ConsumedMintMismatch` (the rebuilt row
+     has amount 0, the channel mint has the credited amount) until that row is handled
+     by hand. [Escalate](_escalation.md) (Tier 1) and stop here.
 2. Load the right key (`ESCROW_CONFIDENTIAL_KEYS`, the instance key), restart the
    services.
 3. Stop every indexer and operator on the database (`indexer-solana`,

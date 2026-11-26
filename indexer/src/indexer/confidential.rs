@@ -23,7 +23,7 @@ use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferAccount, BaseStateWithExtensions,
     StateWithExtensions,
 };
-use std::{str::FromStr, sync::Arc};
+use std::{collections::BTreeSet, str::FromStr, sync::Arc};
 use tracing::{error, info, warn};
 
 const CONFIDENTIAL_DEPOSIT: u8 = 13;
@@ -192,14 +192,15 @@ pub fn report_poisoned(mint: &str) {
 
 /// Boot check: a pinned pubkey requires the matching key, whatever the database holds. Once
 /// any escrow account is configured the key is required and must match at least one of them.
-/// A mint configured with another key is reported poisoned.
+/// A mint configured with another key is reported poisoned and returned, so the indexer parks
+/// its deposits.
 pub async fn check_keys_at_boot(
     storage: &Storage,
     keys: Option<&Keys>,
     pinned: Option<[u8; 32]>,
     source: &dyn EscrowKeySource,
     instance: &Pubkey,
-) -> Result<(), IndexerError> {
+) -> Result<BTreeSet<String>, IndexerError> {
     for mint in storage.get_confidential_poisoned_mints().await? {
         report_poisoned(&mint);
     }
@@ -241,7 +242,7 @@ pub async fn check_keys_at_boot(
         .map(|(mint, key)| (mint.to_string(), key))
         .collect();
     if configured.is_empty() {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
     let Some(keys) = keys else {
         return Err(IndexerError::ConfidentialKeys {
@@ -261,11 +262,13 @@ pub async fn check_keys_at_boot(
             ),
         });
     }
+    let mut foreign = BTreeSet::new();
     for (mint, _) in configured.iter().filter(|(_, pubkey)| *pubkey != ours) {
         error!(%mint, "escrow account configured with another key; the mint is poisoned");
         report_poisoned(mint);
+        foreign.insert(mint.clone());
     }
-    Ok(())
+    Ok(foreign)
 }
 
 /// A deposit's net amount, `None` when `keys` cannot read it.
@@ -505,9 +508,10 @@ mod tests {
     async fn boot_check_needs_no_key_until_a_mint_is_configured() {
         let (storage, mock) = storage_with(vec![]);
         with_token_2022_mints(&mock, &[MINT]);
-        check_keys_at_boot(&storage, None, None, &accounts(&[]), &instance())
+        let foreign = check_keys_at_boot(&storage, None, None, &accounts(&[]), &instance())
             .await
             .unwrap();
+        assert!(foreign.is_empty());
     }
 
     /// The instance's mints come from the database, listed or not: a mint seen only in a
@@ -729,9 +733,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("matches none"), "{err}");
-        check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
+        let foreign = check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
             .await
             .unwrap();
+        assert!(foreign.is_empty());
     }
 
     #[tokio::test]
@@ -743,9 +748,13 @@ mod tests {
             (MINT, cts::keys().pubkey()),
             (foreign_mint, cts::other_keys().pubkey()),
         ]);
-        check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
+        let foreign = check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
             .await
             .unwrap();
+        assert_eq!(
+            foreign,
+            BTreeSet::from([Pubkey::new_from_array(foreign_mint).to_string()])
+        );
         assert_eq!(
             metrics::CONFIDENTIAL_MINT_POISONED
                 .with_label_values(&[&Pubkey::new_from_array(foreign_mint).to_string()])

@@ -430,6 +430,22 @@ mod tests {
         );
     }
 
+    /// With a zero opening the key term of the ciphertext vanishes, so the deposit decrypts
+    /// under any key. Decryptability cannot tell whose account a deposit landed in.
+    #[test]
+    fn a_zero_opening_deposit_decrypts_under_any_key() {
+        use solana_zk_sdk::encryption::pedersen::PedersenOpening;
+        let opening = PedersenOpening::from_bytes(&[0; 32]).unwrap();
+        let pubkey = ElGamalPubkey::try_from(&keys().pubkey()[..]).unwrap();
+        let (lo, hi) = split(70_000);
+        let lo_after = pubkey.encrypt_with_u64(lo, &opening).to_bytes();
+        let hi_after = pubkey.encrypt_with_u64(hi, &opening).to_bytes();
+        assert_eq!(
+            other_keys().decrypt_deposit(&zero(), &zero(), &lo_after, &hi_after),
+            Some(70_000)
+        );
+    }
+
     #[test]
     fn decrypt_deposit_garbage_bytes_fail() {
         let keys = keys();
