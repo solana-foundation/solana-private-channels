@@ -44,11 +44,14 @@
 - New optional secret `ESCROW_CONFIDENTIAL_KEYS` (the escrow instance's ElGamal and AES keys, JSON with base64 `elgamal_secret` and `aes_key`), passed to `indexer-solana`, `operator-solana` and `operator-private-channel` in both compose files and the Ansible deploy (`escrow_confidential_keys` in `secrets.yml`, or Doppler). Blank until an escrow account is configured; `check-required-env.sh` and the deploy refuse a malformed value
 - New optional `ESCROW_CONFIDENTIAL_PUBKEY` (the instance's ElGamal pubkey, base64, as `confidential_keygen` prints it; not secret), wired like `ESCROW_CONFIDENTIAL_KEYS` (`escrow_confidential_pubkey` in the deploy). When set, `indexer-solana`, both operators and `resync` refuse to start unless the keys are set and match it, even on an empty database
 - Devnet tools `confidential_keygen`, `confidential_verify` (checks a backup copy of the instance keys against the pinned pubkey or, offline, a configured escrow account's data), `escrow_account_data` (writes that data to a file; reads no key), `configure_confidential`, `confidential_deposit` and `confidential_withdraw`
+- A confidential deposit on a mint whose escrow account is under another key is stored undecrypted and never minted, even when it decrypts (a zero-opening deposit decrypts under any key). The foreign mints come from the boot key check and from foreign `ConfigureConfidentialAccount` events
 - Runbook `docs/runbooks/confidential_transfers.md` (setup ceremony with backup verification and a quarterly backup drill, one entry per confidential park label and alert) and `docs/CONFIDENTIAL_SCOPE_CORRECTIONS.md`
 
 ### Indexer and operators
 - The escrow operator creates channel mints with `InitializePermanentDelegate(OPERATOR_PERMANENT_DELEGATE)` and `InitializeMint2`, and never mints into a channel mint whose delegate is missing or another key (manual review, `permanent delegate mismatch`)
 - Solvency reconciliation reads channel supply from Token-2022 mints
+- The escrow operator closes its solvency fence on the third dark reconciliation tick, before the outage halt write, so a failing write cannot leave it minting; the next clean tick reopens it
+- A confidential mint held as `stale_aes`, `pending_too_large` or `poisoned` is a dark reconciliation tick, so three in a row halt as an outage. The escrow indexer refuses to boot on a `poisoned` mint. The withdraw sender's background apply and AES repair keep running under an outage halt; rebalances do not
 
 ### Deploy, compose and scripts
 - New env vars: `PRIVATE_CHANNEL_PERMANENT_DELEGATE` (node, required), `PRIVATE_CHANNEL_COMPLIANCE_OWNER` (node, optional, must differ from the delegate) and `OPERATOR_PERMANENT_DELEGATE` (operators, required). Flags `--permanent-delegate` and `--compliance-owner`. Ansible vars `permanent_delegate` and `compliance_owner`

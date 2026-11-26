@@ -141,7 +141,11 @@ pages, and it is skipped whenever one more tick could cross a threshold, so ever
 halt and alert still comes from a tick on the configured cadence.
 A confirmed breach **trips** the fence before the flag write is attempted,
 so a failing write cannot leave this process minting; a tripped fence never
-reopens until the process restarts. A builder refused by the fence is counted as
+reopens until the process restarts. The third dark tick in a row (see
+Inputs-dark halt) **closes** an open fence before the outage flag write is
+attempted; a closed fence is the boot state again, so the next clean tick reopens
+it. While inputs are dark for three ticks no probe runs, so after the inputs
+return the fence waits for the next configured tick, at most one interval. A builder refused by the fence is counted as
 `private_channel_operator_transaction_errors_total{error_reason="solvency_fence_closed"}`
 and its row goes back to `pending` without using a requeue attempt. The fence is
 checked once more after the claim write, so a trip that lands mid-claim still
@@ -149,7 +153,9 @@ stops the send; that row keeps its persisted, never-broadcast signature in
 `processing` and recovery settles it. The state is
 exported as `private_channel_operator_solvency_fence_state` (0 closed, 1 open,
 2 tripped). A closed fence counts as progress for `/health` for the first three
-ticks only; after that, with deposits waiting, `/health` reports the stall. The
+ticks only; after that, with deposits waiting, `/health` reports the stall. While an
+outage flag write keeps failing `/health` stays green until the closed fence has
+outlived those three ticks with a backlog. The
 withdraw operator runs no reconciliation, so its fence is always open and the
 durable flag stays its only gate; while an insolvency write keeps failing it keeps
 releasing, so treat a confirmed-breach page with the flag still unset as urgent and
@@ -177,7 +183,9 @@ behind, more than 120 s of clock skew either way between the channel write node
 and the operator, or an unreadable `mints` row. Restore the input first. Clearing
 the flag while the input is still unreadable halts again on the next tick. If the
 flag write itself fails, the operator retries it within the tick and again on
-later ticks until it lands. `/health` is only forced to 503 once the flag has
+later ticks until it lands. The escrow operator closes its solvency fence before
+the first write attempt, so a failing write cannot leave it minting; the withdraw
+operator reads only the flag, so it keeps releasing until the write lands. `/health` is only forced to 503 once the flag has
 landed, because that latch lasts until a restart; until then the webhook, the
 `input_dark_ticks` gauge and its alert are what page. An outage reason on
 `/health` is replaced by the insolvency reason if a breach later upgrades the
@@ -231,25 +239,30 @@ read as zero custody.
 | State | Metric | Counted as dark | What it means |
 |---|---|---|---|
 | counted | none | no | custody = public + pending + verified available |
-| stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | no | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
-| pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | no | unapplied pending is past the bounded search; the sender's next apply clears it |
-| poisoned | `..._lagging{reason="poisoned"}` = 1 | no | a confidential deposit could not be decrypted |
+| stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | yes | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
+| pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | yes | unapplied pending is past the bounded search; the sender's next apply clears it |
+| poisoned | `..._lagging{reason="poisoned"}` = 1 | yes | a confidential deposit could not be decrypted |
 | key_mismatch | `..._lagging{reason="key_mismatch"}` = 1 | no | the account's ElGamal key is not ours; still compared on its public balance |
 | mismatch | `private_channel_reconciliation_confidential_mismatch{mint}` = 1 | yes | AES copy does not open with matching counters, pending lo does not decrypt, the total overflows, or no key is loaded |
 
 Every held state also exports
 `private_channel_reconciliation_confidential_hold_age_seconds{mint,reason}`.
 
-A mismatch is an [inputs-dark](#inputs-dark-halt) tick with the reason
-`confidential custody not proven for ...`; three in a row halt as an outage. The
-held states are alert only, so a racing deposit or a failure contained to one mint
-never halts the others. While a mint is held its value is unchecked, so treat a
-hold-age alert as urgent. A `key_mismatch` mint is the exception: no confidential
-deposit is ever credited under a foreign key, so its custody is its public balance and
-it is compared, and can halt, like any mint. Startup and manual runs use the same rules: a
-held mint is left out of the comparison (a `key_mismatch` mint is compared on its public
-balance and not reported as held), a mismatch stops the run, and a manual
-`indexer reconcile` exits non-zero naming every held mint and its reason.
+A mismatch, `stale_aes`, `pending_too_large` and `poisoned` are each an
+[inputs-dark](#inputs-dark-halt) tick with the reason
+`confidential custody not proven for ...` naming the mint and its state; three in a
+row halt as an outage, and on the third the escrow operator's solvency fence closes.
+The mint's custody is unknown while it is held, so the fence cannot open on it. A
+racing deposit clears in seconds, well inside one tick, so ordinary lag never halts.
+A `key_mismatch` mint is the exception: no confidential deposit is ever credited under
+a foreign key, so its custody is its public balance and it is compared, and can halt,
+like any mint. Startup and manual runs leave a held mint out of the comparison (a
+`key_mismatch` mint is compared on its public balance and not reported as held) and
+stop on a mismatch. Startup also refuses to boot on a `poisoned` mint, after the
+comparison, with `ConfidentialCustodyHeld`; a `stale_aes` or `pending_too_large` mint
+only warns there, because clearing it can need the deposits the live indexer has yet
+to index. A manual `indexer reconcile` exits non-zero naming every held mint and its
+reason.
 
 Deposits that could not be decrypted (each poisons its mint):
 
@@ -264,16 +277,24 @@ How each state ends. None of them is resolved by reconciliation itself.
 
 - **stale_aes**: should clear within seconds once the sender's repair lands. If it
   lasts, check `operator-private-channel` (the withdraw operator, whose sender runs every
-  apply and repair) is running and not halted, and look for
+  apply and repair) is running and not insolvency-halted, and look for
   `confidential_aes_repair_deferred{mint}`; any later apply, release or
-  `MoveToPublic` also rewrites the copy.
+  `MoveToPublic` also rewrites the copy. The sender keeps applying and repairing under
+  an outage halt, so a hold that raised one clears itself; then clear the flag as for
+  any outage. A hold that lasts three ticks means the sender cannot touch the mint:
+  its withdrawals are blocked (unblock it), or its escrow account is frozen (thaw it).
 - **pending_too_large**: the sender applies pending once it reaches 2^47 base
-  units. If it lasts, check `operator-private-channel` is running, not halted, and the
-  mint is not blocked.
-- **poisoned**: the key that encrypted these rows is not the loaded one. Set
-  `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop every indexer and operator on the database,
-  run `indexer confidential-recover --mint <mint>`, then restart. The mint is
-  counted again once no deposit is flagged `confidential_undecrypted`.
+  units, also under an outage halt. If it lasts, check `operator-private-channel` is
+  running and not insolvency-halted. A hold that lasts three ticks means the mint's
+  withdrawals are blocked (unblock it), its escrow account is frozen (thaw it), or the
+  escrow indexer has not yet indexed the deposits the sender needs to open the pending
+  balance (let it catch up). Once the hold clears, clear the outage flag.
+- **poisoned**: the key that encrypted these rows is not the loaded one. The mint
+  halts as an outage on the third tick, and the escrow indexer refuses to boot on it.
+  Set `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop every indexer and operator
+  on the database, run `indexer confidential-recover --mint <mint>`, then restart and
+  clear the halt flag. The mint is counted again once no deposit is flagged
+  `confidential_undecrypted`.
 - **key_mismatch**: the escrow account was configured with another key. Load the
   right key; if it is lost the confidential custody of this mint is stuck for good,
   so escalate. Its public side stays reconciled meanwhile. If confidential deposits of

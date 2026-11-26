@@ -105,6 +105,9 @@ pub struct TransactionProcessor {
     // Filled with each derived row's mint in the validate-only pass, so resync knows which
     // receipt mints' histories to scan. Ignored on every other path.
     row_mints: Option<Arc<Mutex<BTreeSet<String>>>>,
+    // Mints whose escrow account is configured under a key that is not ours: from the boot
+    // check, plus every foreign configure seen since. Such an account can never be re-keyed.
+    foreign_mints: BTreeSet<String>,
 }
 
 impl TransactionProcessor {
@@ -120,6 +123,7 @@ impl TransactionProcessor {
             consumed: None,
             validate_only: false,
             row_mints: None,
+            foreign_mints: BTreeSet::new(),
         }
     }
 
@@ -140,6 +144,12 @@ impl TransactionProcessor {
 
     pub fn with_confidential_keys(mut self, keys: Option<Arc<Keys>>) -> Self {
         self.confidential_keys = keys;
+        self
+    }
+
+    /// Mints the boot key check found configured under another key.
+    pub fn with_foreign_mints(mut self, foreign_mints: BTreeSet<String>) -> Self {
+        self.foreign_mints = foreign_mints;
         self
     }
 
@@ -314,21 +324,28 @@ impl TransactionProcessor {
 
         let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
         // Decryption is CPU-bound, so it runs off the async executor; rows keep their order.
+        // In instruction order, so a foreign configure parks a deposit later in the same slot.
         let instance = self.configured_escrow_instance_id;
         let keys = self.confidential_keys.clone();
-        let (slot_instructions, confidential_rows) = match tokio::task::spawn_blocking(move || {
-            let rows: Vec<_> = slot_instructions
-                .iter()
-                .map(|ix| convert_confidential(ix, instance.as_ref(), keys.as_deref()))
-                .collect();
-            (slot_instructions, rows)
-        })
-        .await
-        {
-            Ok(converted) => converted,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            Err(_) => return Err(IndexerError::ProcessorPanicked),
-        };
+        let mut foreign = self.foreign_mints.clone();
+        let (slot_instructions, confidential_rows, foreign) =
+            match tokio::task::spawn_blocking(move || {
+                let rows: Vec<_> = slot_instructions
+                    .iter()
+                    .map(|ix| {
+                        convert_confidential(ix, instance.as_ref(), keys.as_deref(), &mut foreign)
+                    })
+                    .collect();
+                (slot_instructions, rows, foreign)
+            })
+            .await
+            {
+                Ok(converted) => converted,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(_) => return Err(IndexerError::ProcessorPanicked),
+            };
+        let new_foreign: Vec<String> = foreign.difference(&self.foreign_mints).cloned().collect();
+        self.foreign_mints = foreign;
         for (instruction_meta, confidential) in slot_instructions.iter().zip(confidential_rows) {
             if let Some(rows) = confidential {
                 poisoned_mints.extend(rows.poisoned);
@@ -401,6 +418,7 @@ impl TransactionProcessor {
                     &mint_statuses,
                     &transactions,
                     &observed_releases,
+                    &new_foreign,
                 )
                 .await
             {
@@ -474,6 +492,7 @@ impl TransactionProcessor {
     /// history, then the status mirror, then transactions. Short-circuits on the
     /// first failing write so a deposit is never inserted without its backing
     /// mint-status row.
+    #[allow(clippy::too_many_arguments)]
     async fn write_slot(
         &self,
         slot: u64,
@@ -482,6 +501,7 @@ impl TransactionProcessor {
         mint_statuses: &[DbMintStatus],
         transactions: &[DbTransaction],
         observed_releases: &[DbObservedRelease],
+        foreign_mints: &[String],
     ) -> Result<(), StorageError> {
         // Insert mints FIRST (before transactions that might reference them)
         if !mints.is_empty() {
@@ -530,6 +550,21 @@ impl TransactionProcessor {
             touched.dedup();
             if let Err(e) = self.storage.sync_mint_status(&touched).await {
                 error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
+                return Err(e);
+            }
+        }
+
+        // Before the checkpoint, so a restart after it still seeds these mints at boot.
+        if !foreign_mints.is_empty() {
+            if let Err(e) = self
+                .storage
+                .record_confidential_foreign_mints(foreign_mints)
+                .await
+            {
+                error!(
+                    "Failed to record foreign-key mints for slot {}: {}",
+                    slot, e
+                );
                 return Err(e);
             }
         }
@@ -806,11 +841,14 @@ struct ConfidentialRows {
 
 /// Convert a confidential escrow instruction on the configured instance. `None` for anything
 /// else. An undecryptable deposit is stored flagged with its raw event, and a configure under
-/// a key that is not ours is reported; either poisons the mint, and the slot still indexes.
+/// a key that is not ours is reported and joins `foreign_mints`. A deposit on a mint in that
+/// set is stored flagged too, since a zero opening decrypts under any key. Each poisons the
+/// mint, and the slot still indexes.
 fn convert_confidential(
     instruction_meta: &InstructionWithMetadata,
     configured_escrow_instance_id: Option<&Pubkey>,
     keys: Option<&Keys>,
+    foreign_mints: &mut BTreeSet<String>,
 ) -> Option<ConfidentialRows> {
     let signature = instruction_meta.signature.as_ref()?;
     let ProgramInstruction::Escrow(escrow_ix) = &instruction_meta.instruction else {
@@ -849,13 +887,20 @@ fn convert_confidential(
     if confidential::configured_with_foreign_key(event, keys) {
         failed("configure");
         rows.poisoned = Some(mint.clone());
+        foreign_mints.insert(mint.clone());
     } else if let ConfidentialEventBody::Configure { elgamal_pubkey } = &event.body {
         use base64::Engine;
         let elgamal_pubkey = base64::engine::general_purpose::STANDARD.encode(elgamal_pubkey);
         info!(%mint, %elgamal_pubkey, %signature, "{}", confidential::CONFIGURED_UNDER_INSTANCE_KEY);
     }
     if let ConfidentialEventBody::Deposit { user, recipient } = &event.body {
-        let amount = confidential::deposit_amount(event, keys);
+        // Tokens sent to an account no instance key can spend must not be credited.
+        let amount = if foreign_mints.contains(&mint) {
+            warn!(%mint, %signature, "deposit on a mint configured under another key; stored undecrypted");
+            None
+        } else {
+            confidential::deposit_amount(event, keys)
+        };
         if amount.is_none() {
             failed("deposit");
             rows.poisoned = Some(mint.clone());
@@ -3684,7 +3729,7 @@ mod confidential_tests {
                 ("foreign", FOREIGN, cts::other_keys().pubkey()),
             ] {
                 let ix = configure(&at(10, name), mint, pubkey);
-                convert_confidential(&ix, Some(&instance()), Some(&keys));
+                convert_confidential(&ix, Some(&instance()), Some(&keys), &mut BTreeSet::new());
             }
         });
         let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
@@ -3707,10 +3752,126 @@ mod confidential_tests {
             && l.contains(crate::indexer::confidential::CONFIGURED_UNDER_INSTANCE_KEY)));
     }
 
+    fn decrypt_failures() -> f64 {
+        metrics::CONFIDENTIAL_DECRYPT_FAILURES
+            .with_label_values(&["deposit"])
+            .get()
+    }
+
+    fn raw_of(ix: &InstructionWithMetadata) -> Vec<u8> {
+        match &ix.instruction {
+            ProgramInstruction::Escrow(escrow) => match escrow.as_ref() {
+                EscrowInstruction::Confidential { event, .. } => event.raw.clone(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// The parked row an undecryptable deposit gets: amount 0, flagged, raw event kept.
+    fn assert_parked(row: &DbTransaction, raw: &[u8]) {
+        assert!(row.confidential_undecrypted, "{row:?}");
+        assert_eq!(row.amount.0, 0);
+        assert_eq!(row.confidential_raw.as_deref(), Some(raw));
+    }
+
+    /// A zero-opening deposit decrypts under any key, so on a mint configured under another
+    /// key a deposit is parked whatever its ciphertext says. A mint under our key is unchanged.
+    #[tokio::test]
+    async fn a_deposit_that_decrypts_on_a_foreign_key_mint_is_stored_undecrypted() {
+        const FOREIGN: [u8; 32] = [41; 32];
+        const OURS: [u8; 32] = [42; 32];
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        run_slot(
+            &mut processor,
+            10,
+            vec![
+                configure(&at(10, "cfg-f"), FOREIGN, cts::other_keys().pubkey()),
+                configure(&at(10, "cfg-o"), OURS, keys.pubkey()),
+            ],
+        )
+        .await
+        .unwrap();
+        let failures = decrypt_failures();
+        let parked = deposit(&at(11, "dep-f"), FOREIGN, &keys, 70_000, 5_000);
+        let raw = raw_of(&parked);
+        run_slot(
+            &mut processor,
+            11,
+            vec![
+                parked,
+                deposit(&at(11, "dep-o"), OURS, &keys, 70_000, 5_000),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = inserted(&mock);
+        let row = |sig: &str| rows.iter().find(|r| r.signature == sig).unwrap().clone();
+        assert_parked(&row("dep-f"), &raw);
+        let ours = row("dep-o");
+        assert!(!ours.confidential_undecrypted);
+        assert_eq!(ours.amount.0, 65_000);
+        assert_eq!(gauge(OURS), 0.0);
+        assert!(decrypt_failures() >= failures + 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_configure_and_its_deposit_in_one_slot_are_ordered() {
+        const FOREIGN: [u8; 32] = [43; 32];
+        let keys = cts::keys();
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let parked = deposit(&at(10, "dep"), FOREIGN, &keys, 70_000, 5_000);
+        let raw = raw_of(&parked);
+        run_slot(
+            &mut processor,
+            10,
+            vec![
+                configure(&at(10, "cfg"), FOREIGN, cts::other_keys().pubkey()),
+                parked,
+            ],
+        )
+        .await
+        .unwrap();
+        assert_parked(&inserted(&mock)[0], &raw);
+    }
+
+    /// The restart case: the boot check seeds the set from the chain, and no configure is seen.
+    #[tokio::test]
+    async fn foreign_mints_from_the_boot_check_park_deposits_without_a_configure_event() {
+        const FOREIGN: [u8; 32] = [44; 32];
+        let keys = cts::keys();
+        let (processor, mock) = processor_with(Some(cts::keys()));
+        let mut processor = processor.with_foreign_mints(BTreeSet::from([mint(FOREIGN)]));
+        let parked = deposit(&at(10, "dep"), FOREIGN, &keys, 70_000, 5_000);
+        let raw = raw_of(&parked);
+        run_slot(&mut processor, 10, vec![parked]).await.unwrap();
+        assert_parked(&inserted(&mock)[0], &raw);
+    }
+
+    /// A foreign configure is recorded, so a restart before any other row for the mint still
+    /// seeds it; the boot check reads only mints the database knows.
+    #[tokio::test]
+    async fn a_foreign_configure_is_recorded_for_the_next_boot() {
+        const FOREIGN: [u8; 32] = [46; 32];
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let slot = vec![
+            configure(&at(10, "cfg-f"), FOREIGN, cts::other_keys().pubkey()),
+            configure(&at(10, "cfg"), MINT_A, cts::keys().pubkey()),
+        ];
+        run_slot(&mut processor, 10, slot).await.unwrap();
+        assert_eq!(
+            mock.confidential_foreign_mints.lock().unwrap().clone(),
+            BTreeSet::from([mint(FOREIGN)])
+        );
+    }
+
     /// Two keyed processors fed the same confidential slot write the same rows. The live versus
     /// resync comparison is e2e test 39, `e2e_escrow_resync_rebuilds_confidential_rows_identically`.
     #[tokio::test]
     async fn two_keyed_processors_write_identical_confidential_rows() {
+        const FOREIGN: [u8; 32] = [45; 32];
         let keys = cts::keys();
         // Built once: ciphertexts are randomized, and a rebuild reads the same bytes.
         let slot = vec![
@@ -3718,6 +3879,8 @@ mod confidential_tests {
             deposit(&at(10, "dep"), MINT_A, &keys, 70_000, 5_000),
             deposit(&at(10, "bad"), MINT_A, &cts::other_keys(), 9, 0),
             release(&at(10, "rel"), MINT_A, &keys, 300, 21),
+            configure(&at(10, "cfg-f"), FOREIGN, cts::other_keys().pubkey()),
+            deposit(&at(10, "dep-f"), FOREIGN, &keys, 70_000, 5_000),
         ];
         let (mut live, live_mock) = processor_with(Some(cts::keys()));
         run_slot(&mut live, 10, slot.clone()).await.unwrap();
@@ -3741,8 +3904,14 @@ mod confidential_tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(key(&live_mock).len(), 2);
+        assert_eq!(key(&live_mock).len(), 3);
         assert_eq!(key(&live_mock), key(&rebuild_mock));
+        let foreign = BTreeSet::from([mint(FOREIGN)]);
+        assert_eq!(live.foreign_mints, foreign);
+        assert_eq!(rebuild.foreign_mints, foreign);
+        assert!(inserted(&live_mock)
+            .iter()
+            .any(|r| r.signature == "dep-f" && r.confidential_undecrypted));
         let release = |mock: &MockStorage| mock.observed_releases.lock().unwrap().clone();
         assert_eq!(release(&live_mock).len(), 1);
         assert_eq!(

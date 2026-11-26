@@ -482,8 +482,9 @@ counter_vec!(
     &["chain", "outcome"]
 );
 
-// A poisoned mint has a confidential deposit our key could not decrypt, or an escrow
-// account configured with another key. It stays held until `indexer confidential-recover`.
+// A poisoned mint has a confidential deposit our key could not decrypt, an escrow account
+// configured with another key, or a deposit parked because of that key. It stays held until
+// `indexer confidential-recover`.
 gauge_vec!(
     CONFIDENTIAL_MINT_POISONED,
     "private_channel_confidential_mint_poisoned",
@@ -498,8 +499,8 @@ counter_vec!(
     &["kind"]
 );
 
-// Confidential custody in escrow reconciliation, read from the escrow account. Held mints are
-// alert-only; a mismatch on a healthy mint counts as a dark input.
+// Confidential custody in escrow reconciliation, read from the escrow account. A mismatch, and
+// any hold but a foreign key, counts as a dark input.
 gauge_vec!(
     RECONCILIATION_CONFIDENTIAL_MISMATCH,
     "private_channel_reconciliation_confidential_mismatch",

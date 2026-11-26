@@ -38,8 +38,10 @@ pub(crate) async fn check_confidential_keys(
     let source = RpcEscrowKeySource {
         rpc: solana_rpc.clone(),
     };
+    // The operator converts no events, so it has no use for the foreign-key mints.
     check_keys_at_boot(storage, keys, pinned, &source, escrow_instance)
         .await
+        .map(|_| ())
         .map_err(|e| OperatorError::InvalidConfig(e.to_string()))
 }
 

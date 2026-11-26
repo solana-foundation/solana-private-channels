@@ -324,6 +324,19 @@ impl Storage {
         confidential_deposits::get_confidential_poisoned_mints(self).await
     }
 
+    /// Record mints whose escrow account was configured under another key. Idempotent.
+    pub async fn record_confidential_foreign_mints(
+        &self,
+        mints: &[String],
+    ) -> Result<(), StorageError> {
+        confidential_deposits::record_confidential_foreign_mints(self, mints).await
+    }
+
+    /// Mints recorded as configured under another key.
+    pub async fn get_confidential_foreign_mints(&self) -> Result<Vec<String>, StorageError> {
+        confidential_deposits::get_confidential_foreign_mints(self).await
+    }
+
     /// A mint's undecrypted confidential deposits as `(id, raw event)`.
     pub async fn get_confidential_undecrypted(
         &self,

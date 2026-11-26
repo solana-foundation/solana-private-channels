@@ -14,7 +14,9 @@ How it works, in short:
 - A confidential deposit becomes a normal deposit row with `confidential = true`.
   A deposit the key cannot decrypt becomes a row flagged `confidential_undecrypted`
   with its raw event bytes, and **poisons** its mint: nothing is minted for it,
-  custody is held, and confidential withdrawals of that mint park.
+  custody is held, and confidential withdrawals of that mint park. A deposit on a mint
+  whose escrow account is under another key is stored the same way even when it
+  decrypts.
 - Custody of a configured mint is the public amount + the decrypted pending balance
   + the available balance, read from the escrow's AES copy and confirmed against the
   on-chain ciphertext. No event history is involved.
@@ -202,8 +204,9 @@ or escrow error 22 on-chain). Nothing was sent, or what was sent failed.
 ### confidential_mint_poisoned
 
 The mint has a confidential deposit the key could not decrypt, or its escrow
-account is configured under a key that is not ours. Custody of the mint is held and
-nothing is minted for its undecrypted deposits.
+account is configured under a key that is not ours, in which case every confidential
+deposit into it is stored undecrypted, even one that decrypts. Custody of the mint is
+held and nothing is minted for its undecrypted deposits.
 
 1. Find the cause:
    ```sql
@@ -218,10 +221,14 @@ nothing is minted for its undecrypted deposits.
      were indexed was wrong or missing. Continue with step 2.
    - **Account under any other key** (a foreign-key mint): it is never recovered
      into the channel. `confidential-recover` refuses it, its confidential
-     deposits stay undecrypted and are never credited, its custody stays held and
+     deposits are parked undecrypted when they are indexed and are never credited,
+     its custody stays held and
      its confidential withdrawals keep parking (release them publicly if the
      public balance covers them, or remint on a confidential-only mint). No instance key can move or verify its
-     confidential balance. [Escalate](_escalation.md) (Tier 1) and stop here.
+     confidential balance. A `resync` of such a mint whose decrypting deposit was
+     credited by an earlier release refuses with `ConsumedMintMismatch` (the rebuilt row
+     has amount 0, the channel mint has the credited amount) until that row is handled
+     by hand. [Escalate](_escalation.md) (Tier 1) and stop here.
 2. Load the right key (`ESCROW_CONFIDENTIAL_KEYS`, the instance key), restart the
    services.
 3. Stop every indexer and operator on the database (`indexer-solana`,
@@ -414,7 +421,8 @@ halt. See
 
 ### Reconciliation confidential lagging
 
-The mint is held, alert only. `reason` says why: `stale_aes` (a deposit raced an
+The mint is held and each tick is an inputs-dark tick; three in a row halt as an
+outage. `reason` says why: `stale_aes` (a deposit raced an
 apply and the copy's gap to the ciphertext is past the bounded search; a raced copy
 whose gap decrypts is counted exactly and never held; the sender repairs the copy) or `pending_too_large` (the
 pending high part is beyond the bounded search; the sender's next apply fixes it).
@@ -426,13 +434,16 @@ failing, see [AES repair deferred](#aes-repair-deferred).
 The mint is held with `reason` `poisoned` (see
 [confidential_mint_poisoned](#confidential_mint_poisoned)) or `key_mismatch` (the
 escrow account is under a key that is not `ESCROW_CONFIDENTIAL_KEYS`). Fires at once;
-nothing clears it automatically. A `key_mismatch` mint is still compared on its public
+nothing clears it automatically. A `poisoned` mint is an inputs-dark tick, so three
+ticks halt as an outage and the escrow indexer refuses to boot until
+`confidential-recover` runs. A `key_mismatch` mint is still compared on its public
 balance, which must cover its liabilities, and halts like any mint when it does not.
 
 ### Confidential hold age
 
-A mint has been held for any reason for over an hour. Its custody is not checked
-while held, except under `key_mismatch`, where no confidential deposit is ever credited
+A mint has been held for any reason for over an hour. Every hold but `key_mismatch`
+is an inputs-dark tick, so by then three ticks have halted as an outage. Its custody
+is not checked while held, except under `key_mismatch`, where no confidential deposit is ever credited
 and the mint is still reconciled on its public balance alone. Find the reason on the
 lagging gauge and follow its entry.
 

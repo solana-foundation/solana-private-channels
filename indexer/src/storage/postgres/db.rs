@@ -228,8 +228,9 @@ fn database_url_password_is_blank(database_url: &str) -> bool {
 
 /// A full reset of every table, in dependency order. Only the pooled `drop_tables` uses it;
 /// resync deletes its own program's rows instead (see `wipe_program_on`).
-const DROP_STATEMENTS: [&str; 17] = [
+const DROP_STATEMENTS: [&str; 18] = [
     "DROP TABLE IF EXISTS resync_state CASCADE",
+    "DROP TABLE IF EXISTS confidential_foreign_mints CASCADE",
     "DROP TABLE IF EXISTS confidential_mint_state CASCADE",
     "DROP TABLE IF EXISTS confidential_operator_attempts CASCADE",
     "DROP TABLE IF EXISTS confidential_sender_state CASCADE",
@@ -741,6 +742,13 @@ impl PostgresDb {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Mints whose escrow account was seen configured under another key. Read at boot, since
+        // such a mint may have no other row; an account is never re-keyed, so rows never go.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS confidential_foreign_mints (mint TEXT PRIMARY KEY)",
         )
         .execute(&self.pool)
         .await?;
@@ -3351,6 +3359,28 @@ impl PostgresDb {
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub async fn record_confidential_foreign_mints_internal(
+        &self,
+        mints: &[String],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO confidential_foreign_mints (mint) SELECT UNNEST($1::text[]) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(mints)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_confidential_foreign_mints_internal(
+        &self,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT mint FROM confidential_foreign_mints ORDER BY mint")
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// A mint's undecrypted deposits as `(id, raw event)`.

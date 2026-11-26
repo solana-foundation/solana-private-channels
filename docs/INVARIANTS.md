@@ -48,7 +48,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | I1 | Solana Private Channels indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent Solana Private Channels block | SHOULD | Done | #55 |
 | I2 | Mainnet indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent mainnet block | SHOULD | Done | #55 |
 | I3 | After downtime, indexers MUST backfill missed slots | MUST | Done | #48 |
-| I4 | A confidential deposit the key cannot decrypt MUST be stored with its raw event and MUST NOT be minted; its mint MUST stay poisoned until recovered, and other mints and public deposits MUST keep flowing | MUST | Done | - |
+| I4 | A confidential deposit the key cannot decrypt, or whose escrow account is under another key, MUST be stored with its raw event and MUST NOT be minted; its mint MUST stay poisoned until recovered, and other mints and public deposits MUST keep flowing | MUST | Done | - |
 | I5 | The withdraw indexer MUST fail the slot on a withdraw-program instruction it does not know, never skip it | MUST | Done | - |
 
 ## Operator
@@ -68,4 +68,4 @@ This document defines the safety and correctness invariants that Solana Private 
 | ID | Invariant | Level | Status | Ref |
 |----|-----------|-------|--------|-----|
 | G1 | On-chain escrow holdings MUST equal total user liabilities in Solana Private Channels | MUST | Done | #12, #39, #14 |
-| G2 | Confidential custody MUST be counted as public + pending + verified available, never as zero when unreadable: an unreadable mint is held or a dark tick | MUST | Done | - |
+| G2 | Confidential custody MUST be counted as public + pending + verified available, never as zero when unreadable: an unreadable mint is a dark tick, except a foreign-key mint, compared on its public balance | MUST | Done | - |

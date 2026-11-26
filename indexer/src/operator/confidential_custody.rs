@@ -14,8 +14,8 @@ use private_channel_confidential::{Ciphertext, Keys, PendingError};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 
-/// Why a configured mint is not compared this time. Alert-only: none of these count toward
-/// the input-dark halt, since each is either lag or a failure contained to the mint.
+/// Why a configured mint is not compared this time. Every hold but a foreign key leaves the
+/// mint's custody unproven, so it is a dark tick and three in a row halt as an outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfidentialHold {
     /// The AES copy does not open and the counters say a deposit raced the last apply.
@@ -58,7 +58,7 @@ impl ConfidentialHold {
 pub enum ConfidentialCustody {
     /// Public plus pending plus the verified available balance.
     Counted(u64),
-    /// Not compared; alert only.
+    /// Not compared in full; see `ConfidentialHold` for which holds count as a dark tick.
     Held(ConfidentialHold),
     /// Custody could not be proven on a healthy mint. Counted as an unreadable input, so a
     /// persistent mismatch still halts.
@@ -361,7 +361,7 @@ pub(crate) mod tests {
         assert_eq!(resolve(Some(&keys), 1, &b).await, Counted(1 + 300 + 5_000));
     }
 
-    /// A gap past the bounded search, or a copy that does not decrypt, is lagging: alert only.
+    /// A gap past the bounded search, or a copy that does not decrypt, is lagging, not a mismatch.
     #[tokio::test]
     async fn an_undecryptable_gap_is_lagging_not_dark() {
         let keys = keys();

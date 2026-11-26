@@ -402,6 +402,7 @@ impl ResyncService {
         from_slot: u64,
         to_slot: u64,
         consumed: Arc<ConsumedSet>,
+        foreign_mints: &BTreeSet<String>,
     ) -> Result<BTreeSet<Pubkey>, IndexerError> {
         info!(
             "Validating the consumed-set against source slots {}..={} before any destruction...",
@@ -414,6 +415,7 @@ impl ResyncService {
         let row_mints = Arc::new(Mutex::new(BTreeSet::new()));
         let mut validator = TransactionProcessor::new(self.storage.clone(), checkpoint_tx)
             .with_confidential_keys(self.confidential_keys.clone())
+            .with_foreign_mints(foreign_mints.clone())
             .with_consumed_set(consumed)
             .with_row_mint_sink(row_mints.clone())
             .validate_only();
@@ -721,6 +723,8 @@ impl ResyncService {
 
         // Pre-flight 2a: the key check every service runs at startup, the first RPC read.
         // Without the key the escrow accounts hold, the rebuild would make poisoned deposits.
+        // The foreign-key mints it finds go to both processors, as on the live indexer.
+        let mut foreign_mints = BTreeSet::new();
         if let (ProgramType::Escrow, Some(instance)) = (self.program_type, self.escrow_instance_id)
         {
             let source = match &self.escrow_key_source {
@@ -733,7 +737,7 @@ impl ResyncService {
                     )),
                 }),
             };
-            crate::indexer::confidential::check_keys_at_boot(
+            foreign_mints = crate::indexer::confidential::check_keys_at_boot(
                 &self.storage,
                 self.confidential_keys.as_deref(),
                 self.pinned_pubkey,
@@ -834,7 +838,13 @@ impl ResyncService {
                 // writing, and collects each rebuilt row's receipt mint on the way.
                 let consumed = Arc::new(consumed);
                 let mints = self
-                    .validate_before_drop(&backfill_service, from_slot, to_slot, consumed.clone())
+                    .validate_before_drop(
+                        &backfill_service,
+                        from_slot,
+                        to_slot,
+                        consumed.clone(),
+                        &foreign_mints,
+                    )
                     .await?;
 
                 // Pre-flight 7: add mints from each receipt mint's history, which also lists
@@ -853,6 +863,7 @@ impl ResyncService {
                         from_slot,
                         to_slot,
                         consumed.clone(),
+                        &foreign_mints,
                     )
                     .await?;
                 }
@@ -896,7 +907,8 @@ impl ResyncService {
         // Start transaction processor as separate tokio task
         let mut transaction_processor =
             TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone())
-                .with_confidential_keys(self.confidential_keys.clone());
+                .with_confidential_keys(self.confidential_keys.clone())
+                .with_foreign_mints(foreign_mints);
         // Wire the escrow instance scope. Pre-flight 1 guarantees Some for the Escrow
         // program. For Withdraw it names the bitmap checked above; the processor only
         // scopes escrow instructions by it, so withdraw rows are unaffected.

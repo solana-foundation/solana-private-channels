@@ -6369,6 +6369,24 @@ impl private_channel_indexer::indexer::confidential::EscrowKeySource for Configu
     }
 }
 
+/// Foreign-key mints survive a re-init and a repeated record, so the next boot reads them.
+#[tokio::test(flavor = "multi_thread")]
+async fn foreign_key_mints_are_recorded_once_and_survive_init(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let mints = ["mint-b".to_string(), "mint-a".to_string()];
+    storage.record_confidential_foreign_mints(&mints).await?;
+    storage
+        .record_confidential_foreign_mints(&mints[..1])
+        .await?;
+    storage.init_schema().await?;
+    assert_eq!(
+        storage.get_confidential_foreign_mints().await?,
+        vec!["mint-a".to_string(), "mint-b".to_string()]
+    );
+    Ok(())
+}
+
 /// The whole recover command against Postgres: re-decrypt from the stored bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn confidential_recover_redecrypts_stored_deposits() -> Result<(), Box<dyn std::error::Error>>

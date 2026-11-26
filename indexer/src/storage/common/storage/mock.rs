@@ -63,6 +63,8 @@ pub struct MockStorage {
     /// Transactions currently in PendingRemint status, used in tests to simulate startup recovery.
     pub pending_remint_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
+    /// Mirrors the `confidential_foreign_mints` table.
+    pub confidential_foreign_mints: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `consumed_channel_mints` table, keyed by source event.
@@ -218,6 +220,7 @@ impl MockStorage {
         self.mints.lock().unwrap().clear();
         self.mint_status_history.lock().unwrap().clear();
         self.consumed_mints.lock().unwrap().clear();
+        self.confidential_foreign_mints.lock().unwrap().clear();
         self.committed_checkpoints.lock().unwrap().clear();
         Ok(())
     }
@@ -784,6 +787,10 @@ impl MockStorage {
     }
 
     pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        let delay = self.delays.lock().unwrap().get("set_outage_halt").copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("set_outage_halt")?;
         let mut halt = self.reconciliation_halt.lock().unwrap();
         // Mirror the conditional upsert: an active insolvency halt is kept.
@@ -1922,6 +1929,29 @@ impl MockStorage {
                 .or_insert_with(|| release.clone());
         }
         Ok(())
+    }
+
+    pub async fn record_confidential_foreign_mints(
+        &self,
+        mints: &[String],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("record_confidential_foreign_mints")?;
+        self.confidential_foreign_mints
+            .lock()
+            .unwrap()
+            .extend(mints.iter().cloned());
+        Ok(())
+    }
+
+    pub async fn get_confidential_foreign_mints(&self) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_confidential_foreign_mints")?;
+        Ok(self
+            .confidential_foreign_mints
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect())
     }
 
     pub async fn get_confidential_poisoned_mints(&self) -> Result<Vec<String>, StorageError> {

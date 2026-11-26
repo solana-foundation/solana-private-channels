@@ -24,6 +24,7 @@ use crate::{
 };
 use private_channel_metrics::MetricLabel;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 #[cfg(feature = "datasource-rpc")]
@@ -419,9 +420,11 @@ fn spawn_transaction_processor(
     escrow_instance_id: Option<Pubkey>,
     health: Option<Arc<HealthState>>,
     confidential_keys: Option<Arc<Keys>>,
+    foreign_mints: BTreeSet<String>,
 ) -> tokio::task::JoinHandle<Result<(), IndexerError>> {
-    let mut transaction_processor =
-        TransactionProcessor::new(storage, checkpoint_tx).with_confidential_keys(confidential_keys);
+    let mut transaction_processor = TransactionProcessor::new(storage, checkpoint_tx)
+        .with_confidential_keys(confidential_keys)
+        .with_foreign_mints(foreign_mints);
     // Wire the escrow instance scope. Config validation guarantees Some for the
     // Escrow program; None here means the Withdraw program, where no instance
     // scoping applies.
@@ -441,6 +444,7 @@ fn spawn_transaction_processor(
 /// the fill starts: with nothing draining the instruction channel the fill either fills
 /// the buffer and parks forever or finishes and has its whole output dropped unread.
 #[cfg(feature = "datasource-rpc")]
+#[allow(clippy::too_many_arguments)]
 async fn run_backfill_only(
     backfill_service: BackfillService,
     storage: Arc<Storage>,
@@ -449,6 +453,7 @@ async fn run_backfill_only(
     configured_start_slot: Option<u64>,
     live_lock_lost: CancellationToken,
     confidential_keys: Option<Arc<Keys>>,
+    foreign_mints: BTreeSet<String>,
 ) -> Result<(), IndexerError> {
     // Resolve first and fail closed: with no live stream there is no ungated fallback.
     let range = backfill_service.resolve_range().await?;
@@ -494,6 +499,7 @@ async fn run_backfill_only(
         escrow_instance_id,
         None,
         confidential_keys,
+        foreign_mints,
     );
     info!("TransactionProcessor task spawned");
 
@@ -644,37 +650,38 @@ pub async fn run(
 
     // Confidential keys: optional until an escrow account is configured, then required and
     // checked against the configured accounts. The withdraw indexer never decrypts.
-    let confidential_keys = match (common_config.program_type, common_config.escrow_instance_id) {
-        (ProgramType::Escrow, Some(instance)) => {
-            let keys = confidential::load_keys()?;
-            let pinned = confidential::load_pinned_pubkey()?;
-            // rpc_url is Solana for the escrow indexer, where the escrow accounts live.
-            let source = confidential::RpcEscrowKeySource {
-                rpc: Arc::new(
-                    crate::operator::utils::RpcClientWithRetry::with_retry_config(
-                        common_config.rpc_url.clone(),
-                        crate::operator::utils::RetryConfig::default(),
-                        solana_commitment_config::CommitmentConfig::confirmed(),
+    let (confidential_keys, foreign_mints) =
+        match (common_config.program_type, common_config.escrow_instance_id) {
+            (ProgramType::Escrow, Some(instance)) => {
+                let keys = confidential::load_keys()?;
+                let pinned = confidential::load_pinned_pubkey()?;
+                // rpc_url is Solana for the escrow indexer, where the escrow accounts live.
+                let source = confidential::RpcEscrowKeySource {
+                    rpc: Arc::new(
+                        crate::operator::utils::RpcClientWithRetry::with_retry_config(
+                            common_config.rpc_url.clone(),
+                            crate::operator::utils::RetryConfig::default(),
+                            solana_commitment_config::CommitmentConfig::confirmed(),
+                        ),
                     ),
-                ),
-            };
-            under_live_lock(
-                &live_lock_lost,
-                confidential::check_keys_at_boot(
-                    &storage,
-                    keys.as_deref(),
-                    pinned,
-                    &source,
-                    &instance,
-                ),
-            )
-            .await
-            .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
-            keys
-        }
-        // A missing instance is refused just below.
-        _ => None,
-    };
+                };
+                let foreign = under_live_lock(
+                    &live_lock_lost,
+                    confidential::check_keys_at_boot(
+                        &storage,
+                        keys.as_deref(),
+                        pinned,
+                        &source,
+                        &instance,
+                    ),
+                )
+                .await
+                .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
+                (keys, foreign)
+            }
+            // A missing instance is refused just below.
+            _ => (None, BTreeSet::new()),
+        };
 
     // The withdraw indexer DB must never be ahead of the channel. Checked once, before any
     // block is read. A restore done while it runs is not caught: every service must be stopped.
@@ -775,6 +782,7 @@ pub async fn run(
                 indexer_config.backfill.start_slot,
                 live_lock_lost.clone(),
                 confidential_keys.clone(),
+                foreign_mints,
             )
             .await;
         }
@@ -801,6 +809,7 @@ pub async fn run(
         common_config.escrow_instance_id,
         health.clone(),
         confidential_keys.clone(),
+        foreign_mints,
     );
 
     // First slot the live RPC source must request, captured from the backfill range so
@@ -2240,6 +2249,7 @@ mod tests {
                 Some(5000),
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2287,6 +2297,7 @@ mod tests {
                 Some(5000),
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2314,6 +2325,7 @@ mod tests {
                 Some(101),
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2341,6 +2353,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2377,6 +2390,7 @@ mod tests {
                     None,
                     CancellationToken::new(),
                     None,
+                    BTreeSet::new(),
                 ),
             )
             .await;
@@ -2409,6 +2423,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2456,6 +2471,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2486,6 +2502,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2523,6 +2540,7 @@ mod tests {
                 None,
                 lost,
                 None,
+                BTreeSet::new(),
             )
             .await;
 
@@ -2564,6 +2582,7 @@ mod tests {
                 None,
                 CancellationToken::new(),
                 None,
+                BTreeSet::new(),
             )
             .await;
 

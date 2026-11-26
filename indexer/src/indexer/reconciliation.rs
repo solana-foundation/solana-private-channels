@@ -283,6 +283,8 @@ pub async fn capture_custody_snapshot(
 
 /// Compare a captured custody snapshot against the ledger as of the snapshot's slot.
 /// Configured mints that cannot be judged are held, never compared as public-only custody.
+/// A poisoned mint refuses the boot; a lagging one may need the live indexer to clear, so
+/// it only warns here and keeps the operator's fence closed at runtime.
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_against_snapshot(
     config: &ReconciliationConfig,
@@ -294,7 +296,7 @@ pub async fn reconcile_against_snapshot(
     snapshot: &CustodySnapshot,
     confidential_keys: Option<&Keys>,
 ) -> Result<(), IndexerError> {
-    reconcile_snapshot(
+    let held = reconcile_snapshot(
         config,
         program_type,
         storage,
@@ -304,8 +306,19 @@ pub async fn reconcile_against_snapshot(
         snapshot,
         confidential_keys,
     )
-    .await
-    .map(|_| ())
+    .await?;
+    let refused: Vec<String> = held
+        .iter()
+        .filter(|(_, hold)| !hold.is_transient())
+        .map(|(mint, hold)| format!("{mint} ({})", hold.label()))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(ReconciliationError::ConfidentialCustodyHeld {
+        mints: refused.join(", "),
+    }
+    .into())
 }
 
 /// The comparison itself; returns the configured mints it held out.
@@ -3426,8 +3439,9 @@ mod tests {
         }
     }
 
-    /// A stale AES copy and a poisoned mint are held on both paths: startup passes without
-    /// them, a manual run reports them by reason.
+    /// A stale AES copy and a poisoned mint are held on both paths. Startup passes without the
+    /// lagging mint, which may need the live indexer to clear, and refuses the poisoned one; a
+    /// manual run reports both by reason.
     #[tokio::test]
     async fn startup_and_manual_hold_a_lagging_or_poisoned_mint() {
         use crate::operator::confidential_custody::tests::{healthy, stale_aes_unreadable_gap};
@@ -3438,7 +3452,19 @@ mod tests {
         ] {
             // The ledger is far above custody: compared, it would block.
             let (startup, manual) = confidential_verdicts(&balances, 10_000_000, poisoned).await;
-            assert!(startup.is_ok(), "{reason}: {startup:?}");
+            if poisoned {
+                assert!(
+                    matches!(
+                        &startup,
+                        Err(IndexerError::Reconciliation(
+                            ReconciliationError::ConfidentialCustodyHeld { mints }
+                        )) if mints.contains(reason)
+                    ),
+                    "{reason}: {startup:?}"
+                );
+            } else {
+                assert!(startup.is_ok(), "{reason}: {startup:?}");
+            }
             assert!(
                 matches!(
                     &manual,
