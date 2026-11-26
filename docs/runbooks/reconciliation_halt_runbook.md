@@ -141,7 +141,11 @@ pages, and it is skipped whenever one more tick could cross a threshold, so ever
 halt and alert still comes from a tick on the configured cadence.
 A confirmed breach **trips** the fence before the flag write is attempted,
 so a failing write cannot leave this process minting; a tripped fence never
-reopens until the process restarts. A builder refused by the fence is counted as
+reopens until the process restarts. The third dark tick in a row (see
+Inputs-dark halt) **closes** an open fence before the outage flag write is
+attempted; a closed fence is the boot state again, so the next clean tick reopens
+it. While inputs are dark for three ticks no probe runs, so after the inputs
+return the fence waits for the next configured tick, at most one interval. A builder refused by the fence is counted as
 `private_channel_operator_transaction_errors_total{error_reason="solvency_fence_closed"}`
 and its row goes back to `pending` without using a requeue attempt. The fence is
 checked once more after the claim write, so a trip that lands mid-claim still
@@ -149,7 +153,9 @@ stops the send; that row keeps its persisted, never-broadcast signature in
 `processing` and recovery settles it. The state is
 exported as `private_channel_operator_solvency_fence_state` (0 closed, 1 open,
 2 tripped). A closed fence counts as progress for `/health` for the first three
-ticks only; after that, with deposits waiting, `/health` reports the stall. The
+ticks only; after that, with deposits waiting, `/health` reports the stall. While an
+outage flag write keeps failing `/health` stays green until the closed fence has
+outlived those three ticks with a backlog. The
 withdraw operator runs no reconciliation, so its fence is always open and the
 durable flag stays its only gate; while an insolvency write keeps failing it keeps
 releasing, so treat a confirmed-breach page with the flag still unset as urgent and
@@ -177,7 +183,9 @@ behind, more than 120 s of clock skew either way between the channel write node
 and the operator, or an unreadable `mints` row. Restore the input first. Clearing
 the flag while the input is still unreadable halts again on the next tick. If the
 flag write itself fails, the operator retries it within the tick and again on
-later ticks until it lands. `/health` is only forced to 503 once the flag has
+later ticks until it lands. The escrow operator closes its solvency fence before
+the first write attempt, so a failing write cannot leave it minting; the withdraw
+operator reads only the flag, so it keeps releasing until the write lands. `/health` is only forced to 503 once the flag has
 landed, because that latch lasts until a restart; until then the webhook, the
 `input_dark_ticks` gauge and its alert are what page. An outage reason on
 `/health` is replaced by the insolvency reason if a breach later upgrades the

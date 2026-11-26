@@ -436,6 +436,7 @@ async fn perform_reconciliation_check(
         input_dark_ticks,
         halted,
         breach_counters,
+        fence,
     )
     .await;
     // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
@@ -484,6 +485,7 @@ async fn track_input_state(
     input_dark_ticks: &mut u32,
     halted: &mut bool,
     breach_counters: &mut BreachCounters,
+    fence: &SolvencyFence,
 ) {
     match missing {
         None => *input_dark_ticks = 0,
@@ -500,6 +502,8 @@ async fn track_input_state(
                     input_dark_ticks, reason
                 );
                 error!(reason = %halt_reason, "RECONCILIATION HALT tripped; freezing both pipelines");
+                // Closed before the write so a failing write cannot keep this process minting.
+                fence.close();
                 let in_force =
                     freeze_pipelines(storage, health, &halt_reason, HaltKind::Outage).await;
                 *halted = in_force.is_some();
@@ -5028,6 +5032,111 @@ mod tests {
         );
     }
 
+    /// The third dark tick closes an open fence before the outage write, so a write that keeps
+    /// failing cannot leave the escrow process minting. A clean tick reopens it.
+    #[tokio::test]
+    async fn a_dark_streak_closes_the_fence_before_the_outage_write() {
+        let (mut env, _) = dark_env().await;
+        env.fence.open();
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        env.mock.set_should_fail("set_outage_halt", true);
+        env.mock
+            .set_delay("set_outage_halt", Duration::from_millis(100));
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        let token = CancellationToken::new();
+
+        for _ in 1..INPUT_DARK_HALT_TICKS {
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &token,
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+            assert!(
+                env.fence.is_open(),
+                "below the threshold the fence stays open"
+            );
+        }
+        // Read the fence once the first write attempt has failed and the retries are pending.
+        let in_flight = async {
+            let started = std::time::Instant::now();
+            while env
+                .mock
+                .call_counts
+                .lock()
+                .unwrap()
+                .get("set_outage_halt")
+                .is_none()
+                && started.elapsed() < Duration::from_secs(10)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            env.fence.state()
+        };
+        let mut liability_dark = 0;
+        let (_, state_during_write) = tokio::join!(
+            run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &token,
+                &mut liability_dark,
+                &mut input_dark,
+            ),
+            in_flight
+        );
+        assert_eq!(
+            state_during_write,
+            FenceState::Closed,
+            "closed while the write is in flight"
+        );
+        assert!(!halted, "the write failed");
+        assert!(env.mock.reconciliation_halt.lock().unwrap().is_none());
+
+        let _ = run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &token,
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+        assert_eq!(
+            env.fence.state(),
+            FenceState::Closed,
+            "still dark, still closed"
+        );
+        assert!(!halted);
+        assert_eq!(
+            env.fence.closed_ticks(),
+            2,
+            "a repeated close does not restart the /health grace"
+        );
+
+        env.mock
+            .set_should_fail("get_mint_balances_for_reconciliation", false);
+        let _ = run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &token,
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+        assert_eq!(input_dark, 0);
+        assert!(env.fence.is_open(), "one clean tick reopens it");
+    }
+
     /// A webhook that counts every halt alert it receives.
     async fn counting_halt_hook() -> (mockito::ServerGuard, Arc<std::sync::atomic::AtomicUsize>) {
         let mut hook = mockito::Server::new_async().await;
@@ -5303,6 +5412,7 @@ mod tests {
                 &mut input_dark,
                 &mut halted,
                 &mut counters,
+                &SolvencyFence::closed(),
             )
             .await;
         }

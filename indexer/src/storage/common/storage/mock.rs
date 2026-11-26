@@ -784,6 +784,10 @@ impl MockStorage {
     }
 
     pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        let delay = self.delays.lock().unwrap().get("set_outage_halt").copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.check_should_fail("set_outage_halt")?;
         let mut halt = self.reconciliation_halt.lock().unwrap();
         // Mirror the conditional upsert: an active insolvency halt is kept.

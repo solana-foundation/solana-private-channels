@@ -16,7 +16,7 @@ pub const CLOSED_TICKS_AS_PROGRESS: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FenceState {
-    /// No clean reconciliation tick yet in this process.
+    /// No clean reconciliation tick yet in this process, or inputs dark for three ticks since.
     Closed = 0,
     Open = 1,
     /// A confirmed insolvency in this process. Only a restart reopens it.
@@ -109,6 +109,24 @@ impl SolvencyFence {
         opened
     }
 
+    /// Close an open fence until the next clean tick reopens it; a trip is left alone. Used when
+    /// inputs go dark, where nothing is proven wrong but nothing is proven right either.
+    pub fn close(&self) {
+        if self
+            .state
+            .compare_exchange(
+                FenceState::Open as u8,
+                FenceState::Closed as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.closed_ticks.store(0, Ordering::SeqCst);
+        }
+        self.publish();
+    }
+
     /// Close for good in this process.
     pub fn trip(&self) {
         self.state
@@ -139,6 +157,7 @@ mod tests {
     enum Op {
         Open,
         Trip,
+        Close,
     }
 
     #[test]
@@ -151,6 +170,9 @@ mod tests {
             (Open, Op::Trip, Tripped),
             (Tripped, Op::Open, Tripped),
             (Tripped, Op::Trip, Tripped),
+            (Closed, Op::Close, Closed),
+            (Open, Op::Close, Closed),
+            (Tripped, Op::Close, Tripped),
         ];
         for (start, op, expected) in cases {
             let fence = SolvencyFence::with_state(start);
@@ -159,10 +181,53 @@ mod tests {
                     fence.open();
                 }
                 Op::Trip => fence.trip(),
+                Op::Close => fence.close(),
             }
             assert_eq!(fence.state(), expected, "{start:?} + {op:?}");
             assert_eq!(fence.is_open(), expected == Open, "{start:?} + {op:?}");
         }
+    }
+
+    #[test]
+    fn close_reopens_only_from_open() {
+        let label = "fence_close_test";
+        let gauge = || {
+            OPERATOR_SOLVENCY_FENCE_STATE
+                .with_label_values(&[label])
+                .get()
+        };
+        let fence = SolvencyFence::closed().reporting_as(label);
+        fence.note_closed_tick();
+        fence.open();
+        assert_eq!(gauge(), 1.0);
+        fence.close();
+        assert_eq!(fence.state(), FenceState::Closed);
+        assert_eq!(
+            fence.closed_ticks(),
+            0,
+            "a close starts a fresh closed count"
+        );
+        assert_eq!(gauge(), 0.0);
+        fence.note_closed_tick();
+        fence.close();
+        assert_eq!(
+            fence.closed_ticks(),
+            1,
+            "closing a closed fence keeps its count"
+        );
+        assert!(
+            fence.open(),
+            "a closed fence reopens on the next clean tick"
+        );
+
+        fence.trip();
+        fence.close();
+        assert_eq!(
+            fence.state(),
+            FenceState::Tripped,
+            "a close never undoes a trip"
+        );
+        assert_eq!(gauge(), 2.0);
     }
 
     #[test]
