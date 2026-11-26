@@ -239,25 +239,30 @@ read as zero custody.
 | State | Metric | Counted as dark | What it means |
 |---|---|---|---|
 | counted | none | no | custody = public + pending + verified available |
-| stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | no | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
-| pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | no | unapplied pending is past the bounded search; the sender's next apply clears it |
-| poisoned | `..._lagging{reason="poisoned"}` = 1 | no | a confidential deposit could not be decrypted |
+| stale_aes | `private_channel_reconciliation_confidential_lagging{reason="stale_aes"}` = 1 | yes | AES copy stale after a deposit raced an apply and its gap to the ciphertext does not decrypt; the sender repairs it |
+| pending_too_large | `..._lagging{reason="pending_too_large"}` = 1 | yes | unapplied pending is past the bounded search; the sender's next apply clears it |
+| poisoned | `..._lagging{reason="poisoned"}` = 1 | yes | a confidential deposit could not be decrypted |
 | key_mismatch | `..._lagging{reason="key_mismatch"}` = 1 | no | the account's ElGamal key is not ours; still compared on its public balance |
 | mismatch | `private_channel_reconciliation_confidential_mismatch{mint}` = 1 | yes | AES copy does not open with matching counters, pending lo does not decrypt, the total overflows, or no key is loaded |
 
 Every held state also exports
 `private_channel_reconciliation_confidential_hold_age_seconds{mint,reason}`.
 
-A mismatch is an [inputs-dark](#inputs-dark-halt) tick with the reason
-`confidential custody not proven for ...`; three in a row halt as an outage. The
-held states are alert only, so a racing deposit or a failure contained to one mint
-never halts the others. While a mint is held its value is unchecked, so treat a
-hold-age alert as urgent. A `key_mismatch` mint is the exception: no confidential
-deposit is ever credited under a foreign key, so its custody is its public balance and
-it is compared, and can halt, like any mint. Startup and manual runs use the same rules: a
-held mint is left out of the comparison (a `key_mismatch` mint is compared on its public
-balance and not reported as held), a mismatch stops the run, and a manual
-`indexer reconcile` exits non-zero naming every held mint and its reason.
+A mismatch, `stale_aes`, `pending_too_large` and `poisoned` are each an
+[inputs-dark](#inputs-dark-halt) tick with the reason
+`confidential custody not proven for ...` naming the mint and its state; three in a
+row halt as an outage, and on the third the escrow operator's solvency fence closes.
+The mint's custody is unknown while it is held, so the fence cannot open on it. A
+racing deposit clears in seconds, well inside one tick, so ordinary lag never halts.
+A `key_mismatch` mint is the exception: no confidential deposit is ever credited under
+a foreign key, so its custody is its public balance and it is compared, and can halt,
+like any mint. Startup and manual runs leave a held mint out of the comparison (a
+`key_mismatch` mint is compared on its public balance and not reported as held) and
+stop on a mismatch. Startup also refuses to boot on a `poisoned` mint, after the
+comparison, with `ConfidentialCustodyHeld`; a `stale_aes` or `pending_too_large` mint
+only warns there, because clearing it can need the deposits the live indexer has yet
+to index. A manual `indexer reconcile` exits non-zero naming every held mint and its
+reason.
 
 Deposits that could not be decrypted (each poisons its mint):
 
@@ -272,16 +277,24 @@ How each state ends. None of them is resolved by reconciliation itself.
 
 - **stale_aes**: should clear within seconds once the sender's repair lands. If it
   lasts, check `operator-private-channel` (the withdraw operator, whose sender runs every
-  apply and repair) is running and not halted, and look for
+  apply and repair) is running and not insolvency-halted, and look for
   `confidential_aes_repair_deferred{mint}`; any later apply, release or
-  `MoveToPublic` also rewrites the copy.
+  `MoveToPublic` also rewrites the copy. The sender keeps applying and repairing under
+  an outage halt, so a hold that raised one clears itself; then clear the flag as for
+  any outage. A hold that lasts three ticks means the sender cannot touch the mint:
+  its withdrawals are blocked (unblock it), or its escrow account is frozen (thaw it).
 - **pending_too_large**: the sender applies pending once it reaches 2^47 base
-  units. If it lasts, check `operator-private-channel` is running, not halted, and the
-  mint is not blocked.
-- **poisoned**: the key that encrypted these rows is not the loaded one. Set
-  `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop every indexer and operator on the database,
-  run `indexer confidential-recover --mint <mint>`, then restart. The mint is
-  counted again once no deposit is flagged `confidential_undecrypted`.
+  units, also under an outage halt. If it lasts, check `operator-private-channel` is
+  running and not insolvency-halted. A hold that lasts three ticks means the mint's
+  withdrawals are blocked (unblock it), its escrow account is frozen (thaw it), or the
+  escrow indexer has not yet indexed the deposits the sender needs to open the pending
+  balance (let it catch up). Once the hold clears, clear the outage flag.
+- **poisoned**: the key that encrypted these rows is not the loaded one. The mint
+  halts as an outage on the third tick, and the escrow indexer refuses to boot on it.
+  Set `ESCROW_CONFIDENTIAL_KEYS` to the instance's keys, stop every indexer and operator
+  on the database, run `indexer confidential-recover --mint <mint>`, then restart and
+  clear the halt flag. The mint is counted again once no deposit is flagged
+  `confidential_undecrypted`.
 - **key_mismatch**: the escrow account was configured with another key. Load the
   right key; if it is lost the confidential custody of this mint is stuck for good,
   so escalate. Its public side stays reconciled meanwhile. If confidential deposits of

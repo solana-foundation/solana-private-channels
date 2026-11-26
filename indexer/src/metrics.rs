@@ -498,8 +498,8 @@ counter_vec!(
     &["kind"]
 );
 
-// Confidential custody in escrow reconciliation, read from the escrow account. Held mints are
-// alert-only; a mismatch on a healthy mint counts as a dark input.
+// Confidential custody in escrow reconciliation, read from the escrow account. A mismatch, and
+// any hold but a foreign key, counts as a dark input.
 gauge_vec!(
     RECONCILIATION_CONFIDENTIAL_MISMATCH,
     "private_channel_reconciliation_confidential_mismatch",

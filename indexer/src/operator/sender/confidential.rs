@@ -30,7 +30,7 @@ use crate::operator::{
     find_event_authority_pda, find_operator_pda, RetryPolicy, RpcClientWithRetry, SignerUtil,
     MAX_POLL_ATTEMPTS_CONFIRMATION,
 };
-use crate::storage::common::models::TransactionStatus;
+use crate::storage::common::models::{HaltInfo, TransactionStatus};
 use crate::storage::common::storage::confidential_sender::{
     attempt_status, rebalance_status, OperatorAttempt, PendingInputs, RebalanceDirection,
     RebalanceRequest,
@@ -396,7 +396,7 @@ pub enum BackgroundApply {
 }
 
 /// Background check: apply only at half the credit cap or 2^47 unapplied pending, and
-/// never while halted, blocked or with a release in flight.
+/// never while insolvency-halted, blocked or with a release in flight.
 pub fn background_apply_due(
     keys: &Keys,
     view: &ConfidentialAccountView,
@@ -2472,6 +2472,33 @@ async fn configured_mints(storage: &Storage) -> Vec<Pubkey> {
     }
 }
 
+/// Which background steps a reconciliation halt holds back; true means held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HaltGates {
+    pub apply: bool,
+    pub rebalance: bool,
+}
+
+/// Any halt, or an unreadable flag, holds rebalances, which move value. The apply and the AES
+/// repair only rewrite the escrow's own account and are what clear a confidential hold, so
+/// only an insolvency halt or an unreadable flag holds them.
+pub fn halt_gates<E>(halt: Result<Option<HaltInfo>, E>) -> HaltGates {
+    match halt {
+        Ok(None) => HaltGates {
+            apply: false,
+            rebalance: false,
+        },
+        Ok(Some(row)) => HaltGates {
+            apply: row.insolvency,
+            rebalance: true,
+        },
+        Err(_) => HaltGates {
+            apply: true,
+            rebalance: true,
+        },
+    }
+}
+
 /// Every 60 s: read each configured escrow account, apply at the thresholds, repair a
 /// stale copy whose backoff passed, and run pending rebalance requests. Reads only otherwise.
 pub async fn background_check(
@@ -2490,10 +2517,7 @@ pub async fn background_check(
     }
     conf.last_background_check = Some(now);
 
-    let halted = matches!(
-        state.storage.is_reconciliation_halted().await,
-        Ok(Some(_)) | Err(_)
-    );
+    let gates = halt_gates(state.storage.is_reconciliation_halted().await);
     // Public withdrawals never touch the escrow's confidential balance, so only a
     // confidential release of the same mint holds its apply or repair.
     let releasing = match state.confidential.as_mut() {
@@ -2502,11 +2526,11 @@ pub async fn background_check(
     };
     for mint in configured_mints(&state.storage).await {
         let release_in_flight = releasing.contains(&mint);
-        if let Err(e) = check_mint(state, &mint, halted, release_in_flight).await {
+        if let Err(e) = check_mint(state, &mint, gates.apply, release_in_flight).await {
             warn!(%mint, "Confidential background check: {e}");
         }
     }
-    run_rebalances(state, storage_tx, halted).await;
+    run_rebalances(state, storage_tx, gates.rebalance).await;
     report_parks_and_generation(state).await;
 }
 
@@ -4759,6 +4783,37 @@ mod tests {
         assert_eq!(background_apply_due(&keys, &half, false, false, true), None);
     }
 
+    #[test]
+    fn halt_gates_hold_the_apply_only_under_insolvency() {
+        use crate::storage::common::models::HaltInfo;
+        let row = |insolvency| {
+            Ok::<_, ()>(Some(HaltInfo {
+                reason: "r".into(),
+                halted_at: Utc::now(),
+                insolvency,
+            }))
+        };
+        let open = HaltGates {
+            apply: false,
+            rebalance: false,
+        };
+        assert_eq!(halt_gates(Ok::<_, ()>(None)), open);
+        assert_eq!(
+            halt_gates(row(false)),
+            HaltGates {
+                apply: false,
+                rebalance: true
+            },
+            "an outage halt holds rebalances but not the apply that may clear it"
+        );
+        let all = HaltGates {
+            apply: true,
+            rebalance: true,
+        };
+        assert_eq!(halt_gates(row(true)), all);
+        assert_eq!(halt_gates(Err::<Option<HaltInfo>, _>(())), all);
+    }
+
     // ---- 23: AES repair ----------------------------------------------------------------
 
     #[test]
@@ -5510,8 +5565,32 @@ mod tests {
         spec: &AccountSpec,
         in_flight: &[(u64, Option<Pubkey>)],
     ) -> bool {
+        background_check_under(spec, in_flight, None).await.0
+    }
+
+    /// The same check with `halt` as the reconciliation halt row; also reports whether a pending
+    /// rebalance request was acted on.
+    async fn background_check_under(
+        spec: &AccountSpec,
+        in_flight: &[(u64, Option<Pubkey>)],
+        halt: Option<crate::storage::common::models::HaltInfo>,
+    ) -> (bool, bool) {
         use private_channel_escrow_program_client::AllowedMint;
         let mock = MockStorage::new();
+        // Larger than the public balance, so a rebalance that runs refuses it at once.
+        let rebalance_mock = mock.clone();
+        let rebalance = Storage::Mock(mock.clone())
+            .insert_rebalance_request(
+                &spec.mint.to_string(),
+                RebalanceDirection::ToConfidential,
+                u64::MAX / 2,
+                0,
+                "r",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        *mock.reconciliation_halt.lock().unwrap() = halt;
         mock.mints.lock().unwrap().insert(
             spec.mint.to_string(),
             crate::storage::common::models::DbMint::new(
@@ -5569,7 +5648,8 @@ mod tests {
             .extend(in_flight.iter().map(|(nonce, _)| *nonce));
         let (tx, _rx) = mpsc::channel(8);
         background_check(&mut state, &tx).await;
-        blockhash.matched_async().await
+        let rebalanced = status_of(&rebalance_mock, rebalance) != rebalance_status::PENDING;
+        (blockhash.matched_async().await, rebalanced)
     }
 
     /// A due apply (credit counter at half its cap) on an account under our key.
@@ -5608,6 +5688,33 @@ mod tests {
         assert!(hold_while_frozen(&mut book, &Pubkey::default(), true));
         assert!(!hold_while_frozen(&mut book, &Pubkey::default(), false));
         assert!(!book.frozen_warned);
+    }
+
+    /// The apply and repair are what clear a confidential hold, so an outage halt, which such a
+    /// hold can raise, must not stop them. An insolvency halt still does; rebalances wait on both.
+    #[tokio::test]
+    async fn background_check_applies_under_an_outage_halt() {
+        use crate::storage::common::models::HaltInfo;
+        ensure_test_signer();
+        let row = |insolvency| {
+            Some(HaltInfo {
+                reason: "r".into(),
+                halted_at: Utc::now(),
+                insolvency,
+            })
+        };
+        for spec in [due_apply(), due_repair()] {
+            assert_eq!(background_check_under(&spec, &[], None).await, (true, true));
+            assert_eq!(
+                background_check_under(&spec, &[], row(false)).await,
+                (true, false),
+                "an outage halt runs the apply and holds rebalances"
+            );
+            assert_eq!(
+                background_check_under(&spec, &[], row(true)).await,
+                (false, false)
+            );
+        }
     }
 
     #[tokio::test]

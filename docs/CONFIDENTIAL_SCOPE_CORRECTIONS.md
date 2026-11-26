@@ -58,7 +58,7 @@ are right.
   apart. When they differ, a deposit raced an apply and the copy is known stale: the gap between
   the copy and the ciphertext is the raced deposits, which reconciliation decrypts in the same
   bounded search as pending and counts exactly. Only when that gap does not decrypt is the mint
-  *lagging* (held, alert only) until the withdraw sender repairs the copy. When the counters
+  *lagging* (held, and a dark tick while it lasts) until the withdraw sender repairs the copy. When the counters
   match, the copy is really wrong: a dark tick, three in a row halt. A pending high part beyond the
   bounded search is also lagging. Held mints are never counted as zero.
 - **Scope:** pending "stays small because the operator applies it regularly".

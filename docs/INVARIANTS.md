@@ -68,4 +68,4 @@ This document defines the safety and correctness invariants that Solana Private 
 | ID | Invariant | Level | Status | Ref |
 |----|-----------|-------|--------|-----|
 | G1 | On-chain escrow holdings MUST equal total user liabilities in Solana Private Channels | MUST | Done | #12, #39, #14 |
-| G2 | Confidential custody MUST be counted as public + pending + verified available, never as zero when unreadable: an unreadable mint is held or a dark tick | MUST | Done | - |
+| G2 | Confidential custody MUST be counted as public + pending + verified available, never as zero when unreadable: an unreadable mint is a dark tick, except a foreign-key mint, compared on its public balance | MUST | Done | - |

@@ -670,12 +670,21 @@ async fn check_invariants(
             universe.unresolved
         )
     });
-    let confidential_missing = (!resolved.mismatched.is_empty()).then(|| {
-        format!(
-            "confidential custody not proven for {:?}",
-            resolved.mismatched
+    // A non-public hold is custody we cannot read, so it is a missing input like a mismatch.
+    let unproven: Vec<String> = resolved
+        .mismatched
+        .iter()
+        .map(|(mint, why)| format!("{mint}: {why}"))
+        .chain(
+            resolved
+                .held
+                .iter()
+                .filter(|(_, hold)| !hold.reconciled_on_public())
+                .map(|(mint, hold)| format!("{mint}: {}", hold.label())),
         )
-    });
+        .collect();
+    let confidential_missing =
+        (!unproven.is_empty()).then(|| format!("confidential custody not proven for {unproven:?}"));
 
     let masked = evaluate_and_maybe_halt(
         storage,
@@ -4552,15 +4561,18 @@ mod tests {
         Ledger,
         /// A configured mint whose AES copy does not open available with matching counters.
         ConfidentialCustody,
+        /// A configured mint held on a stale AES copy whose gap does not decrypt.
+        ConfidentialHold,
     }
 
-    const ALL_INPUTS: [Input; 6] = [
+    const ALL_INPUTS: [Input; 7] = [
         Input::MintSet,
         Input::Custody,
         Input::Envelope,
         Input::ChannelSupply,
         Input::Ledger,
         Input::ConfidentialCustody,
+        Input::ConfidentialHold,
     ];
 
     /// Make `input` unreadable (or readable again) for the ticks that follow.
@@ -4573,14 +4585,21 @@ mod tests {
             Input::Ledger => env
                 .mock
                 .set_should_fail("get_mint_balances_for_reconciliation", failing),
-            Input::ConfidentialCustody => {
-                assert!(failing, "a mismatched account is only ever injected here");
+            Input::ConfidentialCustody | Input::ConfidentialHold => {
+                assert!(failing, "an unreadable account is only ever injected here");
                 let mint: Pubkey = env.mock.pending_transactions.lock().unwrap()[0]
                     .mint
                     .parse()
                     .unwrap();
                 let keys = private_channel_confidential::test_support::keys();
-                let balances = crate::operator::confidential_custody::tests::mismatched(&keys);
+                let balances = match input {
+                    Input::ConfidentialCustody => {
+                        crate::operator::confidential_custody::tests::mismatched(&keys)
+                    }
+                    _ => crate::operator::confidential_custody::tests::stale_aes_unreadable_gap(
+                        &keys,
+                    ),
+                };
                 configure_confidential(env, mint, 100, &balances).await;
             }
             Input::Custody | Input::ChannelSupply => {
@@ -4797,57 +4816,71 @@ mod tests {
         }
     }
 
-    /// A stale AES copy whose gap cannot be decrypted is lag: alert only, never a dark tick,
-    /// and the mint's streaks are neither advanced nor reset.
+    /// A hold that is not judged on the public balance leaves the mint's custody unproven, so
+    /// every tick under it is dark and the third writes the outage halt naming the mint.
     #[tokio::test]
-    async fn a_stale_aes_copy_with_differing_counters_never_goes_dark() {
-        use crate::operator::confidential_custody::tests::stale_aes_unreadable_gap;
-        let keys = private_channel_confidential::test_support::keys();
-        // Supply far above custody: if the mint were compared it would breach.
-        let (env, mint) = confidential_env(900, &stale_aes_unreadable_gap(&keys), 1_000_000).await;
-        let mut counters = BreachCounters {
-            supply: HashMap::from([(mint, 1)]),
-            ..Default::default()
-        };
-        let (dark, halted) =
-            run_confidential_ticks(&env, &mut counters, INPUT_DARK_HALT_TICKS + 1).await;
-        assert_eq!((dark, halted), (0, false));
-        assert_eq!(
-            counters.supply.get(&mint).copied(),
-            Some(1),
-            "streak carried over"
-        );
-        assert_eq!(counters.held_since[&mint].0, "stale_aes");
-        assert!(env
-            .storage
-            .is_reconciliation_halted()
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    /// A poisoned mint is held alert-only, however many ticks pass.
-    #[tokio::test]
-    async fn a_poisoned_confidential_mint_is_held_without_halting() {
-        use crate::operator::confidential_custody::tests::healthy;
+    async fn a_non_public_hold_is_a_dark_tick() {
+        use crate::operator::confidential_custody::tests::{healthy, stale_aes_unreadable_gap};
         use crate::storage::common::models::{DbTransactionBuilder, TransactionType};
         let keys = private_channel_confidential::test_support::keys();
-        let (env, mint) = confidential_env(900, &healthy(&keys), 1_000_000).await;
-        env.mock.pending_transactions.lock().unwrap().push(
-            DbTransactionBuilder::new("s".into(), 1, mint.to_string(), 0)
-                .initiator("user".into())
-                .recipient("user".into())
-                .transaction_type(TransactionType::Deposit)
-                .confidential(true)
-                .undecrypted(vec![1])
-                .build(),
-        );
-        let mut counters = BreachCounters::default();
-        let (dark, halted) =
-            run_confidential_ticks(&env, &mut counters, INPUT_DARK_HALT_TICKS + 1).await;
-        assert_eq!((dark, halted), (0, false));
-        assert_eq!(counters.held_since[&mint].0, "poisoned");
-        assert!(!counters.supply.contains_key(&mint));
+        for label in ["stale_aes", "poisoned"] {
+            let balances = match label {
+                "stale_aes" => stale_aes_unreadable_gap(&keys),
+                _ => healthy(&keys),
+            };
+            // Supply far above custody: if the mint were compared it would breach.
+            let (env, mint) = confidential_env(900, &balances, 1_000_000).await;
+            if label == "poisoned" {
+                env.mock.pending_transactions.lock().unwrap().push(
+                    DbTransactionBuilder::new("s".into(), 1, mint.to_string(), 0)
+                        .initiator("user".into())
+                        .recipient("user".into())
+                        .transaction_type(TransactionType::Deposit)
+                        .confidential(true)
+                        .undecrypted(vec![1])
+                        .build(),
+                );
+            }
+            let mut counters = BreachCounters {
+                supply: HashMap::from([(mint, 1)]),
+                ..Default::default()
+            };
+            let (mut halted, mut input_dark) = (false, 0);
+            for tick in 1..=INPUT_DARK_HALT_TICKS {
+                let _ = run_tick_full(
+                    &env,
+                    &recon_config_zero_tolerance(),
+                    &mut counters,
+                    &mut halted,
+                    &CancellationToken::new(),
+                    &mut 0,
+                    &mut input_dark,
+                )
+                .await;
+                assert_eq!(input_dark, tick, "{label}: the hold is a dark tick");
+                assert!(
+                    !env.fence.is_open(),
+                    "{label} tick {tick}: the fence stays closed"
+                );
+            }
+            assert!(halted, "{label}");
+            let reason = env
+                .storage
+                .is_reconciliation_halted()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label}: the third dark tick halts"))
+                .reason;
+            assert!(reason.contains("required inputs unavailable"), "{reason}");
+            assert!(reason.contains(&mint.to_string()), "{label}: {reason}");
+            assert!(reason.contains(label), "{label}: {reason}");
+            assert_eq!(
+                counters.supply.get(&mint).copied(),
+                Some(1),
+                "{label}: streak carried over"
+            );
+            assert_eq!(counters.held_since[&mint].0, label);
+        }
     }
 
     /// A mint under a foreign key is still compared on its public balance: exact supply

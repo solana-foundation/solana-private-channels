@@ -414,7 +414,8 @@ halt. See
 
 ### Reconciliation confidential lagging
 
-The mint is held, alert only. `reason` says why: `stale_aes` (a deposit raced an
+The mint is held and each tick is an inputs-dark tick; three in a row halt as an
+outage. `reason` says why: `stale_aes` (a deposit raced an
 apply and the copy's gap to the ciphertext is past the bounded search; a raced copy
 whose gap decrypts is counted exactly and never held; the sender repairs the copy) or `pending_too_large` (the
 pending high part is beyond the bounded search; the sender's next apply fixes it).
@@ -426,13 +427,16 @@ failing, see [AES repair deferred](#aes-repair-deferred).
 The mint is held with `reason` `poisoned` (see
 [confidential_mint_poisoned](#confidential_mint_poisoned)) or `key_mismatch` (the
 escrow account is under a key that is not `ESCROW_CONFIDENTIAL_KEYS`). Fires at once;
-nothing clears it automatically. A `key_mismatch` mint is still compared on its public
+nothing clears it automatically. A `poisoned` mint is an inputs-dark tick, so three
+ticks halt as an outage and the escrow indexer refuses to boot until
+`confidential-recover` runs. A `key_mismatch` mint is still compared on its public
 balance, which must cover its liabilities, and halts like any mint when it does not.
 
 ### Confidential hold age
 
-A mint has been held for any reason for over an hour. Its custody is not checked
-while held, except under `key_mismatch`, where no confidential deposit is ever credited
+A mint has been held for any reason for over an hour. Every hold but `key_mismatch`
+is an inputs-dark tick, so by then three ticks have halted as an outage. Its custody
+is not checked while held, except under `key_mismatch`, where no confidential deposit is ever credited
 and the mint is still reconciled on its public balance alone. Find the reason on the
 lagging gauge and follow its entry.
 
