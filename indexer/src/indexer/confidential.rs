@@ -225,7 +225,12 @@ pub async fn check_keys_at_boot(
         .await?
         .into_iter()
         .map(|(mint, _)| mint);
-    for mint in listed.chain(storage.get_unlisted_mints().await?) {
+    // A recorded foreign configure may be a mint with no other row yet; the chain still judges it.
+    let recorded = storage.get_confidential_foreign_mints().await?;
+    for mint in listed
+        .chain(storage.get_unlisted_mints().await?)
+        .chain(recorded)
+    {
         if let Ok(mint) = Pubkey::from_str(&mint) {
             if !mints.contains(&mint) {
                 mints.push(mint);
@@ -761,6 +766,29 @@ mod tests {
                 .get(),
             1.0
         );
+    }
+
+    /// A recorded foreign configure is checked even when the mint has no other row, which is the
+    /// restart case before any deposit or status change for it. The chain still decides.
+    #[tokio::test]
+    async fn boot_check_flags_a_recorded_foreign_mint_the_database_does_not_list() {
+        let (foreign, ours) = ([33u8; 32], [34u8; 32]);
+        let foreign_mint = Pubkey::new_from_array(foreign).to_string();
+        let (storage, mock) = storage_with(vec![]);
+        with_token_2022_mints(&mock, &[MINT]);
+        mock.confidential_foreign_mints.lock().unwrap().extend([
+            foreign_mint.clone(),
+            Pubkey::new_from_array(ours).to_string(),
+        ]);
+        let source = accounts(&[
+            (MINT, cts::keys().pubkey()),
+            (foreign, cts::other_keys().pubkey()),
+            (ours, cts::keys().pubkey()),
+        ]);
+        let foreign = check_keys_at_boot(&storage, Some(&cts::keys()), None, &source, &instance())
+            .await
+            .unwrap();
+        assert_eq!(foreign, BTreeSet::from([foreign_mint]));
     }
 
     #[tokio::test]

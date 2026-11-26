@@ -344,6 +344,7 @@ impl TransactionProcessor {
                 Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
                 Err(_) => return Err(IndexerError::ProcessorPanicked),
             };
+        let new_foreign: Vec<String> = foreign.difference(&self.foreign_mints).cloned().collect();
         self.foreign_mints = foreign;
         for (instruction_meta, confidential) in slot_instructions.iter().zip(confidential_rows) {
             if let Some(rows) = confidential {
@@ -417,6 +418,7 @@ impl TransactionProcessor {
                     &mint_statuses,
                     &transactions,
                     &observed_releases,
+                    &new_foreign,
                 )
                 .await
             {
@@ -490,6 +492,7 @@ impl TransactionProcessor {
     /// history, then the status mirror, then transactions. Short-circuits on the
     /// first failing write so a deposit is never inserted without its backing
     /// mint-status row.
+    #[allow(clippy::too_many_arguments)]
     async fn write_slot(
         &self,
         slot: u64,
@@ -498,6 +501,7 @@ impl TransactionProcessor {
         mint_statuses: &[DbMintStatus],
         transactions: &[DbTransaction],
         observed_releases: &[DbObservedRelease],
+        foreign_mints: &[String],
     ) -> Result<(), StorageError> {
         // Insert mints FIRST (before transactions that might reference them)
         if !mints.is_empty() {
@@ -546,6 +550,21 @@ impl TransactionProcessor {
             touched.dedup();
             if let Err(e) = self.storage.sync_mint_status(&touched).await {
                 error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
+                return Err(e);
+            }
+        }
+
+        // Before the checkpoint, so a restart after it still seeds these mints at boot.
+        if !foreign_mints.is_empty() {
+            if let Err(e) = self
+                .storage
+                .record_confidential_foreign_mints(foreign_mints)
+                .await
+            {
+                error!(
+                    "Failed to record foreign-key mints for slot {}: {}",
+                    slot, e
+                );
                 return Err(e);
             }
         }
@@ -3829,6 +3848,23 @@ mod confidential_tests {
         let raw = raw_of(&parked);
         run_slot(&mut processor, 10, vec![parked]).await.unwrap();
         assert_parked(&inserted(&mock)[0], &raw);
+    }
+
+    /// A foreign configure is recorded, so a restart before any other row for the mint still
+    /// seeds it; the boot check reads only mints the database knows.
+    #[tokio::test]
+    async fn a_foreign_configure_is_recorded_for_the_next_boot() {
+        const FOREIGN: [u8; 32] = [46; 32];
+        let (mut processor, mock) = processor_with(Some(cts::keys()));
+        let slot = vec![
+            configure(&at(10, "cfg-f"), FOREIGN, cts::other_keys().pubkey()),
+            configure(&at(10, "cfg"), MINT_A, cts::keys().pubkey()),
+        ];
+        run_slot(&mut processor, 10, slot).await.unwrap();
+        assert_eq!(
+            mock.confidential_foreign_mints.lock().unwrap().clone(),
+            BTreeSet::from([mint(FOREIGN)])
+        );
     }
 
     /// Two keyed processors fed the same confidential slot write the same rows. The live versus

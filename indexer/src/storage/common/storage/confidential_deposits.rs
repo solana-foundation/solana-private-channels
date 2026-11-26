@@ -13,6 +13,27 @@ pub async fn get_confidential_poisoned_mints(
     }
 }
 
+pub async fn record_confidential_foreign_mints(
+    storage: &Storage,
+    mints: &[String],
+) -> Result<(), StorageError> {
+    match storage {
+        Storage::Postgres(db) => Ok(db.record_confidential_foreign_mints_internal(mints).await?),
+        #[cfg(any(test, feature = "test-mock-storage"))]
+        Storage::Mock(mock) => mock.record_confidential_foreign_mints(mints).await,
+    }
+}
+
+pub async fn get_confidential_foreign_mints(
+    storage: &Storage,
+) -> Result<Vec<String>, StorageError> {
+    match storage {
+        Storage::Postgres(db) => Ok(db.get_confidential_foreign_mints_internal().await?),
+        #[cfg(any(test, feature = "test-mock-storage"))]
+        Storage::Mock(mock) => mock.get_confidential_foreign_mints().await,
+    }
+}
+
 pub async fn get_confidential_undecrypted(
     storage: &Storage,
     mint: &str,
